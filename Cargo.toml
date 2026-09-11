@@ -1,6 +1,60 @@
+[workspace]
+resolver = "3"
+
 [package]
 name = "smart-review"
 version = "0.1.0"
 edition = "2024"
+# Ratatui 0.30.2 declares rust-version 1.88.0, and it is the highest in the tree,
+# so the real MSRV is 1.88 rather than the edition-2024 minimum of 1.85.
+rust-version = "1.88"
+description = "A terminal client for reviewing GitHub pull requests, with LLM-assisted analysis and review ordering."
+repository = "https://github.com/killertux/smart-review"
+publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+toml = { version = "1.1.6", features = ["serde", "preserve_order", "display", "parse"] }
+
+# Inherited by every crate in the workspace (see [workspace.lints] below).
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# `pedantic` is listed first with a lower priority so the individual rules below
+# win when they disagree.
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+dbg_macro = "warn"
+# The TUI owns the terminal; stray printing corrupts the display. Output that is
+# meant for the user goes through a writer so it can be captured in tests.
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.dev.package."*"]
+# Keep dependency code (ratatui, crossterm) optimised even in debug builds so the
+# TUI stays responsive while our own crates remain debuggable.
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

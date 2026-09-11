@@ -1,0 +1,11 @@
+
+
+
+
+ terminal too small
+
+ smart-review needs at least 80x24; this terminal is 60x12
+
+
+
+
