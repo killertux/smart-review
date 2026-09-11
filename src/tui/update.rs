@@ -267,7 +267,7 @@ pub fn candidates(input: &str) -> Vec<(&'static str, &'static str)> {
             let score = if typed.is_empty() {
                 0
             } else {
-                fuzzy_score(typed, name)?
+                crate::fuzzy::score(typed, name)?
             };
             Some((score, *name, *description))
         })
@@ -278,39 +278,6 @@ pub fn candidates(input: &str) -> Vec<(&'static str, &'static str)> {
         .into_iter()
         .map(|(_, name, description)| (name, description))
         .collect()
-}
-
-/// Subsequence match with bonuses for contiguity and for matching early.
-///
-/// Returns `None` when `needle` is not a subsequence of `haystack`.
-fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-
-    let characters: Vec<char> = haystack.chars().collect();
-    let mut score: i32 = 0;
-    let mut cursor = 0;
-    let mut previous: Option<usize> = None;
-
-    for wanted in needle.chars() {
-        let found = cursor
-            + characters
-                .get(cursor..)?
-                .iter()
-                .position(|c| *c == wanted)?;
-        score += 1;
-        if previous == Some(found.wrapping_sub(1)) {
-            score += 2;
-        }
-        cursor = found + 1;
-        previous = Some(found);
-    }
-
-    // Prefer shorter candidates, then earlier matches.
-    let length_penalty = i32::try_from(haystack.chars().count()).unwrap_or(i32::MAX);
-    let cursor_penalty = i32::try_from(cursor).unwrap_or(i32::MAX);
-    Some(score * 10 - length_penalty - cursor_penalty)
 }
 
 /// Completes a partially typed command name.
@@ -409,10 +376,10 @@ mod tests {
 
     #[test]
     fn fuzzy_scoring_prefers_contiguous_and_shorter_matches() {
-        let contiguous = fuzzy_score("doc", "doctor").unwrap();
-        let scattered = fuzzy_score("doc", "d-o-c-nonsense").unwrap();
+        let contiguous = crate::fuzzy::score("doc", "doctor").unwrap();
+        let scattered = crate::fuzzy::score("doc", "d-o-c-nonsense").unwrap();
         assert!(contiguous > scattered, "{contiguous} vs {scattered}");
-        assert!(fuzzy_score("z", "doctor").is_none());
+        assert!(crate::fuzzy::score("z", "doctor").is_none());
     }
 
     #[test]

@@ -1,0 +1,28 @@
+[
+  {
+    "id": 1001,
+    "user": { "login": "alice" },
+    "path": "src/domain/invoice.rs",
+    "line": 31,
+    "original_line": 29,
+    "side": "RIGHT",
+    "body": "Rounding risk when discount is a Percent.",
+    "created_at": "2026-09-10T10:01:00Z",
+    "in_reply_to_id": null,
+    "diff_hunk": "@@ -12,6 +14,9 @@ impl Invoice {\n     pub fn total(&self) -> Money {\n-        self.lines.sum()\n+        let gross = self.lines.sum();\n+        gross - self.discount\n     }",
+    "html_url": "https://github.com/acme/service/pull/141#discussion_r1001"
+  },
+  {
+    "id": 1002,
+    "user": { "login": "bruno" },
+    "path": "src/domain/invoice.rs",
+    "line": 32,
+    "original_line": 30,
+    "side": "RIGHT",
+    "body": "Good catch, I will make discount a Money.",
+    "created_at": "2026-09-10T12:15:00Z",
+    "in_reply_to_id": 1001,
+    "diff_hunk": "@@ -12,6 +14,9 @@ impl Invoice {",
+    "html_url": "https://github.com/acme/service/pull/141#discussion_r1002"
+  }
+]

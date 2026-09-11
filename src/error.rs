@@ -41,9 +41,32 @@ pub enum Error {
 
     #[error("terminal error: {0}")]
     Terminal(#[from] std::io::Error),
+
+    #[error("{message}")]
+    Forge { command: String, message: String },
 }
 
 impl Error {
+    /// Builds an [`Error::Forge`] naming the command that failed.
+    ///
+    /// The command is kept separately from the message because FR-9.1 asks for a
+    /// copyable command, and the message for something a person can read.
+    pub fn forge(command: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Forge {
+            command: command.into(),
+            message: message.into(),
+        }
+    }
+
+    /// The command that produced this error, when there was one.
+    #[must_use]
+    pub fn command(&self) -> Option<&str> {
+        match self {
+            Self::Forge { command, .. } => Some(command),
+            _ => None,
+        }
+    }
+
     /// Builds an [`Error::Io`] with a human-readable action verb.
     pub fn io(action: &'static str, path: impl AsRef<Path>, source: std::io::Error) -> Self {
         Self::Io {

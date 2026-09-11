@@ -36,6 +36,7 @@ pub mod config;
 pub mod doctor;
 pub mod domain;
 pub mod error;
+pub mod fuzzy;
 pub mod logging;
 pub mod paths;
 pub mod ports;

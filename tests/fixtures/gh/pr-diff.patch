@@ -1,0 +1,22 @@
+diff --git a/src/domain/invoice.rs b/src/domain/invoice.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/domain/invoice.rs
++++ b/src/domain/invoice.rs
+@@ -12,6 +12,9 @@ impl Invoice {
+     pub fn total(&self) -> Money {
+-        self.lines.sum()
++        let gross = self.lines.sum();
++        gross - self.discount
+     }
+ }
+diff --git a/docs/logo.png b/docs/logo.png
+new file mode 100644
+index 0000000..2222222
+Binary files /dev/null and b/docs/logo.png differ
+diff --git a/scripts/build.sh b/scripts/build.sh
+old mode 100644
+new mode 100755
+diff --git a/old/name.rs b/new/name.rs
+similarity index 100%
+rename from old/name.rs
+rename to new/name.rs
