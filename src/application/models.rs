@@ -29,14 +29,24 @@ impl CatalogState {
     }
 
     /// A one-line description for the status area.
+    ///
+    /// The skipped count is part of it when there is one: a provider that vanished
+    /// from the picker because the feed changed shape is a puzzle, and "3 entries
+    /// could not be read" is the sentence that solves it (FR-4.7).
     #[must_use]
     pub fn summary(&self) -> String {
-        format!(
+        let mut summary = format!(
             "{} providers, {} models ({})",
             self.providers.len(),
             self.model_count(),
             self.load.source.label()
-        )
+        );
+        let skipped = self.load.catalog.skipped();
+        if skipped > 0 {
+            let _ =
+                std::fmt::Write::write_fmt(&mut summary, format_args!(", {skipped} unreadable"));
+        }
+        summary
     }
 }
 
@@ -842,6 +852,24 @@ mod tests {
         )
         .expect_err("no budget control");
         assert!(error.to_string().contains("budget_tokens"), "{error}");
+    }
+
+    #[test]
+    fn the_summary_admits_what_it_could_not_read() {
+        let text = r#"{"good": {"id": "good", "name": "Good", "api": "https://g/v1",
+            "models": {"m": {"id": "m", "name": "M"}}},
+            "broken": {"id": "broken", "name": 42, "models": {}}}"#;
+        let catalog = Catalog::from_json(text).expect("parses");
+        let state = CatalogState {
+            providers: provider_choices(&catalog),
+            load: CatalogLoad {
+                catalog,
+                source: crate::ports::catalog::CatalogSource::Fetched,
+            },
+        };
+        let summary = state.summary();
+        assert!(summary.contains("1 providers"), "{summary}");
+        assert!(summary.contains("1 unreadable"), "{summary}");
     }
 
     #[test]

@@ -341,6 +341,67 @@
   "name": "DeepSeek",
   "npm": "@ai-sdk/openai-compatible"
  },
+ "friendli": {
+  "api": "https://api.friendli.ai/serverless/v1",
+  "doc": "https://friendli.ai/docs/guides/serverless_endpoints/introduction",
+  "env": [
+   "FRIENDLI_TOKEN"
+  ],
+  "id": "friendli",
+  "models": {
+   "zai-org/GLM-5.3": {
+    "attachment": false,
+    "cost": {
+     "cache_read": 0.26,
+     "input": 1.4,
+     "output": 4.4
+    },
+    "description": "Flagship GLM model for long-horizon coding, agents, and complex project delivery",
+    "family": "glm",
+    "id": "zai-org/GLM-5.3",
+    "interleaved": {
+     "field": "reasoning_content"
+    },
+    "last_updated": "2026-08-14",
+    "limit": {
+     "context": 1048576,
+     "output": 1048576
+    },
+    "modalities": {
+     "input": [
+      "text"
+     ],
+     "output": [
+      "text"
+     ]
+    },
+    "name": "GLM-5.3",
+    "open_weights": true,
+    "reasoning": true,
+    "reasoning_options": [
+     {
+      "type": "effort",
+      "values": [
+       "low",
+       "high",
+       "max"
+      ]
+     },
+     {
+      "max": 1048576,
+      "min": -1,
+      "type": "budget_tokens"
+     }
+    ],
+    "release_date": "2026-08-14",
+    "structured_output": true,
+    "temperature": true,
+    "tool_call": true
+   }
+  },
+  "name": "Friendli",
+  "npm": "@ai-sdk/openai-compatible"
+ },
  "google": {
   "doc": "https://ai.google.dev/gemini-api/docs/models",
   "env": [
@@ -694,6 +755,61 @@
    }
   },
   "name": "LMStudio",
+  "npm": "@ai-sdk/openai-compatible"
+ },
+ "nvidia": {
+  "api": "https://integrate.api.nvidia.com/v1",
+  "doc": "https://docs.api.nvidia.com/nim/",
+  "env": [
+   "NVIDIA_API_KEY"
+  ],
+  "id": "nvidia",
+  "models": {
+   "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+    "attachment": true,
+    "cost": {
+     "input": 0,
+     "output": 0
+    },
+    "description": "Open Nemotron omni model combining reasoning with text, vision, and audio",
+    "family": "nemotron",
+    "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "last_updated": "2026-04-28",
+    "limit": {
+     "context": 256000,
+     "output": 65536
+    },
+    "modalities": {
+     "input": [
+      "text",
+      "image",
+      "video",
+      "audio"
+     ],
+     "output": [
+      "text"
+     ]
+    },
+    "name": "Nemotron 3 Nano Omni",
+    "open_weights": true,
+    "reasoning": true,
+    "reasoning_options": [
+     {
+      "type": "toggle"
+     },
+     {
+      "max": 32768,
+      "min": -1,
+      "type": "budget_tokens"
+     }
+    ],
+    "release_date": "2026-04-28",
+    "structured_output": true,
+    "temperature": true,
+    "tool_call": true
+   }
+  },
+  "name": "Nvidia",
   "npm": "@ai-sdk/openai-compatible"
  },
  "ollama-cloud": {

@@ -23,39 +23,60 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
     providers: BTreeMap<String, Provider>,
+    skipped: usize,
 }
 
 /// Why the catalog payload could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CatalogError {
     /// The payload was not the JSON object of providers that models.dev serves.
-    #[error("the catalog is not JSON: {0}")]
+    #[error("the catalog is not a JSON object of providers: {0}")]
     Malformed(String),
 }
 
 impl Catalog {
     /// Parses the models.dev payload.
     ///
-    /// Unknown fields are ignored rather than rejected: the feed is somebody else's
-    /// to change, and a field we do not use going missing must not empty the picker
-    /// (FR-4.7, §7.5).
+    /// The feed is somebody else's to change, so parsing is **per entry**: only the
+    /// outer object has to be JSON. A provider or a model that does not match what
+    /// this build expects is skipped and counted, because the alternative — failing
+    /// the whole document — is what turned one provider's `"min": -1` into an empty
+    /// model picker for every user (FR-4.7: catalog metadata is advisory).
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogError::Malformed`] when the text is not a JSON object.
+    /// Returns [`CatalogError::Malformed`] only when the text is not a JSON object of
+    /// providers at all.
     pub fn from_json(text: &str) -> Result<Self, CatalogError> {
-        let raw: BTreeMap<String, Provider> = serde_json::from_str(text)
+        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_str(text)
             .map_err(|error| CatalogError::Malformed(error.to_string()))?;
-        // The feed repeats the provider id inside each entry; the key is what the
-        // rest of the app uses, so the id is normalised to match it.
-        let providers = raw
-            .into_iter()
-            .map(|(id, mut provider)| {
-                provider.id.clone_from(&id);
-                (id, provider)
-            })
-            .collect();
-        Ok(Self { providers })
+        let mut providers = BTreeMap::new();
+        let mut skipped = 0_usize;
+        for (id, value) in raw {
+            match Provider::from_value(id.clone(), value) {
+                Ok(provider) => {
+                    skipped += provider.skipped_models;
+                    providers.insert(id, provider);
+                }
+                Err(error) => {
+                    skipped += 1;
+                    crate::logging::log(
+                        crate::logging::Level::Debug,
+                        format!("catalog: skipping provider {id}: {error}"),
+                    );
+                }
+            }
+        }
+        Ok(Self { providers, skipped })
+    }
+
+    /// How many entries the feed published that this build could not read.
+    ///
+    /// Reported rather than swallowed: a provider silently missing from the picker
+    /// is a puzzle, and the count is one sentence that solves it.
+    #[must_use]
+    pub fn skipped(&self) -> usize {
+        self.skipped
     }
 
     /// Every provider in the feed, in id order.
@@ -186,6 +207,53 @@ pub struct Provider {
     /// Models, keyed by model id.
     #[serde(default)]
     pub models: BTreeMap<String, CatalogModel>,
+    /// How many of this provider's models the feed published in a shape this build
+    /// could not read. Not part of the payload; filled in while parsing.
+    #[serde(skip)]
+    pub skipped_models: usize,
+}
+
+impl Provider {
+    /// Parses a provider, tolerating models this build cannot read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the provider's own fields do not match, so the caller
+    /// can skip it and say so.
+    fn from_value(id: String, mut value: serde_json::Value) -> Result<Self, String> {
+        let models = value
+            .get("models")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // The models are taken out before the provider's own fields are parsed, so
+        // that one unreadable model cannot fail the provider that contains it.
+        if let Some(object) = value.as_object_mut() {
+            object.remove("models");
+        }
+        let mut provider: Self =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        let mut readable = BTreeMap::new();
+        let mut skipped = 0;
+        for (model_id, model) in models {
+            match serde_json::from_value::<CatalogModel>(model) {
+                Ok(model) => {
+                    readable.insert(model_id, model);
+                }
+                Err(error) => {
+                    skipped += 1;
+                    crate::logging::log(
+                        crate::logging::Level::Debug,
+                        format!("catalog: skipping {id}/{model_id}: {error}"),
+                    );
+                }
+            }
+        }
+        provider.id = id;
+        provider.models = readable;
+        provider.skipped_models = skipped;
+        Ok(provider)
+    }
 }
 
 impl Provider {
@@ -283,13 +351,13 @@ impl CatalogModel {
     /// The context window, when the feed states a usable one.
     #[must_use]
     pub fn context_limit(&self) -> Option<u32> {
-        self.limit.context.filter(|tokens| *tokens > 0)
+        tokens(self.limit.context)
     }
 
     /// The output cap, when the feed states a usable one.
     #[must_use]
     pub fn output_limit(&self) -> Option<u32> {
-        self.limit.output.filter(|tokens| *tokens > 0)
+        tokens(self.limit.output)
     }
 
     /// The model's declared reasoning options, with the feed's nulls dropped.
@@ -317,8 +385,8 @@ impl CatalogModel {
                 }),
                 RawReasoningOption::BudgetTokens { min, max } => {
                     Some(ReasoningOption::BudgetTokens {
-                        min: *min,
-                        max: *max,
+                        min: tokens(*min),
+                        max: tokens(*max),
                     })
                 }
                 RawReasoningOption::Unknown => None,
@@ -414,13 +482,18 @@ pub enum RawReasoningOption {
         values: Vec<Option<String>>,
     },
     /// An explicit token budget.
+    ///
+    /// The bounds are read as signed integers because the live feed publishes `-1`
+    /// to mean "no minimum" (three models did when this was written), and a `u32`
+    /// would reject the whole document for it. Sanitising happens in
+    /// [`tokens`], which is also where a non-positive bound becomes "none".
     BudgetTokens {
-        /// Smallest accepted budget.
+        /// Smallest accepted budget, as published.
         #[serde(default)]
-        min: Option<u32>,
-        /// Largest accepted budget.
+        min: Option<i64>,
+        /// Largest accepted budget, as published.
         #[serde(default)]
-        max: Option<u32>,
+        max: Option<i64>,
     },
     /// Anything this build does not model; skipped.
     #[serde(other)]
@@ -439,22 +512,35 @@ pub enum ReasoningOption {
     },
     /// A token budget, with the bounds the model declares.
     BudgetTokens {
-        /// Smallest accepted budget.
+        /// Smallest accepted budget, absent when the feed states none.
         min: Option<u32>,
-        /// Largest accepted budget.
+        /// Largest accepted budget, absent when the feed states none.
         max: Option<u32>,
     },
 }
 
 /// Context and output limits.
+///
+/// Signed for the same reason the budget bounds are: a published `-1` or `0` means
+/// "unstated", and it must not be able to fail the parse.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Limit {
-    /// Context window in tokens.
+    /// Context window in tokens, as published.
     #[serde(default)]
-    pub context: Option<u32>,
-    /// Maximum output tokens.
+    pub context: Option<i64>,
+    /// Maximum output tokens, as published.
     #[serde(default)]
-    pub output: Option<u32>,
+    pub output: Option<i64>,
+}
+
+/// A published token count, or `None` when it is not a usable number.
+///
+/// Zero and negatives are the feed's way of saying "no limit": treating `-1` as a
+/// floor of zero would offer a budget nobody can set, and treating `0` as a context
+/// window would truncate every prompt to nothing.
+fn tokens(value: Option<i64>) -> Option<u32> {
+    let value = value.filter(|value| *value > 0)?;
+    u32::try_from(value).ok()
 }
 
 /// Prices per 1M tokens, used only for labelled estimates (§7.5).
@@ -770,6 +856,64 @@ mod tests {
         let catalog = Catalog::from_json(text).expect("parses");
         let model = catalog.model("thing", "m").expect("the model survives");
         assert_eq!(model.name, "M");
+    }
+
+    #[test]
+    fn a_negative_budget_bound_is_read_as_no_bound() {
+        // The live feed publishes `"min": -1` to mean "no minimum". Parsing it as a
+        // `u32` fails the whole document, which is exactly what emptied the picker for
+        // every user: one provider's oddity became nobody's model list.
+        let catalog = catalog();
+        let model = catalog
+            .model("nvidia", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning")
+            .expect("the provider whose bound is -1");
+        let options = model.declared_options();
+        let min = options.iter().find_map(|option| match option {
+            ReasoningOption::BudgetTokens { min, .. } => Some(*min),
+            _ => None,
+        });
+        assert_eq!(min, Some(None), "a floor of -1 means no floor");
+        // And the choice it offers is usable, with the ceiling the feed states.
+        let choice = model
+            .thinking_choices()
+            .into_iter()
+            .find(|choice| choice.needs_input)
+            .expect("a budget control");
+        assert!(choice.is_usable(), "{:?}", choice.refusal);
+        assert_eq!(choice.thinking, Thinking::BudgetTokens { value: 4096 });
+        assert!(
+            Thinking::BudgetTokens { value: 40_000 }
+                .request(model)
+                .is_err(),
+            "the ceiling of 32768 still applies"
+        );
+    }
+
+    #[test]
+    fn a_model_that_cannot_be_read_does_not_take_its_provider_with_it() {
+        let text = r#"{"p": {"id": "p", "name": "P", "api": "https://p/v1", "models": {
+            "good": {"id": "good", "name": "Good"},
+            "broken": {"id": "broken", "name": "Broken", "reasoning_options": 5},
+            "also-broken": {"id": "also-broken", "limit": "none"}}}}"#;
+        let catalog = Catalog::from_json(text).expect("the provider is still readable");
+        assert_eq!(catalog.len(), 1);
+        assert!(
+            catalog.model("p", "good").is_some(),
+            "the good model survives"
+        );
+        assert!(catalog.model("p", "broken").is_none());
+        assert_eq!(catalog.skipped(), 2, "and the feed's oddities are counted");
+    }
+
+    #[test]
+    fn a_provider_that_cannot_be_read_does_not_take_the_catalog_with_it() {
+        let text = r#"{
+            "good": {"id": "good", "name": "Good", "api": "https://g/v1", "models": {}},
+            "broken": {"id": "broken", "name": 42, "models": {}}}"#;
+        let catalog = Catalog::from_json(text).expect("the catalog is still readable");
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.provider("good").is_some());
+        assert_eq!(catalog.skipped(), 1);
     }
 
     #[test]
