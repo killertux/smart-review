@@ -314,6 +314,7 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     ),
     (Scope::In(Mode::Search), "<Enter>", "search.close"),
     (Scope::In(Mode::Search), "<Esc>", "search.close"),
+    (Scope::In(Mode::Normal), "<leader>m", "app.model_picker"),
     (Scope::In(Mode::Normal), "<leader>t", "app.theme_picker"),
     (Scope::In(Mode::Normal), "<leader>T", "theme.toggle"),
     (Scope::In(Mode::Normal), "<leader>?", "app.help"),

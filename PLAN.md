@@ -32,7 +32,8 @@
 |---|---|---|---|---|---|
 | **M0** | Skeleton, rules, CI | `smart-review` opens a themed TUI shell: status line, placeholder panes, modes, `?` help, `<leader>` menu, `:theme`, `:q`. `--version`, `--check`. | `scripts/validate/m0.sh` + manual demo | FR-7.1–7.4, 7.6–7.8, 8.1–8.3, 9.1, 9.2 | ratatui, crossterm, clap, serde, toml, thiserror, anyhow |
 | **M1** | PR browsing & diff reading | Inside a clone: list PRs, filter/search, open one, read metadata + full diff with vim navigation, mouse support, cached. | `scripts/validate/m1.sh` + manual demo | FR-1.1–1.3, 2.1–2.4, 3.2–3.4, 7.5, 7.7, 9.3 | serde_json, `time` (or chrono), unicode-width |
-| **M2** | Workspace + LLM analysis + ordered review | Pick provider/model/thinking and paste a key **in the TUI**, then get a streamed analysis and a re-ordered diff; workspace created in the background. | `scripts/validate/m2.sh` + manual demo | FR-3.1, 3.5, 4.1–4.8 | llm, tokio, reqwest (or reuse), maybe `secrecy` |
+| **M2a** | Workspace + model configuration | Read a PR from a managed worktree (local diff, context and whitespace toggles), and pick provider/model/thinking + paste a key **in the TUI**, with the choice verified against the provider. | `scripts/validate/m2a.sh` + manual demo | FR-3.1, 3.2 (local), 4.5, 4.7, 4.8 | llm, tokio, reqwest, toml_edit |
+| **M2b** | LLM analysis + ordered review | Press `<leader>a`: the analysis streams in, the panel fills, and the tree reorders to domain → application → infra; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/m2b.sh` + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
 | **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/m3.sh` + manual demo | FR-5.1–5.4 | none new |
 | **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` prints commands only. | `scripts/validate/m4.sh` + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
 | **M5** | Polish & release | Visual ranges, thread replies, docs, `NO_COLOR`, release binary + `--version`; backlog items from §11. | `scripts/validate/m5.sh` + manual demo | backlog + NFR polish | decided then |
@@ -141,7 +142,7 @@ List open PRs (newest first, paginated), type `/` to filter, press `Enter` to op
 - [x] PR list UI: rows, draft marker, author, relative time, ±stats, check summary, review decision; explicit pagination with `:load-more` and an honest "showing 50 of ≥137" (FR-2.1).
 - [x] Filter chips → `gh --search` query builder + local fuzzy incremental search (FR-2.2).
 - [x] Disk cache with TTLs, cache-first first paint, revalidate-in-place preserving cursor/scroll, offline indicator (FR-2.3, DEC-14 default).
-- [x] Diff acquisition: remote mode via `gh pr diff --patch` (local mode arrives in M2) (FR-3.2).
+- [x] Diff acquisition: remote mode via `gh pr diff --patch` (local mode arrives in M2a) (FR-3.2).
 - [x] **Unified diff parser** as a pure, exhaustively unit-tested function: renames, binary, mode-only, submodule, CRLF, `\ No newline at end of file`, missing trailing newline, malformed input (FR-3.2).
 - [x] Diff rendering: file tree with per-file stats and folder grouping, hunk headers, dual line numbers, add/del/context styles, cursor line, **virtualized** (only visible lines laid out) (FR-3.3).
 - [x] Side-by-side toggle at width ≥ 140, unavailable below with an explanation (DEC-4, FR-3.3).
@@ -164,24 +165,31 @@ because the raw stream contains only the cells that changed.
 
 Two things M1 does not do, both stated in the interface rather than hidden:
 `<leader>dc`/`<leader>dw` (context lines and whitespace ignoring) need the local
-workspace that M2 creates, and they say so when pressed; and the inline comments are
+workspace that M2a creates, and they say so when pressed; and the inline comments are
 fetched and cached but not yet drawn on the diff, which is M4's publishing flow.
 
 ---
 
-### M2 — Workspace, model configuration, LLM analysis, ordered review
+### M2a — Workspace and model configuration
 
-**Goal:** the product's differentiator. Configure an LLM entirely in the TUI, then get a streamed analysis and an architecture-ordered review.
+**Goal:** everything an analysis needs to exist and be trustworthy, before any money is
+spent on one: the PR checked out locally, and a model chosen and verified in the TUI.
 
 **Runnable artifact**
 ```
 $ cd ~/code/some-repo && smart-review
 ```
-Press `<leader>m` → pick provider → pick model (searchable, with reasoning/cost/context badges) → set thinking → paste the API key into a masked prompt (saved to `credentials.toml`). Open a PR: a worktree is created in the background. Press `<leader>a`: the analysis streams in, the analysis panel fills, and the file tree reorders to domain → application → infra. Press `o` to toggle back to path order. Restart and re-open: cache hit, no network.
+Open a PR: a worktree appears in the background and the diff is now read from it, so
+`<leader>dc` adds context lines and `<leader>dw` hides whitespace. Press `<leader>m` →
+pick provider → pick model (searchable, with reasoning/cost/context badges) → set
+thinking → paste the API key into a masked prompt (saved to `credentials.toml`, mode
+0600). The choice is checked against the provider before it is kept, and the status line
+names the active model.
 
 **Work items**
 - [ ] `WorkspacePort` + `GitCliWorkspace`: `git fetch origin <base> refs/pull/<N>/head`, `git worktree add --detach`, merge-base resolution, `remove`, `prune` (FR-3.1, DEC-1).
 - [ ] Local diff mode: `--unified=<n>` runtime-adjustable, `-w` whitespace toggle, `--find-renames`, three-dot revision (FR-3.2).
+- [ ] `--pr N` actually opens that pull request: M1 accepted the flag, showed it and never acted on it.
 - [ ] File access at the PR revision via `git show <head>:<path>` (independent of worktree state) + `git ls-files` for the tree (FR-4.6, Appendix A).
 - [ ] Workspace lifecycle: reuse for the same head SHA, transparent recreation, `:workspace clean`, stale detection (FR-3.1, DEC-15 default = ask).
 - [ ] `ModelCatalogPort` + models.dev adapter: fetch, TTL cache at `cache/models.json`, offline/manual-entry fallback, hidden-if-unmappable providers (FR-4.7, §7.5).
@@ -189,16 +197,32 @@ Press `<leader>m` → pick provider → pick model (searchable, with reasoning/c
 - [ ] `CredentialsStore`: masked in-TUI entry, atomic `0600` writes, env override + source reporting, `:key clear`, mode verification on load (FR-4.5, §7.4, NFR-3.1).
 - [ ] Model picker UI: three steps, searchable, `Esc` backs out, no restart required, status-line indicator, optional presets (FR-4.5).
 - [ ] Thinking controls constrained by `reasoning_options` (`toggle` / `effort` / `budget_tokens`), explicit refusal for unmappable options, reasoning token usage displayed, **no trace promised** (FR-4.8, DEC-18).
-- [ ] `LlmPort` + `llm`-crate adapter: streaming via tokio, bounded concurrency, cancellation by job id, superseded results dropped (FR-4.4, ARCH-5).
+- [ ] `[llm.active]` written back with `toml_edit`, preserving the user's comments and formatting (FR-8.6, DEC-19).
+- [ ] `LlmPort` + `llm`-crate adapter: chat with streaming and usage, bounded concurrency, cancellation by job id, superseded results dropped (FR-4.4, ARCH-5), plus the connection check the picker runs.
+- [ ] Tests: worktree lifecycle against a real fixture repo, diff flags, catalog parsing from a committed fixture, credential file mode and env precedence, picker state machine, thinking-option mapping.
+
+**FR coverage:** FR-3.1, 3.2 (local), 4.5, 4.7, 4.8.
+**Crates (approved):** `llm` (features `openrouter`, `deepseek`, TLS), `tokio`, `reqwest`, `toml_edit`.
+**Risks:** provider/model heterogeneity is the biggest unknown (DEC-17) — the passthrough path covers most of the catalog, and a provider that cannot be mapped is hidden rather than offered. `llm` crate gaps (effort levels, no reasoning text) are accounted for in FR-4.8. Worktree creation is the first thing here that writes outside `SMART_REVIEW_HOME`'s cache, so its failure modes get their own tests.
+
+---
+
+### M2b — LLM analysis and ordered review
+
+**Goal:** the product's differentiator.
+
+**Runnable artifact:** on the PR from M2a, press `<leader>a`: the analysis streams in, the analysis panel fills, and the file tree reorders to domain → application → infra. Press `o` to toggle back to path order. Restart and re-open: cache hit, no network.
+
+**Work items**
 - [ ] Analysis request/response: strict JSON schema + normalize (unknown paths dropped with warning, missing files appended as `unclassified`), one repair retry, raw text viewable on failure (FR-4.1, §7.1).
-- [ ] Analysis cache keyed by `(repo, pr, head_sha, provider, model, thinking, prompt_version)`, atomic writes, stale marking on head change (FR-4.3).
+- [ ] Analysis cache keyed by `(repo, pr, head_sha, provider, model, thinking, prompt_version)`, atomic writes, stale marking on head change (FR-4.3, DEC-15).
 - [ ] Context bundle builder: metadata + commits + diff + changed files at head + `AGENTS.md`/`CLAUDE.md`/`README.md`, redaction of `.env*`/ignored/oversize/binary, truncation order, token estimate, `:context` inspector + opt-in notice (FR-4.6).
 - [ ] Review plan UI: groups with rationale, recommended vs path order toggle, manual overrides persisted per PR (FR-3.5, FR-4.2, DEC-10 default).
-- [ ] Tests: analysis normalization/repair, cache key sensitivity to thinking, context truncation/redaction, cancellation and superseded-job discard, catalog parsing from a committed fixture, picker state machine.
+- [ ] Tests: analysis normalization/repair, cache key sensitivity to thinking, context truncation/redaction, cancellation and superseded-job discard.
 
-**FR coverage:** FR-3.1, 3.2 (local), 3.5, 4.1–4.8.
-**Crates to approve:** `llm` (features `openrouter`, `deepseek`, plus one TLS feature), `tokio`, an HTTP client for the catalog (`reqwest` already in the tree via `llm` — reuse before adding; `ureq` preferred over a second async stack), possibly `secrecy` for key handling.
-**Risks:** provider/model heterogeneity is the biggest unknown (DEC-17) — build the passthrough path and one native path first, then add native backends only as needed. `llm` crate gaps (effort levels, no reasoning text) are already accounted for in FR-4.8. Token budgeting without a real tokenizer will be approximate; say so in the UI.
+**FR coverage:** FR-3.5, 4.1–4.4, 4.6.
+**Crates to approve:** none new.
+**Risks:** token budgeting without a real tokenizer will be approximate; say so in the UI. A model that answers with prose instead of JSON is a normal outcome, not an exception, so the repair path and the raw-text view are features, not fallbacks.
 
 ---
 
@@ -267,7 +291,7 @@ Press `<leader>m` → pick provider → pick model (searchable, with reasoning/c
 | **Terminal guard** | A single missed restore path corrupts the user's terminal and erodes trust immediately. | FR-9.1, NFR-4.2 |
 | **Port fakes** | Makes every application-level requirement testable offline, which is the only way CI stays fast and hermetic. | ARCH-2, NFR-5.2 |
 | **Theme token set** | Hard-coded colors creep in within days; a lint/test that renders with an all-default theme keeps it honest. | FR-7.7 |
-| **Config loader with unknown-key preservation** | Rewriting a user's config file is data loss; the picker writes config back in M2, so this must be right first. | FR-8.2, FR-8.6 |
+| **Config loader with unknown-key preservation** | Rewriting a user's config file is data loss; the picker writes config back in M2a, so this must be right first. | FR-8.2, FR-8.6 |
 
 ---
 
@@ -296,12 +320,13 @@ Per DEP-1, nothing below is added until approved. Versions come from `cargo add`
 | M0 | `thiserror` | Typed layered errors (ARCH-7) | Avoids hand-written `Display`/`Error` boilerplate |
 | M0 | `anyhow` | Error context at the `main`/CLI boundary only | Small, boundary-only |
 | M1 | `serde_json` | `gh --json` parsing, cache payloads | No std JSON support |
-| M1 | *date/time crate* (`time` preferred) | Relative timestamps, TTLs, ISO-8601 parsing from `gh` | std has no date arithmetic; `time` is smaller than `chrono` |
+| M1 | `chrono` (features `serde`) | Relative timestamps, TTLs, ISO-8601 parsing from `gh` | std has no date arithmetic; **user chose `chrono` over `time`** |
 | M1 | `unicode-width` | Correct width for CJK/emoji in lists and diffs | `str::len` is bytes, not columns |
-| M2 | `llm` (features `openrouter`, `deepseek`, TLS) | Provider abstraction, streaming, reasoning params | Explicitly mandated by the requirements |
-| M2 | `tokio` | Async runtime required by `llm`; job/process supervision | `llm` is async-only |
-| M2 | HTTP client for the catalog | Fetch `models.dev/api.json` | Reuse `reqwest` (already in the tree via `llm`) if a client is exposed; otherwise `ureq`. **Do not add both.** |
-| M2 | `secrecy` *(optional)* | Zeroizing key material, redaction in logs | Reduces the chance of a key leaking through a `Debug` impl |
+| M2a | `llm` (features `openrouter`, `deepseek`, TLS) | Provider abstraction, streaming, reasoning params | Explicitly mandated by the requirements |
+| M2a | `tokio` | Async runtime required by `llm`; job/process supervision | `llm` is async-only |
+| M2a | `reqwest` | Catalog fetch, and the HTTP stack `llm` already pulls in | **User chose `reqwest` directly over `ureq`**, so one HTTP implementation is compiled and there is no second stack to keep current |
+| M2a | `toml_edit` | Write `[llm.active]` back without destroying comments (DEC-19) | `toml` 1.x cannot preserve comments (verified at M0) |
+| — | `secrecy` | Zeroizing key material | **Not added.** Rejected in favour of keeping the only copy of a key in a `String` that is never `Debug`-printed, never logged, and cleared on drop of the picker state (see `credentials.rs`); revisit if that proves hard to hold to. |
 | M5 | `syntect` / `tree-sitter-*` | Syntax highlighting | **Deferred by DEC-4**; needs a new decision + approval |
 
 ---
@@ -310,14 +335,14 @@ Per DEP-1, nothing below is added until approved. Versions come from `cargo add`
 
 | Risk | Impact | Mitigation | Milestone |
 |---|---|---|---|
-| Provider/model heterogeneity (DEC-17) | Analysis silently fails or returns provider-specific errors | Build one native backend + the OpenAI-compatible passthrough first; surface provider errors verbatim; catalog metadata is advisory only | M2 |
-| `llm` crate gaps (3 effort levels, no reasoning text) | Users expect a visible thinking trace | FR-4.8 forbids implying a trace; show settings + reasoning token counts; DEC-18 tracks upstream | M2 |
+| Provider/model heterogeneity (DEC-17) | Analysis silently fails or returns provider-specific errors | Build one native backend + the OpenAI-compatible passthrough first; surface provider errors verbatim; catalog metadata is advisory only | M2a |
+| `llm` crate gaps (3 effort levels, no reasoning text) | Users expect a visible thinking trace | FR-4.8 forbids implying a trace; show settings + reasoning token counts; DEC-18 tracks upstream | M2a |
 | Diff virtualization done late | Large PRs feel broken, then need a rewrite of the renderer | Treat as a first-class M1 requirement with a 10k-line fixture and a performance assertion | M1 |
 | Event loop blocked by a git/gh call | UI freezes; the fix is architectural | Job framework from M0; lint/review rule "no IO in the main loop" in `AGENTS.md` | M0 |
-| Worktree sprawl and disk growth | User annoyance, stale code | Reuse by head SHA, `:workspace clean`, `auto_clean_days`, doctor reporting | M2 |
-| Config rewrite losing user comments | Data loss, trust | Preserve unknown keys, never rewrite the file except for the specific key being set, back up before write | M0/M2 |
+| Worktree sprawl and disk growth | User annoyance, stale code | Reuse by head SHA, `:workspace clean`, `auto_clean_days`, doctor reporting | M2a |
+| Config rewrite losing user comments | Data loss, trust | Preserve unknown keys, never rewrite the file except for the specific key being set, back up before write | M0/M2a |
 | Publish mistakes | Visible, embarrassing, hard to undo | Confirmation modal, verbatim preview, `--dry-run`, draft preserved on failure, sandbox-repo contract tests | M4 |
-| Token cost surprises | Unwanted spend | Pre-send estimate + one-time opt-in per repo, catalog-driven context limits, per-session accounting, ask before re-analyzing a moved head (DEC-15) | M2/M3 |
+| Token cost surprises | Unwanted spend | Pre-send estimate + one-time opt-in per repo, catalog-driven context limits, per-session accounting, ask before re-analyzing a moved head (DEC-15) | M2b/M3 |
 
 ---
 
@@ -325,8 +350,8 @@ Per DEP-1, nothing below is added until approved. Versions come from `cargo add`
 
 - **M0** is deliberately dependency-light: do *not* pull `tokio` yet; prove the terminal lifecycle and the action registry in a synchronous app.
 - **M1 before any LLM work.** A reviewer must be able to browse and read diffs with no model configured; that is also the fallback when the LLM is unavailable.
-- **M2 splits naturally into three parallelisable tracks** once the ports exist: (a) workspace/git, (b) catalog + credentials + picker, (c) `llm` adapter + context bundle + analysis panel. Track (c) depends on (b) only for the active selection.
-- **M3 and M4 are independent** of each other once M2 is done; M4 is the higher-risk one, so consider doing it first if the owner wants a complete review loop sooner.
+- **M2a carries two parallelisable tracks** once the ports exist: (a) workspace/git + local diff, (b) catalog + credentials + picker + `llm` adapter. Track (b) depends on (a) only for the diff source. M2b then builds the context bundle and the analysis panel on both.
+- **M3 and M4 are independent** of each other once M2b is done; M4 is the higher-risk one, so consider doing it first if the owner wants a complete review loop sooner.
 - **M5** only after M0–M4 exit; it is where deferred decisions are revisited.
 
 ---
@@ -337,7 +362,8 @@ Per DEP-1, nothing below is added until approved. Versions come from `cargo add`
 |---|---|
 | M0 | FR-1.2, FR-7.1, FR-7.2, FR-7.3, FR-7.4, FR-7.6, FR-7.7, FR-7.8, FR-8.1, FR-8.2, FR-8.3, FR-8.4, FR-8.5 (subset), FR-8.6, FR-9.1, FR-9.2 |
 | M1 | FR-1.1, FR-1.3, FR-2.1, FR-2.2, FR-2.3, FR-2.4, FR-3.2, FR-3.3, FR-3.4, FR-7.5, FR-9.3 |
-| M2 | FR-3.1, FR-3.5, FR-4.1, FR-4.2, FR-4.3, FR-4.4, FR-4.5, FR-4.6, FR-4.7, FR-4.8 |
+| M2a | FR-3.1, FR-3.2 (local), FR-4.5, FR-4.7, FR-4.8 |
+| M2b | FR-3.5, FR-4.1, FR-4.2, FR-4.3, FR-4.4, FR-4.6 |
 | M3 | FR-5.1, FR-5.2, FR-5.3, FR-5.4 |
 | M4 | FR-6.1, FR-6.2, FR-6.3, FR-6.4, FR-6.5 |
 | M5 | Backlog + NFR polish; nothing in §3 of `REQUIREMENTS.md` may be left unmapped before M5 starts |

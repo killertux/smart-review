@@ -158,6 +158,13 @@ pub struct Output {
     pub status: ExitStatus,
     /// Standard output, decoded lossily as UTF-8.
     pub stdout: String,
+    /// stdout exactly as it arrived.
+    ///
+    /// `stdout` above is a lossy decode, which is the right thing for command
+    /// output that is text and *not* the right thing for `git show <rev>:<path>`,
+    /// where the file may be a PNG. Both are kept: the decode is convenient, the
+    /// bytes are correct.
+    pub stdout_bytes: Vec<u8>,
     /// Standard error, decoded lossily as UTF-8.
     pub stderr: String,
     /// Whether stdout was cut off at the cap.
@@ -369,6 +376,7 @@ impl ProcessRunner {
         Ok(Output {
             status,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stdout_bytes: stdout,
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             stdout_truncated,
             stderr_truncated,
@@ -484,6 +492,24 @@ fn is_text_file_busy(error: &std::io::Error) -> bool {
     #[cfg(not(unix))]
     {
         false
+    }
+}
+
+impl ProcessError {
+    /// Maps a failure onto the workspace error the git adapter reports.
+    ///
+    /// Lives here rather than in `git.rs` because it is the *process* error being
+    /// translated, and both `git.rs` and `git/worktree.rs` need the same answer: a
+    /// missing git is not the same problem as a git command that failed.
+    #[must_use]
+    pub fn into_workspace(self) -> crate::ports::workspace::WorkspaceError {
+        match self {
+            Self::NotFound { .. } => crate::ports::workspace::WorkspaceError::GitUnavailable(
+                "install git and make sure it is on PATH".to_owned(),
+            ),
+            Self::Cancelled { .. } => crate::ports::workspace::WorkspaceError::Cancelled,
+            other => crate::ports::workspace::WorkspaceError::Failed(other.to_string()),
+        }
     }
 }
 

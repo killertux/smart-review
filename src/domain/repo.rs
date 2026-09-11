@@ -142,6 +142,16 @@ impl RepoId {
         format!("{}/{}", self.owner, self.name)
     }
 
+    /// `owner-name`, the directory name managed worktrees live under (FR-3.1).
+    ///
+    /// Deliberately not the cache key: a worktree directory is something a user
+    /// types into `git worktree list` and `cd`, and nested directories there would
+    /// be one more thing to explain.
+    #[must_use]
+    pub fn dir_name(&self) -> String {
+        format!("{}-{}", self.owner, self.name)
+    }
+
     /// `host/owner/name`, the cache partitioning key (FR-1.3).
     #[must_use]
     pub fn key(&self) -> String {

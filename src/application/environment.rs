@@ -68,9 +68,9 @@ pub fn detect(
                 advice: "install git and make sure it is on PATH".to_owned(),
             }
         }
-        other @ crate::ports::workspace::WorkspaceError::Failed(_) => {
-            EnvironmentError::Failed(other.to_string())
-        }
+        // Detection only reports the two failures above; anything else is a git
+        // failure like any other and must not be silently dropped if that changes.
+        other => EnvironmentError::Failed(other.to_string()),
     })?;
 
     let (repo, remote, mode) = resolve_repository(&info, request)?;
@@ -257,13 +257,8 @@ mod tests {
     use crate::ports::workspace::{Remote, RepoInfo};
 
     /// A workspace that reports whatever a test needs.
-    #[derive(Debug)]
-    struct FakeWorkspace(RepoInfo);
-
-    impl WorkspacePort for FakeWorkspace {
-        fn detect(&self) -> Result<RepoInfo, crate::ports::workspace::WorkspaceError> {
-            Ok(self.0.clone())
-        }
+    fn fake_workspace(info: RepoInfo) -> crate::test_support::FakeWorkspace {
+        crate::test_support::FakeWorkspace::new(info)
     }
 
     /// A probe with a fixed answer.
@@ -296,8 +291,8 @@ mod tests {
         }
     }
 
-    fn repo_with(remotes: Vec<Remote>) -> FakeWorkspace {
-        FakeWorkspace(RepoInfo {
+    fn repo_with(remotes: Vec<Remote>) -> crate::test_support::FakeWorkspace {
+        fake_workspace(RepoInfo {
             root: Some(std::path::PathBuf::from("/src/service")),
             remotes,
             default_branch: Some("main".to_owned()),
@@ -306,7 +301,7 @@ mod tests {
     }
 
     fn detect_with(
-        workspace: &FakeWorkspace,
+        workspace: &crate::test_support::FakeWorkspace,
         probe: &FakeProbe,
         request: &DetectRequest,
     ) -> Result<Environment, EnvironmentError> {
@@ -402,7 +397,7 @@ mod tests {
 
     #[test]
     fn not_being_in_a_repository_is_the_first_thing_reported() {
-        let workspace = FakeWorkspace(RepoInfo {
+        let workspace = fake_workspace(RepoInfo {
             git_version: "2.43.0".to_owned(),
             ..RepoInfo::default()
         });
@@ -418,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_repo_override_works_outside_a_clone_and_says_it_is_degraded() {
-        let workspace = FakeWorkspace(RepoInfo::default());
+        let workspace = fake_workspace(RepoInfo::default());
         let request = DetectRequest::with_repo("acme/service");
         let environment = detect_with(&workspace, &ready("2.45.0"), &request).unwrap();
 
@@ -461,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_nonsense_repo_override_is_refused_with_a_shape_to_copy() {
-        let workspace = FakeWorkspace(RepoInfo::default());
+        let workspace = fake_workspace(RepoInfo::default());
         let error = detect_with(
             &workspace,
             &ready("2.45.0"),

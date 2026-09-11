@@ -11,6 +11,7 @@
 
 pub mod diff;
 pub mod environment;
+pub mod model;
 pub mod pr;
 pub mod query;
 pub mod repo;
@@ -20,6 +21,10 @@ pub use diff::{
     DiffLine, FileDiff, FileKind, FileStatus, Hunk, LineKind, Patch, PatchStats, RelPath,
 };
 pub use environment::{Environment, EnvironmentError, GhInstall, RunMode};
+pub use model::{
+    Catalog, CatalogError, CatalogModel, Cost, EffortLevel, Limit, NativeBackend, Provider,
+    ReasoningOption, Route, Thinking, ThinkingChoice, ThinkingError, ThinkingRequest,
+};
 pub use pr::{
     CheckRun, CheckState, CheckSummary, Commit, PrState, PullRequestDetail, PullRequestRef,
     PullRequestSummary, Review, ReviewComment, ReviewDecision, ReviewState,

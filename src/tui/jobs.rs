@@ -31,8 +31,12 @@ use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::logging::{self, Level};
 use crate::ports::cache::CacheStore;
+use crate::ports::catalog::{CatalogLoad, CatalogPolicy, ModelCatalogPort};
 use crate::ports::forge::{ForgePort, ForgeProbe, PullRequestPage};
-use crate::ports::workspace::WorkspacePort;
+use crate::ports::llm::{ChatOutcome, ChatRequest, LlmPort};
+use crate::ports::workspace::{
+    DiffOptions, DiffRequest, Workspace, WorkspacePort, WorkspaceRequest,
+};
 use crate::ports::{Cancel, Clock};
 use crate::tui::app::Effect;
 use crate::tui::list_view::PrListState;
@@ -58,6 +62,12 @@ pub enum Slot {
     Patch,
     /// The environment report.
     Doctor,
+    /// The model catalog (FR-4.7).
+    Catalog,
+    /// One pull request's managed worktree (FR-3.1).
+    Workspace,
+    /// The provider's answer to the picker's connection check (FR-4.5).
+    ModelCheck,
 }
 
 /// What a job was asked to do.
@@ -92,6 +102,40 @@ pub enum Job {
         /// The head commit, which the cache is keyed by.
         head_sha: String,
     },
+    /// Fetch the model catalog (FR-4.7).
+    Catalog {
+        /// How hard to try the network.
+        policy: CatalogPolicy,
+    },
+    /// Materialise a pull request in a managed worktree (FR-3.1).
+    Workspace {
+        /// What to materialise. Boxed for the same reason as the report: it is much
+        /// larger than the other variants and every job crosses a channel.
+        request: Box<WorkspaceRequest>,
+    },
+    /// Ask the provider whether a selection works (FR-4.5).
+    ModelCheck {
+        /// The check request, already built from the resolved selection.
+        request: Box<ChatRequest>,
+    },
+    /// Remove managed worktrees (`:workspace clean`, FR-3.1).
+    CleanWorkspaces {
+        /// Remove every worktree, not only the ones past their age.
+        all: bool,
+        /// How old a worktree must be to be removed when `all` is false.
+        max_age_secs: u64,
+    },
+    /// Diff the open pull request in its own worktree (FR-3.2).
+    LocalPatch {
+        /// Where the worktree is and which flags to use.
+        request: Box<DiffRequest>,
+        /// Which pull request, for the cache key.
+        number: u64,
+        /// The head commit, which the cached diff is keyed by.
+        head_sha: String,
+        /// The flags that produced it, also part of the cache key.
+        options: DiffOptions,
+    },
     /// Collect the environment report (FR-9.3).
     Report {
         /// What to check. Boxed because the context is much larger than any other
@@ -110,8 +154,14 @@ impl Job {
             Self::List { .. } => Slot::List,
             Self::Count { .. } => Slot::Count,
             Self::Detail { .. } => Slot::Detail,
-            Self::Patch { .. } => Slot::Patch,
+            // The local and remote diffs share a slot: only one can be the current
+            // one, so starting either cancels the other.
+            Self::Patch { .. } | Self::LocalPatch { .. } => Slot::Patch,
             Self::Report { .. } => Slot::Doctor,
+            Self::Catalog { .. } => Slot::Catalog,
+            // A worktree and its cleanup share a slot: they are the same resource.
+            Self::Workspace { .. } | Self::CleanWorkspaces { .. } => Slot::Workspace,
+            Self::ModelCheck { .. } => Slot::ModelCheck,
         }
     }
 
@@ -145,6 +195,21 @@ pub enum Outcome {
     Patch(Box<FetchOutcome<Patch>>),
     /// The environment report.
     Checks(Vec<Check>),
+    /// The model catalog arrived (FR-4.7).
+    Catalog(Box<CatalogLoad>),
+    /// A worktree is ready (FR-3.1).
+    Workspace(Box<Workspace>),
+    /// The provider answered the connection check (FR-4.5).
+    ModelChecked(Box<ChatOutcome>),
+    /// Worktrees were removed (FR-3.1).
+    WorkspacesCleaned {
+        /// How many were removed.
+        removed: usize,
+        /// How many were kept.
+        kept: usize,
+        /// The ones that could not be removed, with the reason.
+        failed: Vec<String>,
+    },
     /// The job failed, with the message to show.
     Failed(String),
     /// The job was replaced or abandoned before it finished.
@@ -174,6 +239,7 @@ pub struct Executor {
     forge: Arc<dyn ForgePort>,
     cache: Arc<dyn CacheStore>,
     clock: Arc<dyn Clock>,
+    workspace: Arc<dyn WorkspacePort>,
     repo: RepoId,
     policy: crate::application::prs::CachePolicy,
 }
@@ -185,6 +251,7 @@ impl Executor {
         forge: Arc<dyn ForgePort>,
         cache: Arc<dyn CacheStore>,
         clock: Arc<dyn Clock>,
+        workspace: Arc<dyn WorkspacePort>,
         repo: RepoId,
         policy: crate::application::prs::CachePolicy,
     ) -> Self {
@@ -192,6 +259,7 @@ impl Executor {
             forge,
             cache,
             clock,
+            workspace,
             repo,
             policy,
         }
@@ -231,9 +299,49 @@ impl Executor {
                 Ok(outcome) => Outcome::Patch(Box::new(outcome)),
                 Err(error) => Outcome::Failed(error.to_string()),
             },
-            // Detection and the report do not need a repository, and are handled by
-            // `JobRunner` directly.
-            Job::Detect | Job::Report { .. } => Outcome::Abandoned,
+            // A local diff is read from the worktree rather than from the forge, and
+            // is parsed by the same total parser the remote patch goes through
+            // (FR-3.2), so the review screen cannot tell them apart.
+            Job::LocalPatch {
+                request,
+                number,
+                head_sha,
+                options,
+            } => {
+                // Cache first, with the flags in the key: re-opening a file with the
+                // same toggles must not re-run git (FR-3.2).
+                match prs.cached_patch_with(*number, head_sha, *options) {
+                    Ok(Some(cached)) if !cached.stale => {
+                        return Outcome::Patch(Box::new(FetchOutcome::Fresh(cached.value)));
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+                match self.workspace.diff(request, cancel) {
+                    Ok(text) => {
+                        let patch = crate::domain::diff::parse_patch(&text);
+                        let _ = prs.store_local_patch(*number, head_sha, *options, &patch);
+                        Outcome::Patch(Box::new(FetchOutcome::Fresh(patch)))
+                    }
+                    // The worktree is gone: the caller falls back to the forge, and
+                    // says so rather than showing an empty diff.
+                    Err(error) => match prs.cached_patch_with(*number, head_sha, *options) {
+                        Ok(Some(cached)) => Outcome::Patch(Box::new(FetchOutcome::Offline {
+                            value: cached.value,
+                            reason: error.to_string(),
+                        })),
+                        _ => Outcome::Failed(error.to_string()),
+                    },
+                }
+            }
+            // Detection, the report, the catalog, the worktree and the connection
+            // check do not need a repository resolved through the forge, so
+            // `JobRunner` handles them directly.
+            Job::Detect
+            | Job::Report { .. }
+            | Job::Catalog { .. }
+            | Job::Workspace { .. }
+            | Job::ModelCheck { .. }
+            | Job::CleanWorkspaces { .. } => Outcome::Abandoned,
         }
     }
 }
@@ -246,6 +354,10 @@ pub struct JobRunner {
     workspace: Arc<dyn WorkspacePort>,
     /// The forge probe, for detection.
     probe: Arc<dyn ForgeProbe>,
+    /// The model catalog, for the picker (FR-4.7).
+    catalog: Arc<dyn ModelCatalogPort>,
+    /// The LLM client, for the picker's connection check (FR-4.5).
+    llm: Arc<dyn LlmPort>,
     /// What the command line asked for.
     request: DetectRequest,
     /// Jobs waiting for a free slot.
@@ -274,6 +386,8 @@ impl JobRunner {
     pub fn new(
         workspace: Arc<dyn WorkspacePort>,
         probe: Arc<dyn ForgeProbe>,
+        catalog: Arc<dyn ModelCatalogPort>,
+        llm: Arc<dyn LlmPort>,
         request: DetectRequest,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -281,6 +395,8 @@ impl JobRunner {
             executor: None,
             workspace,
             probe,
+            catalog,
+            llm,
             request,
             queue: VecDeque::new(),
             running: Vec::new(),
@@ -394,6 +510,8 @@ impl JobRunner {
         let executor = self.executor.clone();
         let workspace = Arc::clone(&self.workspace);
         let probe = Arc::clone(&self.probe);
+        let catalog = Arc::clone(&self.catalog);
+        let llm = Arc::clone(&self.llm);
         let request = self.request.clone();
 
         let spawned = std::thread::Builder::new()
@@ -403,21 +521,15 @@ impl JobRunner {
                 // would be occupied for the rest of the session: four such workers
                 // and nothing is ever fetched again, with nothing on screen to say
                 // why. Catching it here means every job sends exactly one answer.
-                let body = std::panic::AssertUnwindSafe(|| match &job {
-                    Job::Detect => {
-                        match detect(workspace.as_ref(), probe.as_ref(), &request, &worker_cancel) {
-                            Ok(environment) => Outcome::Environment(Box::new(environment)),
-                            Err(error) => Outcome::EnvironmentFailed(Box::new(error)),
-                        }
-                    }
-                    Job::Report { context } => Outcome::Checks(doctor::collect(context)),
-                    other => match executor.as_ref() {
-                        Some(executor) => executor.run(other, &worker_cancel),
-                        None => Outcome::Failed(
-                            "the repository is not known yet; run :doctor to see why".to_owned(),
-                        ),
-                    },
-                });
+                let ports = JobPorts {
+                    workspace: workspace.as_ref(),
+                    probe: probe.as_ref(),
+                    catalog: catalog.as_ref(),
+                    llm: llm.as_ref(),
+                    executor: executor.as_deref(),
+                    request: &request,
+                };
+                let body = std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel));
                 let outcome = std::panic::catch_unwind(body).unwrap_or_else(|_| {
                     logging::log(
                         Level::Error,
@@ -460,6 +572,85 @@ impl JobRunner {
     }
 }
 
+/// The ports one job may need.
+///
+/// Borrowed rather than owned so a job can be run without cloning anything: the
+/// worker thread already owns the `Arc`s, and this is the view it passes down.
+struct JobPorts<'a> {
+    workspace: &'a dyn WorkspacePort,
+    probe: &'a dyn ForgeProbe,
+    catalog: &'a dyn ModelCatalogPort,
+    llm: &'a dyn LlmPort,
+    executor: Option<&'a Executor>,
+    request: &'a DetectRequest,
+}
+
+/// Runs a job, whatever kind it is.
+///
+/// Separate from the thread that runs it, so the thread plumbing (`start`) and the
+/// work (`run_job`) can be read and tested apart.
+fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel) -> Outcome {
+    match job {
+        Job::Detect => match detect(ports.workspace, ports.probe, ports.request, cancel) {
+            Ok(environment) => Outcome::Environment(Box::new(environment)),
+            Err(error) => Outcome::EnvironmentFailed(Box::new(error)),
+        },
+        Job::Report { context } => Outcome::Checks(doctor::collect(context)),
+        Job::Catalog { policy } => match ports.catalog.load(*policy) {
+            Ok(load) => Outcome::Catalog(Box::new(load)),
+            Err(error) => Outcome::Failed(error.to_string()),
+        },
+        Job::CleanWorkspaces { all, max_age_secs } => {
+            clean_workspaces(ports.workspace, *all, *max_age_secs, cancel)
+        }
+        Job::Workspace { request } => match ports.workspace.ensure(request, cancel) {
+            Ok(workspace) => Outcome::Workspace(Box::new(workspace)),
+            Err(error) => Outcome::Failed(error.to_string()),
+        },
+        Job::ModelCheck { request } => match ports.llm.complete(request, cancel) {
+            Ok(outcome) => Outcome::ModelChecked(Box::new(outcome)),
+            Err(error) => Outcome::Failed(error.to_string()),
+        },
+        other => match ports.executor {
+            Some(executor) => executor.run(other, cancel),
+            None => Outcome::Failed(
+                "the repository is not known yet; run :doctor to see why".to_owned(),
+            ),
+        },
+    }
+}
+
+/// Removes managed worktrees (`:workspace clean`, FR-3.1).
+fn clean_workspaces(
+    workspace: &dyn WorkspacePort,
+    all: bool,
+    max_age_secs: u64,
+    cancel: &Cancel,
+) -> Outcome {
+    let entries = match workspace.list() {
+        Ok(entries) => entries,
+        Err(error) => return Outcome::Failed(error.to_string()),
+    };
+    let total = entries.len();
+    let mut removed = 0;
+    let mut failed = Vec::new();
+    for entry in entries {
+        let old_enough = entry.age_secs.is_none_or(|age| age >= max_age_secs);
+        if !all && !old_enough {
+            continue;
+        }
+        match workspace.remove(&entry.repo, entry.number, cancel) {
+            Ok(()) => removed += 1,
+            Err(error) => failed.push(format!("pr-{}: {error}", entry.number)),
+        }
+    }
+    Outcome::WorkspacesCleaned {
+        removed,
+        kept: total.saturating_sub(removed + failed.len()),
+        failed,
+    }
+}
+
 /// Turns an effect into the job it asks for, if it asks for one.
 ///
 /// Keeping this mapping here rather than in the reducer is what lets the reducer stay
@@ -483,8 +674,15 @@ pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<
         Effect::RunDoctor => Some(Job::Report {
             context: Box::new(context),
         }),
+        Effect::LoadCatalog(policy) => Some(Job::Catalog { policy: *policy }),
         // A diff reload needs the head SHA, which the caller knows and this does not.
         Effect::ReloadDiff
+        | Effect::EnsureWorkspace(_)
+        | Effect::CheckModel
+        | Effect::ClearKey(_)
+        | Effect::SaveKey { .. }
+        | Effect::SaveSelection(_)
+        | Effect::CleanWorkspaces(_)
         | Effect::CancelInFlight
         | Effect::SetMouse(_)
         | Effect::None
@@ -499,27 +697,22 @@ mod tests {
     use super::*;
     use crate::domain::pr::{CheckRun, CheckSummary, PrState, PullRequestSummary};
     use crate::ports::forge::ForgeCapabilities;
-    use crate::ports::workspace::{RepoInfo, WorkspaceError};
+    use crate::ports::workspace::RepoInfo;
     use crate::test_support::InMemoryCache;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    #[derive(Debug, Default)]
-    struct FakeWorkspace;
-
-    impl WorkspacePort for FakeWorkspace {
-        fn detect(&self) -> Result<RepoInfo, WorkspaceError> {
-            Ok(RepoInfo {
-                root: Some(std::path::PathBuf::from("/src/service")),
-                remotes: vec![crate::ports::workspace::Remote {
-                    name: "origin".to_owned(),
-                    url: "git@github.com:acme/service.git".to_owned(),
-                }],
-                default_branch: Some("main".to_owned()),
-                git_version: "2.43.0".to_owned(),
-            })
-        }
+    fn fake_workspace() -> crate::test_support::FakeWorkspace {
+        crate::test_support::FakeWorkspace::new(RepoInfo {
+            root: Some(std::path::PathBuf::from("/src/service")),
+            remotes: vec![crate::ports::workspace::Remote {
+                name: "origin".to_owned(),
+                url: "git@github.com:acme/service.git".to_owned(),
+            }],
+            default_branch: Some("main".to_owned()),
+            git_version: "2.43.0".to_owned(),
+        })
     }
 
     #[derive(Debug)]
@@ -671,8 +864,8 @@ mod tests {
     }
 
     fn runner_with(delay: Duration) -> (JobRunner, Arc<SlowForge>) {
-        let mut runner = JobRunner::new(
-            Arc::new(FakeWorkspace),
+        let mut runner = crate::test_support::test_job_runner(
+            Arc::new(fake_workspace()),
             Arc::new(FakeProbe {
                 delay: Duration::ZERO,
             }),
@@ -683,6 +876,7 @@ mod tests {
             Arc::clone(&forge) as Arc<dyn ForgePort>,
             Arc::new(InMemoryCache::default()),
             Arc::new(FakeClock),
+            Arc::new(fake_workspace()),
             RepoId::parse("acme/service").unwrap(),
             crate::application::prs::CachePolicy::default(),
         )));
@@ -749,8 +943,8 @@ mod tests {
 
     #[test]
     fn a_failing_job_comes_back_as_a_message_rather_than_a_panic() {
-        let mut runner = JobRunner::new(
-            Arc::new(FakeWorkspace),
+        let mut runner = crate::test_support::test_job_runner(
+            Arc::new(fake_workspace()),
             Arc::new(FakeProbe {
                 delay: Duration::ZERO,
             }),
@@ -937,8 +1131,8 @@ mod tests {
 
     #[test]
     fn a_panicking_job_still_answers_and_frees_its_slot() {
-        let mut runner = JobRunner::new(
-            Arc::new(FakeWorkspace),
+        let mut runner = crate::test_support::test_job_runner(
+            Arc::new(fake_workspace()),
             Arc::new(FakeProbe {
                 delay: Duration::ZERO,
             }),
@@ -948,6 +1142,7 @@ mod tests {
             Arc::new(PanicForge) as Arc<dyn ForgePort>,
             Arc::new(InMemoryCache::default()),
             Arc::new(FakeClock),
+            Arc::new(fake_workspace()),
             RepoId::parse("acme/service").unwrap(),
             crate::application::prs::CachePolicy::default(),
         )));

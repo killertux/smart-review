@@ -6,9 +6,12 @@
 //! each file.
 
 pub mod cache;
+pub mod catalog;
 pub mod clock;
+pub mod credentials;
 pub mod fs;
 pub mod gh;
 pub mod git;
+pub mod http;
 pub mod llm;
 pub mod process;

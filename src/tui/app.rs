@@ -13,17 +13,24 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 
 use crate::Startup;
+use crate::application::models::CatalogState;
 use crate::application::prs::FetchOutcome;
-use crate::config::{Config, ConfigDocument};
+use crate::config::{Config, ConfigDocument, ModelSelection};
 use crate::doctor::{Check, Context};
 use crate::domain::environment::{Environment, EnvironmentError};
 use crate::domain::pr::PullRequestDetail;
 use crate::error::Result;
 use crate::logging::{self, Level};
 use crate::paths::Home;
+use crate::ports::catalog::CatalogPolicy;
+use crate::ports::secret::SecretStore;
+use crate::ports::workspace::{DiffOptions, Workspace};
 use crate::state::AppState;
 use crate::tui::action;
 use crate::tui::components;
+use crate::tui::components::model_picker::{
+    self, PickerState, model_rows, provider_rows, thinking_rows,
+};
 use crate::tui::diff_view::DiffView;
 use crate::tui::event::{self, KeyCode, KeyEvent, KeyModifiers};
 use crate::tui::jobs::{self, Completion, Outcome};
@@ -43,7 +50,7 @@ const MAX_NOTICES: usize = 3;
 pub(crate) const PALETTE_ROWS: usize = 3;
 
 /// What resolving the pending key sequence produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Step {
     /// A binding matched; the effect is what it asked for.
     Fired(Effect),
@@ -58,7 +65,7 @@ enum Step {
 /// Actions are mutually exclusive in M0: the only action that keeps a pending
 /// sequence is the leader menu, and the only ones that need the loop are a theme
 /// change (persist it) and `:doctor` (probe off the event loop).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Default)]
 pub enum Effect {
     /// Nothing to do; the pending key sequence is finished with.
     #[default]
@@ -88,6 +95,97 @@ pub enum Effect {
     SetMouse(bool),
     /// Give up on the work in flight for the current screen (NFR-1.4).
     CancelInFlight,
+    /// Load the model catalog (FR-4.7).
+    LoadCatalog(CatalogPolicy),
+    /// Materialise the open pull request in a managed worktree (FR-3.1).
+    EnsureWorkspace(u64),
+    /// Ask the provider whether the chosen model works (FR-4.5).
+    CheckModel,
+    /// Store a key the user typed (FR-4.5).
+    SaveKey {
+        /// Which provider it belongs to.
+        provider: String,
+        /// The key itself. Kept out of `Debug` by the custom impl below.
+        key: String,
+    },
+    /// Write the chosen model into `config.toml` (FR-8.6).
+    SaveSelection(Box<ModelSelection>),
+    /// Remove a stored key (NFR-3.1).
+    ClearKey(String),
+    /// Remove the worktrees that are no longer needed (FR-3.1).
+    CleanWorkspaces(bool),
+}
+
+impl std::fmt::Debug for Effect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A key must never be printed, not even by `{:?}` in a log line (NFR-3.1).
+        match self {
+            Self::SaveKey { provider, .. } => f
+                .debug_struct("SaveKey")
+                .field("provider", provider)
+                .field("key", &"<redacted>")
+                .finish(),
+            other => f.write_str(&effect_name(other)),
+        }
+    }
+}
+
+/// What the interface starts with: the themes it can cycle through and the list.
+///
+/// Both are read once, before the terminal is taken over, so that cycling themes and
+/// paging the list later are pure computation (NFR-1.2).
+fn initial_view(
+    home: &crate::paths::Home,
+    config: &Config,
+    state: &AppState,
+) -> (Vec<String>, PrListState, Pane) {
+    let focus = state.focus.as_deref().map_or(Pane::default(), Pane::parse);
+    let theme_names = theme::available(home);
+    let list = PrListState::new(
+        u32::try_from(config.review.page_size).unwrap_or(50),
+        u32::try_from(
+            config
+                .review
+                .page_size
+                .saturating_mul(config.review.max_pages.max(1)),
+        )
+        .unwrap_or(500),
+    );
+    (theme_names, list, focus)
+}
+
+/// The calendar year for a Unix timestamp, for "is this model old?" (FR-4.7).
+fn now_year(unix_secs: u64) -> u32 {
+    chrono::DateTime::from_timestamp(i64::try_from(unix_secs).unwrap_or(i64::MAX), 0)
+        .and_then(|time| time.format("%Y").to_string().parse::<u32>().ok())
+        // Before 1970 there is no calendar year to speak of; models are newer.
+        .unwrap_or(1970)
+}
+
+/// A short name for an effect, for logs and tests.
+fn effect_name(effect: &Effect) -> String {
+    match effect {
+        Effect::None => "none".to_owned(),
+        Effect::KeepPending => "keep-pending".to_owned(),
+        Effect::SaveState => "save-state".to_owned(),
+        Effect::RunDoctor => "run-doctor".to_owned(),
+        Effect::DetectEnvironment => "detect-environment".to_owned(),
+        Effect::LoadPullRequests => "load-pull-requests".to_owned(),
+        Effect::LoadMore => "load-more".to_owned(),
+        Effect::CountPullRequests => "count-pull-requests".to_owned(),
+        Effect::OpenPullRequest(number) => format!("open-pull-request({number})"),
+        Effect::ReloadDiff => "reload-diff".to_owned(),
+        Effect::CopyPath(_) => "copy-path".to_owned(),
+        Effect::SetMouse(enabled) => format!("set-mouse({enabled})"),
+        Effect::CancelInFlight => "cancel-in-flight".to_owned(),
+        Effect::LoadCatalog(policy) => format!("load-catalog({policy:?})"),
+        Effect::EnsureWorkspace(number) => format!("ensure-workspace({number})"),
+        Effect::CheckModel => "check-model".to_owned(),
+        Effect::SaveKey { .. } => "save-key".to_owned(),
+        Effect::SaveSelection(_) => "save-selection".to_owned(),
+        Effect::ClearKey(provider) => format!("clear-key({provider})"),
+        Effect::CleanWorkspaces(all) => format!("clean-workspaces({all})"),
+    }
 }
 
 /// The focused pane (FR-7.8).
@@ -356,6 +454,28 @@ pub struct App {
     spinner: usize,
     /// Whether the diff is still being fetched.
     pub(crate) diff_loading: bool,
+    /// The model catalog, once it has been fetched (FR-4.7).
+    pub(crate) catalog: Option<CatalogState>,
+    /// The model picker, when it is open (FR-4.5).
+    pub(crate) picker: Option<PickerState>,
+    /// The selection in use, resolved against the catalog (FR-4.5).
+    pub(crate) active_model: Option<crate::application::models::ResolvedSelection>,
+    /// Why the configured model cannot be used, when it cannot.
+    pub(crate) model_problem: Option<String>,
+    /// The job id of the picker's connection check (FR-4.5).
+    pub(crate) check_job: u64,
+    /// The job id of the catalog fetch (FR-4.7).
+    pub(crate) catalog_job: u64,
+    /// The diff flags the review screen is using (FR-3.2).
+    pub(crate) diff_options: DiffOptions,
+    /// The credential store, for reading and writing provider keys (FR-4.5).
+    pub(crate) secret_store: std::sync::Arc<dyn SecretStore>,
+    /// The workspace port, for listing managed worktrees (FR-3.1).
+    pub(crate) workspace_port: std::sync::Arc<dyn crate::ports::WorkspacePort>,
+    /// The open pull request's worktree, once it exists (FR-3.1).
+    pub(crate) workspace: Option<Workspace>,
+    /// The job id of the worktree being built (FR-3.1).
+    pub(crate) workspace_job: u64,
     /// Why the shown diff came from the cache, when it did (DEC-14).
     pub(crate) diff_offline: Option<String>,
     /// The job id of the newest detection request.
@@ -424,25 +544,16 @@ impl App {
             pr,
             path,
             remote,
+            secret_store,
+            workspace_port,
             ..
         } = startup;
 
-        let focus = state.focus.as_deref().map_or(Pane::default(), Pane::parse);
-        // One directory read, before the terminal is taken over, so cycling
-        // themes later is pure computation.
-        let theme_names = theme::available(&home);
-        let list = PrListState::new(
-            u32::try_from(config.review.page_size).unwrap_or(50),
-            u32::try_from(
-                config
-                    .review
-                    .page_size
-                    .saturating_mul(config.review.max_pages.max(1)),
-            )
-            .unwrap_or(500),
-        );
+        let (theme_names, list, focus) = initial_view(&home, &config, &state);
 
         let mut app = Self {
+            secret_store,
+            workspace_port,
             home,
             config,
             document,
@@ -463,6 +574,15 @@ impl App {
             opening: None,
             spinner: 0,
             diff_loading: false,
+            catalog: None,
+            picker: None,
+            active_model: None,
+            model_problem: None,
+            check_job: 0,
+            catalog_job: 0,
+            diff_options: DiffOptions::default(),
+            workspace: None,
+            workspace_job: 0,
             diff_offline: None,
             environment_job: 0,
             list_job: 0,
@@ -699,21 +819,35 @@ impl App {
                 None
             }
             Outcome::Detail(outcome) if job == self.detail_job => {
-                self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
-                let detail = outcome.into_value();
-                self.notice(
-                    NoticeLevel::Info,
-                    format!(
-                        "opened #{} · {} commit(s) · {} file(s)",
-                        detail.summary.number,
-                        detail.commits.len(),
-                        detail.summary.changed_files
-                    ),
-                );
-                self.detail = Some(detail);
+                self.apply_detail(*outcome);
                 Some(Effect::ReloadDiff)
             }
             Outcome::Patch(outcome) if job == self.patch_job => self.apply_patch(*outcome),
+            Outcome::Catalog(load) if job == self.catalog_job => {
+                self.apply_catalog(*load);
+                None
+            }
+            Outcome::Workspace(workspace) if job == self.workspace_job => {
+                self.workspace = Some(*workspace);
+                // The diff was read from the forge a moment ago; now that the code is
+                // on disk, the same diff is read locally so the context and whitespace
+                // toggles mean something (FR-3.2).
+                Some(Effect::ReloadDiff)
+            }
+            Outcome::ModelChecked(outcome) if job == self.check_job => {
+                self.check_job = 0;
+                self.finish_check(&outcome);
+                None
+            }
+            Outcome::WorkspacesCleaned {
+                removed,
+                kept,
+                failed,
+            } if job == self.workspace_job => {
+                self.workspace_job = 0;
+                self.report_worktrees_cleaned(removed, kept, &failed);
+                None
+            }
             Outcome::Checks(checks) => {
                 self.apply_checks(job, checks);
                 None
@@ -730,9 +864,60 @@ impl App {
             | Outcome::Count(_)
             | Outcome::Detail(_)
             | Outcome::Patch(_)
+            | Outcome::Catalog(_)
+            | Outcome::Workspace(_)
+            | Outcome::ModelChecked(_)
+            | Outcome::WorkspacesCleaned { .. }
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
+    }
+
+    /// Stores a detail and says what was opened (FR-2.4).
+    fn apply_detail(&mut self, outcome: FetchOutcome<PullRequestDetail>) {
+        self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
+        let detail = outcome.into_value();
+        self.notice(
+            NoticeLevel::Info,
+            format!(
+                "opened #{} · {} commit(s) · {} file(s)",
+                detail.summary.number,
+                detail.commits.len(),
+                detail.summary.changed_files
+            ),
+        );
+        self.detail = Some(detail);
+    }
+
+    /// Adopts a freshly fetched catalog and re-resolves the configured model
+    /// (FR-4.5, FR-4.7).
+    fn apply_catalog(&mut self, load: crate::ports::CatalogLoad) {
+        let state = crate::application::models::CatalogState {
+            providers: crate::application::models::provider_choices(&load.catalog),
+            load,
+        };
+        let summary = state.summary();
+        self.catalog = Some(state);
+        // A selection made in an earlier run is only usable once the catalog that
+        // describes it is here, so this is where it is resolved.
+        self.resolve_active_model();
+        self.notice(NoticeLevel::Info, format!("model catalog: {summary}"));
+        self.refresh_picker();
+    }
+
+    /// Says what `:workspace clean` did (FR-3.1).
+    fn report_worktrees_cleaned(&mut self, removed: usize, kept: usize, failed: &[String]) {
+        let mut message = format!("removed {removed} worktree(s), kept {kept}");
+        if !failed.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut message,
+                format_args!("; {} could not be removed", failed.len()),
+            );
+            for failure in failed.iter().take(MAX_NOTICES) {
+                self.notice(NoticeLevel::Warn, failure.clone());
+            }
+        }
+        self.notice(NoticeLevel::Info, message);
     }
 
     /// A sentence naming the repository and account detection resolved.
@@ -857,6 +1042,9 @@ impl App {
             || job == self.detail_job
             || job == self.patch_job
             || job == self.doctor_job
+            || job == self.catalog_job
+            || job == self.workspace_job
+            || job == self.check_job
     }
 
     /// Records a job failure where the user will see it.
@@ -873,6 +1061,30 @@ impl App {
             // A missing count is not worth a notification: the list already says
             // "showing 50 of ≥50", which is true.
             self.list.counting = false;
+        } else if job == self.catalog_job {
+            self.catalog_job = 0;
+            // Without a catalog there is nothing to resolve the configured model
+            // against, so the status line says so rather than pretending (FR-4.5).
+            self.model_problem.get_or_insert_with(|| message.to_owned());
+            if let Some(picker) = self.picker.as_mut() {
+                picker.set_notice(Some(message.to_owned()));
+                self.notice(NoticeLevel::Warn, format!("model catalog: {message}"));
+            }
+        } else if job == self.workspace_job {
+            // Not being able to materialise the code is not fatal: the diff from the
+            // forge is already on screen, and only the toggles need the worktree.
+            self.workspace_job = 0;
+            self.notice(
+                NoticeLevel::Warn,
+                format!("working from the remote diff: {message}"),
+            );
+        } else if job == self.check_job {
+            self.check_job = 0;
+            if let Some(picker) = self.picker.as_mut() {
+                picker.set_checking(false);
+                picker.set_notice(Some(message.to_owned()));
+            }
+            self.notice(NoticeLevel::Error, format!("model check failed: {message}"));
         } else {
             self.notice(NoticeLevel::Error, message.to_owned());
         }
@@ -1355,12 +1567,321 @@ impl App {
     /// Handles one key press (FR-7.1, FR-7.2).
     pub fn on_key(&mut self, event: KeyEvent) -> Effect {
         let combo = keymap::normalize(KeyCombo::from(event));
+        // The picker takes every key while it is open: it is a text-entry surface, so
+        // a bare `j` belongs in its filter rather than in whatever is behind it
+        // (FR-7.2's rule, applied to the modal).
+        if self.picker.is_some() {
+            return self.on_picker_key(combo);
+        }
         match self.mode {
             Mode::Command => self.on_command_key(combo),
             Mode::Search => self.on_search_key(combo),
             Mode::Popup => self.on_popup_key(combo),
             Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
+    }
+
+    /// Opens the model picker and asks for the catalog (FR-4.5, FR-4.7).
+    pub(crate) fn open_model_picker(&mut self) -> Effect {
+        let mut picker = PickerState::new();
+        picker.set_notice(Some("loading the model catalog…".to_owned()));
+        self.picker = Some(picker);
+        self.refresh_picker();
+        // A cache that is fresh answers instantly; a stale one is refreshed in the
+        // background, and the picker shows it either way (FR-4.7).
+        Effect::LoadCatalog(CatalogPolicy::CacheFirst)
+    }
+
+    /// Records the job id of the catalog fetch (FR-4.7).
+    pub(crate) fn record_catalog_job(&mut self, job: u64) {
+        self.catalog_job = job;
+    }
+
+    /// Records the job id of the worktree being built (FR-3.1).
+    pub(crate) fn record_workspace_job(&mut self, job: u64) {
+        self.workspace_job = job;
+    }
+
+    /// Records the job id of the connection check (FR-4.5).
+    pub(crate) fn record_check_job(&mut self, job: u64) {
+        self.check_job = job;
+        if let Some(picker) = self.picker.as_mut() {
+            picker.set_checking(true);
+            picker.set_notice(Some("asking the provider…".to_owned()));
+        }
+    }
+
+    /// The selection currently configured, if it resolves (FR-4.5).
+    #[must_use]
+    pub fn active_model(&self) -> Option<&crate::application::models::ResolvedSelection> {
+        self.active_model.as_ref()
+    }
+
+    /// Why the configured model cannot be used, if it cannot.
+    #[must_use]
+    pub fn model_problem(&self) -> Option<&str> {
+        self.model_problem.as_deref()
+    }
+
+    /// The picker, when it is open.
+    #[must_use]
+    pub fn picker(&self) -> Option<&PickerState> {
+        self.picker.as_ref()
+    }
+
+    /// The managed worktrees on disk (FR-3.1).
+    ///
+    /// A directory listing, read on demand: the same bounded local read the theme
+    /// list does, and cheap enough that `:workspace` does not need a job.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message from the filesystem when the directory cannot be read.
+    pub fn worktrees(
+        &self,
+    ) -> std::result::Result<Vec<crate::ports::workspace::WorkspaceEntry>, String> {
+        self.workspace_port
+            .list()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The credential store (FR-4.5).
+    #[must_use]
+    pub fn secret_store(&self) -> &dyn SecretStore {
+        self.secret_store.as_ref()
+    }
+
+    /// The selection the picker has assembled so far, if it is complete (FR-4.5).
+    #[must_use]
+    pub fn picker_selection(&self) -> Option<ModelSelection> {
+        let picker = self.picker.as_ref()?;
+        Some(ModelSelection {
+            provider: picker.provider()?.to_owned(),
+            model: picker.model()?.to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: picker.thinking().cloned(),
+        })
+    }
+
+    /// The picker, mutably, for the cases that have to change what it says.
+    pub(crate) fn picker_mut(&mut self) -> Option<&mut PickerState> {
+        self.picker.as_mut()
+    }
+
+    /// Closes the picker (FR-4.5).
+    pub(crate) fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// Makes a selection the active one, and resolves it (FR-4.5).
+    pub(crate) fn set_active_selection(&mut self, selection: ModelSelection) {
+        self.config.llm.active = Some(selection);
+        self.resolve_active_model();
+    }
+
+    /// Whether the app should materialise worktrees at all (FR-3.1).
+    #[must_use]
+    pub fn wants_workspace(&self) -> bool {
+        // `[workspace].mode = "remote"` is how a user says "never write a worktree",
+        // and it is honoured here rather than in the adapter so the reason is visible.
+        !self.config.workspace.mode.eq_ignore_ascii_case("remote")
+    }
+
+    /// Whether the open pull request's worktree matches the commit on screen
+    /// (FR-3.1, FR-4.3).
+    #[must_use]
+    pub fn workspace_ready(&self) -> bool {
+        match (&self.workspace, &self.detail) {
+            (Some(workspace), Some(detail)) => workspace.head_sha == detail.summary.head_sha,
+            _ => false,
+        }
+    }
+
+    /// The request that asks the provider whether the active model works (FR-4.5).
+    #[must_use]
+    pub fn check_request(&self) -> Option<crate::ports::llm::ChatRequest> {
+        let resolved = self.active_model.as_ref()?;
+        let key = self
+            .secret_store
+            .get(&resolved.provider, resolved.env_var.as_deref())
+            .ok()
+            .flatten()?;
+        Some(crate::application::models::connection_check(resolved, key))
+    }
+
+    /// The provider the picker is on, if it has chosen one (FR-4.5).
+    #[must_use]
+    pub fn picker_provider(&self) -> Option<String> {
+        self.picker
+            .as_ref()
+            .and_then(|picker| picker.provider().map(str::to_owned))
+    }
+
+    /// Fills the picker's rows for the step it is on (FR-4.5).
+    pub(crate) fn refresh_picker(&mut self) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let step = picker.step();
+        let query = picker.query().to_owned();
+        let rows = match step {
+            model_picker::Step::Provider => self
+                .catalog
+                .as_ref()
+                .map(|state| provider_rows(state, &query))
+                .unwrap_or_default(),
+            model_picker::Step::Model => {
+                let provider = picker.provider().map(str::to_owned);
+                match (self.catalog.as_ref(), provider) {
+                    (Some(state), Some(provider)) => {
+                        model_rows(state, &provider, &query, now_year(self.now_unix_secs()))
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            model_picker::Step::Thinking => {
+                let chosen = (
+                    picker.provider().map(str::to_owned),
+                    picker.model().map(str::to_owned),
+                );
+                match (self.catalog.as_ref(), chosen) {
+                    (Some(state), (Some(provider), Some(model))) => {
+                        thinking_rows(state, &provider, &model)
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            model_picker::Step::Key | model_picker::Step::Confirm => Vec::new(),
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.set_rows(rows);
+        }
+    }
+
+    /// Handles a key while the picker is open (FR-4.5).
+    fn on_picker_key(&mut self, combo: KeyCombo) -> Effect {
+        let Some(mut picker) = self.picker.take() else {
+            return Effect::None;
+        };
+        let mut effect = Effect::None;
+        let mut close = false;
+        match combo.code {
+            // `Esc` walks back a step, and closes the picker from the first step:
+            // that is "back out without changing anything" (FR-4.5).
+            KeyCode::Esc => close = !picker.step_back(),
+            KeyCode::Enter => match picker.advance() {
+                // Nothing to do for either: the picker has already moved, or has put
+                // the reason on screen itself.
+                model_picker::PickerStep::Moved | model_picker::PickerStep::Refused(_) => {}
+                model_picker::PickerStep::KeyTyped { provider, key } => {
+                    effect = Effect::SaveKey { provider, key };
+                }
+                model_picker::PickerStep::Commit {
+                    provider,
+                    model,
+                    thinking,
+                } => {
+                    let selection = ModelSelection {
+                        provider,
+                        model,
+                        temperature: None,
+                        max_tokens: None,
+                        reasoning: thinking,
+                    };
+                    effect = Effect::SaveSelection(Box::new(selection));
+                }
+            },
+            KeyCode::Up => picker.move_cursor(-1),
+            KeyCode::Down => picker.move_cursor(1),
+            KeyCode::Char('p') if combo.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.move_cursor(-1);
+            }
+            KeyCode::Char('n') if combo.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.move_cursor(1);
+            }
+            KeyCode::Char('u') if combo.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.clear_query();
+            }
+            KeyCode::Backspace => picker.backspace(),
+            // A bare character is text here, including `j`, `k`, `q` and the leader
+            // key: the alternative is a search box that cannot contain a `j`.
+            KeyCode::Char(character)
+                if !combo.modifiers.contains(KeyModifiers::CONTROL)
+                    && !combo.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                picker.push_char(character);
+            }
+            _ => {}
+        }
+        if close {
+            self.picker = None;
+        } else {
+            self.picker = Some(picker);
+            self.refresh_picker();
+        }
+        effect
+    }
+
+    /// Marks the picker's step as having stored a key (FR-4.5).
+    pub(crate) fn picker_key_stored(&mut self) {
+        if let Some(picker) = self.picker.as_mut() {
+            picker.key_stored();
+        }
+        self.refresh_picker();
+    }
+
+    /// Resolves the configured selection against the catalog (FR-4.5).
+    pub(crate) fn resolve_active_model(&mut self) {
+        let Some(state) = self.catalog.as_ref() else {
+            return;
+        };
+        let Some(selection) = self.config.llm.active.clone() else {
+            self.active_model = None;
+            self.model_problem = None;
+            return;
+        };
+        match crate::application::models::resolve_selection(
+            &state.load.catalog,
+            &selection,
+            self.secret_store.as_ref(),
+        ) {
+            Ok(resolved) => {
+                for warning in &resolved.warnings {
+                    self.notice(NoticeLevel::Warn, format!("model: {warning}"));
+                }
+                self.model_problem = None;
+                self.active_model = Some(resolved);
+            }
+            Err(error) => {
+                self.active_model = None;
+                self.model_problem = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Reports the result of the connection check (FR-4.5).
+    fn finish_check(&mut self, outcome: &crate::ports::llm::ChatOutcome) {
+        let answer = outcome.text.trim().to_owned();
+        let usage = outcome.usage.map_or_else(
+            || "no usage reported".to_owned(),
+            |usage| {
+                format!(
+                    "{} prompt + {} completion tokens",
+                    usage.prompt, usage.completion
+                )
+            },
+        );
+        let message = if answer.is_empty() {
+            format!("the provider answered with no text ({usage})")
+        } else {
+            format!("the provider answered ({usage})")
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.set_checking(false);
+            picker.set_notice(Some(message.clone()));
+        }
+        self.notice(NoticeLevel::Info, message);
     }
 
     /// Scrolls the roadmap or the picker with the mouse wheel (FR-7.5).

@@ -56,7 +56,10 @@ pub fn run(startup: Startup) -> Result<()> {
     let forge_factory = startup.forge_factory.clone();
     let state_store: Box<dyn StateStore> = Box::new(startup.state_store.clone());
 
+    let catalog = startup.catalog.clone();
+    let llm = startup.llm.clone();
     let workspace = startup.workspace.clone();
+    let workspace_for_executor = startup.workspace.clone();
     let probe = startup.probe.clone();
     let request = DetectRequest {
         repo: startup.repo.clone(),
@@ -70,7 +73,7 @@ pub fn run(startup: Startup) -> Result<()> {
     };
     let mut app = App::new(startup)?;
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
-    let mut runner = JobRunner::new(workspace, probe, request);
+    let mut runner = JobRunner::new(workspace, probe, catalog, llm, request);
 
     // Detection is a job, not a startup step: it runs `gh auth status`, which reaches
     // the network, and the first frame must not wait for it (NFR-1.1).
@@ -86,48 +89,34 @@ pub fn run(startup: Startup) -> Result<()> {
         &mut terminal,
     );
 
+    // A model configured in an earlier run is resolved from the cache, if there is
+    // one: the status line can then name it, and `:model show` can say what is wrong
+    // with it, without the 4 MB catalog fetch that the picker asks for when it opens
+    // (FR-4.7 keeps the network for an explicit request).
+    if app.config.llm.active.is_some() {
+        let _ = apply(
+            Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::CacheOnly),
+            &mut app,
+            state_store.as_ref(),
+            &mut runner,
+            &mut terminal,
+        );
+    }
+
     while !app.should_quit() {
         app.set_now(clock.now_unix_secs());
         terminal.draw(|frame| app.render(frame))?;
         app.tick();
 
         // Results from background jobs, then whatever they asked for next.
-        let mut follow_ups: Vec<Effect> = Vec::new();
-        for completion in runner.poll() {
-            // A repository is only known once detection has answered, so the ports
-            // that need one are built at that moment and kept for the session.
-            let detected = matches!(completion.outcome, Outcome::Environment(_));
-            let effect = app.apply_completion(completion);
-            if detected
-                && let Some(executor) = executor_for(
-                    &app,
-                    forge_factory.as_ref(),
-                    cache.clone(),
-                    clock_source.clone(),
-                )
-            {
-                runner.set_executor(executor);
-                // Cache first: painting what is already on disk before asking the
-                // network is the difference between an instant first list and a
-                // `gh` round trip (FR-2.3). The fetch this triggers replaces it in
-                // place, keeping the cursor on the same pull request.
-                runner.submit(Job::CachedList {
-                    query: app.list.query(),
-                });
-            }
-            if let Some(effect) = effect {
-                follow_ups.push(effect);
-            }
-        }
-        for effect in follow_ups {
-            apply(
-                effect,
-                &mut app,
-                state_store.as_ref(),
-                &mut runner,
-                &mut terminal,
-            );
-        }
+        let mut queued = drain_completions(
+            &mut app,
+            &mut runner,
+            forge_factory.as_ref(),
+            &cache,
+            &clock_source,
+            &workspace_for_executor,
+        );
 
         let effect = if event::poll(app.poll_timeout())? {
             match event::read()? {
@@ -143,8 +132,15 @@ pub fn run(startup: Startup) -> Result<()> {
             app.on_timeout()
         };
 
-        apply(
+        queued.extend(apply(
             effect,
+            &mut app,
+            state_store.as_ref(),
+            &mut runner,
+            &mut terminal,
+        ));
+        drain_effects(
+            queued,
             &mut app,
             state_store.as_ref(),
             &mut runner,
@@ -167,7 +163,10 @@ pub(crate) fn apply(
     state_store: &dyn StateStore,
     runner: &mut JobRunner,
     terminal: &mut terminal::TerminalGuard,
-) {
+) -> Vec<Effect> {
+    // Effects that produce further effects queue them here rather than recursing, so
+    // a chain cannot nest the stack; the caller drains the queue.
+    let mut pending_effects: Vec<Effect> = Vec::new();
     match effect {
         Effect::None | Effect::KeepPending => {}
 
@@ -216,21 +215,42 @@ pub(crate) fn apply(
 
         Effect::ReloadDiff => {
             // The head SHA keys the cached diff, so a reload needs the open PR's.
-            let Some(head_sha) = app
-                .detail
-                .as_ref()
-                .map(|detail| detail.summary.head_sha.clone())
-            else {
-                return;
+            let Some(detail) = app.detail.as_ref() else {
+                return pending_effects;
             };
-            let Some(number) = app.detail.as_ref().map(|detail| detail.summary.number) else {
-                return;
+            let number = detail.summary.number;
+            let head_sha = detail.summary.head_sha.clone();
+            let options = app.diff_options;
+
+            // Which source answers depends on whether the code is on disk yet
+            // (FR-3.2). The forge is always the fallback: a worktree that cannot be
+            // built must not mean a diff that cannot be read.
+            let job = match (&app.workspace, app.workspace_ready()) {
+                (Some(workspace), true) => Job::LocalPatch {
+                    request: Box::new(crate::ports::workspace::DiffRequest {
+                        path: workspace.path.clone(),
+                        base_sha: workspace.base_sha.clone(),
+                        head_sha: workspace.head_sha.clone(),
+                        options,
+                    }),
+                    number,
+                    head_sha: head_sha.clone(),
+                    options,
+                },
+                _ => Job::Patch { number, head_sha },
             };
-            let id = runner.submit(Job::Patch { number, head_sha });
+            let id = runner.submit(job);
             app.patch_job = id;
             app.diff_loading = true;
             // The second step of the same wait: fetching a large diff is the slow half.
             app.advance_opening();
+
+            // Ask for the worktree in the background while the diff is being read, but
+            // only once per pull request: this handler runs again for every context or
+            // whitespace change (FR-3.1).
+            if app.workspace.is_none() && app.workspace_job == 0 && app.wants_workspace() {
+                pending_effects.push(Effect::EnsureWorkspace(number));
+            }
         }
 
         Effect::CopyPath(path) => {
@@ -253,8 +273,231 @@ pub(crate) fn apply(
                 ),
             }
         }
+
+        // The model, key and workspace effects are their own group: they share the
+        // picker's state and they queue work for each other (a saved key commits the
+        // selection, which then asks to be checked).
+        Effect::LoadCatalog(_)
+        | Effect::EnsureWorkspace(_)
+        | Effect::CheckModel
+        | Effect::SaveKey { .. }
+        | Effect::SaveSelection(_)
+        | Effect::ClearKey(_)
+        | Effect::CleanWorkspaces(_) => {
+            let _ = apply_model_effect(&effect, app, runner, &mut pending_effects);
+        }
+    }
+
+    pending_effects
+}
+
+/// Handles the effects that configure a model, a key or the worktrees.
+///
+/// Returns whether the effect belonged to this group, so `apply` can stay exhaustive
+/// without carrying twenty lines of arms that belong together.
+fn apply_model_effect(
+    effect: &Effect,
+    app: &mut App,
+    runner: &mut JobRunner,
+    pending_effects: &mut Vec<Effect>,
+) -> bool {
+    match effect {
+        Effect::LoadCatalog(policy) => {
+            let id = runner.submit(jobs::Job::Catalog { policy: *policy });
+            app.record_catalog_job(id);
+        }
+
+        Effect::EnsureWorkspace(number) => {
+            // Without a resolved repository and an open detail there is nothing to
+            // fetch, and saying nothing is right: the request came from the loop.
+            let (Some(detail), Some(repo)) = (
+                app.detail.as_ref(),
+                app.environment
+                    .as_ref()
+                    .map(|environment| environment.repo.clone()),
+            ) else {
+                return true;
+            };
+            // The remote the repository was identified from is the one to fetch: a
+            // fork's pull request lives on the base repository's `refs/pull/N/head`,
+            // which is exactly where this looks (FR-3.1).
+            let remote = app
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.remote.clone())
+                .unwrap_or_else(|| "origin".to_owned());
+            let request = workspace_request(&repo, &remote, detail, *number);
+            let id = runner.submit(jobs::Job::Workspace {
+                request: Box::new(request),
+            });
+            app.record_workspace_job(id);
+        }
+
+        Effect::SaveKey { provider, key } => {
+            // A local, bounded write: the same exception the theme and keybind files
+            // get, and it happens here because this is where the store lives.
+            match app.secret_store().set(provider, key) {
+                Ok(()) => {
+                    app.picker_key_stored();
+                    // Storing a key is the last step of the picker's flow, so the
+                    // selection is committed straight away: the user typed a key in
+                    // order to use a model, not to keep choosing.
+                    if let Some(selection) = app.picker_selection() {
+                        pending_effects.push(Effect::SaveSelection(Box::new(selection)));
+                    }
+                }
+                Err(error) => {
+                    let message = format!("could not save the key: {error}");
+                    if let Some(picker) = app.picker_mut() {
+                        picker.set_notice(Some(message));
+                    }
+                }
+            }
+        }
+
+        Effect::SaveSelection(selection) => {
+            match crate::config::write_selection(&app.config_path, selection) {
+                Ok(()) => {
+                    // The running session uses it immediately: no restart (FR-4.5).
+                    app.set_active_selection((**selection).clone());
+                    app.close_picker();
+                    pending_effects.push(Effect::CheckModel);
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if let Some(picker) = app.picker_mut() {
+                        picker.set_notice(Some(message));
+                    }
+                }
+            }
+        }
+
+        Effect::CheckModel => {
+            if let Some(request) = app.check_request() {
+                let id = runner.submit(jobs::Job::ModelCheck {
+                    request: Box::new(request),
+                });
+                app.record_check_job(id);
+            }
+        }
+
+        Effect::ClearKey(provider) => match app.secret_store().remove(provider) {
+            Ok(()) => {
+                app.resolve_active_model();
+                app.notice(
+                    app::NoticeLevel::Info,
+                    format!("cleared the stored key for {provider}"),
+                );
+            }
+            Err(error) => app.notice(
+                app::NoticeLevel::Error,
+                format!("could not clear the key: {error}"),
+            ),
+        },
+
+        Effect::CleanWorkspaces(all) => {
+            // Removing worktrees is git work, and git work is a job (ARCH-5).
+            let id = runner.submit(jobs::Job::CleanWorkspaces {
+                all: *all,
+                max_age_secs: u64::from(app.config.workspace.auto_clean_days) * 24 * 60 * 60,
+            });
+            app.record_workspace_job(id);
+        }
+
+        _ => return false,
+    }
+    true
+}
+
+/// The request that materialises a pull request (FR-3.1).
+fn workspace_request(
+    repo: &RepoId,
+    remote: &str,
+    detail: &crate::domain::pr::PullRequestDetail,
+    number: u64,
+) -> crate::ports::workspace::WorkspaceRequest {
+    crate::ports::workspace::WorkspaceRequest {
+        repo: repo.clone(),
+        remote: remote.to_owned(),
+        number,
+        base: detail.summary.base_ref.clone(),
+        head_sha: detail.summary.head_sha.clone(),
     }
 }
+
+/// Collects finished jobs, tells the app, and returns the effects it asked for.
+///
+/// The executor is installed the moment detection resolves a repository, which is why
+/// the ports for repository-scoped jobs are built here: before that there is no
+/// repository to scope them to (FR-1.1).
+fn drain_completions(
+    app: &mut App,
+    runner: &mut JobRunner,
+    factory: &dyn crate::ports::ForgeFactory,
+    cache: &Arc<dyn crate::ports::CacheStore>,
+    clock: &Arc<dyn Clock>,
+    workspace: &Arc<dyn crate::ports::WorkspacePort>,
+) -> Vec<Effect> {
+    let mut follow_ups: Vec<Effect> = Vec::new();
+    for completion in runner.poll() {
+        let detected = matches!(completion.outcome, Outcome::Environment(_));
+        let effect = app.apply_completion(completion);
+        if detected
+            && let Some(executor) = executor_for(
+                app,
+                factory,
+                cache.clone(),
+                clock.clone(),
+                workspace.clone(),
+            )
+        {
+            runner.set_executor(executor);
+            // Cache first: painting what is already on disk before asking the network
+            // is the difference between an instant first list and a `gh` round trip
+            // (FR-2.3). The fetch this triggers replaces it in place, keeping the
+            // cursor on the same pull request.
+            runner.submit(Job::CachedList {
+                query: app.list.query(),
+            });
+        }
+        if let Some(effect) = effect {
+            follow_ups.push(effect);
+        }
+    }
+    follow_ups
+}
+
+/// Applies queued effects, including the ones they queue in turn.
+///
+/// Bounded, because a cycle in the follow-up graph would spin the loop with the
+/// terminal taken over — the worst possible failure for a TUI.
+fn drain_effects(
+    mut queued: Vec<Effect>,
+    app: &mut App,
+    state_store: &dyn StateStore,
+    runner: &mut JobRunner,
+    terminal: &mut terminal::TerminalGuard,
+) {
+    let mut guard = 0;
+    while let Some(effect) = queued.pop() {
+        guard += 1;
+        if guard > MAX_FOLLOW_UPS {
+            logging::log(
+                Level::Error,
+                "the work queued by one input did not settle; stopping it",
+            );
+            return;
+        }
+        let mut more = apply(effect, app, state_store, runner, terminal);
+        queued.append(&mut more);
+    }
+}
+
+/// How many effects one input may queue behind it before the loop gives up.
+///
+/// A number rather than "as many as it takes": a cycle in the follow-up graph would
+/// otherwise spin the event loop with the terminal taken over.
+const MAX_FOLLOW_UPS: usize = 16;
 
 /// Builds the ports a repository-scoped job needs, once detection has resolved one.
 pub(crate) fn executor_for(
@@ -262,12 +505,14 @@ pub(crate) fn executor_for(
     factory: &dyn crate::ports::ForgeFactory,
     cache: Arc<dyn crate::ports::CacheStore>,
     clock: Arc<dyn Clock>,
+    workspace: Arc<dyn crate::ports::WorkspacePort>,
 ) -> Option<Arc<Executor>> {
     let repo: RepoId = app.environment.as_ref()?.repo.clone();
     Some(Arc::new(Executor::new(
         factory.forge(&repo),
         cache,
         clock,
+        workspace,
         repo,
         CachePolicy {
             list_ttl_secs: app.config.cache.ttl_list_secs,

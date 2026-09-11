@@ -10,6 +10,7 @@ pub mod header;
 pub mod help;
 pub mod leader;
 pub mod loading;
+pub mod model_picker;
 pub mod palette;
 pub mod panes;
 pub mod pr_list;
@@ -28,6 +29,18 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The opening indicator is not an overlay: it takes no keyboard focus, so a popup
     // behind it still works and `Esc` means what it always means (give up).
     loading::render(frame, area, app);
+
+    // The model picker is modal but is not an `Overlay`: it takes every key while it
+    // is open (it is a text-entry surface), which `Overlay` does not model.
+    if let Some(picker) = app.picker() {
+        let label = if picker.is_checking() {
+            Some("checking with the provider…")
+        } else {
+            None
+        };
+        picker.render(frame, area, &app.theme, label);
+        return;
+    }
 
     match app.overlay() {
         Overlay::None => {}

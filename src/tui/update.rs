@@ -67,6 +67,31 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "app.theme_picker",
         "Choose a theme, or :theme <name>|reload",
     ),
+    (
+        "model",
+        "app.model_picker",
+        "Choose the provider, model and thinking",
+    ),
+    (
+        "key",
+        "app.command",
+        "Clear a stored key: :key clear <provider>",
+    ),
+    (
+        "catalog",
+        "app.command",
+        "Refresh the model catalog: :catalog refresh",
+    ),
+    (
+        "workspace",
+        "app.command",
+        "Manage worktrees: :workspace clean [--all]",
+    ),
+    (
+        "context",
+        "app.command",
+        "Set the diff context lines: :context 10",
+    ),
     ("version", "app.version", "Show the version"),
 ];
 
@@ -94,6 +119,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             app.open_overlay(Overlay::ThemePicker);
             Effect::None
         }
+        "app.model_picker" => app.open_model_picker(),
         "app.leader_menu" => {
             app.open_overlay(Overlay::Leader);
             Effect::KeepPending
@@ -575,32 +601,58 @@ fn toggle_split(app: &mut App) -> Effect {
 /// and never filters whitespace. Flipping the label would tell the user the pane is
 /// showing something it is not, so in M1 these keys explain rather than lie; M2's
 /// workspace re-diffs locally, where both settings are real.
+/// Cycles the diff context: 3 → 10 → 0 (FR-3.2).
+///
+/// The change is a *re-read*, not a re-render: the context lines are produced by git,
+/// so the diff has to be asked for again. That is why the toggle returns an effect
+/// rather than redrawing, and why it is instant only once the worktree exists.
 fn cycle_context(app: &mut App) -> Effect {
     if app.review.is_none() {
         app.notice(NoticeLevel::Warn, "open a pull request first");
         return Effect::None;
     }
-    app.notice(
-        NoticeLevel::Warn,
-        format!(
-            "context is fixed at {} lines in remote mode; the local workspace in M2 makes it adjustable",
-            app.review.as_ref().map_or(3, |view| view.context)
-        ),
-    );
-    Effect::None
+    app.diff_options.context = match app.diff_options.context {
+        3 => 10,
+        10 => 0,
+        _ => 3,
+    };
+    let context = app.diff_options.context;
+    app.notice(NoticeLevel::Info, format!("diff context: {context} lines"));
+    if !app.workspace_ready() {
+        app.notice(
+            NoticeLevel::Warn,
+            "without the local workspace the diff comes from GitHub, which always uses 3 lines",
+        );
+        return Effect::None;
+    }
+    Effect::ReloadDiff
 }
 
 /// Explains that ignoring whitespace needs the local workspace (FR-3.2).
+/// Toggles whitespace-ignoring diffs (FR-3.2).
 fn toggle_whitespace(app: &mut App) -> Effect {
     if app.review.is_none() {
         app.notice(NoticeLevel::Warn, "open a pull request first");
         return Effect::None;
     }
+    app.diff_options.ignore_whitespace = !app.diff_options.ignore_whitespace;
+    let ignoring = app.diff_options.ignore_whitespace;
     app.notice(
-        NoticeLevel::Warn,
-        "whitespace-ignoring diffs need the local workspace, which arrives in M2",
+        NoticeLevel::Info,
+        if ignoring {
+            "ignoring whitespace-only changes"
+        } else {
+            "showing whitespace-only changes"
+        },
     );
-    Effect::None
+    if !app.workspace_ready() {
+        app.notice(
+            NoticeLevel::Warn,
+            "whitespace-ignoring diffs need the local workspace; it is being prepared",
+        );
+        return Effect::None;
+    }
+    Effect::ReloadDiff
 }
 
 /// Moves the focus on. Inside a review that means the tree and the diff in turn
@@ -629,6 +681,22 @@ fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
     Effect::SaveState
 }
 
+/// The commands that are exactly one action, so the dispatcher below is only about
+/// the ones that need an argument (FR-7.3).
+const DIRECT: &[(&str, &str)] = &[
+    ("q", "app.quit"),
+    ("qa", "app.quit"),
+    ("quit", "app.quit"),
+    ("help", "app.help"),
+    ("doctor", "app.doctor"),
+    ("refresh", "app.refresh"),
+    ("version", "app.version"),
+    ("messages", "notice.clear"),
+    ("load-more", "app.load_more"),
+    ("clear-filters", "filter.clear"),
+    ("copy-path", "review.copy_path"),
+];
+
 /// Runs a `:` command.
 pub fn command(app: &mut App, input: &str) -> Effect {
     let trimmed = input.trim();
@@ -640,21 +708,21 @@ pub fn command(app: &mut App, input: &str) -> Effect {
     let name = parts.next().unwrap_or_default();
     let argument = parts.next().unwrap_or_default().trim();
 
+    if let Some((_, action)) = DIRECT.iter().find(|(alias, _)| *alias == name) {
+        return dispatch(app, action);
+    }
+
     match name {
-        "q" | "qa" | "quit" => dispatch(app, "app.quit"),
-        "help" => dispatch(app, "app.help"),
-        "doctor" => dispatch(app, "app.doctor"),
-        "refresh" => dispatch(app, "app.refresh"),
-        "version" => dispatch(app, "app.version"),
-        "messages" => dispatch(app, "notice.clear"),
         "keymap" => keymap_command(app, argument),
-        "load-more" => dispatch(app, "app.load_more"),
-        "clear-filters" => dispatch(app, "filter.clear"),
-        "copy-path" => dispatch(app, "review.copy_path"),
         "pr" => open_pr(app, argument),
         "filter" => add_filter(app, argument),
         "filter-remove" => remove_filter(app, argument),
         "sort" => set_sort(app, argument),
+        "model" => model_command(app, argument),
+        "key" => key_command(app, argument),
+        "catalog" => catalog_command(app, argument),
+        "workspace" => workspace_command(app, argument),
+        "context" => context_command(app, argument),
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
             "reload" => app.reload_theme(),
@@ -662,15 +730,188 @@ pub fn command(app: &mut App, input: &str) -> Effect {
             name => app.set_theme(name),
         },
         "set" => set_option(app, argument),
-        other => {
-            let mut message = format!("`{other}` is not a command");
-            if let Some(suggestion) = closest_command(other) {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut message,
-                    format_args!("; did you mean `{suggestion}`?"),
+        other => unknown_command(app, other),
+    }
+}
+
+/// Reports a command that does not exist, suggesting the nearest one (FR-7.3).
+fn unknown_command(app: &mut App, name: &str) -> Effect {
+    let mut message = format!("`{name}` is not a command");
+    if let Some(suggestion) = closest_command(name) {
+        let _ = std::fmt::Write::write_fmt(
+            &mut message,
+            format_args!("; did you mean `{suggestion}`?"),
+        );
+    }
+    app.command_error(message);
+    Effect::None
+}
+
+/// `:model`, `:model show`, `:model pick` (FR-4.5).
+fn model_command(app: &mut App, argument: &str) -> Effect {
+    match argument {
+        "" | "pick" => dispatch(app, "app.model_picker"),
+        "show" => {
+            if let Some(resolved) = app.active_model() {
+                let source = if resolved.from_file {
+                    "credentials.toml".to_owned()
+                } else {
+                    resolved
+                        .env_source
+                        .clone()
+                        .unwrap_or_else(|| "environment".to_owned())
+                };
+                app.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "{} · {} · base {} · key from {} · thinking {}",
+                        resolved.label(),
+                        resolved.route_label(),
+                        resolved.base_url.as_deref().unwrap_or("provider default"),
+                        source,
+                        resolved.thinking_label()
+                    ),
                 );
+            } else {
+                let problem = app
+                    .model_problem()
+                    .unwrap_or("no model is configured")
+                    .to_owned();
+                app.notice(NoticeLevel::Warn, format!("{problem}; press <leader>m"));
             }
-            app.command_error(message);
+            Effect::None
+        }
+        other => {
+            app.command_error(format!(
+                "`:model {other}` is not an option; try `:model`, `:model show`"
+            ));
+            Effect::None
+        }
+    }
+}
+
+/// `:key clear <provider>` (NFR-3.1).
+fn key_command(app: &mut App, argument: &str) -> Effect {
+    let mut parts = argument.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("clear"), Some(provider), None) => Effect::ClearKey(provider.to_owned()),
+        // No argument lists what is stored. A command that only works with an
+        // argument is a command you have to remember instead of one you can explore.
+        (None, _, _) => {
+            match app.secret_store().status() {
+                Ok(status) if status.is_empty() => app.notice(
+                    NoticeLevel::Info,
+                    "no keys are stored; <leader>m stores one in credentials.toml",
+                ),
+                Ok(status) => {
+                    let providers: Vec<String> = status
+                        .iter()
+                        .map(|entry| {
+                            let source = entry
+                                .source
+                                .as_ref()
+                                .map_or_else(|| "?".to_owned(), crate::ports::KeySource::label);
+                            format!("{} ({source})", entry.provider)
+                        })
+                        .collect();
+                    app.notice(
+                        NoticeLevel::Info,
+                        format!("stored keys: {}", providers.join(", ")),
+                    );
+                }
+                Err(error) => app.notice(NoticeLevel::Warn, format!("keys: {error}")),
+            }
+            Effect::None
+        }
+        _ => {
+            app.command_error("usage: `:key` or `:key clear <provider>`");
+            Effect::None
+        }
+    }
+}
+
+/// `:catalog refresh` (FR-4.7).
+fn catalog_command(app: &mut App, argument: &str) -> Effect {
+    match argument {
+        "refresh" => Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::Refresh),
+        "" => Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::CacheFirst),
+        other => {
+            app.command_error(format!(
+                "`:catalog {other}` is not an option; try `:catalog refresh`"
+            ));
+            Effect::None
+        }
+    }
+}
+
+/// `:workspace clean [--all]` (FR-3.1).
+fn workspace_command(app: &mut App, argument: &str) -> Effect {
+    match argument {
+        "clean" => Effect::CleanWorkspaces(false),
+        "clean --all" | "clean all" => Effect::CleanWorkspaces(true),
+        // With no argument, say what the worktrees are and what the options do.
+        "" => {
+            match app.worktrees() {
+                Ok(entries) if entries.is_empty() => app.notice(
+                    NoticeLevel::Info,
+                    "no worktrees yet; one is created when a pull request is opened",
+                ),
+                Ok(entries) => {
+                    let total: u64 = entries
+                        .iter()
+                        .filter_map(|entry| entry.age_secs)
+                        .sum::<u64>();
+                    app.notice(
+                        NoticeLevel::Info,
+                        format!(
+                            "{} worktree(s) using about {} MiB; `:workspace clean` removes the ones older than {} days",
+                            entries.len(),
+                            total / 1024,
+                            app.config.workspace.auto_clean_days
+                        ),
+                    );
+                }
+                Err(error) => app.notice(NoticeLevel::Warn, format!("worktrees: {error}")),
+            }
+            Effect::None
+        }
+        other => {
+            app.command_error(format!(
+                "`:workspace {other}` is not an option; try `:workspace clean [--all]`"
+            ));
+            Effect::None
+        }
+    }
+}
+
+/// `:context <n>` (FR-3.2).
+fn context_command(app: &mut App, argument: &str) -> Effect {
+    if argument.is_empty() {
+        app.notice(
+            NoticeLevel::Info,
+            format!(
+                "diff context is {} lines; `:context <0-1000>` changes it, `<leader>dc` cycles it",
+                app.diff_options.context
+            ),
+        );
+        return Effect::None;
+    }
+    match argument.parse::<u32>() {
+        Ok(lines) if lines <= 1000 => {
+            app.diff_options.context = lines;
+            app.notice(NoticeLevel::Info, format!("diff context: {lines} lines"));
+            if app.workspace_ready() {
+                Effect::ReloadDiff
+            } else {
+                app.notice(
+                    NoticeLevel::Warn,
+                    "the diff comes from GitHub until the workspace is ready, so the context is still 3",
+                );
+                Effect::None
+            }
+        }
+        _ => {
+            app.command_error("usage: `:context <0-1000>`");
             Effect::None
         }
     }

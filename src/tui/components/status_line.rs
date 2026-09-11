@@ -80,11 +80,24 @@ fn pull_request_label(app: &App) -> String {
         .map_or_else(|| PLACEHOLDER.to_owned(), |number| format!("#{number}"))
 }
 
+/// The active model and its thinking setting (FR-4.5, FR-4.8).
+///
+/// Three states, each said plainly: nothing chosen yet, chosen and verified, chosen
+/// but unusable — and the last names the reason, because "the model is set but the
+/// key is missing" is the one a user has to act on.
 fn model_label(app: &App) -> String {
-    app.config.llm.active.as_ref().map_or_else(
-        || PLACEHOLDER.to_owned(),
-        |active| format!("{}/{}", active.provider, active.model),
-    )
+    if let Some(resolved) = app.active_model() {
+        return format!(
+            "{} thinking:{}",
+            resolved.label(),
+            resolved.thinking_label()
+        );
+    }
+    match (app.config.llm.active.as_ref(), app.model_problem()) {
+        (Some(_), Some(problem)) => format!("{PLACEHOLDER} ({problem})"),
+        (Some(active), None) => format!("{}/{} (unverified)", active.provider, active.model),
+        (None, _) => PLACEHOLDER.to_owned(),
+    }
 }
 
 fn notice_style(theme: &Theme, level: NoticeLevel) -> Style {
