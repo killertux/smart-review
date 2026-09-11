@@ -93,7 +93,9 @@ pub fn run(startup: Startup) -> Result<()> {
     // A model configured in an earlier run is resolved from the cache, if there is
     // one: the status line can then name it, and `:model show` can say what is wrong
     // with it, without the 4 MB catalog fetch that the picker asks for when it opens
-    // (FR-4.7 keeps the network for an explicit request).
+    // (FR-4.7 keeps the network for an explicit request). When there is no cache the
+    // fetch follows by itself, because a user who has already chosen a model should
+    // not have to open a picker to make the app notice — see `catalog_unavailable`.
     if app.config.llm.active.is_some() {
         let _ = apply(
             Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::CacheOnly),

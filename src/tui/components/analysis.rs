@@ -19,16 +19,28 @@ use crate::tui::theme::{Theme, element};
 /// Renders the analysis panel: the answer, or the progress towards it (FR-4.1).
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
-    let mut lines = panel_lines(app, theme);
-
-    // The footer says how to leave and what else is available, which is the one thing
-    // a popup has to do beyond showing content.
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        " a reopens this · o switches order · `:analysis raw` shows the model's text · Esc closes"
-            .to_owned(),
-        theme.style(element::MUTED),
-    )));
+    // The notices and the key hints come first, because the panel is capped at the
+    // height of the terminal and an analysis is longer than any screen: a footer would
+    // be the first thing cut off, and "how do I leave" is not the thing to lose.
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " a reopens this · o switches order · `:plan` and `:context` show the rest · Esc closes"
+                .to_owned(),
+            theme.style(element::MUTED),
+        )),
+        Line::default(),
+    ];
+    if app.analysis_repaired() {
+        // Stated here rather than only in a notice, because a notice is gone by the
+        // time the reader wonders why the plan looks like a second attempt.
+        lines.push(Line::from(Span::styled(
+            " This analysis needed a second attempt: the first answer could not be used."
+                .to_owned(),
+            theme.style(element::NOTICE_WARN),
+        )));
+        lines.push(Line::default());
+    }
+    lines.extend(panel_lines(app, theme));
 
     let height = height_for(lines.len()).saturating_add(2).min(area.height);
     let popup = layout::centered(area, area.width.saturating_sub(4), height);
@@ -60,85 +72,153 @@ fn panel_title(app: &App) -> String {
 
 /// The body of the panel (FR-4.1, FR-4.2).
 fn panel_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
     match app.analysis_state() {
         // While a run is in flight the panel shows what arrived, because the answer
         // streaming in is the progress indicator that costs nothing (FR-4.4).
         AnalysisState::Gathering
         | AnalysisState::Running { .. }
-        | AnalysisState::Streaming { .. } => {
-            lines.push(Line::from(vec![
-                Span::styled(" ", theme.style(element::FG)),
-                Span::styled(app.analysis_state().label(), theme.style(element::ACCENT)),
-                Span::styled(
-                    if app.analysis_state().is_running() {
-                        "  (Esc cancels)"
-                    } else {
-                        ""
-                    }
-                    .to_owned(),
-                    theme.style(element::MUTED),
-                ),
-            ]));
-            lines.push(Line::default());
-            let text = app.analysis_stream();
-            if text.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    " waiting for the first token…".to_owned(),
-                    theme.style(element::MUTED),
-                )));
-            }
-            // Only the tail is drawn: the interesting part of a stream is the end, and
-            // the answer is displayed properly once it has been parsed.
-            for line in text
-                .lines()
-                .rev()
-                .take(24)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-            {
-                lines.push(Line::from(Span::styled(
-                    format!(" {}", crate::tui::text::truncate(line, 120)),
-                    theme.style(element::FG),
-                )));
-            }
-            if app.analysis_stream_truncated() {
-                lines.push(Line::from(Span::styled(
-                    " … the preview is bounded; the full text is used once it is complete"
-                        .to_owned(),
-                    theme.style(element::MUTED),
-                )));
-            }
-        }
-        AnalysisState::Unusable { reason } => {
-            lines.push(Line::from(Span::styled(
-                format!(" the answer could not be used: {reason}"),
-                theme.style(element::NOTICE_WARN),
-            )));
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                " `:analysis raw` shows what the model actually wrote.".to_owned(),
-                theme.style(element::MUTED),
-            )));
-        }
-        AnalysisState::Cancelled => {
-            lines.push(Line::from(Span::styled(
-                " the analysis was cancelled".to_owned(),
-                theme.style(element::MUTED),
-            )));
-            lines.push(Line::from(Span::styled(
-                " the tree keeps the order it had; <leader>a starts again".to_owned(),
-                theme.style(element::MUTED),
-            )));
-        }
-        AnalysisState::Ready | AnalysisState::Idle => {
-            lines.extend(answer_lines(app, theme));
-        }
+        | AnalysisState::Streaming { .. } => running_lines(app, theme),
+        // The one thing an analysis must never do is spend money without being asked
+        // (FR-4.6), so this state gets a panel of its own rather than a line that
+        // scrolls away.
+        AnalysisState::Confirming => confirming_lines(app, theme),
+        AnalysisState::Unusable { reason } => unusable_lines(theme, reason),
+        AnalysisState::Cancelled => cancelled_lines(theme),
+        AnalysisState::Ready | AnalysisState::Idle => answer_lines(app, theme),
     }
+}
 
+/// What a run in flight shows: the stage, and the text as it arrives (FR-4.4).
+fn running_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(" ", theme.style(element::FG)),
+            Span::styled(app.analysis_state().label(), theme.style(element::ACCENT)),
+            Span::styled(
+                if app.analysis_state().is_running() {
+                    "  (Esc cancels)"
+                } else {
+                    ""
+                }
+                .to_owned(),
+                theme.style(element::MUTED),
+            ),
+        ]),
+        Line::default(),
+    ];
+    let text = app.analysis_stream();
+    if text.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " waiting for the first token…".to_owned(),
+            theme.style(element::MUTED),
+        )));
+        return lines;
+    }
+    // Only the tail is drawn: the interesting part of a stream is the end, and the
+    // answer is displayed properly once it has been parsed.
+    for line in text
+        .lines()
+        .rev()
+        .take(24)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", crate::tui::text::truncate(line, 120)),
+            theme.style(element::FG),
+        )));
+    }
+    if app.analysis_stream_truncated() {
+        lines.push(Line::from(Span::styled(
+            " … the preview is bounded; the full text is used once it is complete".to_owned(),
+            theme.style(element::MUTED),
+        )));
+    }
     lines
+}
+
+/// What the user is asked before the first send of a repository (FR-4.6).
+fn confirming_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Nothing has been sent yet.".to_owned(),
+            theme.style(element::NOTICE_WARN),
+        )),
+        Line::default(),
+    ];
+    match app.context_bundle() {
+        Some(bundle) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " This would send {} to {}.",
+                    bundle.summary(),
+                    app.model_label()
+                ),
+                theme.style(element::FG),
+            )));
+            for segment in bundle.segments.iter().take(12) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if segment.included { "  ✓ " } else { "  ✗ " },
+                        if segment.included {
+                            theme.style(element::FG)
+                        } else {
+                            theme.style(element::MUTED)
+                        },
+                    ),
+                    Span::styled(
+                        crate::tui::text::truncate(&segment.label, 60),
+                        theme.style(element::FG),
+                    ),
+                ]));
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                " `:context` lists everything, included and not.".to_owned(),
+                theme.style(element::MUTED),
+            )));
+        }
+        None => lines.push(Line::from(Span::styled(
+            " The context is being gathered…".to_owned(),
+            theme.style(element::MUTED),
+        ))),
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " <leader>a again sends it · Esc closes this and sends nothing".to_owned(),
+        theme.style(element::ACCENT),
+    )));
+    lines
+}
+
+/// An answer that could not be used (FR-4.1).
+fn unusable_lines(theme: &Theme, reason: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            format!(" the answer could not be used: {reason}"),
+            theme.style(element::NOTICE_WARN),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            " `:analyze raw` shows what the model actually wrote.".to_owned(),
+            theme.style(element::MUTED),
+        )),
+    ]
+}
+
+/// A run the user stopped (FR-4.4).
+fn cancelled_lines(theme: &Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            " the analysis was cancelled".to_owned(),
+            theme.style(element::MUTED),
+        )),
+        Line::from(Span::styled(
+            " the tree keeps the order it had; <leader>a starts again".to_owned(),
+            theme.style(element::MUTED),
+        )),
+    ]
 }
 
 /// The parsed answer: summary, intent, risks, questions and the plan (FR-4.1).
@@ -178,9 +258,11 @@ fn answer_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         lines.extend(section(theme, "Why", &panel.intent));
     }
     lines.extend(risk_lines(theme, &panel.risks));
-    lines.extend(plan_lines(app, theme));
-    lines.extend(question_lines(theme, &panel.questions));
+    // Corrections before the plan: what was dropped changes how the rest is read, and
+    // the plan is also in the tree beside this panel (FR-4.2).
     lines.extend(warning_lines(app, theme));
+    lines.extend(question_lines(theme, &panel.questions));
+    lines.extend(plan_lines(app, theme));
     lines
 }
 

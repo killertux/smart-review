@@ -23,6 +23,8 @@
 
 use futures::StreamExt;
 use llm::builder::{LLMBackend, LLMBuilder};
+use llm::chat::ChatProvider;
+use llm::providers::openai_compatible::{OpenAICompatibleProvider, OpenAIProviderConfig};
 // `chat`, `usage` and `thinking` come from `ChatProvider`/`ChatResponse`, which are
 // supertraits of the `llm::LLMProvider` this module returns; naming them again here
 // would be redundant.
@@ -47,7 +49,16 @@ impl LlmCrate {
     }
 
     /// Builds a configured provider for one request.
-    fn provider(request: &ChatRequest) -> Result<Box<dyn llm::LLMProvider>, LlmError> {
+    ///
+    /// Two kinds, because the crate has two: its own backends through the builder, and
+    /// the generic OpenAI-compatible provider for the passthrough route (DEC-17). Only
+    /// [`ChatProvider`] is needed, which is what lets a passthrough provider be built
+    /// directly instead of through the builder, whose `OpenAI` backend speaks the
+    /// Responses API rather than `/chat/completions` — see [`passthrough`].
+    fn provider(request: &ChatRequest) -> Result<Box<dyn ChatProvider>, LlmError> {
+        if let Route::Passthrough { base_url } = &request.route {
+            return passthrough(request, base_url);
+        }
         let (backend, base_url) = route(request)?;
         let mut builder = LLMBuilder::new()
             .backend(backend)
@@ -76,8 +87,11 @@ impl LlmCrate {
             }),
             Some(ThinkingRequest::BudgetTokens(tokens)) => builder.reasoning_budget_tokens(tokens),
         };
+        // `LLMProvider` is a `ChatProvider`, and upcasting the box is stable since
+        // Rust 1.86 (the MSRV here is 1.88).
         builder
             .build()
+            .map(|provider| provider as Box<dyn ChatProvider>)
             .map_err(|error| translate(&request.provider, &error))
     }
 
@@ -85,6 +99,68 @@ impl LlmCrate {
     fn messages(request: &ChatRequest) -> Vec<ChatMessage> {
         vec![ChatMessage::user().content(request.prompt.clone()).build()]
     }
+}
+
+/// A provider for the passthrough route, speaking `/chat/completions` (DEC-17).
+///
+/// Built from the crate's generic OpenAI-compatible provider rather than from
+/// `LLMBackend::OpenAI`, and that distinction is the whole point: the crate's `OpenAI`
+/// backend talks to the **Responses API** (`/responses`) for chat and streaming, which
+/// `OpenAI` itself implements and which almost no other "OpenAI-compatible" provider
+/// does. Pointing that backend at another provider's base URL would 404 on every
+/// request, so the passthrough builds the compatible provider directly.
+fn passthrough(request: &ChatRequest, base_url: &str) -> Result<Box<dyn ChatProvider>, LlmError> {
+    let url = base_url.trim();
+    if url.is_empty() {
+        return Err(LlmError::Unroutable {
+            provider: request.provider.clone(),
+        });
+    }
+    let reasoning_effort = match request.thinking {
+        Some(ThinkingRequest::Effort(level)) => Some(level.as_str().to_owned()),
+        _ => None,
+    };
+    let provider = OpenAICompatibleProvider::<Compatible>::new(
+        request.api_key.expose(),
+        Some(url.to_owned()),
+        Some(request.model.clone()),
+        request.max_tokens,
+        request.temperature,
+        Some(request.timeout_secs),
+        request.system.clone(),
+        None,
+        None,
+        None,
+        None,
+        reasoning_effort,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    Ok(Box::new(provider))
+}
+
+/// The configuration of a provider reached by passthrough.
+///
+/// Everything here is a default, because the catalog gives the app a base URL and a
+/// model and nothing else: what a provider supports is discovered from its answers, not
+/// from local knowledge, which is why the capabilities are stated as absences.
+struct Compatible;
+
+impl OpenAIProviderConfig for Compatible {
+    const PROVIDER_NAME: &'static str = "OpenAI-compatible";
+    const DEFAULT_BASE_URL: &'static str = "https://example.invalid/";
+    const DEFAULT_MODEL: &'static str = "";
+    /// `/chat/completions`, which is what makes this route useful (DEC-17).
+    const CHAT_ENDPOINT: &'static str = "chat/completions";
+    /// Reasoning *toggles* are not expressed here: the crate's compatible provider
+    /// accepts an effort string, and the domain refuses an option it cannot send
+    /// (FR-4.8) rather than this adapter guessing.
+    const SUPPORTS_REASONING_EFFORT: bool = true;
 }
 
 /// The crate's backend and the base URL to use, if any (DEC-17).
@@ -98,18 +174,11 @@ fn route(request: &ChatRequest) -> Result<(LLMBackend, Option<String>), LlmError
         Route::Native(NativeBackend::Groq) => Ok((LLMBackend::Groq, None)),
         Route::Native(NativeBackend::Mistral) => Ok((LLMBackend::Mistral, None)),
         Route::Native(NativeBackend::Xai) => Ok((LLMBackend::XAI, None)),
-        // The passthrough: the crate's OpenAI-compatible backend, pointed at the
-        // provider's own endpoint. Nothing else about the request changes, which is
-        // what makes 170-odd providers reachable without a backend each.
-        Route::Passthrough { base_url } => {
-            let url = base_url.trim();
-            if url.is_empty() {
-                return Err(LlmError::Unroutable {
-                    provider: request.provider.clone(),
-                });
-            }
-            Ok((LLMBackend::OpenAI, Some(url.to_owned())))
-        }
+        // Handled before this function is reached: a passthrough provider is built
+        // rather than named (see `passthrough`).
+        Route::Passthrough { .. } => Err(LlmError::Unroutable {
+            provider: request.provider.clone(),
+        }),
     }
 }
 
@@ -312,21 +381,41 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_with_only_a_base_url_goes_through_the_passthrough() {
+    fn a_provider_with_only_a_base_url_goes_through_the_compatible_passthrough() {
+        // Why this matters: the crate's OpenAI backend talks to the *Responses API*
+        // (`/responses`) for both chat and streaming, which OpenAI implements and
+        // almost no other OpenAI-compatible provider does. Pointing that backend at
+        // another provider's base URL 404s on every request, so the passthrough builds
+        // the compatible provider instead — and the endpoint below is the guarantee.
+        assert_eq!(Compatible::CHAT_ENDPOINT, "chat/completions");
         let request = request("lmstudio", "qwen/qwen3-coder-30b");
-        let (backend, url) = route(&request).expect("routed");
-        assert_eq!(backend, LLMBackend::OpenAI, "the compatible backend");
-        assert_eq!(url.as_deref(), Some("http://127.0.0.1:1234/v1"));
+        assert!(
+            passthrough(&request, "http://127.0.0.1:1234/v1").is_ok(),
+            "the compatible provider builds for any base URL"
+        );
+        // It is reachable through the adapter, which is what the app calls.
+        assert!(LlmCrate::provider(&request).is_ok());
+        // And `route` never sees a passthrough: a named backend is the other path.
+        assert!(
+            matches!(route(&request), Err(LlmError::Unroutable { .. })),
+            "the passthrough is built, not named"
+        );
     }
 
     #[test]
     fn a_passthrough_without_a_url_is_refused_rather_than_sent_somewhere() {
-        let mut request = request("lmstudio", "m");
-        request.route = crate::domain::model::Route::Passthrough {
+        let request = request("lmstudio", "m");
+        // A blank base URL is not a provider: falling back to a default endpoint would
+        // be a request to somebody else's service.
+        assert!(matches!(
+            passthrough(&request, "   "),
+            Err(LlmError::Unroutable { .. })
+        ));
+        let mut blank = request.clone();
+        blank.route = crate::domain::model::Route::Passthrough {
             base_url: "   ".to_owned(),
         };
-        let error = route(&request).expect_err("refused");
-        assert!(matches!(error, LlmError::Unroutable { .. }), "{error:?}");
+        assert!(LlmCrate::provider(&blank).is_err());
     }
 
     #[test]

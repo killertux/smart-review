@@ -665,6 +665,8 @@ pub(crate) fn stored_analysis(head_sha: &str) -> crate::ports::StoredAnalysis {
         },
         analysis: normalized.analysis,
         raw: "{}".to_owned(),
+        warnings: normalized.warnings,
+        repaired: false,
         stored_at: 1_767_225_600,
     }
 }

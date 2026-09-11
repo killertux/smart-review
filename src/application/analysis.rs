@@ -385,22 +385,26 @@ impl<'a> Analyst<'a> {
             }
         };
 
-        let stored = StoredAnalysis {
+        // The corrections and the repair flag are part of the answer, so they are
+        // stored with it: a reader who opens the analysis tomorrow is told what was
+        // fixed just as much as the reader who watched it arrive (FR-4.1).
+        let mut warnings = normalized.warnings;
+        let mut stored = StoredAnalysis {
             key: request.key.clone(),
             analysis: normalized.analysis.clone(),
             raw: cap_raw(&raw),
+            warnings: Vec::new(),
+            repaired,
             stored_at: self.clock.now_unix_secs(),
         };
         // A cache that cannot be written must not lose the analysis the user just paid
-        // for: it is reported and the run continues.
-        let store_warning = self
-            .cache
-            .put(&stored)
-            .err()
-            .map(|error| format!("the analysis could not be cached: {error}"));
+        // for: it is reported and the run continues, and the warning is part of what
+        // is stored so it follows the document.
+        if let Err(error) = self.cache.put(&stored) {
+            warnings.push(format!("the analysis could not be cached: {error}"));
+        }
+        stored.warnings.clone_from(&warnings);
 
-        let mut warnings = normalized.warnings;
-        warnings.extend(store_warning);
         Ok(AnalysisRun::Ready(Box::new(Analyzed {
             analysis: Box::new(normalized.analysis),
             warnings,

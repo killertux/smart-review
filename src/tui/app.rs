@@ -327,6 +327,8 @@ pub enum AnalysisState {
     Idle,
     /// Gathering the context, which is the local half.
     Gathering,
+    /// Gathered, and waiting for the user to agree to send it (FR-4.6).
+    Confirming,
     /// Waiting for the provider, with the stage it is on.
     Running {
         /// What the job is doing: asking, or repairing.
@@ -358,12 +360,19 @@ impl AnalysisState {
         )
     }
 
+    /// Whether the user is being asked to confirm a send (FR-4.6).
+    #[must_use]
+    pub fn is_confirming(&self) -> bool {
+        matches!(self, Self::Confirming)
+    }
+
     /// The one-line description for the status area.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
             Self::Idle => "no analysis".to_owned(),
             Self::Gathering => "gathering the context".to_owned(),
+            Self::Confirming => "ready to send; confirm with <leader>a".to_owned(),
             Self::Running { stage } | Self::Streaming { stage } => stage.clone(),
             Self::Ready => "analysed".to_owned(),
             Self::Unusable { reason } => format!("unusable answer: {reason}"),
@@ -640,6 +649,8 @@ pub struct App {
     pub(crate) check_job: u64,
     /// The job id of the catalog fetch (FR-4.7).
     pub(crate) catalog_job: u64,
+    /// Whether the automatic fetch for a configured model has already been tried.
+    pub(crate) catalog_auto_fetched: bool,
     /// The diff flags the review screen is using (FR-3.2).
     pub(crate) diff_options: DiffOptions,
     /// Where the diff on screen was read from (FR-3.2).
@@ -762,6 +773,7 @@ impl App {
             model_problem: None,
             check_job: 0,
             catalog_job: 0,
+            catalog_auto_fetched: false,
             diff_options: DiffOptions::default(),
             diff_source: DiffSource::Forge,
             workspace: None,
@@ -1051,6 +1063,14 @@ impl App {
             // A failure is gated like any other result: a superseded request's error
             // must not be announced as if it were the newest one.
             Outcome::Failed(message) if self.is_current_job(job) => {
+                // The decision to fetch a missing catalog is made before the failure
+                // is reported: reporting clears the job id it would be checked
+                // against, and the fetch is the more useful thing to do than to
+                // announce that there was nothing to read.
+                if let Some(effect) = self.catalog_unavailable(job) {
+                    self.catalog_job = 0;
+                    return Some(effect);
+                }
                 self.report_job_failure(job, &message);
                 None
             }
@@ -1106,6 +1126,36 @@ impl App {
         }
     }
 
+    /// Fetches the catalog when a configured model needs it and the cache was empty.
+    ///
+    /// The startup load is cache-only so that a fresh run makes no network call
+    /// (FR-4.7). That is the right default, but it left a user who had already chosen a
+    /// model being told there was no model until they opened the picker — a fetch they
+    /// had not asked for is worth less than a working model they did ask for.
+    ///
+    /// Once only: an unreachable catalog must not become a fetch loop, and the second
+    /// failure is a real failure worth reporting.
+    #[must_use]
+    pub fn catalog_unavailable(&mut self, job: u64) -> Option<Effect> {
+        if job != self.catalog_job
+            || self.catalog.is_some()
+            || self.catalog_auto_fetched
+            || self.config.llm.active.is_none()
+        {
+            // No model configured means the picker is where a model is chosen, and it
+            // fetches the catalog when it opens.
+            return None;
+        }
+        self.catalog_auto_fetched = true;
+        logging::log(
+            Level::Debug,
+            "no cached catalog and a model is configured: fetching it now",
+        );
+        Some(Effect::LoadCatalog(
+            crate::ports::catalog::CatalogPolicy::Refresh,
+        ))
+    }
+
     /// Applies what the analysis cache held (FR-4.3, DEC-15).
     ///
     /// A stored analysis for the *current* head is used without asking; one for an
@@ -1120,8 +1170,7 @@ impl App {
     ) {
         self.panel.stale = stale.map(Box::new);
         if let Some(stored) = current {
-            let repaired = false;
-            self.adopt_analysis(stored, repaired, Vec::new());
+            self.adopt_analysis(stored);
         } else if let Some(stale) = &self.panel.stale {
             let age = crate::domain::time::relative(
                 crate::domain::time::from_unix_secs(
@@ -1170,6 +1219,10 @@ impl App {
             .detail
             .as_ref()
             .map(|detail| (detail.summary.number, detail.summary.head_sha.clone()));
+        // The gather is over. Whatever happens next (a run, the inspector, or the user
+        // thinking about it) starts from "nothing is in flight", which is what the
+        // second key press and the status line both read.
+        self.panel.state = AnalysisState::Idle;
         let bundle = Box::new(bundle);
         match intent {
             AnalysisIntent::Inspect => {
@@ -1190,6 +1243,10 @@ impl App {
                     return Some(Effect::RunAnalysis { force: false });
                 }
                 self.panel.confirmed = true;
+                // The panel as well as the notice: a notice expires after a few
+                // seconds, and a question that disappears before it is answered is not
+                // a question. This is also where the size estimate stays readable.
+                self.panel.state = AnalysisState::Confirming;
                 self.notice(
                     NoticeLevel::Info,
                     format!(
@@ -1198,6 +1255,7 @@ impl App {
                         self.model_label()
                     ),
                 );
+                self.open_overlay(Overlay::Analysis);
                 None
             }
         }
@@ -1222,9 +1280,14 @@ impl App {
                         }),
                     analysis: (*ready.analysis).clone(),
                     raw: self.panel.stream.text().to_owned(),
+                    // The document is already in the cache (the use case stored it);
+                    // this value is what the panel shows, carrying the same
+                    // corrections and the same repair flag the cache holds.
+                    warnings: ready.warnings.clone(),
+                    repaired: ready.repaired,
                     stored_at: self.now_unix_secs,
                 };
-                self.adopt_analysis(stored, ready.repaired, ready.warnings.clone());
+                self.adopt_analysis(stored);
                 let usage = ready
                     .usage
                     .map(|usage| {
@@ -1278,12 +1341,7 @@ impl App {
     }
 
     /// Takes a document as the current analysis and re-orders the review (FR-4.2).
-    fn adopt_analysis(
-        &mut self,
-        stored: crate::ports::StoredAnalysis,
-        repaired: bool,
-        warnings: Vec<String>,
-    ) {
+    fn adopt_analysis(&mut self, stored: crate::ports::StoredAnalysis) {
         // The plan is derived here rather than in the view, so the panel and the tree
         // can never disagree about what the analysis said (FR-4.2).
         let derived = crate::domain::plan::Plan::from_analysis(&stored.analysis);
@@ -1293,7 +1351,8 @@ impl App {
         let keep = self.panel.plan.as_ref().is_some_and(|existing| {
             existing.overridden && existing.matches_head(&stored.analysis.head_sha)
         });
-        self.panel.warnings = warnings;
+        let repaired = stored.repaired;
+        self.panel.warnings.clone_from(&stored.warnings);
         self.panel.stale = None;
         self.panel.raw = None;
         self.panel.stream.clear();
@@ -1361,7 +1420,7 @@ impl App {
     }
 
     /// The model, as the interface names it.
-    fn model_label(&self) -> String {
+    pub(crate) fn model_label(&self) -> String {
         self.active_model.as_ref().map_or_else(
             || "the configured model".to_owned(),
             |resolved| format!("{}/{}", resolved.provider, resolved.model),
@@ -1576,6 +1635,15 @@ impl App {
     #[must_use]
     pub fn analysis_stream_truncated(&self) -> bool {
         self.panel.stream.is_truncated()
+    }
+
+    /// Whether the stored analysis needed a repair pass (FR-4.1).
+    #[must_use]
+    pub fn analysis_repaired(&self) -> bool {
+        self.panel
+            .analysis
+            .as_ref()
+            .is_some_and(|stored| stored.repaired)
     }
 
     /// What was corrected while normalizing the analysis (FR-4.1).
@@ -3777,6 +3845,85 @@ mod tests {
         assert!(app.latest_notice().is_some());
         app.tick_at(Instant::now() + NOTICE_LIFETIME + Duration::from_secs(1));
         assert!(app.latest_notice().is_none());
+    }
+
+    #[test]
+    fn a_configured_model_gets_the_catalog_fetched_without_the_picker() {
+        let (_dir, mut app) = app();
+        // No cache, so the startup load failed; a model is configured, so the fetch
+        // follows on its own rather than waiting for the picker to be opened.
+        app.config.llm.active = Some(ModelSelection {
+            provider: "fake".to_owned(),
+            model: "fake-analysis-1".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+        });
+        app.record_catalog_job(9);
+        assert!(matches!(
+            app.catalog_unavailable(9),
+            Some(Effect::LoadCatalog(CatalogPolicy::Refresh))
+        ));
+        // Without a configured model the picker is where a model is chosen, so no
+        // fetch is started behind the user's back.
+        let (_dir2, mut bare) = super::tests::app();
+        bare.record_catalog_job(9);
+        assert!(bare.catalog_unavailable(9).is_none());
+        // And a catalog that arrived is never fetched again by this path.
+        let (_dir3, mut loaded) = super::tests::app();
+        loaded.config.llm.active = Some(ModelSelection {
+            provider: "fake".to_owned(),
+            model: "fake-analysis-1".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+        });
+        loaded.record_catalog_job(9);
+        loaded.catalog = Some(crate::application::models::CatalogState {
+            load: crate::ports::catalog::CatalogLoad {
+                catalog: crate::domain::model::Catalog::from_json("{}").expect("empty"),
+                source: crate::ports::catalog::CatalogSource::Fetched,
+            },
+            providers: Vec::new(),
+        });
+        assert!(loaded.catalog_unavailable(9).is_none());
+    }
+
+    #[test]
+    fn the_automatic_catalog_fetch_happens_once() {
+        let (_dir, mut app) = app();
+        app.config.llm.active = Some(ModelSelection {
+            provider: "fake".to_owned(),
+            model: "fake-analysis-1".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+        });
+        app.record_catalog_job(9);
+        assert!(app.catalog_unavailable(9).is_some());
+        // A second failure is a real failure: fetching again would be a loop.
+        app.record_catalog_job(10);
+        assert!(app.catalog_unavailable(10).is_none());
+    }
+
+    #[test]
+    fn a_gathered_bundle_is_not_a_run_in_flight() {
+        let (_dir, mut app) = app();
+        app.panel.state = crate::tui::app::AnalysisState::Gathering;
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR #141",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        app.apply_context(
+            bundle,
+            crate::application::analysis::AnalysisIntent::Estimate,
+        );
+        assert_eq!(app.panel.state, crate::tui::app::AnalysisState::Confirming);
+        assert!(!app.analysis_state().is_running());
+        assert!(app.analysis_state().is_confirming());
     }
 
     #[test]

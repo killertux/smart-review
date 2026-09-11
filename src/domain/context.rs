@@ -340,9 +340,9 @@ impl Bundle {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "~{} tokens ({} KB), {} of {} items",
+            "~{} tokens ({}), {} of {} items",
             self.estimated_tokens,
-            human_bytes(self.bytes() as u64).trim_end_matches(" B"),
+            human_bytes(self.bytes() as u64),
             self.included(),
             self.segments.len()
         )
@@ -351,13 +351,7 @@ impl Bundle {
     /// The `:context` inspector's body.
     #[must_use]
     pub fn inspection(&self) -> Vec<String> {
-        let mut lines = vec![format!(
-            "context: {} · budget {} tokens",
-            self.summary(),
-            // The budget is a property of the policy, not of the bundle, so the caller
-            // adds it when it knows it; this line is complete without it.
-            "see [llm].max_context_tokens"
-        )];
+        let mut lines = vec![format!("context: {}", self.summary())];
         for segment in &self.segments {
             lines.push(segment.inspection_line());
         }
@@ -974,6 +968,9 @@ mod tests {
         let bundle = build_with(&inputs);
         let summary = bundle.summary();
         assert!(summary.contains("tokens"), "{summary}");
+        // The size is bytes and says so: the first version of this line printed the
+        // byte count next to the word "KB".
+        assert!(summary.contains(" B)"), "{summary}");
         assert!(summary.contains("2 of 2 items"), "{summary}");
     }
 

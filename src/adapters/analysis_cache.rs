@@ -44,6 +44,12 @@ struct Document {
     /// The model's text, so a repaired answer can be read back (FR-4.1).
     #[serde(default)]
     raw: String,
+    /// What normalization corrected (FR-4.1).
+    #[serde(default)]
+    warnings: Vec<String>,
+    /// Whether a repair pass was needed (FR-4.1).
+    #[serde(default)]
+    repaired: bool,
     /// When it was stored, in seconds since the Unix epoch.
     stored_at: u64,
 }
@@ -199,6 +205,8 @@ fn read_document(path: &Path) -> Result<Option<StoredAnalysis>, AnalysisCacheErr
             key: document.key.into_key(),
             analysis: document.analysis,
             raw: document.raw,
+            warnings: document.warnings,
+            repaired: document.repaired,
             stored_at: document.stored_at,
         })),
         Err(error) => Err(AnalysisCacheError::Malformed {
@@ -243,6 +251,8 @@ impl AnalysisCachePort for DiskAnalysisCache {
             key: document.key.into_key(),
             analysis: document.analysis,
             raw: document.raw,
+            warnings: document.warnings,
+            repaired: document.repaired,
             stored_at: document.stored_at,
         }))
     }
@@ -257,6 +267,8 @@ impl AnalysisCachePort for DiskAnalysisCache {
             key: StoredKey::of(&stored.key),
             analysis: stored.analysis.clone(),
             raw: stored.raw.clone(),
+            warnings: stored.warnings.clone(),
+            repaired: stored.repaired,
             stored_at: stored.stored_at,
         };
         let body = serde_json::to_string(&document).map_err(|error| AnalysisCacheError::Io {
@@ -378,6 +390,8 @@ mod tests {
             key: key.clone(),
             analysis: analysis(&key.head_sha),
             raw: "{\"summary\": \"what changed\"}".to_owned(),
+            warnings: vec!["one invented path was dropped".to_owned()],
+            repaired: false,
             stored_at,
         }
     }
@@ -392,6 +406,10 @@ mod tests {
         assert_eq!(found.analysis.token_usage.reasoning, Some(50));
         assert_eq!(found.raw, "{\"summary\": \"what changed\"}");
         assert_eq!(found.stored_at, 100);
+        // The corrections travel with the document: they describe the answer, not
+        // the run.
+        assert_eq!(found.warnings, ["one invented path was dropped"]);
+        assert!(!found.repaired);
         assert_eq!(found.key, key);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -424,6 +442,8 @@ mod tests {
             key: StoredKey::of(&key),
             analysis: analysis(&key.head_sha),
             raw: String::new(),
+            warnings: Vec::new(),
+            repaired: false,
             stored_at: 1,
         };
         DiskAnalysisCache::write(

@@ -113,6 +113,15 @@ pub struct StoredAnalysis {
     /// The model's text, kept so a repaired or failed answer can be read back
     /// (FR-4.1).
     pub raw: String,
+    /// What normalization corrected, kept with the document (FR-4.1).
+    ///
+    /// Persisted rather than recomputed because it is a property of the *answer*, not
+    /// of the run that fetched it: an analysis read back from the cache dropped three
+    /// invented paths just as much as the run that wrote it did, and the user who
+    /// opens it tomorrow should be told.
+    pub warnings: Vec<String>,
+    /// Whether a repair pass was needed to get this answer (FR-4.1).
+    pub repaired: bool,
     /// When it was stored, in seconds since the Unix epoch.
     pub stored_at: u64,
 }
