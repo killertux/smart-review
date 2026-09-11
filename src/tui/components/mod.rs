@@ -3,6 +3,7 @@
 //! Each component is a function of application state and a rectangle, which
 //! keeps rendering testable with `TestBackend` and free of hidden state.
 
+pub mod analysis;
 pub mod command_line;
 pub mod doctor;
 pub mod filter_bar;
@@ -48,6 +49,9 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Overlay::Leader => leader::render(frame, area, app),
         Overlay::Doctor => doctor::render(frame, area, app),
         Overlay::ThemePicker => theme_picker::render(frame, area, app),
+        Overlay::Analysis => analysis::render(frame, area, app),
+        Overlay::Context => analysis::render_context(frame, area, app),
+        Overlay::RawAnswer => analysis::render_raw(frame, area, app),
     }
 }
 

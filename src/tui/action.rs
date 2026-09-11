@@ -286,6 +286,30 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
+        id: "diff.toggle_order",
+        description: "Switch between the recommended and path orders",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "app.analyze_panel",
+        description: "Analyse the pull request, or open the analysis",
+        group: Group::App,
+        hint: false,
+    },
+    ActionDef {
+        id: "plan.move_up",
+        description: "Move the selected review-plan group up",
+        group: Group::App,
+        hint: false,
+    },
+    ActionDef {
+        id: "plan.move_down",
+        description: "Move the selected review-plan group down",
+        group: Group::App,
+        hint: false,
+    },
+    ActionDef {
         id: "app.load_more",
         description: "Fetch the next page of pull requests",
         group: Group::App,

@@ -26,6 +26,7 @@ pub mod llm;
 pub mod secret;
 pub mod workspace;
 
+pub use analysis::{AnalysisCacheError, AnalysisCachePort, AnalysisKey, StoredAnalysis};
 pub use cache::{CacheKey, CacheKeyError, CacheStore, Stored};
 pub use cancel::Cancel;
 pub use catalog::{CatalogFetchError, CatalogLoad, CatalogPolicy, CatalogSource, ModelCatalogPort};

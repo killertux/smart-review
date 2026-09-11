@@ -315,6 +315,14 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Search), "<Enter>", "search.close"),
     (Scope::In(Mode::Search), "<Esc>", "search.close"),
     (Scope::In(Mode::Normal), "<leader>m", "app.model_picker"),
+    (Scope::In(Mode::Normal), "<leader>a", "app.analyze_panel"),
+    // `o` toggles the review order (FR-3.5); it is unbound elsewhere, and it is what
+    // the requirement names.
+    (Scope::In(Mode::Normal), "o", "diff.toggle_order"),
+    // `J`/`K` move the plan group under the tree cursor (FR-4.2), in the spirit of
+    // `J`/`K` in a scrolling list elsewhere.
+    (Scope::In(Mode::Normal), "J", "plan.move_down"),
+    (Scope::In(Mode::Normal), "K", "plan.move_up"),
     (Scope::In(Mode::Normal), "<leader>t", "app.theme_picker"),
     (Scope::In(Mode::Normal), "<leader>T", "theme.toggle"),
     (Scope::In(Mode::Normal), "<leader>?", "app.help"),

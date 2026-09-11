@@ -21,6 +21,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use crate::application::analysis::{
+    AnalysisIntent, AnalysisRequest, AnalysisRun, Analyst, Progress as AnalysisProgress,
+};
 use crate::application::environment::{DetectRequest, detect};
 use crate::application::prs::{FetchOutcome, Prs};
 use crate::doctor::{self, Check, Context};
@@ -30,6 +33,7 @@ use crate::domain::pr::PullRequestDetail;
 use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::logging::{self, Level};
+use crate::ports::analysis::{AnalysisCachePort, AnalysisKey, StoredAnalysis};
 use crate::ports::cache::CacheStore;
 use crate::ports::catalog::{CatalogLoad, CatalogPolicy, ModelCatalogPort};
 use crate::ports::forge::{ForgePort, ForgeProbe, PullRequestPage};
@@ -40,6 +44,11 @@ use crate::ports::workspace::{
 use crate::ports::{Cancel, Clock};
 use crate::tui::app::Effect;
 use crate::tui::list_view::PrListState;
+
+/// How many progress messages are handed to the interface in one poll. Anything
+/// beyond it is dropped: the answer arrives whole in the completion, so a dropped
+/// preview costs nothing but a redrawn frame that is already stale.
+pub const MAX_PROGRESS_MESSAGES: usize = 256;
 
 /// How many jobs may run at once. Process jobs are the expensive ones, and four is
 /// what ARCH-5 allows.
@@ -68,6 +77,10 @@ pub enum Slot {
     Workspace,
     /// The provider's answer to the picker's connection check (FR-4.5).
     ModelCheck,
+    /// Reading a stored analysis, and gathering the context bundle (FR-4.3, FR-4.6).
+    Analysis,
+    /// The analysis request itself (FR-4.1).
+    Analyze,
 }
 
 /// What a job was asked to do.
@@ -136,6 +149,27 @@ pub enum Job {
         /// The flags that produced it, also part of the cache key.
         options: DiffOptions,
     },
+    /// Read whatever is already stored for a pull request (FR-4.3).
+    LoadAnalysis {
+        /// The question to look for, and the head it belongs to.
+        key: Box<AnalysisKey>,
+    },
+    /// Gather the context bundle, which is the expensive local half of an analysis
+    /// (FR-4.6).
+    GatherContext {
+        /// What to gather for.
+        request: Box<AnalysisRequest>,
+        /// What to do with the bundle when it arrives.
+        intent: AnalysisIntent,
+    },
+    /// Ask the provider for an analysis (FR-4.1).
+    RunAnalysis {
+        /// What to ask.
+        request: Box<AnalysisRequest>,
+        /// The bundle that was gathered and shown as an estimate, so what the user
+        /// agreed to send is what is sent.
+        bundle: Box<crate::domain::context::Bundle>,
+    },
     /// Collect the environment report (FR-9.3).
     Report {
         /// What to check. Boxed because the context is much larger than any other
@@ -162,6 +196,10 @@ impl Job {
             // A worktree and its cleanup share a slot: they are the same resource.
             Self::Workspace { .. } | Self::CleanWorkspaces { .. } => Slot::Workspace,
             Self::ModelCheck { .. } => Slot::ModelCheck,
+            // Reading and gathering are one slot: they are both "preparing the
+            // analysis", and a second request should replace the first.
+            Self::LoadAnalysis { .. } | Self::GatherContext { .. } => Slot::Analysis,
+            Self::RunAnalysis { .. } => Slot::Analyze,
         }
     }
 
@@ -206,6 +244,24 @@ pub enum Outcome {
     Workspace(Box<Workspace>),
     /// The provider answered the connection check (FR-4.5).
     ModelChecked(Box<ChatOutcome>),
+    /// What the analysis cache held for a pull request (FR-4.3, DEC-15).
+    Stored {
+        /// The entry matching the current question, if any.
+        current: Option<Box<StoredAnalysis>>,
+        /// An entry for the same pull request at an older commit, if any.
+        stale: Option<Box<StoredAnalysis>>,
+        /// The review-plan overrides stored for this pull request (FR-4.2).
+        plan: Option<Box<crate::domain::plan::Plan>>,
+    },
+    /// A gathered context bundle (FR-4.6).
+    Context {
+        /// The bundle.
+        bundle: Box<crate::domain::context::Bundle>,
+        /// What the caller wanted it for.
+        intent: AnalysisIntent,
+    },
+    /// The analysis finished, one way or another (FR-4.1).
+    Analyzed(Box<AnalysisRun>),
     /// Worktrees were removed (FR-3.1).
     WorkspacesCleaned {
         /// How many were removed.
@@ -221,6 +277,19 @@ pub enum Outcome {
     Abandoned,
 }
 
+/// Something a running job wants the interface to know now (FR-4.4).
+///
+/// A separate channel from completions because the invariant that makes the runner
+/// simple — one message per job, exactly once — is what makes it trustworthy, and
+/// streaming text has no business breaking it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    /// Which job this is about.
+    pub job: u64,
+    /// What it wants to say.
+    pub update: AnalysisProgress,
+}
+
 /// A finished job, on its way back to the event loop.
 #[derive(Debug, Clone)]
 pub struct Completion {
@@ -228,6 +297,30 @@ pub struct Completion {
     pub job: u64,
     /// What it produced.
     pub outcome: Outcome,
+}
+
+/// The ports one repository's jobs need (ARCH-2).
+///
+/// A struct rather than eight arguments: they are built together, replaced together,
+/// and a call site with eight `Arc`s in a row is one where a swap is invisible.
+#[derive(Debug)]
+pub struct ExecutorPorts {
+    /// The forge, once a repository is known.
+    pub forge: Arc<dyn ForgePort>,
+    /// The answer cache (FR-2.3).
+    pub cache: Arc<dyn CacheStore>,
+    /// Injected time.
+    pub clock: Arc<dyn Clock>,
+    /// The checkout and its worktrees (FR-3.1).
+    pub workspace: Arc<dyn WorkspacePort>,
+    /// Where analyses live (FR-4.3).
+    pub analysis: Arc<dyn AnalysisCachePort>,
+    /// The provider (FR-4.1).
+    pub llm: Arc<dyn LlmPort>,
+    /// Which repository these are scoped to.
+    pub repo: RepoId,
+    /// How long the forge answers are reused.
+    pub policy: crate::application::prs::CachePolicy,
 }
 
 /// A job that is running.
@@ -245,6 +338,10 @@ pub struct Executor {
     cache: Arc<dyn CacheStore>,
     clock: Arc<dyn Clock>,
     workspace: Arc<dyn WorkspacePort>,
+    /// Where analyses and their review-plan overrides are kept (FR-4.3).
+    analysis: Arc<dyn AnalysisCachePort>,
+    /// The provider, for the analysis request itself (FR-4.1).
+    llm: Arc<dyn LlmPort>,
     repo: RepoId,
     policy: crate::application::prs::CachePolicy,
 }
@@ -252,26 +349,31 @@ pub struct Executor {
 impl Executor {
     /// Binds the executor to a repository and the ports it reads through.
     #[must_use]
-    pub fn new(
-        forge: Arc<dyn ForgePort>,
-        cache: Arc<dyn CacheStore>,
-        clock: Arc<dyn Clock>,
-        workspace: Arc<dyn WorkspacePort>,
-        repo: RepoId,
-        policy: crate::application::prs::CachePolicy,
-    ) -> Self {
+    pub fn new(ports: ExecutorPorts) -> Self {
+        let ExecutorPorts {
+            forge,
+            cache,
+            clock,
+            workspace,
+            analysis,
+            llm,
+            repo,
+            policy,
+        } = ports;
         Self {
             forge,
             cache,
             clock,
             workspace,
+            analysis,
+            llm,
             repo,
             policy,
         }
     }
 
     /// Runs one job to completion.
-    fn run(&self, job: &Job, cancel: &Cancel) -> Outcome {
+    fn run(&self, job: &Job, cancel: &Cancel, sink: &ProgressSink<'_>) -> Outcome {
         let prs = Prs::new(
             self.forge.as_ref(),
             self.cache.as_ref(),
@@ -315,58 +417,35 @@ impl Executor {
                 number,
                 head_sha,
                 options,
-            } => {
-                // Cache first, with the flags in the key: re-opening a file with the
-                // same toggles must not re-run git (FR-3.2).
-                match prs.cached_patch_with(*number, head_sha, *options, DiffSource::Worktree) {
-                    Ok(Some(cached)) if !cached.stale => {
-                        return Outcome::Patch {
-                            outcome: Box::new(FetchOutcome::Fresh(cached.value)),
-                            source: DiffSource::Worktree,
-                        };
-                    }
-                    Ok(_) | Err(_) => {}
-                }
-                logging::log(
-                    Level::Debug,
-                    format!(
-                        "diffing {} locally at {} (context {}, whitespace {})",
-                        request.path.display(),
-                        head_sha,
-                        options.context,
-                        if options.ignore_whitespace {
-                            "ignored"
-                        } else {
-                            "shown"
-                        }
-                    ),
-                );
-                match self.workspace.diff(request, cancel) {
-                    Ok(text) => {
-                        let patch = crate::domain::diff::parse_patch(&text);
-                        let _ = prs.store_local_patch(*number, head_sha, *options, &patch);
-                        Outcome::Patch {
-                            outcome: Box::new(FetchOutcome::Fresh(patch)),
-                            source: DiffSource::Worktree,
-                        }
-                    }
-                    // The worktree is gone: the caller falls back to the forge, and
-                    // says so rather than showing an empty diff.
-                    Err(error) => match prs.cached_patch_with(
-                        *number,
-                        head_sha,
-                        *options,
-                        DiffSource::Worktree,
-                    ) {
-                        Ok(Some(cached)) => Outcome::Patch {
-                            outcome: Box::new(FetchOutcome::Offline {
-                                value: cached.value,
-                                reason: error.to_string(),
-                            }),
-                            source: DiffSource::Worktree,
-                        },
-                        _ => Outcome::Failed(error.to_string()),
+            } => self.local_patch(&prs, request, *number, head_sha, *options, cancel),
+            // Reading what is stored, gathering what would be sent, and asking for
+            // the analysis: all three need the repository, the clock and the cache,
+            // which is exactly what the executor holds (FR-4.3, FR-4.6).
+            Job::LoadAnalysis { key } => {
+                let analyst = self.analyst();
+                let plan = self.analysis.plan(&self.repo, key.pr).ok().flatten();
+                match (analyst.cached(key), analyst.stale(key)) {
+                    (Ok(current), Ok(stale)) => Outcome::Stored {
+                        current: current.map(Box::new),
+                        stale: stale.map(Box::new),
+                        plan: plan.map(Box::new),
                     },
+                    (Err(error), _) | (_, Err(error)) => Outcome::Failed(error.to_string()),
+                }
+            }
+            Job::GatherContext { request, intent } => {
+                let (bundle, _) = self.analyst().gather(request, cancel);
+                Outcome::Context {
+                    bundle: Box::new(bundle),
+                    intent: *intent,
+                }
+            }
+            Job::RunAnalysis { request, bundle } => {
+                let analyst = self.analyst();
+                let mut report = |update: AnalysisProgress| sink.send(update);
+                match analyst.run(request, bundle, cancel, &mut report) {
+                    Ok(run) => Outcome::Analyzed(Box::new(run)),
+                    Err(error) => Outcome::Failed(error.to_string()),
                 }
             }
             // Detection, the report, the catalog, the worktree and the connection
@@ -379,6 +458,82 @@ impl Executor {
             | Job::ModelCheck { .. }
             | Job::CleanWorkspaces { .. } => Outcome::Abandoned,
         }
+    }
+
+    /// Diffs the open pull request in its own worktree (FR-3.2).
+    ///
+    /// Extracted from [`Executor::run`] because it is the one arm with three
+    /// fallbacks — cache, worktree, cached-with-a-reason — and reading them inside a
+    /// twenty-arm match hides exactly the part that matters.
+    fn local_patch(
+        &self,
+        prs: &Prs<'_>,
+        request: &DiffRequest,
+        number: u64,
+        head_sha: &str,
+        options: DiffOptions,
+        cancel: &Cancel,
+    ) -> Outcome {
+        // Cache first, with the flags in the key: re-opening a file with the
+        // same toggles must not re-run git (FR-3.2).
+        match prs.cached_patch_with(number, head_sha, options, DiffSource::Worktree) {
+            Ok(Some(cached)) if !cached.stale => {
+                return Outcome::Patch {
+                    outcome: Box::new(FetchOutcome::Fresh(cached.value)),
+                    source: DiffSource::Worktree,
+                };
+            }
+            Ok(_) | Err(_) => {}
+        }
+        logging::log(
+            Level::Debug,
+            format!(
+                "diffing {} locally at {} (context {}, whitespace {})",
+                request.path.display(),
+                head_sha,
+                options.context,
+                if options.ignore_whitespace {
+                    "ignored"
+                } else {
+                    "shown"
+                }
+            ),
+        );
+        match self.workspace.diff(request, cancel) {
+            Ok(text) => {
+                let patch = crate::domain::diff::parse_patch(&text);
+                let _ = prs.store_local_patch(number, head_sha, options, &patch);
+                Outcome::Patch {
+                    outcome: Box::new(FetchOutcome::Fresh(patch)),
+                    source: DiffSource::Worktree,
+                }
+            }
+            // The worktree is gone: the caller falls back to the forge, and
+            // says so rather than showing an empty diff.
+            Err(error) => {
+                match prs.cached_patch_with(number, head_sha, options, DiffSource::Worktree) {
+                    Ok(Some(cached)) => Outcome::Patch {
+                        outcome: Box::new(FetchOutcome::Offline {
+                            value: cached.value,
+                            reason: error.to_string(),
+                        }),
+                        source: DiffSource::Worktree,
+                    },
+                    _ => Outcome::Failed(error.to_string()),
+                }
+            }
+        }
+    }
+
+    /// The analysis use case, bound to this repository's ports.
+    fn analyst(&self) -> Analyst<'_> {
+        Analyst::new(
+            self.workspace.as_ref(),
+            self.analysis.as_ref(),
+            self.llm.as_ref(),
+            self.clock.as_ref(),
+            &self.repo,
+        )
     }
 }
 
@@ -404,6 +559,9 @@ pub struct JobRunner {
     next_id: u64,
     sender: Sender<Completion>,
     receiver: Receiver<Completion>,
+    /// Progress from jobs that stream.
+    progress_sender: Sender<Progress>,
+    progress_receiver: Receiver<Progress>,
 }
 
 impl std::fmt::Debug for JobRunner {
@@ -427,6 +585,7 @@ impl JobRunner {
         request: DetectRequest,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
         Self {
             executor: None,
             workspace,
@@ -441,12 +600,23 @@ impl JobRunner {
             next_id: 1,
             sender,
             receiver,
+            progress_sender,
+            progress_receiver,
         }
     }
 
     /// Supplies the ports a repository-scoped job needs.
     pub fn set_executor(&mut self, executor: Arc<Executor>) {
         self.executor = Some(executor);
+    }
+
+    /// The LLM client, which the executor needs once a repository is known.
+    ///
+    /// Handed out rather than duplicated: the runner already owns it, and two `Arc`s
+    /// to the same client is one fewer thing to keep in step.
+    #[must_use]
+    pub fn llm(&self) -> Arc<dyn LlmPort> {
+        Arc::clone(&self.llm)
     }
 
     /// Whether a repository has been resolved.
@@ -524,6 +694,21 @@ impl JobRunner {
         completions
     }
 
+    /// Everything the running jobs have said since the last call.
+    ///
+    /// Bounded: a provider that streams faster than the interface draws must not be
+    /// able to grow the queue without limit, and the text on screen is a preview of
+    /// the answer rather than the answer.
+    pub fn poll_progress(&mut self) -> Vec<Progress> {
+        let mut progress = Vec::new();
+        while let Ok(update) = self.progress_receiver.try_recv() {
+            if progress.len() < MAX_PROGRESS_MESSAGES {
+                progress.push(update);
+            }
+        }
+        progress
+    }
+
     /// Starts as many queued jobs as there is room for.
     fn pump(&mut self) {
         while self.running.len() < MAX_IN_FLIGHT {
@@ -543,6 +728,7 @@ impl JobRunner {
         let cancel = Cancel::new();
         let worker_cancel = cancel.clone();
         let sender = self.sender.clone();
+        let progress_sender = self.progress_sender.clone();
         let executor = self.executor.clone();
         let workspace = Arc::clone(&self.workspace);
         let probe = Arc::clone(&self.probe);
@@ -565,7 +751,12 @@ impl JobRunner {
                     executor: executor.as_deref(),
                     request: &request,
                 };
-                let body = std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel));
+                let sink = ProgressSink {
+                    sender: &progress_sender,
+                    job: id,
+                };
+                let body =
+                    std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel, &sink));
                 let outcome = std::panic::catch_unwind(body).unwrap_or_else(|_| {
                     logging::log(
                         Level::Error,
@@ -608,6 +799,24 @@ impl JobRunner {
     }
 }
 
+/// Where a streaming job reports what it is doing, and which job it is (FR-4.4).
+struct ProgressSink<'a> {
+    sender: &'a Sender<Progress>,
+    job: u64,
+}
+
+impl ProgressSink<'_> {
+    /// Sends an update, dropping it when nobody is listening.
+    ///
+    /// A dropped preview costs nothing: the answer arrives whole in the completion.
+    fn send(&self, update: AnalysisProgress) {
+        let _ = self.sender.send(Progress {
+            job: self.job,
+            update,
+        });
+    }
+}
+
 /// The ports one job may need.
 ///
 /// Borrowed rather than owned so a job can be run without cloning anything: the
@@ -625,7 +834,7 @@ struct JobPorts<'a> {
 ///
 /// Separate from the thread that runs it, so the thread plumbing (`start`) and the
 /// work (`run_job`) can be read and tested apart.
-fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel) -> Outcome {
+fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel, sink: &ProgressSink<'_>) -> Outcome {
     match job {
         Job::Detect => match detect(ports.workspace, ports.probe, ports.request, cancel) {
             Ok(environment) => Outcome::Environment(Box::new(environment)),
@@ -648,7 +857,7 @@ fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel) -> Outcome {
             Err(error) => Outcome::Failed(error.to_string()),
         },
         other => match ports.executor {
-            Some(executor) => executor.run(other, cancel),
+            Some(executor) => executor.run(other, cancel, sink),
             None => Outcome::Failed(
                 "the repository is not known yet; run :doctor to see why".to_owned(),
             ),
@@ -719,6 +928,11 @@ pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<
         | Effect::SaveKey { .. }
         | Effect::SaveSelection(_)
         | Effect::CleanWorkspaces(_)
+        | Effect::LoadAnalysis
+        | Effect::GatherContext(_)
+        | Effect::RunAnalysis { .. }
+        | Effect::CancelAnalysis
+        | Effect::SavePlan(_)
         | Effect::CancelInFlight
         | Effect::SetMouse(_)
         | Effect::None
@@ -908,14 +1122,16 @@ mod tests {
             DetectRequest::default(),
         );
         let forge = Arc::new(SlowForge::new(delay));
-        runner.set_executor(Arc::new(Executor::new(
-            Arc::clone(&forge) as Arc<dyn ForgePort>,
-            Arc::new(InMemoryCache::default()),
-            Arc::new(FakeClock),
-            Arc::new(fake_workspace()),
-            RepoId::parse("acme/service").unwrap(),
-            crate::application::prs::CachePolicy::default(),
-        )));
+        runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
+            forge: Arc::clone(&forge) as Arc<dyn ForgePort>,
+            cache: Arc::new(InMemoryCache::default()),
+            clock: Arc::new(FakeClock),
+            workspace: Arc::new(fake_workspace()),
+            analysis: Arc::new(crate::test_support::InMemoryAnalysis::default()),
+            llm: Arc::new(crate::test_support::NoLlm),
+            repo: RepoId::parse("acme/service").unwrap(),
+            policy: crate::application::prs::CachePolicy::default(),
+        })));
         (runner, forge)
     }
 
@@ -1174,14 +1390,16 @@ mod tests {
             }),
             DetectRequest::default(),
         );
-        runner.set_executor(Arc::new(Executor::new(
-            Arc::new(PanicForge) as Arc<dyn ForgePort>,
-            Arc::new(InMemoryCache::default()),
-            Arc::new(FakeClock),
-            Arc::new(fake_workspace()),
-            RepoId::parse("acme/service").unwrap(),
-            crate::application::prs::CachePolicy::default(),
-        )));
+        runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
+            forge: Arc::new(PanicForge) as Arc<dyn ForgePort>,
+            cache: Arc::new(InMemoryCache::default()),
+            clock: Arc::new(FakeClock),
+            workspace: Arc::new(fake_workspace()),
+            analysis: Arc::new(crate::test_support::InMemoryAnalysis::default()),
+            llm: Arc::new(crate::test_support::NoLlm),
+            repo: RepoId::parse("acme/service").unwrap(),
+            policy: crate::application::prs::CachePolicy::default(),
+        })));
 
         // Three panicking jobs in a row: if a panic lost its slot, the third submit
         // would never start and this would time out.

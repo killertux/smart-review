@@ -104,7 +104,7 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &App, view: &DiffView) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(border_style(app, Pane::Diff))
-        .title(format!(" Files ({}) ", view.patch.stats().files));
+        .title(format!(" {} ", tree_title(view)));
 
     let height = usize::from(area.height.saturating_sub(2));
     // The offset is kept in the view by `prepare`, which the frame calls with the
@@ -127,6 +127,15 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &App, view: &DiffView) {
     );
 }
 
+/// The tree pane's title: the order in force (FR-3.5).
+///
+/// Only the order: the two positions are in the status line, which is wide enough to
+/// show them without cutting them off, and a title that says half of something is
+/// worse than a title that says one thing.
+fn tree_title(view: &DiffView) -> String {
+    format!("{} ({})", view.order.label(), view.patch.stats().files)
+}
+
 /// One tree row.
 fn tree_line(
     theme: &Theme,
@@ -144,6 +153,35 @@ fn tree_line(
 
     let indent = "  ".repeat(usize::from(row.depth));
     match &row.kind {
+        // A plan group is a heading, not a directory: it carries the position it is
+        // read in, which is the whole point of the ordered view (FR-4.2).
+        TreeKind::Group {
+            order,
+            files,
+            folded,
+            ..
+        } => {
+            let marker = if *folded { "▸" } else { "▾" };
+            Line::from(vec![
+                Span::styled(
+                    format!(" {marker} {order}. "),
+                    tint(theme.style(element::TREE_DIR)),
+                ),
+                Span::styled(
+                    text::truncate(&format!("{} ({files})", row.label), 24),
+                    tint(theme.style(element::ACCENT)),
+                ),
+            ])
+        }
+        // The rationale is why this group is read here (FR-4.2). It is dimmed and
+        // indented under its heading so the list still scans as a list.
+        TreeKind::Rationale { .. } => Line::from(vec![
+            Span::styled("    ".to_owned(), base),
+            Span::styled(
+                text::truncate(&row.label, 24),
+                tint(theme.style(element::MUTED)),
+            ),
+        ]),
         TreeKind::Directory { files, folded, .. } => {
             let marker = if *folded { "▸" } else { "▾" };
             Line::from(vec![
@@ -262,6 +300,15 @@ fn diff_title(theme: &Theme, view: &DiffView, width: u16, app: &App) -> String {
     // that is not true (FR-3.2).
     let title = format!(" {} · {} · ctx {} ", stats.label(), mode, view.context);
     let mut title = title;
+    // The analysis's note about the file on screen, where the user already is. It is
+    // truncated hard: the panel is where the full text lives, and a header that grows
+    // without bound stops being a header.
+    if let Some(note) = app.current_file_note() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut title,
+            format_args!("· {} ", text::truncate(&note, 40)),
+        );
+    }
     if app.diff_loading {
         title.push_str("· loading… ");
     }
@@ -539,7 +586,9 @@ index 1a2b3c4..5d6e7f8 100644
     fn the_screen_shows_a_tree_and_a_diff() {
         let (_dir, mut app) = app_with_patch();
         let rendered = draw(&mut app, 120, 30);
-        assert!(rendered.contains("Files (1)"), "{rendered}");
+        // The pane names the order it is in, which is what the toggle changes
+        // (FR-3.5).
+        assert!(rendered.contains("path order (1)"), "{rendered}");
         assert!(rendered.contains("invoice.rs"), "{rendered}");
         assert!(rendered.contains("unified"), "{rendered}");
         assert!(
@@ -547,6 +596,46 @@ index 1a2b3c4..5d6e7f8 100644
             "the hunk heading: {rendered}"
         );
         assert!(rendered.contains("gross - self.discount"), "{rendered}");
+    }
+
+    /// An app whose pull request is the one the analysis fixture describes.
+    fn app_with_analysed_patch() -> (TempHome, App) {
+        let (dir, mut app) = app_with_patch();
+        app.set_environment(crate::test_support::environment());
+        app.open_review(
+            crate::test_support::analysis_detail(),
+            DiffView::new(crate::test_support::analysis_patch()),
+        );
+        app.panel.analysis = Some(Box::new(crate::test_support::stored_analysis("abc123")));
+        (dir, app)
+    }
+
+    #[test]
+    fn the_plan_view_shows_groups_with_their_reason_and_both_positions() {
+        let (_dir, mut app) = app_with_analysed_patch();
+        let plan = crate::domain::plan::Plan::from_analysis(
+            &app.panel.analysis.as_ref().expect("set").analysis,
+        );
+        if let Some(view) = app.review.as_mut() {
+            view.set_plan(Some(plan));
+        }
+        let rendered = draw(&mut app, 140, 30);
+        // FR-4.2: the heading, its position in the order, and the reason it is read
+        // there. FR-3.5: where the file sits in both orders, in the status line where
+        // there is room for it.
+        assert!(rendered.contains("recommended order"), "{rendered}");
+        assert!(rendered.contains("1. domain"), "{rendered}");
+        assert!(rendered.contains("rules first"), "{rendered}");
+        assert!(rendered.contains("plan ·"), "{rendered}");
+        assert!(rendered.contains("path"), "{rendered}");
+    }
+
+    #[test]
+    fn the_diff_header_carries_the_analysis_note_for_the_file_on_screen() {
+        let (_dir, mut app) = app_with_analysed_patch();
+        let rendered = draw(&mut app, 160, 24);
+        // FR-4.1: what the analysis said about this file, where the reader already is.
+        assert!(rendered.contains("check the sign"), "{rendered}");
     }
 
     #[test]
@@ -593,7 +682,7 @@ index 1a2b3c4..5d6e7f8 100644
     fn a_pane_that_is_too_short_still_renders_the_rows_that_fit() {
         let (_dir, mut app) = app_with_patch();
         let rendered = draw(&mut app, 100, 24);
-        assert!(rendered.contains("Files"), "{rendered}");
+        assert!(rendered.contains("order"), "{rendered}");
         assert!(rendered.contains("unified"), "{rendered}");
     }
 

@@ -35,6 +35,21 @@ use crate::ports::{Cancel, Clock};
 /// would dilute the instruction it wrote.
 pub const CONVENTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "README.md"];
 
+/// What the caller wants a gathered bundle for (FR-4.6).
+///
+/// The bundle is expensive to gather and is the thing a user is asked to approve, so
+/// the gather is shared: the estimate that is shown, the inspector that explains it and
+/// the request that is finally sent all use the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisIntent {
+    /// Show how large the request would be, before anything is sent (FR-4.6).
+    Estimate,
+    /// Send it (FR-4.1).
+    Run,
+    /// Open the `:context` inspector (FR-4.6).
+    Inspect,
+}
+
 /// Progress reported while an analysis runs (FR-4.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Progress {
@@ -57,7 +72,10 @@ pub struct Checkout {
 }
 
 /// Everything an analysis needs that the caller already knows.
-#[derive(Debug)]
+///
+/// `Clone` because the same request is gathered with, shown as an estimate and then
+/// sent: the three steps must describe the same thing (FR-4.6).
+#[derive(Debug, Clone)]
 pub struct AnalysisRequest {
     /// What is being asked, for the cache key (FR-4.3).
     pub key: AnalysisKey,

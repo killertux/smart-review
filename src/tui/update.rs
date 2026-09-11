@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::application::analysis::AnalysisIntent;
 use crate::tui::action;
 use crate::tui::app::{App, Effect, NoticeLevel, Overlay};
 use crate::tui::keymap::{self, KeyCombo, Mode};
@@ -90,7 +91,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "context",
         "app.command",
-        "Set the diff context lines: :context 10",
+        "Inspect what an analysis would send, or set the diff context: :context 10",
+    ),
+    (
+        "analyze",
+        "app.analyze_panel",
+        "Analyse the open pull request: :analyze [--force|raw]",
+    ),
+    (
+        "plan",
+        "app.command",
+        "Review order: :plan move <file> <group> | reset | path",
     ),
     ("version", "app.version", "Show the version"),
 ];
@@ -120,6 +131,19 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "app.model_picker" => app.open_model_picker(),
+        "app.analyze_panel" => {
+            // `<leader>a` opens what is there and runs what is not: a user who has an
+            // analysis wants to read it, and a user who has none wants one.
+            if app.analysis_panel().is_some()
+                || app.analysis_state().is_running()
+                || app.raw_answer().is_some()
+            {
+                app.open_overlay(Overlay::Analysis);
+                Effect::None
+            } else {
+                start_analysis(app, "")
+            }
+        }
         "app.leader_menu" => {
             app.open_overlay(Overlay::Leader);
             Effect::KeepPending
@@ -133,7 +157,19 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "app.cancel" => {
-            app.cancel_overlay();
+            // An open popup is what `Esc` closes first; a run in flight is what it
+            // cancels next (FR-4.4). Doing both at once would make the key feel like
+            // it did nothing.
+            if app.overlay() != Overlay::None {
+                app.cancel_overlay();
+                return Effect::None;
+            }
+            if app.analysis_state().is_running() {
+                return Effect::CancelAnalysis;
+            }
+            if app.mode != crate::tui::keymap::Mode::Normal {
+                app.mode = crate::tui::keymap::Mode::Normal;
+            }
             Effect::None
         }
         "app.refresh" => {
@@ -154,7 +190,8 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         other
             if other.starts_with("app.")
                 || other.starts_with("notice.")
-                || other.starts_with("theme.") =>
+                || other.starts_with("theme.")
+                || other.starts_with("plan.") =>
         {
             dispatch_app(app, other)
         }
@@ -181,8 +218,47 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
 
 /// Changes the focused pane and remembers it (FR-8.5).
 /// The application lifecycle and view actions.
+/// `o`: switches between the recommended and path orders (FR-3.5).
+///
+/// Both positions are reported, because the point of the toggle is comparison: the
+/// user wants to know where the file they are reading sits in each order, not merely
+/// that something changed.
+fn toggle_order(app: &mut App) -> Effect {
+    let Some(view) = app.review_mut() else {
+        app.notice(NoticeLevel::Warn, "open a pull request first".to_owned());
+        return Effect::None;
+    };
+    if view.plan.is_none() {
+        app.notice(
+            NoticeLevel::Info,
+            "only one order so far: <leader>a analyses the pull request, or the diff's own \
+             path order is kept"
+                .to_owned(),
+        );
+        return Effect::None;
+    }
+    view.toggle_order();
+    let order = view.order;
+    let positions = view
+        .order_positions()
+        .map(|positions| format!(" · {positions}"))
+        .unwrap_or_default();
+    let source = view
+        .plan
+        .as_ref()
+        .map(|plan| plan.source.label())
+        .unwrap_or_default();
+    app.notice(
+        NoticeLevel::Info,
+        format!("{} ({source}){positions}", order.label()),
+    );
+    Effect::None
+}
+
 fn dispatch_app(app: &mut App, id: &str) -> Effect {
     match id {
+        "plan.move_up" | "plan.move_down" => move_plan_group(app, id == "plan.move_down"),
+        "plan.reset" => reset_plan(app),
         "app.version" => {
             app.notice(
                 NoticeLevel::Info,
@@ -308,6 +384,7 @@ fn dispatch_diff(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "diff.toggle_split" => toggle_split(app),
+        "diff.toggle_order" => toggle_order(app),
         "diff.cycle_context" => cycle_context(app),
         "diff.toggle_whitespace" => toggle_whitespace(app),
         "review.copy_path" => copy_path(app),
@@ -723,6 +800,8 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "catalog" => catalog_command(app, argument),
         "workspace" => workspace_command(app, argument),
         "context" => context_command(app, argument),
+        "analyze" => start_analysis(app, argument),
+        "plan" => plan_command(app, argument),
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
             "reload" => app.reload_theme(),
@@ -745,6 +824,182 @@ fn unknown_command(app: &mut App, name: &str) -> Effect {
     }
     app.command_error(message);
     Effect::None
+}
+
+/// `<leader>a` and `:analyze [--force|raw]` (FR-4.1, FR-4.4).
+///
+/// The sequence a user meets is: no model means the picker, nothing open means a
+/// message, a second press confirms the first send for a repository, and after that
+/// one press runs it (FR-4.6).
+fn start_analysis(app: &mut App, argument: &str) -> Effect {
+    match argument {
+        "raw" => {
+            if app.raw_answer().is_some() {
+                app.open_overlay(Overlay::RawAnswer);
+            } else if app.panel.analysis.is_some() {
+                app.notice(
+                    NoticeLevel::Info,
+                    "the stored analysis came from a usable answer; its text is not kept"
+                        .to_owned(),
+                );
+            } else {
+                app.notice(
+                    NoticeLevel::Warn,
+                    "there is no answer to show; <leader>a runs one".to_owned(),
+                );
+            }
+            return Effect::None;
+        }
+        "" | "--force" => {}
+        other => {
+            app.command_error(format!(
+                "`:analyze {other}` is not an option; try `:analyze`, `:analyze --force` or \
+                 `:analyze raw`"
+            ));
+            return Effect::None;
+        }
+    }
+
+    if !app.has_model() {
+        // FR-4.5: with no model the feature is inert with a call to action, not
+        // broken.
+        let problem = app
+            .model_problem()
+            .unwrap_or("no model is selected")
+            .to_owned();
+        app.notice(
+            NoticeLevel::Info,
+            format!("{problem}; <leader>m chooses one"),
+        );
+        return dispatch(app, "app.model_picker");
+    }
+    if app.detail.is_none() {
+        app.notice(NoticeLevel::Warn, "open a pull request first".to_owned());
+        return Effect::None;
+    }
+    if app.analysis_state().is_running() {
+        // Already running: the panel is where the answer arrives, and `Esc` is the
+        // key that stops it (FR-4.4). Re-running here would throw away the tokens
+        // already paid for.
+        app.open_overlay(Overlay::Analysis);
+        return Effect::None;
+    }
+
+    let bundle = app.take_context_bundle_for_current_head();
+    if let Some(bundle) = bundle {
+        // The estimate has been shown and agreed to; send it (FR-4.6).
+        if app.panel.confirmed || app.analysis_opt_in_recorded() {
+            app.record_analysis_opt_in();
+            app.begin_analysis();
+            app.panel.bundle = Some(Box::new(bundle));
+            return Effect::RunAnalysis {
+                force: argument == "--force",
+            };
+        }
+    } else if app.panel.confirmed && app.analysis_opt_in_recorded() {
+        // The confirmation was for a bundle that is no longer current: gather again.
+        return Effect::GatherContext(AnalysisIntent::Estimate);
+    }
+    Effect::GatherContext(AnalysisIntent::Estimate)
+}
+
+/// `J`/`K`: moves the selected review-plan group (FR-4.2).
+fn move_plan_group(app: &mut App, down: bool) -> Effect {
+    let Some(group) = app.selected_plan_group() else {
+        app.notice(
+            NoticeLevel::Info,
+            "put the cursor on a group heading in the Files pane, then J or K moves it".to_owned(),
+        );
+        return Effect::None;
+    };
+    let Some(plan) = app.plan_mut() else {
+        return Effect::None;
+    };
+    let delta = if down { 1 } else { -1 };
+    if plan.move_group(&group, delta) {
+        let updated = plan.clone();
+        app.after_plan_change();
+        return Effect::SavePlan(Box::new(updated));
+    }
+    app.notice(
+        NoticeLevel::Info,
+        format!(
+            "`{group}` is already as far {} as it goes",
+            if down { "down" } else { "up" }
+        ),
+    );
+    Effect::None
+}
+
+/// `:plan reset|path|recommended|move <file> <group>` (FR-4.2).
+fn plan_command(app: &mut App, argument: &str) -> Effect {
+    let mut parts = argument.split_whitespace();
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (None, ..) => {
+            app.notice(NoticeLevel::Info, app.plan_summary());
+            Effect::None
+        }
+        (Some("reset"), None, _, _) => reset_plan(app),
+        (Some("path"), None, _, _) => {
+            if let Some(view) = app.review_mut() {
+                view.set_order(crate::domain::plan::OrderMode::Path);
+            }
+            app.notice(NoticeLevel::Info, "path order".to_owned());
+            Effect::None
+        }
+        (Some("recommended"), None, _, _) => {
+            if app.plan().is_none() {
+                app.notice(
+                    NoticeLevel::Warn,
+                    "there is no plan yet; <leader>a analyses the pull request".to_owned(),
+                );
+                return Effect::None;
+            }
+            if let Some(view) = app.review_mut() {
+                view.set_order(crate::domain::plan::OrderMode::Recommended);
+            }
+            app.notice(NoticeLevel::Info, "recommended order".to_owned());
+            Effect::None
+        }
+        (Some("move"), Some(file), Some(group), None) => {
+            let Some(plan) = app.plan_mut() else {
+                app.command_error("there is no plan to change; <leader>a analyses first");
+                return Effect::None;
+            };
+            if !plan.pin_file(file, group) {
+                app.command_error(format!("`{file}` is already in `{group}`"));
+                return Effect::None;
+            }
+            let updated = plan.clone();
+            app.after_plan_change();
+            Effect::SavePlan(Box::new(updated))
+        }
+        (Some(other), ..) => {
+            app.command_error(format!(
+                "`:plan {other}` is not an option; try `:plan`, `:plan reset`, `:plan path`, \
+                 `:plan recommended` or `:plan move <file> <group>`"
+            ));
+            Effect::None
+        }
+    }
+}
+
+/// `:plan reset`: back to the order the analysis asked for (FR-4.2).
+fn reset_plan(app: &mut App) -> Effect {
+    let Some(stored) = app.panel.analysis.as_deref() else {
+        app.notice(
+            NoticeLevel::Warn,
+            "there is no analysed plan to reset to".to_owned(),
+        );
+        return Effect::None;
+    };
+    let plan = crate::domain::plan::Plan::from_analysis(&stored.analysis);
+    app.set_plan(plan.clone());
+    app.notice(
+        NoticeLevel::Info,
+        "the review order is the analysis's again".to_owned(),
+    );
+    Effect::SavePlan(Box::new(plan))
 }
 
 /// `:model`, `:model show`, `:model pick` (FR-4.5).
@@ -887,14 +1142,23 @@ fn workspace_command(app: &mut App, argument: &str) -> Effect {
 /// `:context <n>` (FR-3.2).
 fn context_command(app: &mut App, argument: &str) -> Effect {
     if argument.is_empty() {
+        // FR-4.6's inspector: what an analysis would send. A number still means the
+        // diff's own context, which is the M1 meaning of the same word (FR-3.2) — and
+        // the difference is stated rather than guessed at, because `:context 6` and
+        // `:context` doing two different things is worth one sentence.
+        if app.context_bundle().is_some() {
+            app.open_overlay(Overlay::Context);
+            return Effect::None;
+        }
         app.notice(
             NoticeLevel::Info,
             format!(
-                "diff context is {} lines; `:context <0-1000>` changes it, `<leader>dc` cycles it",
+                "gathering what an analysis would send ({} diff context lines; `:context <0-1000>` \
+                 changes that)",
                 app.diff_options.context
             ),
         );
-        return Effect::None;
+        return Effect::GatherContext(AnalysisIntent::Inspect);
     }
     match argument.parse::<u32>() {
         Ok(lines) if lines <= 1000 => {
@@ -1292,5 +1556,366 @@ mod tests {
         );
         assert_eq!(super::command(&mut app, "pr"), Effect::None);
         assert!(app.command_error_text().is_some());
+    }
+
+    /// An app with a pull request open, a repository and a model: everything the
+    /// analysis path needs (FR-4.1).
+    fn app_ready_to_analyse() -> (crate::test_support::TempHome, App) {
+        let (dir, mut app) = test_app();
+        app.set_environment(crate::test_support::environment());
+        app.open_review(
+            crate::test_support::analysis_detail(),
+            crate::tui::diff_view::DiffView::new(crate::test_support::analysis_patch()),
+        );
+        app.active_model = Some(crate::test_support::resolved_model());
+        (dir, app)
+    }
+
+    #[test]
+    fn analysing_without_a_model_opens_the_picker_and_says_why() {
+        let (_dir, mut app) = test_app();
+        app.open_review(
+            crate::test_support::analysis_detail(),
+            crate::tui::diff_view::DiffView::new(crate::test_support::analysis_patch()),
+        );
+        // FR-4.5: the feature is inert with a call to action, never broken. What the
+        // effect asks for is the catalog the picker needs; what matters here is that
+        // the picker opened and the reason was said.
+        let _ = dispatch(&mut app, "app.analyze_panel");
+        assert!(app.picker().is_some(), "the picker opens");
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("no model")),
+            "{:?}",
+            app.latest_notice()
+        );
+    }
+
+    #[test]
+    fn the_first_press_gathers_the_context_and_the_second_one_confirms_it() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        // FR-4.6: before anything is sent, the user is told what would be and asked.
+        let effect = dispatch(&mut app, "app.analyze_panel");
+        assert!(
+            matches!(effect, Effect::GatherContext(AnalysisIntent::Estimate)),
+            "{effect:?}"
+        );
+
+        // The gather arrives: the notice names the size, and nothing has been sent.
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR #141",
+                commits: "abc",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        let effect = app.apply_context(bundle, AnalysisIntent::Estimate);
+        assert!(effect.is_none(), "nothing is sent on the first press");
+        assert!(app.panel.confirmed);
+        let notice = app.latest_notice().expect("a notice").text.clone();
+        assert!(notice.contains("press <leader>a again"), "{notice}");
+        assert!(notice.contains("tokens"), "{notice}");
+
+        // The second press sends it.
+        let effect = dispatch(&mut app, "app.analyze_panel");
+        assert!(
+            matches!(effect, Effect::RunAnalysis { force: false }),
+            "{effect:?}"
+        );
+        assert!(app.analysis_opt_in_recorded(), "the opt-in is recorded");
+    }
+
+    #[test]
+    fn once_the_repository_has_agreed_the_next_analysis_needs_one_press() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.record_analysis_opt_in();
+        app.panel.bundle = Some(Box::new(crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR #141",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        )));
+        app.panel.bundle_for = Some((141, "abc123".to_owned()));
+        let effect = dispatch(&mut app, "app.analyze_panel");
+        assert!(
+            matches!(effect, Effect::RunAnalysis { force: false }),
+            "{effect:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_gathered_for_another_commit_is_not_sent() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.panel.bundle = Some(Box::new(crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR #141",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        )));
+        // The head moved since the bundle was gathered (FR-4.3).
+        app.panel.bundle_for = Some((141, "anedotheraaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()));
+        let effect = dispatch(&mut app, "app.analyze_panel");
+        assert!(
+            matches!(effect, Effect::GatherContext(AnalysisIntent::Estimate)),
+            "{effect:?}"
+        );
+        assert!(app.panel.bundle.is_none(), "the stale bundle was dropped");
+    }
+
+    #[test]
+    fn the_key_watches_a_run_rather_than_restarting_it() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.panel.state = crate::tui::app::AnalysisState::Streaming {
+            stage: "asking".to_owned(),
+        };
+        let effect = dispatch(&mut app, "app.analyze_panel");
+        assert!(matches!(effect, Effect::None), "{effect:?}");
+        assert_eq!(app.overlay(), Overlay::Analysis);
+        // And `Esc` is what stops it (FR-4.4).
+        assert!(matches!(dispatch(&mut app, "app.cancel"), Effect::None));
+        assert!(matches!(
+            dispatch(&mut app, "app.cancel"),
+            Effect::CancelAnalysis
+        ));
+    }
+
+    #[test]
+    fn escaped_cancels_a_run_after_closing_what_is_open() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.panel.state = crate::tui::app::AnalysisState::Streaming {
+            stage: "asking".to_owned(),
+        };
+        // A popup is closed first, so one press does not do two things.
+        app.open_overlay(Overlay::Analysis);
+        assert!(matches!(dispatch(&mut app, "app.cancel"), Effect::None));
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(matches!(
+            dispatch(&mut app, "app.cancel"),
+            Effect::CancelAnalysis
+        ));
+    }
+
+    #[test]
+    fn a_stale_stream_is_dropped_by_job_id() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.record_analysis_job(7);
+        app.apply_progress(crate::tui::jobs::Progress {
+            job: 6,
+            update: crate::application::analysis::Progress::Delta("old".to_owned()),
+        });
+        assert!(
+            app.analysis_stream().is_empty(),
+            "a superseded run is dropped"
+        );
+        app.apply_progress(crate::tui::jobs::Progress {
+            job: 7,
+            update: crate::application::analysis::Progress::Delta("new".to_owned()),
+        });
+        assert_eq!(app.analysis_stream(), "new");
+        assert!(matches!(
+            app.analysis_state(),
+            crate::tui::app::AnalysisState::Streaming { .. }
+        ));
+    }
+
+    #[test]
+    fn a_ready_analysis_orders_the_review_and_fills_the_panel() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.record_analysis_job(3);
+        app.apply_analysis(crate::application::analysis::AnalysisRun::Ready(Box::new(
+            crate::application::analysis::Analyzed {
+                analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
+                warnings: vec!["one file was unclassified".to_owned()],
+                repaired: false,
+                usage: None,
+            },
+        )));
+
+        // FR-4.2: the tree is grouped by the plan, in the recommended order.
+        let view = app.review.as_ref().expect("the review is open");
+        assert_eq!(view.order, crate::domain::plan::OrderMode::Recommended);
+        let groups: Vec<&str> = view
+            .tree
+            .iter()
+            .filter_map(|row| match &row.kind {
+                crate::tui::diff_view::TreeKind::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, ["domain", "tests"]);
+        // The panel has the document, and the corrections are kept.
+        let panel = app.analysis_panel().expect("a panel");
+        assert_eq!(panel.summary, "Billing rounds half up.");
+        assert_eq!(panel.risks.len(), 1);
+        assert_eq!(app.analysis_warnings(), ["one file was unclassified"]);
+        assert_eq!(app.analysis_state(), &crate::tui::app::AnalysisState::Ready);
+    }
+
+    #[test]
+    fn an_unusable_answer_keeps_its_text_and_says_why() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.record_analysis_job(3);
+        app.apply_analysis(crate::application::analysis::AnalysisRun::Unparsed(
+            Box::new(crate::application::analysis::Unparsed {
+                raw: "I could not do that.".to_owned(),
+                reason: "the answer contained no JSON object".to_owned(),
+                repaired: true,
+                usage: None,
+            }),
+        ));
+        // FR-4.1: the text is kept and shown, never silently dropped.
+        let (reason, raw) = app.raw_answer().expect("the raw text");
+        assert!(reason.contains("no JSON object"), "{reason}");
+        assert_eq!(raw, "I could not do that.");
+        assert!(matches!(
+            app.analysis_state(),
+            crate::tui::app::AnalysisState::Unusable { .. }
+        ));
+        assert_eq!(app.overlay(), Overlay::RawAnswer);
+    }
+
+    #[test]
+    fn a_cancelled_run_says_so_without_pretending_it_failed() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.record_analysis_job(3);
+        app.apply_analysis(crate::application::analysis::AnalysisRun::Cancelled);
+        assert_eq!(
+            app.analysis_state(),
+            &crate::tui::app::AnalysisState::Cancelled
+        );
+        assert!(app.analysis_panel().is_none());
+    }
+
+    #[test]
+    fn the_order_toggles_between_the_plan_and_the_paths() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.set_plan(crate::domain::plan::Plan::from_analysis(
+            &crate::test_support::stored_analysis("abc123").analysis,
+        ));
+        assert_eq!(
+            app.review.as_ref().expect("open").order,
+            crate::domain::plan::OrderMode::Recommended
+        );
+        assert!(matches!(
+            dispatch(&mut app, "diff.toggle_order"),
+            Effect::None
+        ));
+        let view = app.review.as_ref().expect("open");
+        assert_eq!(view.order, crate::domain::plan::OrderMode::Path);
+        // The notice names both positions, which is what makes the toggle comparable.
+        let notice = app.latest_notice().expect("a notice").text.clone();
+        assert!(notice.contains("path order"), "{notice}");
+        assert!(notice.contains("plan ·"), "{notice}");
+    }
+
+    #[test]
+    fn moving_a_group_with_j_and_k_persists_the_order() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.set_plan(crate::domain::plan::Plan::from_analysis(
+            &crate::test_support::stored_analysis("abc123").analysis,
+        ));
+        // The cursor has to be on a group heading, which is where the user's is when
+        // they press the key.
+        {
+            let view = app.review.as_mut().expect("open");
+            view.tree_focused = true;
+            view.tree_cursor = 0;
+        }
+        assert_eq!(app.selected_plan_group().as_deref(), Some("domain"));
+        let effect = dispatch(&mut app, "plan.move_down");
+        let Effect::SavePlan(plan) = effect else {
+            panic!("expected the order to be saved, got {effect:?}");
+        };
+        assert!(plan.overridden);
+        assert_eq!(plan.groups[0].group, "tests", "the groups swapped");
+        assert_eq!(app.plan().expect("a plan").groups[0].group, "tests");
+    }
+
+    #[test]
+    fn moving_a_group_without_one_selected_says_what_to_do() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.set_plan(crate::domain::plan::Plan::from_analysis(
+            &crate::test_support::stored_analysis("abc123").analysis,
+        ));
+        let effect = dispatch(&mut app, "plan.move_up");
+        assert!(matches!(effect, Effect::None));
+        let notice = app.latest_notice().expect("a notice").text.clone();
+        assert!(notice.contains("group heading"), "{notice}");
+    }
+
+    #[test]
+    fn the_plan_command_pins_a_file_and_resets() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        // Reset needs the analysis to reset *to*, which is what a user has when they
+        // are looking at a plan derived from one (FR-4.2).
+        app.panel.analysis = Some(Box::new(crate::test_support::stored_analysis("abc123")));
+        app.set_plan(crate::domain::plan::Plan::from_analysis(
+            &app.panel.analysis.as_ref().expect("set").analysis,
+        ));
+        let effect = command(&mut app, "plan move tests/money.rs domain");
+        let Effect::SavePlan(plan) = effect else {
+            panic!("expected a save, got {effect:?}");
+        };
+        assert_eq!(plan.group_of("tests/money.rs"), Some("domain"));
+        assert!(matches!(
+            command(&mut app, "plan reset"),
+            Effect::SavePlan(_)
+        ));
+        assert!(!app.plan().expect("a plan").overridden, "reset clears it");
+        // `:plan` with no argument explains the current order.
+        assert!(matches!(command(&mut app, "plan"), Effect::None));
+        let notice = app.latest_notice().expect("a notice").text.clone();
+        assert!(notice.contains("1.domain"), "{notice}");
+    }
+
+    #[test]
+    fn the_context_command_gathers_and_then_shows_what_would_be_sent() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        let effect = command(&mut app, "context");
+        assert!(
+            matches!(effect, Effect::GatherContext(AnalysisIntent::Inspect)),
+            "{effect:?}"
+        );
+        // Once it is gathered, the same command opens the inspector rather than
+        // gathering again (FR-4.6).
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR #141",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        app.panel.bundle = Some(Box::new(bundle));
+        assert!(matches!(command(&mut app, "context"), Effect::None));
+        assert_eq!(app.overlay(), Overlay::Context);
+        // A number still means the diff's own context (FR-3.2).
+        let _ = command(&mut app, "context 10");
+        assert_eq!(app.diff_options.context, 10);
+    }
+
+    #[test]
+    fn the_raw_command_shows_the_answer_only_when_there_is_one() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        assert!(matches!(command(&mut app, "analyze raw"), Effect::None));
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("no answer to show")),
+            "{:?}",
+            app.latest_notice()
+        );
+        app.panel.raw = Some(("bad json".to_owned(), "the text".to_owned()));
+        assert!(matches!(command(&mut app, "analyze raw"), Effect::None));
+        assert_eq!(app.overlay(), Overlay::RawAnswer);
+    }
+
+    #[test]
+    fn an_unknown_analyze_option_is_refused_with_the_options_that_exist() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        assert!(matches!(command(&mut app, "analyze --now"), Effect::None));
+        let error = app.command_error_text().expect("an error").to_owned();
+        assert!(error.contains("--force"), "{error}");
     }
 }

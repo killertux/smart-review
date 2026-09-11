@@ -1,4 +1,4 @@
- smart┌ Help  [27/49] ───────────────────────────────────────────────────────────────────────┐rvice
+ smart┌ Help  [27/53] ───────────────────────────────────────────────────────────────────────┐rvice
 │ filt│ APP                                                                                  │     │
 │ sear│   <C-c>, <Space>q, q  Quit smart-review                                              │     │
 ┌ no r│   <Space>?, ?         Show the help popup                                            │─────┐
@@ -10,6 +10,9 @@
 │     │   ·                   Show the version                                               │     │
 │     │   ·                   Dismiss the current notification                               │     │
 │     │   <Space>m            Choose the provider, model and thinking settings               │     │
+│     │   <Space>a            Analyse the pull request, or open the analysis                 │     │
+│     │   K                   Move the selected review-plan group up                         │     │
+│     │   J                   Move the selected review-plan group down                       │     │
 │     │   ·                   Fetch the next page of pull requests                           │     │
 │     │ NAVIGATION                                                                           │     │
 │     │   <Up>, k             Move up                                                        │     │
@@ -22,9 +25,6 @@
 │     │   <C-f>               Move a screen down                                             │     │
 │     │   <C-b>               Move a screen up                                               │     │
 │     │   <Esc>, h            Close the review, or clear the search and filters              │     │
-│     │ PANES                                                                                │     │
-│     │   <Tab>               Focus the next pane                                            │     │
-│     │   <S-Tab>             Focus the previous pane                                        │     │
-└─────│ SEARCH                                                                               │─────┘
- POPUP│   /                   Filter the loaded pull requests as you type                    │mands
+└─────│ PANES                                                                                │─────┘
+ POPUP│   <Tab>               Focus the next pane                                            │mands
       └──────────────────────────────────────────────────────────────────────────────────────┘
