@@ -29,7 +29,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let style = if selected {
             theme.style(element::SELECTION)
         } else {
-            theme.style(element::PICKER_SELECTED)
+            theme.style(element::MUTED)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {name:<10}"), style),

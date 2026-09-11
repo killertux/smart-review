@@ -39,13 +39,24 @@ fn lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Takes the suite lock and returns a fresh, fixed home directory, so the
-/// snapshots do not depend on the machine.
+/// A fixed, short home directory.
+///
+/// It must not be derived from the checkout location: a path longer than the
+/// pane's value column is shortened, and how it is shortened depends on the path,
+/// so the rendered text would differ between a repository under `$HOME` and one
+/// under `/tmp`. Keeping it short also means the path never reaches the columns a
+/// centred popup leaves uncovered. `/tmp` exists on every Unix runner; Windows is
+/// best effort (DEC-12).
+#[cfg(unix)]
+const SNAPSHOT_HOME: &str = "/tmp/smart-review-snapshot";
+
+#[cfg(not(unix))]
+const SNAPSHOT_HOME: &str = "smart-review-snapshot";
+
+/// Takes the suite lock and returns a fresh home directory of a fixed length.
 fn snapshot_home() -> (MutexGuard<'static, ()>, PathBuf) {
     let guard = lock();
-    let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("snapshot-home");
+    let home = PathBuf::from(SNAPSHOT_HOME);
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("create the snapshot home");
     (guard, home)
@@ -98,29 +109,40 @@ fn buffer_to_string(buffer: &Buffer) -> String {
     output
 }
 
-/// Removes the parts of a frame that legitimately differ between runs.
+/// Rebuilds one row of the right-hand pane with a fixed value.
 ///
-/// The path rows are replaced wholesale rather than by string substitution: the
-/// pane shortens long paths, and whether it shortens depends on where the
-/// checkout lives (a repository under `$HOME` and one in `/tmp` render
-/// differently). `paths::shorten_for_display` has its own test for that.
+/// The path rows depend on where the checkout lives — the pane shortens long
+/// paths, and whether it shortens at all depends on the length of the whole path
+/// — so replacing the rendered text is the only way to keep the snapshot stable.
+/// `paths::shorten_for_display` has its own test for the shortening itself.
+fn rewrite_row(line: &str, label: &str, value: &str) -> Option<String> {
+    let (left, right) = line.split_once("││")?;
+    if !right.trim_start().starts_with(label) {
+        return None;
+    }
+    // Character count, not byte offset: the border is multi-byte, so `rfind`
+    // would inflate the width by its extra bytes and shift the padding.
+    let width = right[..right.rfind('│')?].chars().count();
+    let rebuilt = format!(" {label:<9}{value}");
+    Some(format!("{left}││{rebuilt:<width$}│"))
+}
+
+/// Removes the parts of a frame that legitimately differ between runs.
 fn normalize(text: &str, home: &Path) -> String {
-    text.replace(&home.display().to_string(), "<HOME>")
+    let normalized = text
         .lines()
         .map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("uptime") {
-                " uptime    0s".to_owned()
-            } else if trimmed.starts_with("home ") {
-                " home     <HOME>".to_owned()
-            } else if trimmed.starts_with("config ") {
-                " config   <HOME>/config.toml".to_owned()
-            } else {
-                line.to_owned()
-            }
+            rewrite_row(line, "home", "<HOME>")
+                .or_else(|| rewrite_row(line, "config", "<HOME>/config.toml"))
+                .or_else(|| rewrite_row(line, "uptime", "0s"))
+                .unwrap_or_else(|| line.to_owned())
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    // Anything else that mentions the checkout path is the same on every run of
+    // this machine but not on another, so normalise it too.
+    normalized.replace(&home.display().to_string(), "<HOME>")
 }
 
 fn assert_snapshot(name: &str, actual: &str) {

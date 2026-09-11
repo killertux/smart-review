@@ -35,6 +35,17 @@ const MAX_NOTICES: usize = 3;
 /// How many command candidates to offer while typing (FR-7.3).
 pub(crate) const PALETTE_ROWS: usize = 3;
 
+/// What resolving the pending key sequence produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// A binding matched; the effect is what it asked for.
+    Fired(Effect),
+    /// A longer sequence could still match, so wait for the next key.
+    Waiting,
+    /// Nothing matches.
+    Unmatched,
+}
+
 /// What the reducer wants the event loop to do next.
 ///
 /// Actions are mutually exclusive in M0: the only action that keeps a pending
@@ -691,18 +702,20 @@ impl App {
             return Effect::None;
         }
 
-        let Some(action) = self.pending_action() else {
+        match self.step(true) {
+            Step::Fired(effect) => {
+                if effect != Effect::KeepPending {
+                    self.finish_sequence();
+                }
+                effect
+            }
             // `g` on its own is a prefix of `gg` but is not bound to anything;
             // dropping it silently is the vim behaviour.
-            self.pending.clear();
-            return Effect::None;
-        };
-
-        let effect = update::dispatch(self, &action);
-        if effect != Effect::KeepPending {
-            self.pending.clear();
+            Step::Waiting | Step::Unmatched => {
+                self.pending.clear();
+                Effect::None
+            }
         }
-        effect
     }
 
     /// Marks the doctor job as started and opens the popup (FR-9.3).
@@ -744,23 +757,18 @@ impl App {
         self.doctor_job = self.doctor_job.wrapping_add(1);
     }
 
+    /// Surfaces the startup warnings without consuming them: the shell pane and
+    /// `:doctor` report the same list, and `App::warnings` is what they read.
     fn report_startup_warnings(&mut self) {
-        let warnings = std::mem::take(&mut self.warnings);
-        for warning in &warnings {
+        for warning in &self.warnings {
             logging::log(Level::Warn, warning);
         }
-        for warning in warnings.into_iter().take(MAX_NOTICES) {
+        let announced: Vec<String> = self.warnings.iter().take(MAX_NOTICES).cloned().collect();
+        for warning in announced {
             self.notice(NoticeLevel::Warn, warning);
         }
     }
 
-    /// Whether a key press matches a global binding that should apply even in a
-    /// text-entry mode (FR-8.3).
-    ///
-    /// Only combinations with a real modifier qualify. Inside the command line a
-    /// bare `?`, `:` or the leader key is text the user is typing, not a
-    /// command — treating them as bindings makes `:set ui.timeoutlen=250`
-    /// impossible, because the space would open the leader menu.
     /// Ends a key sequence, closing the leader menu with it (FR-7.3).
     ///
     /// `Effect::KeepPending` skips this so the next key can complete the
@@ -775,6 +783,13 @@ impl App {
         }
     }
 
+    /// Whether a key press matches a global binding that should apply while a
+    /// command is being typed (FR-8.3).
+    ///
+    /// Only combinations with a real modifier qualify. On the command line a bare
+    /// `?`, `:` or the leader key is text the user is typing, not a command —
+    /// treating them as bindings makes `:set ui.timeoutlen=250` impossible,
+    /// because the space would open the leader menu.
     fn global_action(&self, combo: KeyCombo) -> Option<String> {
         if !combo
             .modifiers
@@ -801,59 +816,94 @@ impl App {
         }
 
         self.pending.push(combo);
-        self.advance()
+
+        match self.step(false) {
+            Step::Fired(effect) => {
+                if effect != Effect::KeepPending {
+                    self.finish_sequence();
+                }
+                effect
+            }
+            Step::Waiting => Effect::None,
+            Step::Unmatched => {
+                let keys = keymap::describe_sequence(&self.pending);
+                let was_leader = self.leader_open;
+                self.finish_sequence();
+                // A modified global must still work while a longer sequence is
+                // pending: `<Space>` then `<C-c>` has to quit, not complain.
+                if let Some(effect) = self.rescue_global(combo) {
+                    return effect;
+                }
+                let level = if was_leader {
+                    NoticeLevel::Info
+                } else {
+                    NoticeLevel::Warn
+                };
+                self.notice(level, format!("`{keys}` is not bound"));
+                Effect::None
+            }
+        }
     }
 
-    fn advance(&mut self) -> Effect {
+    /// Advances the pending sequence one step.
+    ///
+    /// `fire_ambiguous` makes a sequence that is both a binding and a prefix of a
+    /// longer one (the leader, typically) fire its own binding, which is what the
+    /// timeout does; on a key press it means "wait for the next key".
+    fn step(&mut self, fire_ambiguous: bool) -> Step {
         let timeout = self.keymap.timeout();
         let mode = self.mode;
 
-        let next = match self.keymap.resolve(mode, &self.pending) {
-            Resolution::Match(binding) => Some(binding.action.clone()),
+        let action = match self.keymap.resolve(mode, &self.pending) {
+            Resolution::Match(binding) => binding.action.clone(),
+            Resolution::Ambiguous(binding) if fire_ambiguous => binding.action.clone(),
             Resolution::Ambiguous(_) | Resolution::Prefix => {
                 self.deadline = Some(Instant::now() + timeout);
-                return Effect::None;
+                return Step::Waiting;
             }
-            Resolution::None => None,
+            Resolution::None => return Step::Unmatched,
         };
 
-        if let Some(action) = next {
-            let effect = update::dispatch(self, &action);
-            if effect != Effect::KeepPending {
-                self.finish_sequence();
-            }
-            return effect;
-        }
-
-        let keys = keymap::describe_sequence(&self.pending);
-        let was_leader = self.leader_open;
-        self.finish_sequence();
-        let level = if was_leader {
-            NoticeLevel::Info
-        } else {
-            NoticeLevel::Warn
-        };
-        self.notice(level, format!("`{keys}` is not bound"));
-        Effect::None
+        self.deadline = None;
+        Step::Fired(update::dispatch(self, &action))
     }
 
-    /// The action the pending sequence would fire on timeout.
-    fn pending_action(&self) -> Option<String> {
-        match self.keymap.resolve(self.mode, &self.pending) {
-            Resolution::Match(binding) | Resolution::Ambiguous(binding) => {
-                Some(binding.action.clone())
+    /// Fires a modified global binding that the pending sequence swallowed.
+    fn rescue_global(&mut self, combo: KeyCombo) -> Option<Effect> {
+        if !combo
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        match self.keymap.resolve_global(&[combo]) {
+            Resolution::Match(binding) => {
+                let action = binding.action.clone();
+                self.finish_sequence();
+                Some(update::dispatch(self, &action))
             }
-            Resolution::Prefix | Resolution::None => None,
+            _ => None,
         }
     }
 
     fn on_popup_key(&mut self, combo: KeyCombo) -> Effect {
-        // The popup table governs popups, global bindings included, so a user can
-        // bind keys for a popup. The arms below are the built-in popup behaviour
-        // that deliberately needs no binding (FR-8.3).
-        if let Resolution::Match(binding) = self.keymap.resolve(Mode::Popup, &[combo]) {
-            let action = binding.action.clone();
-            return update::dispatch(self, &action);
+        // Popups resolve the popup scope first (globals included), so
+        // `[keys.popup]` bindings work, multi-key sequences included. The arms
+        // below are the built-in popup behaviour that needs no binding (FR-8.3).
+        self.pending.push(combo);
+
+        match self.step(false) {
+            Step::Fired(effect) => {
+                if effect != Effect::KeepPending {
+                    self.finish_sequence();
+                }
+                return effect;
+            }
+            Step::Waiting => return Effect::None,
+            Step::Unmatched => {
+                self.pending.clear();
+                self.deadline = None;
+            }
         }
 
         match combo.code {
@@ -1330,6 +1380,90 @@ mod tests {
         // And the cursor is reachable again.
         press(&mut app, "j");
         assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn the_leader_menu_opened_from_a_popup_still_completes() {
+        // The popup path did not seed the pending sequence, so every entry of a
+        // menu opened with <Space> from a popup was dead (FR-7.3).
+        let (_dir, mut app) = app();
+        press(&mut app, "?");
+        assert_eq!(app.overlay(), Overlay::Help);
+
+        press(&mut app, "<Space>");
+        app.on_timeout();
+        assert_eq!(app.overlay(), Overlay::Leader);
+        assert_eq!(app.pending.len(), 1, "the leader must stay pending");
+
+        press(&mut app, "t");
+        assert_eq!(app.overlay(), Overlay::ThemePicker);
+    }
+
+    #[test]
+    fn the_command_line_closes_an_open_popup() {
+        // `:` used to leave the popup on screen, so it stopped being modal and
+        // the mode/overlay pairing was one open_overlay never produces (FR-7.1).
+        let (_dir, mut app) = app();
+        press(&mut app, "?");
+        press(&mut app, ":");
+        assert_eq!(app.mode(), Mode::Command);
+        assert_eq!(app.overlay(), Overlay::None);
+
+        press(&mut app, "<Esc>");
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn a_modified_global_still_works_mid_sequence() {
+        // `<Space>` then `<C-c>` used to be reported as "not bound" instead of
+        // quitting (FR-8.3).
+        let (_dir, mut app) = app();
+        press(&mut app, "<Space>");
+        app.on_timeout();
+        assert!(app.leader_open);
+        press(&mut app, "<C-c>");
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn popup_bindings_from_the_keymap_fire() {
+        let dir = temp_home();
+        dir.write(
+            "keybinds.toml",
+            "[keys.popup]\n\"x\" = \"app.theme_picker\"\n\"z z\" = \"app.help\"\n",
+        );
+        let cli = Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(dir.path().to_path_buf()),
+            log_level: None,
+            check: false,
+        };
+        let startup = Startup::load(&cli).unwrap();
+        let mut app = App::new(startup).unwrap();
+        app.set_now(1_000);
+
+        // A single-key popup binding.
+        press(&mut app, "?");
+        assert_eq!(app.overlay(), Overlay::Help);
+        press(&mut app, "x");
+        assert_eq!(app.overlay(), Overlay::ThemePicker);
+
+        // A multi-key popup binding.
+        press(&mut app, "<Esc>");
+        press(&mut app, "?");
+        press(&mut app, "z");
+        press(&mut app, "z");
+        assert_eq!(
+            app.overlay(),
+            Overlay::Help,
+            "multi-key popup sequences work"
+        );
     }
 
     #[test]

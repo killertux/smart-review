@@ -269,8 +269,12 @@ fn read_tail(path: &Path, bytes: u64) -> std::io::Result<String> {
     let partial = start > 0;
     file.seek(SeekFrom::Start(start))?;
 
-    let mut buffer = String::new();
-    (&mut file).take(bytes).read_to_string(&mut buffer)?;
+    // Read bytes, not a `String`: the seek can land inside a multi-byte
+    // character (a path or a theme name in a log line), and a strict decode would
+    // then report "no log yet" for a log that exists.
+    let mut raw = Vec::new();
+    (&mut file).take(bytes).read_to_end(&mut raw)?;
+    let mut buffer = String::from_utf8_lossy(&raw).into_owned();
 
     // Drop the first line when it was cut in half by the seek.
     if partial {
@@ -506,6 +510,24 @@ mod tests {
             !summary.contains("ancient warning"),
             "the whole file was read: {summary}"
         );
+    }
+
+    #[test]
+    fn the_tail_reader_survives_a_split_character() {
+        // A multi-byte character straddling the 64 KiB window must not make the
+        // log look missing.
+        let dir = temp_home();
+        let body = format!(
+            "{}\n2026-01-01T00:00:00Z warn  caf\u{e9} near the boundary\n",
+            "x".repeat(usize::try_from(LOG_TAIL_BYTES).unwrap_or(0) - 8)
+        );
+        let path = dir.write("utf8.log", &body);
+        let summary = tail_summary(&path, 200);
+        assert!(
+            summary.contains("warning(s)") || summary.contains("no warnings or errors"),
+            "{summary}"
+        );
+        assert_ne!(summary, "no log yet", "the log exists");
     }
 
     #[test]

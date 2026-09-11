@@ -674,13 +674,14 @@ pub fn load(home: &Home, ui: &UiConfig, warnings: &mut Vec<String>) -> Result<Ke
         };
         let Some(scope) = scope else {
             warnings.push(format!(
-                "keybinds: unknown section `[{section_name}]` is ignored"
+                "{file}: `[{section_name}]` is not a mode section (global, normal, insert, \
+                 command, search, popup, visual); it is ignored"
             ));
             continue;
         };
         let Some(section) = value.as_table() else {
             warnings.push(format!(
-                "keybinds: `[{section_name}]` should be a table of \"keys\" = \"action\""
+                "{file}: `[{section_name}]` should be a table of \"keys\" = \"action\""
             ));
             continue;
         };
@@ -1035,8 +1036,10 @@ mod tests {
         let mut warnings = Vec::new();
         load(&home, &UiConfig::default(), &mut warnings).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("unknown section")),
-            "{warnings:?}"
+            warnings
+                .iter()
+                .any(|w| w.contains("keybinds.toml") && w.contains("[silly]")),
+            "the warning should name the file and the section: {warnings:?}"
         );
     }
 

@@ -18,7 +18,7 @@ pub mod update;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver};
 
 use crate::Startup;
 use crate::doctor::Check;
@@ -42,8 +42,10 @@ pub fn run(startup: Startup) -> Result<()> {
 
     let mut app = App::new(startup)?;
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
-    // Reports carry the job id they belong to so a superseded one is discarded.
-    let (doctor_sender, doctor_receiver) = mpsc::channel::<(u64, Vec<Check>)>();
+    // One channel per request: when the worker dies without sending, the receiver
+    // disconnects and the wait ends instead of hanging on "collecting…". Reports
+    // also carry their job id, so a superseded one is discarded.
+    let mut doctor_receiver: Option<mpsc::Receiver<(u64, Vec<Check>)>> = None;
 
     while !app.should_quit() {
         app.set_now(clock.now_unix_secs());
@@ -51,15 +53,11 @@ pub fn run(startup: Startup) -> Result<()> {
         app.tick();
 
         // Results from background jobs.
-        loop {
-            match doctor_receiver.try_recv() {
+        if let Some(receiver) = doctor_receiver.take() {
+            match receiver.try_recv() {
                 Ok((job, checks)) => app.apply_checks(job, checks),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // The worker died without reporting; stop waiting for it.
-                    app.abort_doctor_job();
-                    break;
-                }
+                Err(mpsc::TryRecvError::Empty) => doctor_receiver = Some(receiver),
+                Err(mpsc::TryRecvError::Disconnected) => app.abort_doctor_job(),
             }
         }
 
@@ -84,7 +82,7 @@ pub fn run(startup: Startup) -> Result<()> {
             app.on_timeout()
         };
 
-        apply(effect, &mut app, state_store.as_ref(), &doctor_sender);
+        apply(effect, &mut app, state_store.as_ref(), &mut doctor_receiver);
     }
 
     logging::log(Level::Info, "shutting down normally");
@@ -99,7 +97,7 @@ fn apply(
     effect: Effect,
     app: &mut App,
     state_store: &dyn StateStore,
-    doctor_sender: &Sender<(u64, Vec<Check>)>,
+    doctor_receiver: &mut Option<Receiver<(u64, Vec<Check>)>>,
 ) {
     match effect {
         Effect::None | Effect::KeepPending => {}
@@ -116,9 +114,11 @@ fn apply(
         Effect::RunDoctor => {
             let job = app.doctor_job();
             let request = app.doctor_request();
-            let sender = doctor_sender.clone();
+            let (sender, receiver) = mpsc::channel();
+            *doctor_receiver = Some(receiver);
             // The probes run `git` and `gh`, so they must not run on the event
-            // loop (FR-9.3, NFR-1.2). The report comes back over the channel.
+            // loop (FR-9.3, NFR-1.2). The report comes back over the channel, and
+            // dropping `sender` with the thread is what ends the wait if it dies.
             let _ = std::thread::spawn(move || {
                 let checks = crate::doctor::collect(&request);
                 let _ = sender.send((job, checks));

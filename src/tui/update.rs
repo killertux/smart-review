@@ -72,6 +72,9 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::KeepPending
         }
         "app.command" => {
+            // Leaving a popup open behind the command line would break the
+            // mode/overlay pairing and leave its keys live (FR-7.1).
+            app.cancel_overlay();
             app.command.clear();
             app.mode = Mode::Command;
             Effect::None
