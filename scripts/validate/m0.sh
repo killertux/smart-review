@@ -174,9 +174,12 @@ if script --version 2>&1 | grep -q util-linux; then
   # `script` gives the command a pty whose window size is 0x0 when there is no
   # controlling terminal, which makes the app render an empty screen; `stty`
   # inside the pty fixes the size so this check actually exercises rendering.
-  # Type an unknown command first: it must be reported on screen, not swallowed
-  # (FR-7.4), and then quit normally.
-  (sleep 1; printf ':bogus\r'; sleep 1; printf ':q\r'; sleep 2) \
+  # 1. the leader menu must appear as soon as the leader is pressed, so Esc 200 ms
+  #    later still catches it open (waiting for `timeoutlen` would mean the menu
+  #    never opened at all, and the frame would never be written);
+  # 2. an unknown command must be reported on screen, not swallowed (FR-7.4);
+  # 3. then quit normally.
+  (sleep 1; printf ' '; sleep 0.2; printf '\033'; sleep 1; printf ':bogus\r'; sleep 1; printf ':q\r'; sleep 2) \
     | SMART_REVIEW_HOME="$PTY_HOME" timeout 20 \
       script -qefc "stty rows 40 cols 120 2>/dev/null; '$ROOT/$BIN'" /dev/null \
     >/tmp/m0-tui.log 2>&1
@@ -205,6 +208,12 @@ if script --version 2>&1 | grep -q util-linux; then
     ok "the interface painted the header and the status line"
   else
     bad "the interface rendered nothing"
+  fi
+
+  if grep -q 'leader' /tmp/m0-tui-text.log; then
+    ok "the leader menu appears without waiting for the timeout"
+  else
+    bad "the leader menu did not appear on the key press"
   fi
 
   if grep -q 'bogus' /tmp/m0-tui-text.log; then

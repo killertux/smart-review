@@ -4,7 +4,7 @@
 │   M1  read the diff with vim motions and the mouse   ││ config   <HOME>/config.toml              │
 │   M2  a managed worktree per pull request            ││ keys     0 parsed                        │
 │   M2  pick provider, model and thinking in the TUI   ││ theme    dark (built-in)                 │
-│   M2  streamed analysis and a review-ordered diff    ││ keybinds 19 bindings                     │
+│   M2  streamed analysis and a review-ordered diff    ││ keybinds 18 bindings                     │
 │   M3  a persistent chat about the pull request       ││ focus    list                            │
 │   M4  inline comments and one batched review         ││ uptime   0s                              │
 │   M5  polish, docs and release builds                ││                                          │

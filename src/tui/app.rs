@@ -19,6 +19,7 @@ use crate::error::Result;
 use crate::logging::{self, Level};
 use crate::paths::Home;
 use crate::state::AppState;
+use crate::tui::action;
 use crate::tui::components;
 use crate::tui::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::tui::keymap::{self, KeyCombo, Keymap, Mode, Resolution};
@@ -240,6 +241,9 @@ pub struct App {
     /// marks. It can differ from `theme.name()`: a theme file may declare its own
     /// display name.
     pub(crate) theme_request: String,
+    /// Every theme the user can choose, read once at startup (and refreshed when
+    /// the picker opens) so toggling never touches the disk (NFR-1.2).
+    pub(crate) theme_names: Vec<String>,
     /// Persisted state. Written by the event loop, never from the reducer.
     pub(crate) state: AppState,
     /// Warnings collected during startup and at runtime.
@@ -326,6 +330,9 @@ impl App {
         } = startup;
 
         let focus = state.focus.as_deref().map_or(Pane::default(), Pane::parse);
+        // One directory read, before the terminal is taken over, so cycling
+        // themes later is pure computation.
+        let theme_names = theme::available(&home);
 
         let mut app = Self {
             home,
@@ -338,6 +345,7 @@ impl App {
             theme,
             theme_source,
             theme_request,
+            theme_names,
             state,
             warnings,
             repo,
@@ -539,6 +547,24 @@ impl App {
         }
     }
 
+    /// Switches to the next available theme, wrapping around (FR-7.7).
+    ///
+    /// Cycles through everything the user has: the built-ins plus any theme files
+    /// they added, in the order the picker lists them.
+    pub(crate) fn toggle_theme(&mut self) -> Effect {
+        if self.theme_names.is_empty() {
+            self.notice(NoticeLevel::Warn, "no themes are available");
+            return Effect::None;
+        }
+        let next = self
+            .theme_names
+            .iter()
+            .position(|name| name == &self.theme_request)
+            .map_or(0, |index| (index + 1) % self.theme_names.len());
+        let name = self.theme_names[next].clone();
+        self.set_theme(&name)
+    }
+
     /// Re-reads the active theme from disk (FR-8.4).
     pub(crate) fn reload_theme(&mut self) -> Effect {
         let name = self.theme_request.clone();
@@ -602,8 +628,11 @@ impl App {
                 // reads the disk and a broken theme file is reported when the
                 // picker opens rather than when it is committed (FR-7.7).
                 let mut warnings = Vec::new();
-                let entries: Vec<PickerEntry> = theme::available(&self.home)
-                    .into_iter()
+                self.theme_names = theme::available(&self.home);
+                let entries: Vec<PickerEntry> = self
+                    .theme_names
+                    .iter()
+                    .cloned()
                     .map(|name| match theme::load(&self.home, &name, &mut warnings) {
                         Ok((theme, source)) => PickerEntry {
                             name,
@@ -857,7 +886,19 @@ impl App {
         let action = match self.keymap.resolve(mode, &self.pending) {
             Resolution::Match(binding) => binding.action.clone(),
             Resolution::Ambiguous(binding) if fire_ambiguous => binding.action.clone(),
-            Resolution::Ambiguous(_) | Resolution::Prefix => {
+            Resolution::Ambiguous(binding) => {
+                let action = binding.action.clone();
+                if action::is_hint(&action) {
+                    // Show the hints now, not after `timeoutlen` (which-key
+                    // behaviour): the sequence stays pending, so the next key can
+                    // still complete a longer binding (FR-7.3).
+                    self.deadline = Some(Instant::now() + timeout);
+                    return Step::Fired(update::dispatch(self, &action));
+                }
+                self.deadline = Some(Instant::now() + timeout);
+                return Step::Waiting;
+            }
+            Resolution::Prefix => {
                 self.deadline = Some(Instant::now() + timeout);
                 return Step::Waiting;
             }
@@ -1181,20 +1222,81 @@ mod tests {
     }
 
     #[test]
-    fn the_leader_menu_waits_and_then_opens() {
+    fn the_leader_menu_opens_on_the_key_press() {
+        // A hints menu must not wait for the ambiguity timeout: the whole point of
+        // pressing the leader is to see what is available (FR-7.3).
         let (_dir, mut app) = app();
         press(&mut app, "<Space>");
-        assert_eq!(app.pending.len(), 1);
-        assert!(!app.leader_open);
-
-        let effect = app.on_timeout();
-        assert_eq!(effect, Effect::KeepPending, "the menu stays open for a key");
+        assert_eq!(app.pending.len(), 1, "the sequence stays open");
         assert!(app.leader_open);
         assert_eq!(app.overlay(), Overlay::Leader);
 
+        // A continuation still completes the longer binding.
         press(&mut app, "?");
         assert_eq!(app.overlay(), Overlay::Help);
         assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn an_ambiguous_binding_that_is_not_a_hint_still_waits() {
+        let dir = temp_home();
+        dir.write(
+            "keybinds.toml",
+            "[keys.normal]\n\"g\" = \"nav.top\"\n\"gg\" = \"nav.bottom\"\n",
+        );
+        let cli = Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(dir.path().to_path_buf()),
+            log_level: None,
+            check: false,
+        };
+        let startup = Startup::load(&cli).unwrap();
+        let mut app = App::new(startup).unwrap();
+        app.set_now(1_000);
+        app.cursor = 3;
+
+        // `g` is bound and is also a prefix of `gg`, so it waits rather than
+        // firing immediately: only hints short-circuit the timeout.
+        press(&mut app, "g");
+        assert_eq!(app.cursor, 3, "the shorter binding must not fire yet");
+        app.on_timeout();
+        assert_eq!(app.cursor, 0, "the timeout fires `g`");
+
+        press(&mut app, "gg");
+        assert_eq!(app.cursor, ROADMAP.len() - 1);
+    }
+
+    #[test]
+    fn toggling_cycles_through_every_theme() {
+        let (_dir, mut app) = app();
+        assert_eq!(app.theme.name(), "dark");
+        assert_eq!(
+            app.theme_names,
+            vec!["dark".to_owned(), "light".to_owned()],
+            "the list is read once at startup"
+        );
+
+        let effect = press(&mut app, "<Space>T");
+        assert_eq!(effect, Effect::SaveState);
+        assert_eq!(app.theme.name(), "light");
+
+        // Wrap around rather than stopping at the last theme.
+        press(&mut app, "<Space>T");
+        assert_eq!(app.theme.name(), "dark");
+    }
+
+    #[test]
+    fn toggling_and_the_picker_agree_on_the_current_theme() {
+        let (_dir, mut app) = app();
+        press(&mut app, "<Space>T");
+        assert_eq!(app.theme.name(), "light");
+        press(&mut app, "<Space>t");
+        assert_eq!(app.picker_cursor(), 1, "the picker marks the toggled theme");
     }
 
     #[test]
@@ -1368,7 +1470,7 @@ mod tests {
         app.on_timeout();
         assert_eq!(app.overlay(), Overlay::Leader);
 
-        press(&mut app, "l");
+        press(&mut app, "T");
         assert_eq!(app.theme.name(), "light");
         assert!(!app.leader_open);
         assert_eq!(
@@ -1601,7 +1703,7 @@ mod tests {
     #[test]
     fn a_theme_change_asks_the_loop_to_persist_state() {
         let (_dir, mut app) = app();
-        let effect = press(&mut app, "<Space>l");
+        let effect = press(&mut app, "<Space>T");
         assert_eq!(effect, Effect::SaveState);
         assert_eq!(app.state.theme.as_deref(), Some("light"));
     }

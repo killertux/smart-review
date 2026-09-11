@@ -223,7 +223,7 @@ fn shell_with_theme_picker_open() {
 fn shell_in_light_theme() {
     let (_serial, home) = snapshot_home();
     let mut app = build(&home);
-    press(&mut app, "<Space>l");
+    press(&mut app, "<Space>T");
     let frame = normalize(&render(&mut app, 100, 30), &home);
     assert_snapshot("shell_light", &frame);
 }

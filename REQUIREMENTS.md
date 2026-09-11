@@ -328,10 +328,12 @@ Acceptance criteria:
 - [ ] Key notation supports modifiers and special keys: `<C-d>`, `<S-Tab>`, `<leader>`, `<Esc>`, `<CR>`, `<BS>`, `<Space>`, `<F1>`–`<F12>`.
 
 **FR-7.3 Help & discoverability** — MUST — M0
-`?` opens a help popup; `<leader>` alone (after timeout) opens a menu popup listing available leader bindings with descriptions; `:` with no text opens a command palette with fuzzy completion. All three MUST be generated from the same action registry (FR-7.2) so documentation cannot drift.
+`?` opens a help popup; `<leader>` opens a menu popup listing the available continuations with descriptions; `:` with no text opens a command palette with fuzzy completion. All three MUST be generated from the same action registry (FR-7.2) so documentation cannot drift.
+
+The leader menu is a **hint**: it appears as soon as the leader is pressed rather than after `timeoutlen`, and the sequence stays open, so a continuation key still completes a longer binding and `Esc` dismisses it. Hints are declared in the registry, so another menu can opt in without special-casing an action id.
 
 **FR-7.4 Command line** — MUST — M0/M1
-Minimum commands: `:q`/`:qa`, `:help`, `:pr <N>`, `:filter <query>`, `:clear-filters`, `:sort <field>`, `:theme <name>`, `:set <key>=<value>`, `:keymap`, `:model [show|save <name>|use <name>]`, `:key [set|clear] <provider>`, `:catalog refresh`, `:analyze [--force]`, `:context [add|remove <path>]`, `:chat new|list|export`, `:draft clear|remove`, `:workspace clean`, `:refresh`, `:doctor`, `:dry-run on|off`. Unknown commands produce an inline error; `Tab` completes.
+Minimum commands: `:q`/`:qa`, `:help`, `:pr <N>`, `:filter <query>`, `:clear-filters`, `:sort <field>`, `:theme [<name>|next|reload]`, `:set <key>=<value>`, `:keymap`, `:model [show|save <name>|use <name>]`, `:key [set|clear] <provider>`, `:catalog refresh`, `:analyze [--force]`, `:context [add|remove <path>]`, `:chat new|list|export`, `:draft clear|remove`, `:workspace clean`, `:refresh`, `:doctor`, `:dry-run on|off`. Unknown commands produce an inline error; `Tab` completes.
 
 **FR-7.5 Mouse** — MUST — M1
 Enabled by default, toggleable via `:set mouse=false`. Scroll wheel scrolls the hovered/focused pane; left click focuses a pane; click selects a list row; click on the file tree toggles/opens; click on a diff line moves the cursor there (and is the entry point for a comment). Text drag-selection and right-click menus are MAY.
@@ -340,10 +342,11 @@ Enabled by default, toggleable via `:set mouse=false`. Scroll wheel scrolls the 
 Persistent left segment: mode, repo, PR, provider/model, draft count. Right segment: transient notifications (info/warn/error) with dedup and auto-expiry; errors persist until dismissed and are also written to the log. Long operations show a spinner with a label and `Esc` to cancel.
 
 **FR-7.7 Theming** — MUST — M0/M1
-Two built-in themes (`dark`, `light`), user themes in `~/.smart-review/themes/*.toml`, selectable with `:theme`/`<leader>t` and previewed live. All colors MUST come from the theme — no hard-coded colors in widgets (enforced by review + a test that renders with an all-default theme).
+Two built-in themes (`dark`, `light`) and any number of user themes in `~/.smart-review/themes/*.toml`. `<leader>t` opens the picker, which previews each theme as the cursor moves; `<leader>T` cycles to the next available theme, wrapping around, so N themes work without one binding per theme. `:theme <name>`, `:theme next` and `:theme reload` cover the same ground from the command line. The list of themes is read once at startup, so cycling never touches the disk (NFR-1.2). All colors MUST come from the theme — no hard-coded colors in widgets (enforced by review + a test that renders with an all-default theme).
 Acceptance criteria:
 - [ ] Themeable elements: app background/foreground, borders, titles, cursor line, selection, status line (normal/insert/command/error), notification levels, tree (dir/file/modified/added/deleted), diff (add, add-emphasis, del, del-emphasis, context, hunk header, line numbers, stale marker), comment/draft markers, chat (user/assistant/system), syntax tokens.
 - [ ] Missing keys fall back to the theme's declared `base` (default `dark`), then to built-in defaults.
+- [ ] Cycling with `<leader>T` visits every theme the picker lists, in the same order, and remembers the choice in `state.toml`.
 - [ ] Invalid color values report the file, the element, the rejected value and the accepted formats (named, `#RRGGBB`, `#RGB`, `indexed:N`). Line numbers would need span-preserving parsing (`toml_edit`, DEC-19); the same trade-off as FR-7.2.
 - [ ] Respecting `NO_COLOR` is MAY but if implemented must keep the UI usable.
 
@@ -684,6 +687,7 @@ Default bindings (all remappable; this is the compiled-in default set):
 | `<leader> a` | `llm.analyze` | |
 | `<leader> c` | `chat.open` | |
 | `<leader> d` | `diff.menu` | split/context/whitespace |
+| `<leader> T` | `theme.toggle` | next theme, wrapping |
 | `<leader> f` | `filter.menu` | |
 | `<leader> l` | `review_order.menu` | |
 | `<leader> r r` | `review.publish` | |

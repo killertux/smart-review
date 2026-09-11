@@ -21,9 +21,9 @@
 │     │   <S-Tab>             Focus the previous pane                                        │     │
 │     │ THEME                                                                                │     │
 │     │   <Space>t            Choose a theme                                                 │     │
-│     │   <Space>d            Switch to the dark theme                                       │     │
-│     │   <Space>l            Switch to the light theme                                      │     │
+│     │   <Space>T            Switch to the next theme                                       │     │
 │     │                                                                                      │     │
 │     │ Esc closes · : commands · <leader> action menu · :keymap <action>                    │     │
-└─────└──────────────────────────────────────────────────────────────────────────────────────┘─────┘
+│     └──────────────────────────────────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
  POPUP list · acme/service · — · — · 0 drafts                ? help · <leader> actions · : commands

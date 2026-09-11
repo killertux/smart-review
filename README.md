@@ -37,12 +37,12 @@ Inside the app:
 | `<Tab>` / `<S-Tab>` | next / previous pane |
 | `?` | help |
 | `<Space>` | leader menu |
-| `<Space>t` | theme picker |
-| `<Space>d` / `<Space>l` | dark / light theme |
+| `<Space>t` | theme picker, previewed live |
+| `<Space>T` | next theme (wraps through all of them) |
 | `:` | command line |
 | `<C-c>`, `:q`, `<Space>q` | quit |
 
-`:help`, `:doctor`, `:theme <name>`, `:set ui.timeoutlen=250`, `:keymap`,
+`:help`, `:doctor`, `:theme <name>|next|reload`, `:set ui.timeoutlen=250`, `:keymap`,
 `:version`. `Esc` closes a popup or cancels a half-typed key sequence.
 
 ## Where things live

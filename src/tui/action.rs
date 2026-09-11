@@ -43,6 +43,10 @@ pub struct ActionDef {
     pub description: &'static str,
     /// Grouping used by the help popup.
     pub group: Group,
+    /// Whether this action is a *hint*: it runs as soon as its prefix is pressed
+    /// instead of waiting for `timeoutlen`, while the sequence stays open so a
+    /// longer binding can still complete it. Only menus want this (FR-7.3).
+    pub hint: bool,
 }
 
 /// Every action this build understands.
@@ -51,91 +55,103 @@ pub const ACTIONS: &[ActionDef] = &[
         id: "app.quit",
         description: "Quit smart-review",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.help",
         description: "Show the help popup",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.command",
         description: "Open the command line",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.leader_menu",
         description: "Show the available leader bindings",
         group: Group::App,
+        hint: true,
     },
     ActionDef {
         id: "app.cancel",
         description: "Close the current popup, or cancel pending keys",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.refresh",
         description: "Refresh the current view",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.doctor",
         description: "Show environment checks",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.version",
         description: "Show the version",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "notice.clear",
         description: "Dismiss the current notification",
         group: Group::App,
+        hint: false,
     },
     ActionDef {
         id: "app.theme_picker",
         description: "Choose a theme",
         group: Group::Theme,
+        hint: false,
     },
     ActionDef {
-        id: "theme.use_dark",
-        description: "Switch to the dark theme",
+        id: "theme.toggle",
+        description: "Switch to the next theme",
         group: Group::Theme,
-    },
-    ActionDef {
-        id: "theme.use_light",
-        description: "Switch to the light theme",
-        group: Group::Theme,
+        hint: false,
     },
     ActionDef {
         id: "nav.up",
         description: "Move up",
         group: Group::Navigation,
+        hint: false,
     },
     ActionDef {
         id: "nav.down",
         description: "Move down",
         group: Group::Navigation,
+        hint: false,
     },
     ActionDef {
         id: "nav.top",
         description: "Jump to the first item",
         group: Group::Navigation,
+        hint: false,
     },
     ActionDef {
         id: "nav.bottom",
         description: "Jump to the last item",
         group: Group::Navigation,
+        hint: false,
     },
     ActionDef {
         id: "pane.next",
         description: "Focus the next pane",
         group: Group::Pane,
+        hint: false,
     },
     ActionDef {
         id: "pane.prev",
         description: "Focus the previous pane",
         group: Group::Pane,
+        hint: false,
     },
 ];
 
@@ -155,6 +171,13 @@ pub fn find(id: &str) -> Option<&'static ActionDef> {
 #[must_use]
 pub fn is_known(id: &str) -> bool {
     find(id).is_some()
+}
+
+/// Whether `id` is a hint action, which fires as soon as its prefix is pressed
+/// rather than after the ambiguity timeout (FR-7.3).
+#[must_use]
+pub fn is_hint(id: &str) -> bool {
+    find(id).is_some_and(|action| action.hint)
 }
 
 /// The closest known action to `id`, for "did you mean" messages (DEV-7).

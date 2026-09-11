@@ -101,8 +101,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             app.dismiss_notices();
             Effect::None
         }
-        "theme.use_dark" => app.set_theme("dark"),
-        "theme.use_light" => app.set_theme("light"),
+        "theme.toggle" => app.toggle_theme(),
         "nav.up" => {
             app.move_cursor(-1);
             Effect::None
@@ -160,6 +159,7 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
             "reload" => app.reload_theme(),
+            "next" => dispatch(app, "theme.toggle"),
             name => app.set_theme(name),
         },
         "set" => set_option(app, argument),
