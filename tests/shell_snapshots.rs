@@ -434,7 +434,6 @@ fn shell_with_the_diff_in_split_view() {
     app.open_review(detail(), diff_view());
     // Wide enough for the split view, which needs 140 columns (DEC-4).
     press(&mut app, "<Space>ds");
-    press(&mut app, "j");
     let frame = normalize(&render(&mut app, 150, 24), &home);
     assert_snapshot("shell_diff_split", &frame);
 }

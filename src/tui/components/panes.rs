@@ -24,7 +24,27 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         review::render(frame, area, app);
         return;
     }
-    super::pr_list::render_with_filters(frame, area, app);
+    // The list screen is the filter bar above the list itself. Both rectangles come
+    // from the same function the event loop uses to place a mouse event, so the rows a
+    // click maps to are the rows that were drawn.
+    let (filter_bar, list) = body_split(area);
+    super::filter_bar::render(frame, filter_bar, app);
+    super::pr_list::render(frame, list, app);
+}
+
+/// Splits the body into the filter bar and the list pane.
+///
+/// One function, called by the renderer *and* by the loop that records the geometry a
+/// mouse event is tested against: two copies of this arithmetic is how a click ends up
+/// selecting the row below the one it was aimed at (FR-7.5).
+#[must_use]
+pub fn body_split(body: Rect) -> (Rect, Rect) {
+    let rows = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(super::filter_bar::HEIGHT),
+        ratatui::layout::Constraint::Min(3),
+    ])
+    .split(body);
+    (rows[0], rows[1])
 }
 
 /// Renders the "terminal too small" message (FR-7.8).

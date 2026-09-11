@@ -184,6 +184,18 @@ impl PrListState {
         self.cursor = visible[position];
     }
 
+    /// Puts the cursor on a visible row by index, clamped to the rows that exist.
+    ///
+    /// This is what a click on the list means: the pointer names a *row of the
+    /// window*, which is an offset into what is visible rather than into the fetched
+    /// list, because a search can hide most of it.
+    pub fn select_visible(&mut self, index: usize) {
+        let visible = self.visible();
+        if let Some(target) = visible.get(index.min(visible.len().saturating_sub(1))) {
+            self.cursor = *target;
+        }
+    }
+
     /// Moves the cursor to the first or last visible row.
     pub fn move_cursor_to(&mut self, last: bool) {
         let visible = self.visible();

@@ -189,11 +189,14 @@ fn unimplemented_action(app: &mut App, id: &str) -> Effect {
 fn dispatch_list(app: &mut App, id: &str) -> Effect {
     match id {
         "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
+            // `move_current` routes to whichever pane has the cursor: the list, or the
+            // tree/diff of an open review. Calling the list directly here is what left
+            // `j`/`k` moving a cursor nothing drew.
             match id {
-                "nav.up" => app.move_cursor(-1),
-                "nav.down" => app.move_cursor(1),
-                "nav.top" => app.move_cursor_to(false),
-                _ => app.move_cursor_to(true),
+                "nav.up" => move_current(app, Movement::Rows(-1)),
+                "nav.down" => move_current(app, Movement::Rows(1)),
+                "nav.top" => move_to_end(app, false),
+                _ => move_to_end(app, true),
             }
             Effect::None
         }
@@ -201,8 +204,12 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
         "nav.back" => go_back(app),
         "nav.half_down" | "nav.page_down" | "nav.half_up" | "nav.page_up" => {
             let forward = matches!(id, "nav.half_down" | "nav.page_down");
-            let half = matches!(id, "nav.half_down" | "nav.half_up");
-            move_current(app, if forward { 1 } else { -1 }, half);
+            let direction = if forward { 1 } else { -1 };
+            let movement = match id {
+                "nav.half_down" | "nav.half_up" => Movement::Half(direction),
+                _ => Movement::Page(direction),
+            };
+            move_current(app, movement);
             Effect::None
         }
         "search.open" => {
@@ -217,11 +224,11 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "search.next" => {
-            move_current(app, 1, false);
+            move_current(app, Movement::Rows(1));
             Effect::None
         }
         "search.prev" => {
-            move_current(app, -1, false);
+            move_current(app, Movement::Rows(-1));
             Effect::None
         }
         "filter.menu" => {
@@ -460,17 +467,68 @@ fn go_back(app: &mut App) -> Effect {
     Effect::None
 }
 
+/// How far the cursor should move.
+///
+/// Three named distances rather than a `delta` and a boolean: the boolean version
+/// conflated "half a screen" with "a whole one" and silently turned `<C-f>` into a
+/// single row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Movement {
+    /// A number of rows, signed.
+    Rows(i32),
+    /// Half a screen, signed.
+    Half(i32),
+    /// A whole screen, signed.
+    Page(i32),
+}
+
 /// Moves whatever pane has the cursor.
-fn move_current(app: &mut App, direction: i32, half: bool) {
+fn move_current(app: &mut App, movement: Movement) {
     if let Some(view) = app.review.as_mut() {
         if view.tree_focused {
-            view.move_tree(direction);
-        } else {
-            view.move_page(direction, half);
+            // The tree is a list of files: a screen and a row mean the same thing to
+            // it, and paging it is not worth a second notion of position.
+            view.move_tree(movement.delta());
+            return;
+        }
+        match movement {
+            Movement::Rows(delta) => view.move_by(delta),
+            Movement::Half(delta) => view.move_page(delta, true),
+            Movement::Page(delta) => view.move_page(delta, false),
         }
         return;
     }
-    app.list.move_page(direction, half);
+    match movement {
+        Movement::Rows(delta) => app.list.move_cursor(delta),
+        Movement::Half(delta) => app.list.move_page(delta, true),
+        Movement::Page(delta) => app.list.move_page(delta, false),
+    }
+}
+
+impl Movement {
+    /// The signed distance, for the panes that treat every movement as rows.
+    const fn delta(self) -> i32 {
+        match self {
+            Self::Rows(delta) | Self::Half(delta) | Self::Page(delta) => delta,
+        }
+    }
+}
+
+/// Jumps the cursor of whichever pane has it to the first or last row.
+fn move_to_end(app: &mut App, last: bool) {
+    if let Some(view) = app.review.as_mut() {
+        if view.tree_focused {
+            view.tree_cursor = if last {
+                view.tree.len().saturating_sub(1)
+            } else {
+                0
+            };
+        } else {
+            view.move_to(last);
+        }
+        return;
+    }
+    app.list.move_cursor_to(last);
 }
 
 /// Runs a closure against the open review view, if there is one.

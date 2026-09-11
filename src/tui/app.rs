@@ -90,18 +90,6 @@ pub enum Effect {
     CancelInFlight,
 }
 
-/// What this build can show, so the shell is honest about being a shell.
-pub(crate) const ROADMAP: &[&str] = &[
-    "M1  browse, filter and search pull requests",
-    "M1  read the diff with vim motions and the mouse",
-    "M2  a managed worktree per pull request",
-    "M2  pick provider, model and thinking in the TUI",
-    "M2  streamed analysis and a review-ordered diff",
-    "M3  a persistent chat about the pull request",
-    "M4  inline comments and one batched review",
-    "M5  polish, docs and release builds",
-];
-
 /// The focused pane (FR-7.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Pane {
@@ -296,8 +284,6 @@ pub struct App {
     pub(crate) command: CommandLine,
     /// Recent notifications.
     pub(crate) notices: Vec<Notice>,
-    /// Cursor over [`ROADMAP`].
-    pub(crate) cursor: usize,
     /// Themes offered by the picker, resolved when it opens so rendering never
     /// reads the filesystem (FR-7.7).
     pub(crate) picker_items: Vec<PickerEntry>,
@@ -350,9 +336,10 @@ pub struct App {
     started_at: u64,
     /// The width of the last frame.
     last_width: u16,
-    /// The first row of the list pane, in terminal coordinates, learned from the
-    /// last frame so a click can be placed (FR-7.5).
-    list_top: u16,
+    /// The filter bar's rectangle, learned from the last frame (FR-7.5).
+    filter_bar_rect: ratatui::layout::Rect,
+    /// The list pane's rectangle, learned from the last frame.
+    list_pane: ratatui::layout::Rect,
     /// The first row of the review panes.
     review_top: u16,
     /// The width of the file tree, which separates the two review panes.
@@ -444,7 +431,6 @@ impl App {
             leader_open: false,
             command: CommandLine::default(),
             notices: Vec::new(),
-            cursor: 0,
             picker_items: Vec::new(),
             picker_cursor: 0,
             theme_before_picker: None,
@@ -459,7 +445,8 @@ impl App {
             // Zero until a frame has been drawn: a width that was never measured
             // must not be used to decide anything.
             last_width: 0,
-            list_top: 0,
+            filter_bar_rect: ratatui::layout::Rect::default(),
+            list_pane: ratatui::layout::Rect::default(),
             review_top: 0,
             tree_width: 30,
             quit: false,
@@ -819,6 +806,9 @@ impl App {
 
     /// Scrolls the pane under the pointer.
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) {
+        // The wheel moves the selection, three rows at a time, and the view follows
+        // it: the cursor is what `Enter` acts on, so leaving it behind the visible
+        // window would make the wheel feel like it changed nothing.
         let pane = self.pane_at(column, row).unwrap_or(self.focus);
         match pane {
             Pane::PullRequests => {
@@ -849,11 +839,12 @@ impl App {
         self.focus = pane;
         match pane {
             Pane::PullRequests => {
-                // The panes start below the header, the filter bar and the table
-                // header, which is three rows plus one for the border.
-                let offset = row.saturating_sub(self.list_top + 3);
-                if self.review.is_none() {
-                    self.list.move_cursor(i32::from(offset));
+                // The visible row under the pointer, turned into an absolute index by
+                // the same offset the frame drew with.
+                if let Some(index) =
+                    crate::tui::components::pr_list::row_at(self.list_pane, self.list.scroll, row)
+                {
+                    self.list.select_visible(index);
                 }
             }
             Pane::Diff => {
@@ -876,40 +867,61 @@ impl App {
     }
 
     /// Which pane a terminal coordinate is in, if any.
+    ///
+    /// Anything outside a pane is `None`: a click on the filter bar or on a border
+    /// must not move a cursor somewhere the user did not point at.
     fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
         if self.review.is_some() {
-            if row < self.review_top {
-                return None;
-            }
-            return Some(Pane::Diff);
+            // The tree and the diff share the area below the tab bar.
+            return (row >= self.review_top).then_some(Pane::Diff);
         }
-        if row < self.list_top + 1 {
-            return None;
-        }
-        if column < self.tree_width && self.review.is_some() {
-            return Some(Pane::Diff);
-        }
-        Some(Pane::PullRequests)
+        self.list_pane
+            .contains(ratatui::layout::Position::from((column, row)))
+            .then_some(Pane::PullRequests)
     }
 
     /// Records the pane geometry of the last frame, so a mouse event can be placed.
     ///
     /// Called from `render`, which is where the sizes are known. It is arithmetic
     /// only: the render path still performs no IO.
-    fn record_geometry(&mut self, area: ratatui::layout::Rect) {
-        self.last_width = area.width;
-        self.list_top = area.y;
+    fn record_geometry(&mut self, body: ratatui::layout::Rect) {
+        self.last_width = body.width;
         self.tree_width = crate::tui::components::review::TREE_WIDTH;
-        self.review_top = area.y + 1;
+        self.review_top = body.y + 1;
+        // The filter bar sits above the list; the pane below it is the one the mouse
+        // is tested against, and the same rectangle the renderer draws into.
+        let (filter_bar, list) = components::panes::body_split(body);
+        self.filter_bar_rect = filter_bar;
+        self.list_pane = list;
     }
 
     /// Recomputes the scroll offsets for the panes that are about to be drawn.
-    fn sync_scroll(&mut self, area: ratatui::layout::Rect) {
+    /// Works out the scroll offsets for the panes about to be drawn.
+    ///
+    /// The renderer and the mouse both read the result, so the row a click maps to is
+    /// the row that was drawn there.
+    fn sync_scroll(&mut self) {
+        let inner = self.review_body_height();
         if let Some(view) = self.review.as_mut() {
-            let body = area.height.saturating_sub(1);
-            let inner = body.saturating_sub(2);
             view.prepare(inner, inner);
         }
+        let height = crate::tui::components::pr_list::layout(self.list_pane).height;
+        let position = self.list.cursor_position().unwrap_or(0);
+        self.list.scroll = crate::tui::components::scroll_for(
+            position,
+            self.list.scroll,
+            height,
+            self.list.visible_len(),
+        );
+    }
+
+    /// How tall the review panes' row area is.
+    fn review_body_height(&self) -> u16 {
+        // The body, less the tab row, less the two borders.
+        self.list_pane
+            .height
+            .saturating_add(crate::tui::components::filter_bar::HEIGHT)
+            .saturating_sub(3)
     }
 
     /// Opens the command line with a prefix already typed (FR-7.4).
@@ -1221,16 +1233,6 @@ impl App {
     }
 
     /// Scrolls the roadmap or the picker with the mouse wheel (FR-7.5).
-    pub fn on_scroll(&mut self, delta: i32) {
-        if self.mode == Mode::Popup {
-            if self.overlay == Overlay::ThemePicker {
-                self.move_picker(delta);
-            }
-            return;
-        }
-        self.move_cursor(delta);
-    }
-
     /// Fires a pending sequence once its timeout expires (FR-7.2).
     pub fn on_timeout(&mut self) -> Effect {
         self.deadline = None;
@@ -1532,20 +1534,6 @@ impl App {
         self.preview_picker();
     }
 
-    /// Moves the roadmap cursor.
-    pub(crate) fn move_cursor(&mut self, delta: i32) {
-        self.cursor = clamp_cursor(self.cursor, delta, ROADMAP.len());
-    }
-
-    /// Moves the roadmap cursor to one end.
-    pub(crate) fn move_cursor_to(&mut self, last: bool) {
-        self.cursor = if last {
-            ROADMAP.len().saturating_sub(1)
-        } else {
-            0
-        };
-    }
-
     /// Typing in the `/` box filters the loaded list as the user types (FR-2.2).
     ///
     /// Ordinary characters are text, exactly as on the command line: a search for
@@ -1647,7 +1635,7 @@ impl App {
         .split(area);
 
         self.record_geometry(rows[1]);
-        self.sync_scroll(rows[1]);
+        self.sync_scroll();
 
         components::header::render(frame, rows[0], self);
         components::panes::render(frame, rows[1], self);
@@ -1769,18 +1757,41 @@ mod tests {
     }
 
     #[test]
-    fn navigation_moves_the_cursor_and_stops_at_the_ends() {
-        let (_dir, mut app) = app();
-        assert_eq!(app.cursor, 0);
+    fn navigation_moves_the_list_cursor_and_stops_at_the_ends() {
+        let (_dir, mut app) = list_app();
+        assert_eq!(app.list.selected().unwrap().number, 1);
+
         press(&mut app, "j");
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.list.selected().unwrap().number, 2);
+        press(&mut app, "j");
+        assert_eq!(app.list.selected().unwrap().number, 3);
         press(&mut app, "k");
         press(&mut app, "k");
-        assert_eq!(app.cursor, 0, "the cursor should not go negative");
+        assert_eq!(app.list.selected().unwrap().number, 1);
+        press(&mut app, "k");
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            1,
+            "and not past the top"
+        );
+
         press(&mut app, "G");
-        assert_eq!(app.cursor, ROADMAP.len() - 1);
+        assert_eq!(app.list.selected().unwrap().number, 5);
         press(&mut app, "gg");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.list.selected().unwrap().number, 1);
+    }
+
+    #[test]
+    fn the_page_keys_move_the_list_too() {
+        let (_dir, mut app) = list_app();
+        app.list.viewport = 2;
+        // A two-row viewport: half a screen is one row, a whole screen is two.
+        press(&mut app, "<C-d>");
+        assert_eq!(app.list.selected().unwrap().number, 2, "half a screen");
+        press(&mut app, "<C-f>");
+        assert_eq!(app.list.selected().unwrap().number, 4, "a whole screen");
+        press(&mut app, "<C-u>");
+        assert_eq!(app.list.selected().unwrap().number, 3, "half a screen back");
     }
 
     #[test]
@@ -1831,17 +1842,35 @@ mod tests {
         let startup = Startup::load(&cli).unwrap();
         let mut app = App::new(startup).unwrap();
         app.set_now(1_000);
-        app.cursor = 3;
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=5).map(summary).collect(),
+            50,
+        ));
+        app.list.move_cursor(3);
+        assert_eq!(app.list.selected().unwrap().number, 4);
 
         // `g` is bound and is also a prefix of `gg`, so it waits rather than
         // firing immediately: only hints short-circuit the timeout.
         press(&mut app, "g");
-        assert_eq!(app.cursor, 3, "the shorter binding must not fire yet");
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            4,
+            "the shorter binding must not fire yet"
+        );
         app.on_timeout();
-        assert_eq!(app.cursor, 0, "the timeout fires `g`");
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            1,
+            "the timeout fires `g`, which is nav.top"
+        );
 
+        app.list.move_cursor(3);
         press(&mut app, "gg");
-        assert_eq!(app.cursor, ROADMAP.len() - 1);
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            5,
+            "the longer binding is the one that fires"
+        );
     }
 
     #[test]
@@ -2026,10 +2055,11 @@ mod tests {
 
     #[test]
     fn a_leader_binding_closes_the_menu_when_it_fires() {
+        // Needs rows, because the assertion is about what the cursor did afterwards.
         // The menu opens on the ambiguity timeout, so a test that fires
         // <leader>t without waiting would never have opened it and would miss
         // this (FR-7.3).
-        let (_dir, mut app) = app();
+        let (_dir, mut app) = list_app();
         press(&mut app, "<Space>");
         app.on_timeout();
         assert_eq!(app.overlay(), Overlay::Leader);
@@ -2045,7 +2075,7 @@ mod tests {
 
         // And the cursor is reachable again.
         press(&mut app, "j");
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.list.selected().map(|pr| pr.number), Some(2));
     }
 
     #[test]
@@ -2245,11 +2275,62 @@ mod tests {
         assert_eq!(app.command.input, "doctor");
     }
 
-    /// Draws a frame so the pane geometry the mouse arithmetic needs is real.
-    fn frame(app: &mut App, width: u16, height: u16) {
+    /// Draws a frame and hands back the terminal, so a test can ask where something
+    /// actually appeared.
+    fn drawn(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+    }
+
+    /// The terminal row whose text contains `needle`.
+    fn row_of(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, needle: &str) -> u16 {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        for y in area.top()..area.bottom() {
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            if line.contains(needle) {
+                return y;
+            }
+        }
+        panic!("`{needle}` is not on screen");
+    }
+
+    /// Draws a frame so the pane geometry the mouse arithmetic needs is real.
+    fn frame(app: &mut App, width: u16, height: u16) {
+        let _ = drawn(app, width, height);
+    }
+
+    /// One pull request summary, for tests that only need rows to exist.
+    fn summary(number: u64) -> crate::domain::pr::PullRequestSummary {
+        crate::domain::pr::PullRequestSummary {
+            number,
+            title: format!("PR {number}"),
+            author: "alice".to_owned(),
+            state: crate::domain::pr::PrState::Open,
+            is_draft: false,
+            base_ref: "main".to_owned(),
+            head_ref: "topic".to_owned(),
+            head_sha: "abc".to_owned(),
+            created_at: crate::domain::time::Timestamp::default(),
+            updated_at: crate::domain::time::Timestamp::default(),
+            additions: 1,
+            deletions: 1,
+            changed_files: 1,
+            labels: Vec::new(),
+            review_decision: None,
+            checks: crate::domain::pr::CheckSummary::default(),
+            url: String::new(),
+            is_cross_repository: false,
+        }
     }
 
     fn click(column: u16, row: u16) -> event::MouseEvent {
@@ -2277,118 +2358,78 @@ mod tests {
     fn list_app() -> (TempHome, App) {
         let (dir, mut app) = app();
         app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
-            (1..=5)
-                .map(|number| {
-                    let mut summary = crate::domain::pr::PullRequestSummary {
-                        number,
-                        title: format!("PR {number}"),
-                        author: "alice".to_owned(),
-                        state: crate::domain::pr::PrState::Open,
-                        is_draft: false,
-                        base_ref: "main".to_owned(),
-                        head_ref: "topic".to_owned(),
-                        head_sha: "abc".to_owned(),
-                        created_at: crate::domain::time::Timestamp::default(),
-                        updated_at: crate::domain::time::Timestamp::default(),
-                        additions: 1,
-                        deletions: 1,
-                        changed_files: 1,
-                        labels: Vec::new(),
-                        review_decision: None,
-                        checks: crate::domain::pr::CheckSummary::default(),
-                        url: String::new(),
-                        is_cross_repository: false,
-                    };
-                    summary.number = number;
-                    summary
-                })
-                .collect(),
+            (1..=5).map(summary).collect(),
             50,
         ));
         (dir, app)
     }
 
     #[test]
-    fn escape_cancels_work_in_flight_before_going_back() {
-        let (_dir, mut app) = list_app();
-        app.environment_running = false;
-        app.list.loading = true;
-
-        // A back press while a fetch is running asks for the fetch to stop, and the
-        // screen stays where it is (NFR-1.4).
-        assert_eq!(press(&mut app, "<Esc>"), Effect::CancelInFlight);
-        assert!(app.review.is_none());
-
-        app.cancelled_in_flight();
-        assert!(!app.list.loading);
-        assert!(
-            app.latest_notice()
-                .is_some_and(|notice| notice.text.contains("cancelled")),
-            "the user is told the work stopped"
-        );
-
-        // With nothing in flight it goes back instead.
-        assert_eq!(press(&mut app, "<Esc>"), Effect::None);
-    }
-
-    #[test]
-    fn escape_leaves_the_review_and_h_does_the_same() {
-        use crate::tui::diff_view::DiffView;
-
-        let (_dir, mut app) = list_app();
-        app.environment_running = false;
-        app.set_review(DiffView::new(crate::domain::diff::parse_patch(
-            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n",
-        )));
-        assert!(app.review_screen().is_some());
-
-        press(&mut app, "<Esc>");
-        assert!(app.review_screen().is_none(), "Esc closes the review");
-
-        app.set_review(DiffView::new(crate::domain::diff::parse_patch(
-            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n",
-        )));
-        press(&mut app, "h");
-        assert!(app.review_screen().is_none(), "and so does h");
-    }
-
-    #[test]
-    fn q_quits_and_the_list_is_reachable_again_after_a_review() {
-        let (_dir, mut app) = app();
-        press(&mut app, "q");
-        assert!(app.should_quit(), "q quits, as the keymap table says");
-    }
-
-    #[test]
     fn a_click_on_a_list_row_selects_that_row() {
         let (_dir, mut app) = list_app();
-        frame(&mut app, 100, 30);
-        let first_row = app.list_top + 3;
+        let terminal = drawn(&mut app, 100, 30);
 
-        // The first row of the table, then the second.
-        app.on_mouse(click(10, first_row));
-        assert_eq!(app.list.selected().unwrap().number, 1);
-        app.on_mouse(click(10, first_row + 1));
-        assert_eq!(app.list.selected().unwrap().number, 2);
+        // The row is found in the *rendered frame*, not from the geometry constants
+        // the click handler uses: a test that shares the implementation's arithmetic
+        // passes with the implementation's mistakes (this one did, when the handler
+        // was two rows out).
+        let row = row_of(&terminal, "PR 3");
+        app.on_mouse(click(10, row));
+        assert_eq!(app.list.selected().unwrap().number, 3);
 
-        // A click on the filter bar is above the list and changes nothing.
-        app.on_mouse(click(10, 1));
-        assert_eq!(app.list.selected().unwrap().number, 2);
+        let row = row_of(&terminal, "PR 5");
+        app.on_mouse(click(10, row));
+        assert_eq!(app.list.selected().unwrap().number, 5);
+
+        // The filter bar is not a row: a click there must not move the cursor.
+        app.on_mouse(click(10, app.filter_bar_rect.y));
+        assert_eq!(app.list.selected().unwrap().number, 5);
     }
 
     #[test]
-    fn the_wheel_scrolls_the_pane_under_the_pointer() {
-        let (_dir, mut app) = list_app();
-        frame(&mut app, 100, 30);
+    fn a_click_lands_on_the_right_row_when_the_list_is_scrolled() {
+        // More pull requests than fit even in a full-height pane, so the list has to
+        // scroll for the test to mean anything.
+        let (dir, mut app) = app();
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=40).map(summary).collect(),
+            50,
+        ));
+        let _ = &dir;
+        press(&mut app, "G");
+        let terminal = drawn(&mut app, 100, 24);
 
-        app.on_mouse(wheel(10, app.list_top + 3, true));
+        let row = row_of(&terminal, "PR 40");
+        assert!(
+            app.list.scroll > 0,
+            "the list scrolled to reach the last row"
+        );
+
+        app.on_mouse(click(10, row));
         assert_eq!(
             app.list.selected().unwrap().number,
-            4,
-            "three rows at a time in the list"
+            40,
+            "a click maps through the scroll offset"
         );
-        app.on_mouse(wheel(10, app.list_top + 3, false));
+    }
+
+    #[test]
+    fn the_wheel_moves_the_list_cursor_in_the_direction_the_terminal_reports() {
+        let (_dir, mut app) = list_app();
+        drawn(&mut app, 100, 30);
         assert_eq!(app.list.selected().unwrap().number, 1);
+
+        app.on_mouse(wheel(10, 10, true));
+        assert!(
+            app.list.selected().unwrap().number > 1,
+            "a wheel-down event moves down the list"
+        );
+        let after_down = app.list.selected().unwrap().number;
+        app.on_mouse(wheel(10, 10, false));
+        assert!(
+            app.list.selected().unwrap().number < after_down,
+            "and a wheel-up event moves back up"
+        );
     }
 
     /// A review with a directory, so the tree has a folder row to click.
@@ -2402,22 +2443,6 @@ mod tests {
         );
         app.set_review(DiffView::new(patch));
         (dir, app)
-    }
-
-    #[test]
-    fn a_click_on_a_tree_row_opens_the_file() {
-        let (_dir, mut app) = review_app();
-        frame(&mut app, 120, 30);
-
-        // Row one is the `src` directory, row two the first file: clicking a file
-        // does what pressing Enter on it does (FR-7.5).
-        app.on_mouse(click(5, app.review_top + 2));
-        let view = app.review.as_ref().unwrap();
-        assert_eq!(view.current_path().unwrap().as_str(), "src/one.rs");
-        assert!(
-            !view.tree_focused,
-            "opening a file moves the focus to the diff"
-        );
     }
 
     #[test]

@@ -13,6 +13,9 @@ use crate::tui::app::App;
 use crate::tui::keymap::Mode;
 use crate::tui::theme::{Theme, element};
 
+/// How many rows the bar occupies: the chips, then the search box.
+pub const HEIGHT: u16 = 2;
+
 /// Renders the bar, two rows tall: chips, then the search box.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;

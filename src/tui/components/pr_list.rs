@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::domain::pr::{CheckState, PullRequestSummary, ReviewDecision};
 use crate::tui::app::{App, Pane};
-use crate::tui::components::{border_style, filter_bar};
+use crate::tui::components::border_style;
 use crate::tui::list_view::PrListState;
 use crate::tui::text;
 use crate::tui::theme::{Theme, element};
@@ -74,6 +74,41 @@ impl Columns {
             + 1
             + self.decision
     }
+}
+
+/// Where the rows of the list pane are.
+///
+/// The pane has a border, a column header and a rule above the first row, and a
+/// border below the last. Drawing, scrolling and hit-testing all read this, so a
+/// click cannot land on a different row from the one it was aimed at (FR-7.5) — which
+/// is exactly what happened while two of them counted the rows independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListLayout {
+    /// The first row of the pane, in terminal coordinates.
+    pub first_row: u16,
+    /// How many rows fit.
+    pub height: usize,
+}
+
+/// The row layout of a list pane.
+#[must_use]
+pub fn layout(pane: Rect) -> ListLayout {
+    // Border, header, rule above; border below.
+    let header = 3;
+    ListLayout {
+        first_row: pane.y.saturating_add(header),
+        height: usize::from(pane.height.saturating_sub(header + 1)),
+    }
+}
+
+/// The visible row index a terminal row is over, if it is over a row at all.
+#[must_use]
+pub fn row_at(pane: Rect, scroll: usize, row: u16) -> Option<usize> {
+    let layout = layout(pane);
+    if row < layout.first_row || row >= pane.bottom() {
+        return None;
+    }
+    Some(scroll + usize::from(row - layout.first_row))
 }
 
 /// Renders the list pane (FR-2.1).
@@ -363,17 +398,6 @@ fn empty_state(app: &App) -> Vec<Line<'static>> {
         muted,
     )));
     lines
-}
-
-/// Renders the filter bar above the list (FR-2.2).
-pub fn render_with_filters(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let rows = ratatui::layout::Layout::vertical([
-        ratatui::layout::Constraint::Length(2),
-        ratatui::layout::Constraint::Min(3),
-    ])
-    .split(area);
-    filter_bar::render(frame, rows[0], app);
-    render(frame, rows[1], app);
 }
 
 /// The state the list pane reads, exposed so tests can build one.
