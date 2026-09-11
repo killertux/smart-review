@@ -30,8 +30,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     if lines.is_empty() {
+        let message = if app.doctor_running {
+            " collecting the environment report…"
+        } else {
+            " no checks were run"
+        };
         lines.push(Line::from(Span::styled(
-            " no checks were run".to_owned(),
+            message.to_owned(),
             theme.style(element::MUTED),
         )));
     }

@@ -10,22 +10,38 @@ use crate::tui::action;
 use crate::tui::app::{App, Effect, NoticeLevel, Overlay};
 use crate::tui::keymap::{self, KeyCombo, Mode};
 
-/// Commands accepted by the `:` line, with the action each one triggers.
+/// Commands accepted by the `:` line: name, the action it triggers, and the
+/// description the palette shows.
 ///
-/// Aliases live here; the action ids themselves all come from the registry
-/// (`action::ACTIONS`), which a test enforces.
-pub const COMMANDS: &[(&str, &str)] = &[
-    ("doctor", "app.doctor"),
-    ("help", "app.help"),
-    ("keymap", "app.help"),
-    ("messages", "notice.clear"),
-    ("q", "app.quit"),
-    ("qa", "app.quit"),
-    ("quit", "app.quit"),
-    ("refresh", "app.refresh"),
-    ("set", "app.command"),
-    ("theme", "app.theme_picker"),
-    ("version", "app.version"),
+/// The display text lives here rather than being taken from the action because a
+/// command can be more specific than the action behind it (`:set` uses the
+/// command-line machinery but is not "open the command line"). The action ids
+/// themselves all come from the registry (`action::ACTIONS`), which a test
+/// enforces.
+pub const COMMANDS: &[(&str, &str, &str)] = &[
+    ("doctor", "app.doctor", "Show the environment report"),
+    ("help", "app.help", "Show the help popup"),
+    ("keymap", "app.help", "List the active keybindings"),
+    (
+        "messages",
+        "notice.clear",
+        "Dismiss the current notification",
+    ),
+    ("q", "app.quit", "Quit smart-review"),
+    ("qa", "app.quit", "Quit smart-review"),
+    ("quit", "app.quit", "Quit smart-review"),
+    ("refresh", "app.refresh", "Refresh the current view"),
+    (
+        "set",
+        "app.command",
+        "Change an option: :set ui.timeoutlen=250",
+    ),
+    (
+        "theme",
+        "app.theme_picker",
+        "Choose a theme, or :theme <name>|reload",
+    ),
+    ("version", "app.version", "Show the version"),
 ];
 
 /// Runs an action.
@@ -100,7 +116,8 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             app.move_cursor_to(true);
             Effect::None
         }
-        "pane.next" | "pane.prev" => set_focus(app, app.focus.next()),
+        "pane.next" => set_focus(app, app.focus.next()),
+        "pane.prev" => set_focus(app, app.focus.prev()),
         other => {
             app.notice(
                 NoticeLevel::Warn,
@@ -232,7 +249,8 @@ fn set_option(app: &mut App, spec: &str) -> Effect {
     }
 }
 
-/// Commands matching what has been typed so far, best match first.
+/// Commands matching what has been typed so far, best match first, with the
+/// description to display.
 ///
 /// Matching is fuzzy: the typed characters must appear in order, and contiguous
 /// or earlier matches rank higher (FR-7.3).
@@ -242,20 +260,20 @@ pub fn candidates(input: &str) -> Vec<(&'static str, &'static str)> {
 
     let mut scored: Vec<(i32, &'static str, &'static str)> = COMMANDS
         .iter()
-        .filter_map(|(name, action)| {
+        .filter_map(|(name, _action, description)| {
             let score = if typed.is_empty() {
                 0
             } else {
                 fuzzy_score(typed, name)?
             };
-            Some((score, *name, *action))
+            Some((score, *name, *description))
         })
         .collect();
 
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
     scored
         .into_iter()
-        .map(|(_, name, action)| (name, action))
+        .map(|(_, name, description)| (name, description))
         .collect()
 }
 
@@ -308,7 +326,17 @@ pub fn complete_command(input: &str) -> String {
     match names.as_slice() {
         [] => input.to_owned(),
         [single] => (*single).to_owned(),
-        several => common_prefix(several),
+        several => {
+            // Never hand back something shorter than what was typed: the shared
+            // prefix of `help` and `theme` is empty, and completing to it would
+            // wipe the buffer (FR-7.4).
+            let prefix = common_prefix(several);
+            if prefix.chars().count() > typed.chars().count() {
+                prefix
+            } else {
+                input.to_owned()
+            }
+        }
     }
 }
 
@@ -329,7 +357,7 @@ fn common_prefix(names: &[&str]) -> String {
 fn closest_command(typed: &str) -> Option<&'static str> {
     COMMANDS
         .iter()
-        .map(|(name, _)| (action::levenshtein(typed, name), *name))
+        .map(|(name, _, _)| (action::levenshtein(typed, name), *name))
         .filter(|(distance, _)| *distance <= 3)
         .min_by_key(|(distance, _)| *distance)
         .map(|(_, name)| name)
@@ -341,11 +369,12 @@ mod tests {
 
     #[test]
     fn every_command_maps_to_a_registered_action() {
-        for (name, id) in COMMANDS {
+        for (name, id, description) in COMMANDS {
             assert!(
                 action::is_known(id),
                 "command `{name}` maps to unknown action `{id}`"
             );
+            assert!(!description.is_empty(), "`{name}` needs a description");
         }
     }
 
@@ -389,6 +418,19 @@ mod tests {
         assert_eq!(all.len(), COMMANDS.len());
         let typed = candidates("thm");
         assert_eq!(typed.first().map(|(name, _)| *name), Some("theme"));
+    }
+
+    #[test]
+    fn tab_never_deletes_what_was_typed() {
+        // `help`, `theme` and `refresh` all match `h`, and their shared prefix is
+        // empty; completing to it would clear the buffer.
+        for typed in ["h", "he", "r", "se"] {
+            let completed = complete_command(typed);
+            assert!(
+                completed.starts_with(typed),
+                "completing `{typed}` produced `{completed}`"
+            );
+        }
     }
 
     #[test]

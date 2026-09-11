@@ -85,6 +85,15 @@ impl Pane {
         }
     }
 
+    /// The other pane, going backwards.
+    ///
+    /// Identical to [`Pane::next`] with two panes, but explicit so adding a third
+    /// pane does not silently make `pane.prev` move forwards.
+    #[must_use]
+    pub const fn prev(self) -> Self {
+        self.next()
+    }
+
     /// Name used in the status line and in `state.toml`.
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -148,6 +157,20 @@ impl Notice {
     }
 }
 
+/// One row of the theme picker.
+///
+/// The theme is resolved when the picker opens, so moving the cursor never
+/// touches the disk and previewing cannot fail halfway through (FR-7.7).
+#[derive(Debug, Clone)]
+pub(crate) struct PickerEntry {
+    /// The name shown, and the one used by `:theme`.
+    pub(crate) name: String,
+    /// The resolved theme, when it loaded.
+    pub(crate) theme: Option<Theme>,
+    /// Where it came from, for the status line.
+    pub(crate) source: Option<String>,
+}
+
 /// The `:` command line buffer (FR-7.4).
 #[derive(Debug, Clone, Default)]
 pub struct CommandLine {
@@ -202,6 +225,10 @@ pub struct App {
     pub(crate) theme: Theme,
     /// Where the theme came from.
     pub(crate) theme_source: String,
+    /// The name the active theme was requested by, which is what the picker
+    /// marks. It can differ from `theme.name()`: a theme file may declare its own
+    /// display name.
+    pub(crate) theme_request: String,
     /// Persisted state. Written by the event loop, never from the reducer.
     pub(crate) state: AppState,
     /// Warnings collected during startup and at runtime.
@@ -231,9 +258,9 @@ pub struct App {
     pub(crate) notices: Vec<Notice>,
     /// Cursor over [`ROADMAP`].
     pub(crate) cursor: usize,
-    /// Themes offered by the picker, captured when it opens so rendering never
+    /// Themes offered by the picker, resolved when it opens so rendering never
     /// reads the filesystem (FR-7.7).
-    pub(crate) picker_items: Vec<String>,
+    pub(crate) picker_items: Vec<PickerEntry>,
     /// Cursor inside the theme picker.
     pub(crate) picker_cursor: usize,
     /// Theme in force when the picker opened, restored if it is cancelled.
@@ -246,6 +273,8 @@ pub struct App {
     pub(crate) checks: Vec<Check>,
     /// Whether a doctor job is in flight.
     pub(crate) doctor_running: bool,
+    /// Counter used to discard a report from a superseded job.
+    doctor_job: u64,
     /// Unix time as of the current loop iteration, injected by the loop so the
     /// reducer and the components never read the clock themselves.
     now_unix_secs: u64,
@@ -275,6 +304,7 @@ impl App {
             keymap,
             theme,
             theme_source,
+            theme_request,
             state,
             warnings,
             repo,
@@ -296,6 +326,7 @@ impl App {
             keymap,
             theme,
             theme_source,
+            theme_request,
             state,
             warnings,
             repo,
@@ -317,6 +348,7 @@ impl App {
             focus,
             checks: Vec::new(),
             doctor_running: false,
+            doctor_job: 0,
             now_unix_secs: 0,
             started_at: 0,
             quit: false,
@@ -435,7 +467,14 @@ impl App {
         );
 
         if self.notices.len() >= MAX_NOTICES {
-            self.notices.remove(0);
+            // Evict an expiring notice before a persistent error: errors stay
+            // until the user dismisses them (FR-7.6).
+            let victim = self
+                .notices
+                .iter()
+                .position(|notice| notice.expires.is_some())
+                .unwrap_or(0);
+            self.notices.remove(victim);
         }
         self.notices.push(Notice {
             level,
@@ -474,6 +513,7 @@ impl App {
             Ok((theme, source)) => {
                 self.theme = theme;
                 self.theme_source = source;
+                name.clone_into(&mut self.theme_request);
                 for warning in warnings {
                     self.notice(NoticeLevel::Warn, warning);
                 }
@@ -490,7 +530,7 @@ impl App {
 
     /// Re-reads the active theme from disk (FR-8.4).
     pub(crate) fn reload_theme(&mut self) -> Effect {
-        let name = self.theme.name().to_owned();
+        let name = self.theme_request.clone();
         let mut warnings = Vec::new();
         match theme::load(&self.home, &name, &mut warnings) {
             Ok((theme, source)) => {
@@ -547,12 +587,37 @@ impl App {
         match self.overlay {
             Overlay::ThemePicker => {
                 self.theme_before_picker = Some((self.theme.clone(), self.theme_source.clone()));
-                self.picker_items = theme::available(&self.home);
+                // Resolve every candidate once, here, so moving the cursor never
+                // reads the disk and a broken theme file is reported when the
+                // picker opens rather than when it is committed (FR-7.7).
+                let mut warnings = Vec::new();
+                let entries: Vec<PickerEntry> = theme::available(&self.home)
+                    .into_iter()
+                    .map(|name| match theme::load(&self.home, &name, &mut warnings) {
+                        Ok((theme, source)) => PickerEntry {
+                            name,
+                            theme: Some(theme),
+                            source: Some(source),
+                        },
+                        Err(error) => {
+                            warnings.push(error.to_string());
+                            PickerEntry {
+                                name,
+                                theme: None,
+                                source: None,
+                            }
+                        }
+                    })
+                    .collect();
+                self.picker_items = entries;
                 self.picker_cursor = self
                     .picker_items
                     .iter()
-                    .position(|candidate| candidate == self.theme.name())
+                    .position(|entry| entry.name == self.theme_request)
                     .unwrap_or(0);
+                for warning in warnings {
+                    self.notice(NoticeLevel::Warn, warning);
+                }
             }
             Overlay::Help => self.help_filter = None,
             _ => {}
@@ -640,18 +705,43 @@ impl App {
         effect
     }
 
-    /// Delivers a doctor report collected off the event loop (FR-9.3).
-    pub(crate) fn apply_checks(&mut self, checks: Vec<Check>) {
-        self.checks = checks;
-        self.doctor_running = false;
-    }
-
-    /// Marks the doctor job as started and opens the popup.
-    pub(crate) fn start_doctor(&mut self) {
+    /// Marks the doctor job as started and opens the popup (FR-9.3).
+    ///
+    /// Returns the job id so the event loop can tag the report: a report from a
+    /// superseded job must not be applied.
+    pub(crate) fn start_doctor(&mut self) -> u64 {
+        self.doctor_job = self.doctor_job.wrapping_add(1);
         self.checks = Vec::new();
         self.doctor_running = true;
         self.open_overlay(Overlay::Doctor);
         self.notice(NoticeLevel::Info, "collecting the environment report…");
+        self.doctor_job
+    }
+
+    /// The id of the most recent doctor request.
+    pub(crate) const fn doctor_job(&self) -> u64 {
+        self.doctor_job
+    }
+
+    /// Delivers a doctor report collected off the event loop (FR-9.3).
+    pub(crate) fn apply_checks(&mut self, job: u64, checks: Vec<Check>) {
+        if job != self.doctor_job {
+            return; // a superseded report
+        }
+        self.checks = checks;
+        self.doctor_running = false;
+    }
+
+    /// The doctor job died without reporting, so stop waiting for it.
+    pub(crate) fn abort_doctor_job(&mut self) {
+        if self.doctor_running {
+            self.doctor_running = false;
+            self.notice(
+                NoticeLevel::Error,
+                "the environment report could not be collected",
+            );
+        }
+        self.doctor_job = self.doctor_job.wrapping_add(1);
     }
 
     fn report_startup_warnings(&mut self) {
@@ -671,6 +761,20 @@ impl App {
     /// bare `?`, `:` or the leader key is text the user is typing, not a
     /// command — treating them as bindings makes `:set ui.timeoutlen=250`
     /// impossible, because the space would open the leader menu.
+    /// Ends a key sequence, closing the leader menu with it (FR-7.3).
+    ///
+    /// `Effect::KeepPending` skips this so the next key can complete the
+    /// sequence; every other outcome means the sequence is over, and the menu
+    /// must not outlive it.
+    fn finish_sequence(&mut self) {
+        self.pending.clear();
+        self.deadline = None;
+        self.leader_open = false;
+        if self.overlay == Overlay::Leader {
+            self.overlay = Overlay::None;
+        }
+    }
+
     fn global_action(&self, combo: KeyCombo) -> Option<String> {
         if !combo
             .modifiers
@@ -715,21 +819,15 @@ impl App {
 
         if let Some(action) = next {
             let effect = update::dispatch(self, &action);
-            self.deadline = None;
             if effect != Effect::KeepPending {
-                self.pending.clear();
+                self.finish_sequence();
             }
             return effect;
         }
 
         let keys = keymap::describe_sequence(&self.pending);
         let was_leader = self.leader_open;
-        self.pending.clear();
-        self.deadline = None;
-        self.leader_open = false;
-        if self.overlay == Overlay::Leader {
-            self.overlay = Overlay::None;
-        }
+        self.finish_sequence();
         let level = if was_leader {
             NoticeLevel::Info
         } else {
@@ -750,7 +848,11 @@ impl App {
     }
 
     fn on_popup_key(&mut self, combo: KeyCombo) -> Effect {
-        if let Some(action) = self.global_action(combo) {
+        // The popup table governs popups, global bindings included, so a user can
+        // bind keys for a popup. The arms below are the built-in popup behaviour
+        // that deliberately needs no binding (FR-8.3).
+        if let Resolution::Match(binding) = self.keymap.resolve(Mode::Popup, &[combo]) {
+            let action = binding.action.clone();
             return update::dispatch(self, &action);
         }
 
@@ -772,7 +874,10 @@ impl App {
                 Effect::None
             }
             KeyCode::Enter if self.overlay == Overlay::ThemePicker => {
-                let name = self.picker_items.get(self.picker_cursor).cloned();
+                let name = self
+                    .picker_items
+                    .get(self.picker_cursor)
+                    .map(|entry| entry.name.clone());
                 self.close_overlay();
                 match name {
                     Some(name) => self.set_theme(&name),
@@ -789,12 +894,14 @@ impl App {
             return;
         }
         self.picker_cursor = clamp_cursor(self.picker_cursor, delta, count);
-        // Preview the highlighted theme; `cancel_overlay` puts the original back.
-        if let Some(name) = self.picker_items.get(self.picker_cursor).cloned() {
-            let mut warnings = Vec::new();
-            if let Ok((theme, source)) = theme::load(&self.home, &name, &mut warnings) {
-                self.theme = theme;
-                self.theme_source = source;
+        // Preview from the list resolved when the picker opened; `cancel_overlay`
+        // puts the original back.
+        if let Some(entry) = self.picker_items.get(self.picker_cursor)
+            && let Some(theme) = &entry.theme
+        {
+            self.theme = theme.clone();
+            if let Some(source) = &entry.source {
+                self.theme_source.clone_from(source);
             }
         }
     }
@@ -1141,13 +1248,103 @@ mod tests {
         assert!(app.doctor_running);
         assert!(app.checks().is_empty());
 
-        app.apply_checks(vec![Check {
-            name: "home",
-            status: crate::doctor::Status::Ok,
-            detail: "ok".to_owned(),
-        }]);
+        let job = app.doctor_job();
+        app.apply_checks(
+            job,
+            vec![Check {
+                name: "home",
+                status: crate::doctor::Status::Ok,
+                detail: "ok".to_owned(),
+            }],
+        );
         assert!(!app.doctor_running);
         assert_eq!(app.checks().len(), 1);
+    }
+
+    #[test]
+    fn a_stale_doctor_report_is_discarded() {
+        let (_dir, mut app) = app();
+        press(&mut app, ":");
+        for character in "doctor".chars() {
+            press(&mut app, &character.to_string());
+        }
+        press(&mut app, "<CR>");
+        let first = app.doctor_job();
+
+        // A second request supersedes the first.
+        press(&mut app, ":");
+        for character in "doctor".chars() {
+            press(&mut app, &character.to_string());
+        }
+        press(&mut app, "<CR>");
+
+        app.apply_checks(first, Vec::new());
+        assert!(
+            app.doctor_running,
+            "the stale report must not resolve the job"
+        );
+
+        app.apply_checks(
+            app.doctor_job(),
+            vec![Check {
+                name: "home",
+                status: crate::doctor::Status::Ok,
+                detail: "ok".to_owned(),
+            }],
+        );
+        assert!(!app.doctor_running);
+    }
+
+    #[test]
+    fn a_dead_doctor_job_stops_waiting() {
+        let (_dir, mut app) = app();
+        press(&mut app, ":");
+        for character in "doctor".chars() {
+            press(&mut app, &character.to_string());
+        }
+        press(&mut app, "<CR>");
+        assert!(app.doctor_running);
+        app.abort_doctor_job();
+        assert!(!app.doctor_running);
+    }
+
+    #[test]
+    fn a_leader_binding_closes_the_menu_when_it_fires() {
+        // The menu opens on the ambiguity timeout, so a test that fires
+        // <leader>t without waiting would never have opened it and would miss
+        // this (FR-7.3).
+        let (_dir, mut app) = app();
+        press(&mut app, "<Space>");
+        app.on_timeout();
+        assert_eq!(app.overlay(), Overlay::Leader);
+
+        press(&mut app, "l");
+        assert_eq!(app.theme.name(), "light");
+        assert!(!app.leader_open);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "the leader menu must not outlive the binding it fired"
+        );
+
+        // And the cursor is reachable again.
+        press(&mut app, "j");
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn a_persistent_error_survives_the_notice_queue() {
+        let (_dir, mut app) = app();
+        app.notice(NoticeLevel::Error, "boom");
+        for text in ["one", "two", "three", "four"] {
+            app.notice(NoticeLevel::Info, text);
+        }
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.level == NoticeLevel::Error),
+            "an error must not be evicted by informational notices"
+        );
     }
 
     #[test]

@@ -42,7 +42,8 @@ pub fn run(startup: Startup) -> Result<()> {
 
     let mut app = App::new(startup)?;
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
-    let (doctor_sender, doctor_receiver) = mpsc::channel::<Vec<Check>>();
+    // Reports carry the job id they belong to so a superseded one is discarded.
+    let (doctor_sender, doctor_receiver) = mpsc::channel::<(u64, Vec<Check>)>();
 
     while !app.should_quit() {
         app.set_now(clock.now_unix_secs());
@@ -50,8 +51,16 @@ pub fn run(startup: Startup) -> Result<()> {
         app.tick();
 
         // Results from background jobs.
-        while let Ok(checks) = doctor_receiver.try_recv() {
-            app.apply_checks(checks);
+        loop {
+            match doctor_receiver.try_recv() {
+                Ok((job, checks)) => app.apply_checks(job, checks),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The worker died without reporting; stop waiting for it.
+                    app.abort_doctor_job();
+                    break;
+                }
+            }
         }
 
         let effect = if event::poll(app.poll_timeout())? {
@@ -90,7 +99,7 @@ fn apply(
     effect: Effect,
     app: &mut App,
     state_store: &dyn StateStore,
-    doctor_sender: &Sender<Vec<Check>>,
+    doctor_sender: &Sender<(u64, Vec<Check>)>,
 ) {
     match effect {
         Effect::None | Effect::KeepPending => {}
@@ -105,13 +114,14 @@ fn apply(
         }
 
         Effect::RunDoctor => {
+            let job = app.doctor_job();
             let request = app.doctor_request();
             let sender = doctor_sender.clone();
             // The probes run `git` and `gh`, so they must not run on the event
             // loop (FR-9.3, NFR-1.2). The report comes back over the channel.
             let _ = std::thread::spawn(move || {
                 let checks = crate::doctor::collect(&request);
-                let _ = sender.send(checks);
+                let _ = sender.send((job, checks));
             });
         }
     }

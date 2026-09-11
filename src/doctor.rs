@@ -224,12 +224,16 @@ fn log_detail(context: &Context) -> String {
 /// How many lines of the log the doctor looks at.
 const LOG_TAIL_LINES: usize = 200;
 
+/// How many bytes of the log the doctor reads.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
 /// Summarises the warnings and errors at the end of the log.
 ///
-/// The log is read from its end: only the tail matters for "what went wrong just
-/// now", and it keeps the read bounded regardless of how big the file grew.
+/// Only the tail matters for "what went wrong just now", and reading just the
+/// tail keeps the cost bounded even when a long session has grown the file well
+/// past the rotation threshold (FR-9.2).
 fn tail_summary(path: &Path, lines: usize) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = read_tail(path, LOG_TAIL_BYTES) else {
         return "no log yet".to_owned();
     };
 
@@ -253,6 +257,30 @@ fn tail_summary(path: &Path, lines: usize) -> String {
     format!(
         "{warnings} warning(s) and {errors} error(s) in the last {lines} lines; most recent: {last}"
     )
+}
+
+/// Reads at most `bytes` from the end of a file.
+fn read_tail(path: &Path, bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(bytes);
+    let partial = start > 0;
+    file.seek(SeekFrom::Start(start))?;
+
+    let mut buffer = String::new();
+    (&mut file).take(bytes).read_to_string(&mut buffer)?;
+
+    // Drop the first line when it was cut in half by the seek.
+    if partial {
+        if let Some(newline) = buffer.find('\n') {
+            buffer.drain(..=newline);
+        } else {
+            buffer.clear();
+        }
+    }
+    Ok(buffer)
 }
 
 fn config_check(context: &Context) -> Check {
@@ -451,10 +479,40 @@ mod tests {
 
     #[test]
     fn the_full_report_adds_the_tool_probes() {
-        let (_dir, context) = context();
+        let (_dir, mut context) = context();
+        // Point the probe at a binary that cannot exist, so this test spawns no
+        // process a developer machine might not have and never reaches the
+        // network (AGENTS.md §8).
+        "smart-review-no-such-binary".clone_into(&mut context.config.forge.gh_path);
         let names: Vec<&str> = collect(&context).iter().map(|check| check.name).collect();
         assert!(names.contains(&"git"), "{names:?}");
         assert!(names.contains(&"gh"), "{names:?}");
+    }
+
+    #[test]
+    fn reading_the_tail_of_a_file_is_bounded() {
+        let dir = temp_home();
+        // One warning far from the end and one inside the tail window: only the
+        // second should be counted, which is what proves the read is bounded.
+        let body = format!(
+            "2026-01-01T00:00:00Z warn  ancient warning\n{}\n2026-01-01T00:00:01Z warn  recent warning\n",
+            "x".repeat(200_000)
+        );
+        let path = dir.write("big.log", &body);
+
+        let summary = tail_summary(&path, 200);
+        assert!(summary.contains("recent warning"), "{summary}");
+        assert!(
+            !summary.contains("ancient warning"),
+            "the whole file was read: {summary}"
+        );
+    }
+
+    #[test]
+    fn the_tail_reader_survives_a_single_long_line() {
+        let dir = temp_home();
+        let path = dir.write("one.log", &"y".repeat(200_000));
+        assert!(tail_summary(&path, 200).contains("no warnings or errors"));
     }
 
     #[test]

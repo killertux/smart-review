@@ -7,6 +7,9 @@
 //! Volatile content (the home path and the uptime counter) is normalised so the
 //! snapshots are stable across machines and runs.
 
+// An integration test is its own crate, so it needs its own allow: assertions
+// unwrap, and `UPDATE_SNAPSHOTS=1` prints. Production code is still covered by
+// the workspace lints (AGENTS.md §7).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -96,12 +99,22 @@ fn buffer_to_string(buffer: &Buffer) -> String {
 }
 
 /// Removes the parts of a frame that legitimately differ between runs.
+///
+/// The path rows are replaced wholesale rather than by string substitution: the
+/// pane shortens long paths, and whether it shortens depends on where the
+/// checkout lives (a repository under `$HOME` and one in `/tmp` render
+/// differently). `paths::shorten_for_display` has its own test for that.
 fn normalize(text: &str, home: &Path) -> String {
     text.replace(&home.display().to_string(), "<HOME>")
         .lines()
         .map(|line| {
-            if line.trim_start().starts_with("uptime") {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("uptime") {
                 " uptime    0s".to_owned()
+            } else if trimmed.starts_with("home ") {
+                " home     <HOME>".to_owned()
+            } else if trimmed.starts_with("config ") {
+                " config   <HOME>/config.toml".to_owned()
             } else {
                 line.to_owned()
             }

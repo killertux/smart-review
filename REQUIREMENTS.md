@@ -344,7 +344,7 @@ Two built-in themes (`dark`, `light`), user themes in `~/.smart-review/themes/*.
 Acceptance criteria:
 - [ ] Themeable elements: app background/foreground, borders, titles, cursor line, selection, status line (normal/insert/command/error), notification levels, tree (dir/file/modified/added/deleted), diff (add, add-emphasis, del, del-emphasis, context, hunk header, line numbers, stale marker), comment/draft markers, chat (user/assistant/system), syntax tokens.
 - [ ] Missing keys fall back to the theme's declared `base` (default `dark`), then to built-in defaults.
-- [ ] Invalid color values report the file, line and accepted formats (named, `#RRGGBB`, `#RGB`, `indexed:N`).
+- [ ] Invalid color values report the file, the element, the rejected value and the accepted formats (named, `#RRGGBB`, `#RGB`, `indexed:N`). Line numbers would need span-preserving parsing (`toml_edit`, DEC-19); the same trade-off as FR-7.2.
 - [ ] Respecting `NO_COLOR` is MAY but if implemented must keep the UI usable.
 
 **FR-7.8 Layout & responsiveness** — MUST — M0

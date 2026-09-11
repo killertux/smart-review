@@ -39,6 +39,9 @@ pub struct Startup {
     pub theme: Theme,
     /// Where the theme came from, for `:doctor`.
     pub theme_source: String,
+    /// The name the theme was requested by (a built-in name or a file stem),
+    /// which is what the picker marks. It can differ from `theme.name()`.
+    pub theme_request: String,
     /// Persisted state.
     pub state: AppState,
     /// Non-fatal problems to report once the UI is up.
@@ -122,6 +125,13 @@ impl Startup {
             .or_else(|| state.theme.clone())
             .unwrap_or(default_theme);
 
+        // Remember what was asked for: a theme file may declare its own display
+        // name, and the picker has to mark the entry the user actually chose.
+        let theme_request = if requested.is_empty() {
+            "dark".to_owned()
+        } else {
+            requested.clone()
+        };
         let (theme, theme_source) = match theme::load(&home, &requested, &mut warnings) {
             Ok(loaded_theme) => loaded_theme,
             Err(error) => {
@@ -142,6 +152,7 @@ impl Startup {
             keymap,
             theme,
             theme_source,
+            theme_request,
             state,
             warnings,
             repo: cli.repo.clone(),

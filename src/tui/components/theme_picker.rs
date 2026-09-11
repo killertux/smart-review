@@ -17,9 +17,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let names = &app.picker_items;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (index, name) in names.iter().enumerate() {
+    for (index, entry) in names.iter().enumerate() {
         let selected = index == app.picker_cursor();
-        let current = name == app.theme.name();
+        // Compare the requested name, not the display name a theme file may
+        // declare, or the marker lands on the wrong row (FR-7.7).
+        let current = entry.name == app.theme_request;
         let style = if selected {
             theme.style(element::PICKER_SELECTED)
         } else {
@@ -27,7 +29,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         let marker = if current { "*" } else { " " };
         lines.push(Line::from(Span::styled(
-            format!(" {marker} {name} "),
+            format!(" {marker} {} ", entry.name),
             style,
         )));
     }

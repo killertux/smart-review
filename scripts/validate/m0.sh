@@ -136,8 +136,9 @@ else
   cat /tmp/m0-bad-config.log
 fi
 
-# The warning has to say which file it is about (FR-8.6).
-if grep -q "$TMP_HOME/config.toml" /tmp/m0-bad-config.log; then
+# The warning itself has to name the file (FR-8.6). The doctor's config line
+# always mentions the path, so match the prefix only a prefixed warning has.
+if grep -q "$TMP_HOME/config.toml: config:" /tmp/m0-bad-config.log; then
   ok "the warning names the configuration file"
 else
   bad "the warning does not name the configuration file"

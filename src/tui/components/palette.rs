@@ -9,7 +9,6 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::tui::action;
 use crate::tui::app::{App, PALETTE_ROWS};
 use crate::tui::keymap::Mode;
 use crate::tui::theme::element;
@@ -25,8 +24,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let matches = crate::tui::update::candidates(&app.command.input);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for (name, action_id) in matches.iter().take(PALETTE_ROWS) {
-        let description = action::find(action_id).map_or("", |definition| definition.description);
+    for (name, description) in matches.iter().take(PALETTE_ROWS) {
         let selected = app.command.input.trim() == *name;
         let style = if selected {
             theme.style(element::SELECTION)
@@ -35,7 +33,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {name:<10}"), style),
-            Span::styled(description.to_owned(), theme.style(element::MUTED)),
+            Span::styled((*description).to_owned(), theme.style(element::MUTED)),
         ]));
     }
 

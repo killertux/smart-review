@@ -192,6 +192,17 @@ pub enum Origin {
     },
 }
 
+impl Origin {
+    /// A `file [section] "key"` label for warnings, or `None` for compiled-in
+    /// bindings, which have no file to point at (FR-7.2).
+    fn label(&self) -> Option<String> {
+        match self {
+            Self::Default => None,
+            Self::User { file, section, key } => Some(format!("{file} [{section}] \"{key}\"")),
+        }
+    }
+}
+
 /// One binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
@@ -430,13 +441,16 @@ impl Keymap {
         origin: Origin,
         warnings: &mut Vec<String>,
     ) {
+        // Name the file, section and key in every warning it produces (FR-7.2).
+        let at = origin.label().unwrap_or_else(|| "keybinds".to_owned());
+
         if action == "none" || action == "nop" {
             let before = self.bindings.len();
             self.bindings
                 .retain(|binding| !(binding.scope == scope && binding.keys == keys));
             if before == self.bindings.len() {
                 warnings.push(format!(
-                    "keybinds: `{}` was not bound, so unbinding it does nothing",
+                    "{at}: `{}` was not bound, so unbinding it does nothing",
                     describe_sequence(keys)
                 ));
             }
@@ -444,8 +458,7 @@ impl Keymap {
         }
 
         if !action::is_known(action) {
-            let mut message =
-                format!("keybinds: `{action}` is not an action this build implements");
+            let mut message = format!("{at}: `{action}` is not an action this build implements");
             if let Some(suggestion) = action::suggest(action) {
                 let _ = write!(message, "; did you mean `{}`?", suggestion.id);
             }
@@ -461,7 +474,7 @@ impl Keymap {
             && previous.action != action
         {
             warnings.push(format!(
-                "keybinds: `{}` was already bound to `{}`; the later binding wins",
+                "{at}: `{}` was already bound to `{}`; the later binding wins",
                 describe_sequence(keys),
                 previous.action
             ));
@@ -675,14 +688,14 @@ pub fn load(home: &Home, ui: &UiConfig, warnings: &mut Vec<String>) -> Result<Ke
         for (key_spec, action_value) in section {
             let Some(action) = action_value.as_str() else {
                 warnings.push(format!(
-                    "keybinds: `[{section_name}] {key_spec}` should map to an action id string"
+                    "{file} [{section_name}] \"{key_spec}\": the value should be an action id string"
                 ));
                 continue;
             };
             let keys = match parse_keys(key_spec, &leader) {
                 Ok(keys) => keys,
                 Err(error) => {
-                    warnings.push(format!("keybinds: {error}"));
+                    warnings.push(format!("{file} [{section_name}] \"{key_spec}\": {error}"));
                     continue;
                 }
             };
@@ -997,6 +1010,13 @@ mod tests {
         }
         assert!(
             warnings.iter().any(|w| w.contains("did you mean")),
+            "{warnings:?}"
+        );
+        // FR-7.2: a warning has to say which file, section and key it is about.
+        assert!(
+            warnings.iter().any(|w| w.contains("keybinds.toml")
+                && w.contains("[normal]")
+                && w.contains("\"zz\"")),
             "{warnings:?}"
         );
     }

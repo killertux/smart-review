@@ -23,7 +23,7 @@
 │                                                      ││                                          │
 │                                                      ││                                          │
 └──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- theme     Choose a theme
+ theme     Choose a theme, or :theme <name>|reload
 
 
  COMMAND list · acme/service · — · — · 0 drafts              ? help · <leader> actions · : commands
