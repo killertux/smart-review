@@ -44,6 +44,8 @@ Inside the app:
 | `}` / `{` | next / previous file |
 | `za` | fold the hunk (or the whole file, from its banner) |
 | `y` | copy the current file path (OSC 52) |
+| wheel | scroll the pane under the pointer |
+| click | focus a pane and put the cursor on the row you clicked |
 | `<Space>f` / `<Space>s` | add a filter / change the order |
 | `<Space>d` then `s` `c` `w` | split view, context lines, whitespace |
 | `<Space>t` / `<Space>T` | theme picker / next theme |
@@ -56,6 +58,10 @@ Inside the app:
 `:sort updated desc`, `:load-more`, `:copy-path`, `:theme <name>|next|reload`,
 `:set ui.timeoutlen=250`, `:keymap`, `:version`. `Esc` closes a popup or cancels a
 half-typed key sequence.
+
+Opening a pull request fetches its detail and then its diff, so the wait shows a
+centred indicator naming the pull request, which step it is on and how long it has
+been going; `Esc` gives up on it.
 
 Two mechanisms filter the list, and the interface keeps them visibly apart: the
 **chips** change what GitHub is asked (`gh pr list --search`), while the `/` box

@@ -423,8 +423,7 @@ mod tests {
             script.push_str(
                 "  *) echo \"fake gh: unexpected call: $*\" >&2; exit 1 ;;\nesac\nexit 0\n",
             );
-            dir.write("gh", &script);
-            set_executable(&dir.path().join("gh"));
+            dir.write_executable("gh", &script);
 
             Self { dir }
         }
@@ -456,15 +455,6 @@ mod tests {
             self.calls().pop().unwrap_or_default()
         }
     }
-
-    #[cfg(unix)]
-    fn set_executable(path: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    #[cfg(not(unix))]
-    fn set_executable(_path: &std::path::Path) {}
 
     const LIST: &str = include_str!("../../../tests/fixtures/gh/pr-list.json");
     const VIEW: &str = include_str!("../../../tests/fixtures/gh/pr-view.json");
@@ -747,9 +737,7 @@ mod tests {
     #[test]
     fn a_cancelled_call_does_not_wait_for_the_timeout() {
         let dir = temp_home();
-        let program = dir.path().join("gh");
-        dir.write("gh", "#!/bin/sh\nsleep 30\n");
-        set_executable(&program);
+        let program = dir.write_executable("gh", "#!/bin/sh\nsleep 30\n");
 
         let forge = GhCliForge::new(&program, RepoId::parse("acme/service").unwrap());
         let cancel = Cancel::new();

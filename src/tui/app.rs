@@ -153,6 +153,49 @@ pub enum Overlay {
     ThemePicker,
 }
 
+/// A pull request being opened, and how far along that is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opening {
+    /// Which pull request.
+    pub number: u64,
+    /// Which step the fetch is on.
+    pub stage: OpeningStage,
+    /// When the fetch started, for the elapsed time.
+    started_at: u64,
+}
+
+/// The two steps of opening a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningStage {
+    /// `gh pr view`: the metadata, commits, checks and reviews.
+    Detail,
+    /// `gh pr diff`: the patch itself, which is the slow one.
+    Diff,
+}
+
+impl Opening {
+    /// The first line of the indicator.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        format!("Opening #{}", self.number)
+    }
+
+    /// The second line: what is being fetched, and for how long.
+    #[must_use]
+    pub fn detail(&self, now: u64) -> String {
+        let what = match self.stage {
+            OpeningStage::Detail => "fetching the pull request",
+            OpeningStage::Diff => "fetching the diff",
+        };
+        let elapsed = now.saturating_sub(self.started_at);
+        if elapsed < 2 {
+            what.to_owned()
+        } else {
+            format!("{what} · {elapsed}s so far")
+        }
+    }
+}
+
 /// Severity of a status line message (FR-7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
@@ -307,6 +350,10 @@ pub struct App {
     pub(crate) detail: Option<PullRequestDetail>,
     /// The review view, present when a pull request is open (FR-3.3).
     pub(crate) review: Option<DiffView>,
+    /// The pull request being opened, if one is (FR-7.6).
+    opening: Option<Opening>,
+    /// Advances the opening spinner; driven by the loop's tick.
+    spinner: usize,
     /// Whether the diff is still being fetched.
     pub(crate) diff_loading: bool,
     /// Why the shown diff came from the cache, when it did (DEC-14).
@@ -340,6 +387,8 @@ pub struct App {
     filter_bar_rect: ratatui::layout::Rect,
     /// The list pane's rectangle, learned from the last frame.
     list_pane: ratatui::layout::Rect,
+    /// The whole body rectangle, for the bounds a click has to fall inside.
+    body_rect: ratatui::layout::Rect,
     /// The first row of the review panes.
     review_top: u16,
     /// The width of the file tree, which separates the two review panes.
@@ -411,6 +460,8 @@ impl App {
             list,
             detail: None,
             review: None,
+            opening: None,
+            spinner: 0,
             diff_loading: false,
             diff_offline: None,
             environment_job: 0,
@@ -447,6 +498,7 @@ impl App {
             last_width: 0,
             filter_bar_rect: ratatui::layout::Rect::default(),
             list_pane: ratatui::layout::Rect::default(),
+            body_rect: ratatui::layout::Rect::default(),
             review_top: 0,
             tree_width: 30,
             quit: false,
@@ -545,6 +597,7 @@ impl App {
         self.review = Some(view);
         self.focus = Pane::Diff;
         self.diff_loading = false;
+        self.stop_opening();
     }
 
     /// Closes the review screen and returns to the list (FR-3.4).
@@ -589,9 +642,12 @@ impl App {
                 self.count_job = id;
                 self.list.counting = true;
             }
-            Effect::OpenPullRequest(_) => {
+            Effect::OpenPullRequest(number) => {
                 self.detail_job = id;
                 self.diff_loading = true;
+                // The indicator appears on the key press rather than when the first
+                // response arrives: the wait is what it exists for.
+                self.begin_opening(*number);
             }
             Effect::RunDoctor => self.doctor_job = id,
             // The rest ask for no job, or are handled by `apply` rather than here.
@@ -734,6 +790,45 @@ impl App {
         None
     }
 
+    /// Notes that a pull request is being opened, which the indicator shows.
+    pub fn begin_opening(&mut self, number: u64) {
+        self.opening = Some(Opening {
+            number,
+            stage: OpeningStage::Detail,
+            started_at: self.now_unix_secs,
+        });
+    }
+
+    /// Moves the indicator on to the second step.
+    pub fn advance_opening(&mut self) {
+        if let Some(opening) = self.opening.as_mut() {
+            opening.stage = OpeningStage::Diff;
+        }
+    }
+
+    /// Stops showing the indicator.
+    pub fn stop_opening(&mut self) {
+        self.opening = None;
+    }
+
+    /// The pull request being opened, if one is.
+    #[must_use]
+    pub fn opening(&self) -> Option<Opening> {
+        self.opening
+    }
+
+    /// The spinner frame, advanced by the loop's tick.
+    #[must_use]
+    pub fn spinner(&self) -> usize {
+        self.spinner
+    }
+
+    /// The clock as of the last loop iteration.
+    #[must_use]
+    pub fn now_unix_secs(&self) -> u64 {
+        self.now_unix_secs
+    }
+
     /// Whether anything is in flight for the screen the user is looking at.
     #[must_use]
     pub fn loading_something(&self) -> bool {
@@ -745,6 +840,7 @@ impl App {
 
     /// Forgets the work that was cancelled, so the spinners stop.
     pub fn cancelled_in_flight(&mut self) {
+        self.stop_opening();
         self.environment_running = false;
         self.list.loading = false;
         self.list.counting = false;
@@ -771,6 +867,7 @@ impl App {
             self.list.error = Some(message.to_owned());
         } else if job == self.detail_job || job == self.patch_job {
             self.diff_loading = false;
+            self.stop_opening();
             self.notice(NoticeLevel::Error, format!("could not open it: {message}"));
         } else if job == self.count_job {
             // A missing count is not worth a notification: the list already says
@@ -806,25 +903,25 @@ impl App {
 
     /// Scrolls the pane under the pointer.
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) {
-        // The wheel moves the selection, three rows at a time, and the view follows
-        // it: the cursor is what `Enter` acts on, so leaving it behind the visible
-        // window would make the wheel feel like it changed nothing.
+        // Three rows a notch, and it scrolls the *text*: a wheel is for moving what you
+        // are reading. Moving the selection instead reads as the wheel being broken —
+        // or backwards — because the text only budges once the selection reaches the
+        // edge of the window.
         let pane = self.pane_at(column, row).unwrap_or(self.focus);
         match pane {
             Pane::PullRequests => {
-                self.list.move_cursor(delta * 3);
+                self.list.scroll_by(delta * 3);
                 self.focus = Pane::PullRequests;
             }
             Pane::Diff => {
                 if let Some(view) = self.review.as_mut() {
-                    // The tree and the diff are both in the right-hand region; the
-                    // tree is the narrow left one.
+                    // The tree and the diff share the region; the tree is the narrow
+                    // one on the left.
                     if column < self.tree_width {
-                        view.tree_focused = true;
-                        view.move_tree(delta * 3);
+                        view.scroll_tree_by(delta * 3);
                     } else {
                         view.tree_focused = false;
-                        view.move_by(delta * 3);
+                        view.scroll_by(delta * 3);
                     }
                 }
             }
@@ -843,27 +940,51 @@ impl App {
                 // the same offset the frame drew with.
                 if let Some(index) =
                     crate::tui::components::pr_list::row_at(self.list_pane, self.list.scroll, row)
+                    && index < self.list.visible_len()
                 {
                     self.list.select_visible(index);
                 }
             }
             Pane::Diff => {
+                // The visible row under the pointer, turned into an absolute index by
+                // the offset the frame drew with. Passing the offset itself to
+                // `move_by`/`move_tree` (both of which are *relative*) is what made
+                // clicks land somewhere else entirely once anything had scrolled.
+                let Some(offset) = self.review_row(row) else {
+                    return;
+                };
                 if let Some(view) = self.review.as_mut() {
                     if column < self.tree_width {
-                        view.tree_focused = true;
-                        let offset = row.saturating_sub(self.review_top + 1);
-                        view.move_tree(i32::from(offset));
-                        // A click on a tree row does what pressing Enter on it does:
-                        // opening a file, or folding a folder (FR-7.5).
-                        view.activate_tree();
+                        let index = view.tree_scroll + offset;
+                        // Only a row that exists: clicking the empty space below the
+                        // last file must not open it.
+                        if index < view.tree.len() {
+                            view.select_tree_row(index);
+                            // A click on a tree row does what pressing Enter on it
+                            // does: opening a file, or folding a folder (FR-7.5).
+                            view.activate_tree();
+                        }
                     } else {
-                        view.tree_focused = false;
-                        let offset = row.saturating_sub(self.review_top + 1);
-                        view.move_by(i32::from(offset));
+                        let index = view.scroll + offset;
+                        if index < view.rows.len() {
+                            view.tree_focused = false;
+                            view.select_row(index);
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// The row of a review pane a terminal row is over, as an offset into the visible
+    /// rows, or `None` when it is over a border, the tab bar, or nothing.
+    fn review_row(&self, row: u16) -> Option<usize> {
+        let first = self.review_top.saturating_add(1);
+        let last = self.body_rect.bottom().saturating_sub(2);
+        if row < first || row > last {
+            return None;
+        }
+        Some(usize::from(row - first))
     }
 
     /// Which pane a terminal coordinate is in, if any.
@@ -886,6 +1007,7 @@ impl App {
     /// only: the render path still performs no IO.
     fn record_geometry(&mut self, body: ratatui::layout::Rect) {
         self.last_width = body.width;
+        self.body_rect = body;
         self.tree_width = crate::tui::components::review::TREE_WIDTH;
         self.review_top = body.y + 1;
         // The filter bar sits above the list; the pane below it is the one the mouse
@@ -907,12 +1029,18 @@ impl App {
         }
         let height = crate::tui::components::pr_list::layout(self.list_pane).height;
         let position = self.list.cursor_position().unwrap_or(0);
-        self.list.scroll = crate::tui::components::scroll_for(
+        self.list.scroll = crate::tui::components::ensure_visible(
             position,
             self.list.scroll,
             height,
             self.list.visible_len(),
         );
+        // The wheel offsets are in visible rows, and a search or a refresh can change
+        // how many there are, so the stored offset is clamped after either.
+        self.list.scroll = self
+            .list
+            .scroll
+            .min(self.list.visible_len().saturating_sub(height));
     }
 
     /// How tall the review panes' row area is.
@@ -1213,6 +1341,9 @@ impl App {
 
     /// Expires old notifications.
     pub fn tick(&mut self) {
+        // The indicator's spinner is driven from here: the loop already calls this once
+        // per iteration, which is exactly the cadence an animation wants.
+        self.spinner = self.spinner.wrapping_add(1);
         self.tick_at(Instant::now());
     }
 
@@ -2414,21 +2545,65 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_moves_the_list_cursor_in_the_direction_the_terminal_reports() {
-        let (_dir, mut app) = list_app();
-        drawn(&mut app, 100, 30);
-        assert_eq!(app.list.selected().unwrap().number, 1);
+    fn the_wheel_scrolls_the_list_rather_than_only_moving_the_cursor() {
+        // More rows than fit, so the wheel has something to scroll.
+        let (dir, mut app) = app();
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=40).map(summary).collect(),
+            50,
+        ));
+        let _ = &dir;
+        drawn(&mut app, 100, 24);
+        assert_eq!(app.list.scroll, 0);
 
         app.on_mouse(wheel(10, 10, true));
-        assert!(
-            app.list.selected().unwrap().number > 1,
-            "a wheel-down event moves down the list"
-        );
-        let after_down = app.list.selected().unwrap().number;
+        assert!(app.list.scroll > 0, "a wheel-down event moves the text");
+
+        let scrolled = app.list.scroll;
         app.on_mouse(wheel(10, 10, false));
         assert!(
-            app.list.selected().unwrap().number < after_down,
-            "and a wheel-up event moves back up"
+            app.list.scroll < scrolled,
+            "and a wheel-up event moves it back"
+        );
+        assert_eq!(app.list.scroll, 0, "back to the top");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_diff_and_the_tree() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app) = review_app();
+        // A diff that is taller than the pane, so the wheel has somewhere to go.
+        let patch = crate::domain::diff::parse_patch(include_str!(
+            "../../tests/fixtures/gh/pr-diff-large.patch"
+        ));
+        app.set_review(DiffView::new(patch));
+        frame(&mut app, 120, 30);
+        assert_eq!(app.review.as_ref().unwrap().scroll, 0);
+
+        app.on_mouse(wheel(60, app.review_top + 4, true));
+        let after = app.review.as_ref().unwrap().scroll;
+        assert!(after > 0, "the wheel moves the diff text");
+
+        app.on_mouse(wheel(60, app.review_top + 4, false));
+        assert!(
+            app.review.as_ref().unwrap().scroll < after,
+            "and moves it back"
+        );
+    }
+
+    #[test]
+    fn a_click_below_the_last_tree_row_does_nothing() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+        let before = app.review.as_ref().unwrap().current_path().cloned();
+
+        // Far below the two-line tree, inside the pane's rectangle.
+        app.on_mouse(click(5, app.review_top + 12));
+        assert_eq!(
+            app.review.as_ref().unwrap().current_path().cloned(),
+            before,
+            "the empty space under the tree is not a row"
         );
     }
 
@@ -2443,6 +2618,27 @@ mod tests {
         );
         app.set_review(DiffView::new(patch));
         (dir, app)
+    }
+
+    #[test]
+    fn a_click_on_a_file_row_opens_that_file() {
+        let (_dir, mut app) = review_app();
+        let terminal = drawn(&mut app, 120, 30);
+
+        // Row two of the tree is `src/two.rs`: the row is found on screen, so the test
+        // does not depend on how the pane's rows are counted.
+        let row = row_of(&terminal, "two.rs");
+        app.on_mouse(click(5, row));
+        assert_eq!(
+            app.review
+                .as_ref()
+                .unwrap()
+                .current_path()
+                .unwrap()
+                .as_str(),
+            "src/two.rs"
+        );
+        assert!(app.review.as_ref().unwrap().current_file_label().is_some());
     }
 
     #[test]

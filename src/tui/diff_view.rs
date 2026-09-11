@@ -215,6 +215,8 @@ pub struct DiffView {
     pub tree_cursor: usize,
     /// The first visible row of the tree.
     pub tree_scroll: usize,
+    /// How many tree rows fit, learned from the last frame.
+    pub tree_viewport: u16,
     /// Whether the split (side-by-side) view is asked for. Whether it can be
     /// *shown* is a width question, answered at draw time (DEC-4).
     pub split: bool,
@@ -254,6 +256,7 @@ impl DiffView {
             tree_focused: false,
             tree_cursor: 0,
             tree_scroll: 0,
+            tree_viewport: 0,
             split: false,
             context: 3,
             ignore_whitespace: false,
@@ -310,15 +313,13 @@ impl DiffView {
     /// on the world.
     pub fn prepare(&mut self, diff_height: u16, tree_height: u16) {
         self.ensure_visible(diff_height);
-        let tree_height = usize::from(tree_height.max(1));
-        let mut scroll = self.tree_scroll.min(self.tree_cursor);
-        if self.tree_cursor >= scroll + tree_height {
-            scroll = self.tree_cursor + 1 - tree_height;
-        }
-        if self.tree_cursor < scroll {
-            scroll = self.tree_cursor;
-        }
-        self.tree_scroll = scroll.min(self.tree.len().saturating_sub(tree_height));
+        self.tree_viewport = tree_height.max(1);
+        self.tree_scroll = crate::tui::components::ensure_visible(
+            self.tree_cursor,
+            self.tree_scroll,
+            usize::from(self.tree_viewport),
+            self.tree.len(),
+        );
     }
 
     /// The row under the cursor.
@@ -339,6 +340,30 @@ impl DiffView {
         self.patch.files.get(self.current_file()?)?.path()
     }
 
+    /// Scrolls the diff view by `delta` rows, dragging the cursor if it would be left
+    /// outside the window.
+    pub fn scroll_by(&mut self, delta: i32) {
+        crate::tui::components::scroll_view(
+            &mut self.cursor,
+            &mut self.scroll,
+            delta,
+            usize::from(self.viewport.max(1)),
+            self.rows.len(),
+        );
+    }
+
+    /// Scrolls the file tree by `delta` rows.
+    pub fn scroll_tree_by(&mut self, delta: i32) {
+        self.tree_focused = true;
+        crate::tui::components::scroll_view(
+            &mut self.tree_cursor,
+            &mut self.tree_scroll,
+            delta,
+            usize::from(self.tree_viewport.max(1)),
+            self.tree.len(),
+        );
+    }
+
     /// Moves by whole rows, stopping at the ends.
     pub fn move_by(&mut self, delta: i32) {
         if self.rows.is_empty() {
@@ -348,6 +373,26 @@ impl DiffView {
             .cursor
             .saturating_add_signed(delta as isize)
             .min(self.rows.len() - 1);
+    }
+
+    /// Puts the cursor on a row of the *window*, clamped to the rows that exist.
+    ///
+    /// What a click means: the pointer names a visible row, and the caller has already
+    /// added the scroll offset, so this is an absolute index into [`Self::rows`].
+    pub fn select_row(&mut self, index: usize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.cursor = index.min(self.rows.len() - 1);
+    }
+
+    /// Puts the tree cursor on a row, and gives the tree the focus.
+    pub fn select_tree_row(&mut self, index: usize) {
+        if self.tree.is_empty() {
+            return;
+        }
+        self.tree_focused = true;
+        self.tree_cursor = index.min(self.tree.len() - 1);
     }
 
     /// Moves to the first or last row.
@@ -516,18 +561,17 @@ impl DiffView {
     /// Called by the renderer with the height it was given, which is how the view
     /// learns the size of its own window without the reducer needing to know it.
     pub fn ensure_visible(&mut self, height: u16) {
-        let height = height.max(1);
-        self.viewport = height;
-        let height = usize::from(height);
-
-        let last = self.rows.len().saturating_sub(1);
-        self.cursor = self.cursor.min(last);
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + height {
-            self.scroll = self.cursor + 1 - height;
-        }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
+        self.viewport = height.max(1);
+        let height = usize::from(self.viewport);
+        // The shared rule, so the diff and the list agree on what "visible" means and a
+        // view the user scrolled by hand is not dragged back.
+        self.scroll = crate::tui::components::ensure_visible(
+            self.cursor,
+            self.scroll,
+            height,
+            self.rows.len(),
+        );
+        self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
     }
 
     /// The one-line summary the diff header shows.
@@ -984,6 +1028,28 @@ Binary files /dev/null and b/docs/logo.png differ
         assert_eq!(view.current().unwrap().file, 0);
         view.move_file(false);
         assert_eq!(view.cursor, 0, "and nothing before the first");
+    }
+
+    #[test]
+    fn a_click_selects_an_absolute_row() {
+        let mut view = view();
+        view.select_row(6);
+        assert_eq!(view.cursor, 6);
+        view.select_row(usize::MAX);
+        assert_eq!(view.cursor, view.rows.len() - 1, "clamped, not wrapped");
+
+        view.select_tree_row(3);
+        assert_eq!(view.tree_cursor, 3);
+        assert!(view.tree_focused);
+        view.select_tree_row(usize::MAX);
+        assert_eq!(view.tree_cursor, view.tree.len() - 1);
+
+        // An empty view stays at zero rather than panicking.
+        let mut empty = DiffView::new(Patch::default());
+        empty.select_row(4);
+        empty.select_tree_row(4);
+        assert_eq!(empty.cursor, 0);
+        assert_eq!(empty.tree_cursor, 0);
     }
 
     #[test]

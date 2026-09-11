@@ -147,9 +147,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Only the rows that fit are laid out (FR-3.3's rule, applied to the list too).
     let body_height = usize::from(area.height.saturating_sub(4));
     let visible = list.visible();
-    let position = list.cursor_position().unwrap_or(0);
-    let scroll =
-        crate::tui::components::scroll_for(position, list.scroll, body_height, visible.len());
+    // The offset `App::render` worked out, so the rows drawn here are the rows a click
+    // maps to.
+    let scroll = list.scroll.min(visible.len().saturating_sub(body_height));
 
     for row in visible.iter().skip(scroll).take(body_height) {
         let selected = *row == list.cursor_index();

@@ -212,14 +212,8 @@ mod tests {
     fn a_logged_out_gh_is_reported_with_what_it_said() {
         // The fake answers both probes: a version, then a failed auth status.
         let dir = crate::test_support::temp_home();
-        let program = dir.path().join("gh");
         let script = "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"gh version 2.45.0 (2025-07-18)\" ;;\n  auth) echo \"You are not logged into any GitHub hosts. Run gh auth login to authenticate.\" >&2; exit 1 ;;\nesac\nexit 0\n";
-        dir.write("gh", script);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755));
-        }
+        let program = dir.write_executable("gh", script);
 
         let probe = GhCliProbe::new(&program);
         match probe.probe(&Cancel::new()).unwrap() {

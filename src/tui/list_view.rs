@@ -196,6 +196,26 @@ impl PrListState {
         }
     }
 
+    /// Scrolls the view by `delta` rows, which is what the wheel does.
+    pub fn scroll_by(&mut self, delta: i32) {
+        let mut cursor = self.cursor_index();
+        let mut offset = self.scroll;
+        crate::tui::components::scroll_view(
+            &mut cursor,
+            &mut offset,
+            delta,
+            usize::from(self.viewport.max(1)),
+            self.items.len(),
+        );
+        // The cursor is stored as an index into `items`; the view offsets are positions
+        // within the visible rows, so the cursor is written back through the mapping.
+        let visible = self.visible();
+        if let Some(index) = visible.iter().position(|index| *index >= cursor) {
+            self.cursor = visible[index];
+        }
+        self.scroll = offset;
+    }
+
     /// Moves the cursor to the first or last visible row.
     pub fn move_cursor_to(&mut self, last: bool) {
         let visible = self.visible();

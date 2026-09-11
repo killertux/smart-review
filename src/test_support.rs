@@ -52,6 +52,31 @@ impl TempHome {
         let _ = std::fs::write(&path, contents);
         path
     }
+
+    /// Writes an executable script and returns its path.
+    ///
+    /// The contents go to a temporary name and are renamed into place, because writing
+    /// the script and then `exec`ing it is racy: another thread's `fork` inherits the
+    /// open write descriptor, and the kernel refuses to execute a file that any
+    /// process still holds open for writing — "Text file busy". The rename gives the
+    /// exec target an inode that was never open for writing anywhere.
+    #[cfg(unix)]
+    pub(crate) fn write_executable(&self, name: &str, contents: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let final_path = self.path.join(name);
+        let temporary = self.path.join(format!("{name}.pending"));
+        let _ = std::fs::write(&temporary, contents);
+        let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::rename(&temporary, &final_path);
+        final_path
+    }
+
+    /// Writes an executable script; on platforms without modes this is [`Self::write`].
+    #[cfg(not(unix))]
+    pub(crate) fn write_executable(&self, name: &str, contents: &str) -> PathBuf {
+        self.write(name, contents)
+    }
 }
 
 impl Default for TempHome {

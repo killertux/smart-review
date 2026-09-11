@@ -30,6 +30,18 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// runaway process cannot exhaust memory (NFR-1.3).
 pub const DEFAULT_OUTPUT_CAP: usize = 32 * 1024 * 1024;
 
+/// How many times a spawn is retried when the kernel says the file is busy.
+///
+/// "Text file busy" is not about our program being wrong: the kernel refuses to
+/// `exec` a file that any process holds open for writing, which happens when another
+/// thread in this process was mid-`fork` while the file was being written (a test
+/// harness building a fake `gh`, for instance) or when a package manager is replacing
+/// the binary. The condition clears as soon as that other process execs, so a retry
+/// over a few milliseconds is the right answer rather than a hard failure.
+const SPAWN_ATTEMPTS: u32 = 8;
+/// How long to wait between spawn attempts.
+const SPAWN_BACKOFF: Duration = Duration::from_millis(10);
+
 /// How often a running child is checked for exit, timeout and cancellation.
 ///
 /// This is the latency of `Esc` on a running command, so it is well inside the
@@ -287,20 +299,34 @@ impl ProcessRunner {
         if let Some(dir) = &spec.cwd {
             command.current_dir(dir);
         }
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| match source.kind() {
-                std::io::ErrorKind::NotFound => ProcessError::NotFound {
-                    program: program.clone(),
-                },
-                _ => ProcessError::Spawn {
-                    program: program.clone(),
-                    source,
-                },
-            })?;
+        let mut child = {
+            let mut attempts = 0;
+            loop {
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(source) => {
+                        attempts += 1;
+                        if is_text_file_busy(&source) && attempts < SPAWN_ATTEMPTS {
+                            thread::sleep(SPAWN_BACKOFF);
+                            continue;
+                        }
+                        return Err(match source.kind() {
+                            std::io::ErrorKind::NotFound => ProcessError::NotFound {
+                                program: program.clone(),
+                            },
+                            _ => ProcessError::Spawn {
+                                program: program.clone(),
+                                source,
+                            },
+                        });
+                    }
+                }
+            }
+        };
 
         // Read both pipes on their own threads: a child that fills one pipe while
         // we block on the other would otherwise deadlock.
@@ -440,6 +466,25 @@ fn read_capped(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     }
 
     (kept, truncated)
+}
+
+/// Whether an error is the kernel's "text file busy".
+///
+/// Matched on the raw code as well as the kind: `ExecutableFileBusy` wraps ETXTBSY,
+/// but a platform that reports it as `Other` would otherwise lose the retry.
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::ExecutableFileBusy {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // ETXTBSY is 26 on Linux and 26 on macOS.
+        error.raw_os_error() == Some(26)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Whether a program was given as a path rather than as a name to look up.
@@ -654,6 +699,17 @@ mod tests {
     fn an_empty_stderr_says_so_rather_than_showing_nothing() {
         let output = runner().run(&shell("exit 1"), &Cancel::new()).unwrap();
         assert_eq!(output.stderr_tail(), "no error output");
+    }
+
+    #[test]
+    fn a_busy_executable_is_recognised() {
+        let busy = std::io::Error::from_raw_os_error(26);
+        assert!(is_text_file_busy(&busy) || !cfg!(unix));
+        assert!(!is_text_file_busy(&std::io::Error::from_raw_os_error(2)));
+        assert!(!is_text_file_busy(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "nope"
+        )));
     }
 
     #[test]

@@ -39,9 +39,16 @@ BEFORE="$(git status --porcelain --ignored=no | sort)"
 make_fake_gh() {
   local dir="$1" fail_list="${2:-0}"
   mkdir -p "$dir"
-  cat >"$dir/gh" <<EOF
+
+  # The heredoc is quoted, so nothing in the script is expanded when it is *written*:
+  # the fake reads its own directory at run time instead. An unquoted heredoc expanded
+  # `$(...)` and `$FIXTURES` with the validator's own values, which is how `pr view`
+  # ended up answering 141 for every number, and how the patch case worked by luck.
+  cat >"$dir/gh" <<'GH'
 #!/bin/sh
-case "\$1:\$2" in
+here=$(dirname "$0")
+fixtures=$(cat "$here/fixtures")
+case "$1:$2" in
   --version:*)
     echo "gh version 2.45.0 (2025-07-18)"
     exit 0
@@ -53,33 +60,43 @@ case "\$1:\$2" in
     exit 0
     ;;
   pr:list)
-    if [ "$fail_list" = "1" ]; then
+    if [ "$(cat "$here/fail_list")" = "1" ]; then
       echo "could not resolve host: github.com" >&2
       exit 1
     fi
-    cat "$FIXTURES/pr-list.json"
+    cat "$fixtures/pr-list.json"
     exit 0
     ;;
   pr:view)
-    cat "$FIXTURES/pr-view.json"
+    # Answer for the number that was asked for: otherwise `:pr 138` opens a detail
+    # saying 141, and the diff that follows is the wrong one.
+    number=$(printf '%s' "$*" | sed -n 's/.*view \([0-9][0-9]*\).*/\1/p')
+    sed "s/\"number\": 141/\"number\": ${number:-141}/" "$fixtures/pr-view.json"
     exit 0
     ;;
   pr:diff)
-    cat "$FIXTURES/pr-diff.patch"
+    # Pull request 138 has a long diff, so the screen checks have something that
+    # actually overflows the pane.
+    case "$*" in
+      *138*) cat "$fixtures/pr-diff-large.patch" ;;
+      *) cat "$fixtures/pr-diff.patch" ;;
+    esac
     exit 0
     ;;
   api:*)
-    case "\$*" in
-      *graphql*) cat "$FIXTURES/graphql-count.json" ;;
+    case "$*" in
+      *graphql*) cat "$fixtures/graphql-count.json" ;;
       *) printf '[]' ;;
     esac
     exit 0
     ;;
 esac
-echo "fake gh: unexpected call: \$*" >&2
+echo "fake gh: unexpected call: $*" >&2
 exit 1
-EOF
+GH
   chmod +x "$dir/gh"
+  printf '%s' "$FIXTURES" >"$dir/fixtures"
+  printf '%s' "$fail_list" >"$dir/fail_list"
 }
 
 # Runs the interface in a pty, sends some keys, and strips the escape sequences so
@@ -335,6 +352,37 @@ else
     ok "hunk navigation reaches the next hunk"
   else
     bad "hunk navigation did not reach the second hunk"
+    printf '%s\n' "$SCREEN" | tail -8
+  fi
+
+  # The wheel scrolls the *text*. Opening a PR whose diff is longer than the pane and
+  # rolling down must move what is displayed: a wheel that only walks a selection down
+  # the screen looks broken, and it looked broken here twice.
+  HOME_WHEEL="$TMP/home-wheel"
+  SCREEN="$(run_tui "$HOME_WHEEL" ':pr 138\r' "$FAKE" /tmp/m1-wheel-before.log)"
+  if printf '%s' "$SCREEN" | saw "line 001 of the invoice"; then
+    ok "a long diff starts at the top"
+  else
+    bad "the long diff did not render from the top"
+    printf '%s\n' "$SCREEN" | tail -8
+  fi
+
+  HOME_WHEEL2="$TMP/home-wheel2"
+  SCREEN="$(run_tui "$HOME_WHEEL2" ':pr 138\r~\033[<65;60;12M\033[<65;60;12M\033[<65;60;12M' "$FAKE" /tmp/m1-wheel.log)"
+  if printf '%s' "$SCREEN" | saw "line 001 of the invoice"; then
+    bad "the wheel did not scroll the diff"
+    printf '%s\n' "$SCREEN" | tail -8
+  else
+    ok "the wheel scrolls the diff text"
+  fi
+
+  # And a click lands on the row it was aimed at: the second file in the tree.
+  HOME_CLICK="$TMP/home-click"
+  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;5M' "$FAKE" /tmp/m1-click.log)"
+  if printf '%s' "$SCREEN" | saw "A docs/logo.png"; then
+    ok "a click on a tree row opens that file"
+  else
+    bad "the click did not open the file under the pointer"
     printf '%s\n' "$SCREEN" | tail -8
   fi
 

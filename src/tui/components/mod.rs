@@ -9,6 +9,7 @@ pub mod filter_bar;
 pub mod header;
 pub mod help;
 pub mod leader;
+pub mod loading;
 pub mod palette;
 pub mod panes;
 pub mod pr_list;
@@ -24,6 +25,10 @@ use crate::tui::app::{App, Overlay};
 
 /// Renders whichever popup is open, if any (FR-7.3, FR-7.7, FR-9.3).
 pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // The opening indicator is not an overlay: it takes no keyboard focus, so a popup
+    // behind it still works and `Esc` means what it always means (give up).
+    loading::render(frame, area, app);
+
     match app.overlay() {
         Overlay::None => {}
         Overlay::Help => help::render(frame, area, app),
@@ -42,21 +47,49 @@ pub(crate) fn border_style(app: &App, pane: crate::tui::app::Pane) -> ratatui::s
     }
 }
 
-/// The first visible row of a scrolling list, keeping `cursor` inside the window.
+/// Clamps a view offset to the rows that exist.
+pub(crate) fn clamp_offset(offset: usize, height: usize, len: usize) -> usize {
+    offset.min(len.saturating_sub(height.max(1)))
+}
+
+/// The offset that keeps `cursor` inside the window.
 ///
-/// Shared by the list and the file tree so both scroll the same way: the previous
-/// offset is used as a hint but the cursor always wins, which is what keeps a
-/// refresh from scrolling the user somewhere unexpected (FR-2.3).
-pub(crate) fn scroll_for(cursor: usize, previous: usize, height: usize, len: usize) -> usize {
+/// This runs before every frame, and it never moves the window further than it has to:
+/// a cursor that is already visible leaves the offset alone, so a view the user
+/// scrolled by hand is not dragged back under the cursor.
+pub(crate) fn ensure_visible(cursor: usize, offset: usize, height: usize, len: usize) -> usize {
     let height = height.max(1);
-    let mut scroll = previous.min(cursor);
-    if cursor >= scroll + height {
-        scroll = cursor + 1 - height;
+    let offset = clamp_offset(offset, height, len);
+    if cursor < offset {
+        return clamp_offset(cursor, height, len);
     }
-    if cursor < scroll {
-        scroll = cursor;
+    if cursor >= offset + height {
+        return clamp_offset(cursor + 1 - height, height, len);
     }
-    scroll.min(len.saturating_sub(height))
+    offset
+}
+
+/// Scrolls the *view* by `delta` rows, dragging the cursor only if it would fall
+/// outside the window.
+///
+/// A wheel moves the text, which is what a wheel is for; the cursor follows only when
+/// it would otherwise be left behind, because the cursor is what `Enter` acts on.
+pub(crate) fn scroll_view(
+    cursor: &mut usize,
+    offset: &mut usize,
+    delta: i32,
+    height: usize,
+    len: usize,
+) {
+    let height = height.max(1);
+    *offset = clamp_offset(offset.saturating_add_signed(delta as isize), height, len);
+
+    let last = len.saturating_sub(1);
+    if *cursor < *offset {
+        *cursor = *offset;
+    } else if *cursor >= *offset + height {
+        *cursor = (*offset + height - 1).min(last);
+    }
 }
 
 /// Converts a number of lines into a `u16` height, saturating rather than

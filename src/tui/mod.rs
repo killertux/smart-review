@@ -229,6 +229,8 @@ pub(crate) fn apply(
             let id = runner.submit(Job::Patch { number, head_sha });
             app.patch_job = id;
             app.diff_loading = true;
+            // The second step of the same wait: fetching a large diff is the slow half.
+            app.advance_opening();
         }
 
         Effect::CopyPath(path) => {
