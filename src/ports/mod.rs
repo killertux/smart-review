@@ -17,6 +17,7 @@
 //! | [`SecretStore`] | M2a |
 //! | [`LlmPort`] | M2a (connection check) / M2b (analysis) |
 
+pub mod analysis;
 pub mod cache;
 pub mod cancel;
 pub mod catalog;

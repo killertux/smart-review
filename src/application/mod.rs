@@ -10,6 +10,7 @@
 //! return a value or a typed error. The event loop decides when to call them and
 //! what to do with the answer.
 
+pub mod analysis;
 pub mod environment;
 pub mod models;
 pub mod prs;

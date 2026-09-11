@@ -565,7 +565,7 @@ pub struct Cost {
 /// The shape is the catalog's: `toggle` is a boolean, `effort` a named level,
 /// `budget_tokens` a token count. Serialised into `config.toml` as
 /// `reasoning = { type = "…", value = … }`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Thinking {
     /// Send thinking on or off.
@@ -607,6 +607,17 @@ impl Thinking {
             Self::Effort { value } => value.clone(),
             Self::BudgetTokens { value } => value.to_string(),
         }
+    }
+
+    /// The setting as one token for a status line, `thinking:high` (FR-4.8).
+    ///
+    /// Separate from [`Thinking::value_label`] because the status line wants the
+    /// setting named and the value, while a list wants only the value next to a
+    /// control it already labels.
+    #[must_use]
+    pub fn label(thinking: &Option<Self>) -> Option<String> {
+        let thinking = thinking.as_ref()?;
+        Some(format!("thinking:{}", thinking.value_label()))
     }
 
     /// What to ask the `llm` crate for, or why the crate cannot express it.
