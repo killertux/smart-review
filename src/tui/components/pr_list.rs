@@ -54,7 +54,7 @@ impl Columns {
         }
     }
 
-    /// Total columns used, for padding the header underline.
+    /// Total columns the table needs, which a narrow pane is not allowed to exceed.
     fn total(&self) -> usize {
         2 + self.number
             + 1
@@ -99,11 +99,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // A sticky header row, so a long list stays readable.
     lines.push(header_row(theme, &columns));
-    let rule: String = "─".repeat(
-        columns
-            .total()
-            .min(usize::from(area.width).saturating_sub(2)),
-    );
+    // The rule spans the pane: it separates the header from the rows, so it should
+    // not stop where the last column happens to end.
+    let rule: String = "─".repeat(usize::from(area.width).saturating_sub(2));
     lines.push(Line::from(Span::styled(rule, theme.style(element::MUTED))));
 
     // Only the rows that fit are laid out (FR-3.3's rule, applied to the list too).
