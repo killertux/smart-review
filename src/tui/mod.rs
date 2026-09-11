@@ -8,9 +8,11 @@
 pub mod action;
 pub mod app;
 pub mod components;
+pub mod diff_view;
 pub mod event;
 pub mod keymap;
 pub mod layout;
+pub mod list_view;
 pub mod terminal;
 pub mod theme;
 pub mod update;
