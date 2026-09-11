@@ -283,7 +283,16 @@ mod tests {
         ]));
 
         let info = GitCli::new().in_dir(&root).detect().unwrap();
-        assert_eq!(info.root.as_deref(), Some(root.as_path()));
+        // `git rev-parse --show-toplevel` reports the *resolved* path, and on macOS
+        // the temporary directory is reached through a symlink (`/var` →
+        // `/private/var`), so the comparison is on the canonical form. The adapter is
+        // right to report what git says.
+        let reported = info.root.clone().unwrap_or_default();
+        let expected = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let reported_canonical =
+            std::fs::canonicalize(&reported).unwrap_or_else(|_| reported.clone());
+        assert_eq!(reported_canonical, expected);
+        assert!(reported.join(".git").exists(), "and it is the fixture");
         assert!(!info.git_version.is_empty());
         assert_eq!(info.remotes.len(), 1);
         assert_eq!(info.remotes[0].name, "origin");
