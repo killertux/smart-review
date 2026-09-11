@@ -272,6 +272,9 @@ pub fn write_selection(
         .ok_or_else(|| ConfigWriteError::NotATable {
             path: path.display().to_string(),
         })?;
+    // Implicit, so a config that had no `[llm]` section does not gain an empty one:
+    // only the `[llm.active]` table the user actually set appears.
+    llm.set_implicit(true);
     llm.insert("active", toml_edit::Item::Table(selection_table(selection)));
 
     crate::adapters::fs::write_atomic(path, &document.to_string()).map_err(|error| {

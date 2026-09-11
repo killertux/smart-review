@@ -369,6 +369,15 @@ impl PickerState {
     /// `key_present` is decided by the app, which is the only thing that can look at
     /// the credential store.
     pub fn advance(&mut self) -> PickerStep {
+        // The key and confirm steps have no list to select from: they act on what
+        // has already been chosen. Requiring a row here first is what made Enter do
+        // nothing at all on the key step, because the app clears the rows for it.
+        match self.step {
+            Step::Key => return self.finish_key(),
+            Step::Confirm => return self.commit(),
+            Step::Provider | Step::Model | Step::Thinking => {}
+        }
+
         let Some(row) = self.rows.get(self.cursor).cloned() else {
             return PickerStep::Refused("nothing is selected".to_owned());
         };
@@ -402,31 +411,70 @@ impl PickerState {
                 self.cursor = 0;
                 PickerStep::Moved
             }
-            (Step::Key, _) => {
-                let Some(provider) = self.provider.clone() else {
-                    return PickerStep::Refused("choose a provider first".to_owned());
-                };
-                if self.key_input.trim().is_empty() {
-                    self.notice = Some("type or paste the key first".to_owned());
-                    return PickerStep::Refused("the key is empty".to_owned());
-                }
-                PickerStep::KeyTyped {
-                    provider,
-                    key: self.key_input.clone(),
-                }
-            }
-            (Step::Confirm, _) => match (&self.provider, &self.model) {
-                (Some(provider), Some(model)) => PickerStep::Commit {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                    thinking: self.thinking.clone(),
-                },
-                _ => PickerStep::Refused("choose a model first".to_owned()),
-            },
             // A row that belongs to another step cannot happen: the app only ever
             // fills the rows for the current step. Refuse rather than panic.
             _ => PickerStep::Refused("that choice does not belong on this step".to_owned()),
         }
+    }
+
+    /// Enter on the key step: hand the key back to be stored (FR-4.5).
+    fn finish_key(&mut self) -> PickerStep {
+        let Some(provider) = self.provider.clone() else {
+            return PickerStep::Refused("choose a provider first".to_owned());
+        };
+        if self.key_input.trim().is_empty() {
+            self.notice = Some("type or paste the key first".to_owned());
+            return PickerStep::Refused("the key is empty".to_owned());
+        }
+        PickerStep::KeyTyped {
+            provider,
+            key: self.key_input.clone(),
+        }
+    }
+
+    /// Enter on the confirm step: commit what has been chosen (FR-4.5).
+    fn commit(&mut self) -> PickerStep {
+        match (&self.provider, &self.model) {
+            (Some(provider), Some(model)) => PickerStep::Commit {
+                provider: provider.clone(),
+                model: model.clone(),
+                thinking: self.thinking.clone(),
+            },
+            _ => PickerStep::Refused("choose a model first".to_owned()),
+        }
+    }
+
+    /// The two lines under the list: what happened, and what the keys do.
+    fn footer_lines(&self, theme: &Theme, checking_label: Option<&str>) -> Vec<Line<'static>> {
+        let mut footer: Vec<Line<'static>> = Vec::new();
+        if let Some(label) = checking_label {
+            footer.push(Line::from(Span::styled(
+                label.to_owned(),
+                theme.style(element::NOTICE_INFO),
+            )));
+        } else if let Some(notice) = &self.notice {
+            footer.push(Line::from(Span::styled(
+                notice.clone(),
+                theme.style(element::MUTED),
+            )));
+        }
+        let empty = self.rows.is_empty() && self.step != Step::Key;
+        footer.push(Line::from(Span::styled(
+            if empty {
+                "nothing matches; <C-u> clears the filter".to_owned()
+            } else {
+                match self.step {
+                    Step::Key => "type or paste the key · Enter saves · Esc goes back".to_owned(),
+                    Step::Confirm => {
+                        "Enter saves the choice and checks it with the provider · Esc goes back"
+                            .to_owned()
+                    }
+                    _ => "<C-n>/<C-p> or ↑/↓ move · Enter chooses · Esc goes back".to_owned(),
+                }
+            },
+            theme.style(element::MUTED),
+        )));
+        footer
     }
 
     /// Draws the picker.
@@ -520,34 +568,7 @@ impl PickerState {
         frame.render_widget(Paragraph::new(header), chunks[0]);
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
-        let mut footer = Vec::new();
-        if let Some(label) = checking_label {
-            footer.push(Line::from(Span::styled(
-                label.to_owned(),
-                theme.style(element::NOTICE_INFO),
-            )));
-        } else if let Some(notice) = &self.notice {
-            footer.push(Line::from(Span::styled(
-                notice.clone(),
-                theme.style(element::MUTED),
-            )));
-        }
-        let empty = self.rows.is_empty() && self.step != Step::Key;
-        footer.push(Line::from(Span::styled(
-            if empty {
-                "nothing matches; <C-u> clears the filter".to_owned()
-            } else {
-                match self.step {
-                    Step::Key => "type or paste the key · Enter saves · Esc goes back".to_owned(),
-                    Step::Confirm => {
-                        "Enter saves the choice and checks it with the provider · Esc goes back"
-                            .to_owned()
-                    }
-                    _ => "<C-n>/<C-p> or ↑/↓ move · Enter chooses · Esc goes back".to_owned(),
-                }
-            },
-            theme.style(element::MUTED),
-        )));
+        let footer = self.footer_lines(theme, checking_label);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
     }
 }
@@ -773,6 +794,7 @@ mod tests {
         picker.advance();
         picker.set_rows(thinking_rows());
         picker.advance();
+        picker.set_rows(Vec::new());
         assert!(matches!(picker.advance(), PickerStep::Refused(_)));
         assert_eq!(picker.step(), Step::Key, "still on the key step");
         assert!(
@@ -885,5 +907,43 @@ mod tests {
     fn advancing_with_an_empty_list_says_so() {
         let mut picker = PickerState::new();
         assert!(matches!(picker.advance(), PickerStep::Refused(_)));
+    }
+
+    #[test]
+    fn entering_the_key_step_clears_the_previous_steps_rows() {
+        // A guard against the bug this test suite missed: the key step must work
+        // with no rows at all, because that is the state the app puts it in.
+        let mut picker = PickerState::new();
+        picker.provider = Some("deepseek".to_owned());
+        picker.model = Some("m".to_owned());
+        picker.step = Step::Key;
+        picker.set_rows(Vec::new());
+        for character in "sk-1".chars() {
+            picker.push_char(character);
+        }
+        assert_eq!(
+            picker.advance(),
+            PickerStep::KeyTyped {
+                provider: "deepseek".to_owned(),
+                key: "sk-1".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_confirm_step_commits_with_no_rows_either() {
+        let mut picker = PickerState::new();
+        picker.provider = Some("deepseek".to_owned());
+        picker.model = Some("m".to_owned());
+        picker.step = Step::Confirm;
+        picker.set_rows(Vec::new());
+        assert_eq!(
+            picker.advance(),
+            PickerStep::Commit {
+                provider: "deepseek".to_owned(),
+                model: "m".to_owned(),
+                thinking: None
+            }
+        );
     }
 }

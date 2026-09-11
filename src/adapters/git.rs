@@ -270,8 +270,11 @@ impl WorkspacePort for GitCli {
         let path = self.worktree_path(repo, number).ok_or_else(|| {
             WorkspaceError::Failed("no worktree directory is configured".to_owned())
         })?;
-        self.drop_worktree(&path, cancel)?;
+        // The ref is deleted first, while the worktree still resolves to the
+        // repository that owns both: afterwards there is nothing left to run git in
+        // when the app was started from a different checkout.
         self.delete_head_ref(repo, number, cancel);
+        self.drop_worktree(&path, cancel)?;
         Ok(())
     }
 }

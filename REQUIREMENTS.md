@@ -1,6 +1,6 @@
 # Smart Review — Requirements Specification
 
-**Status:** Draft v0.8 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M1 is implemented and M2a is in progress; §5's keymap reflects M1.
+**Status:** Draft v0.8 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M1 and M2a are implemented; §5's keymap reflects them. M2b (analysis and review order) is next.
 **Scope:** v1 (MVP) + post-v1 backlog
 **Source of truth:** this file. If code and this file disagree, the file wins or the file is updated in the same change.
 

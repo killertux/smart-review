@@ -363,6 +363,40 @@ impl DiffLine {
     }
 }
 
+/// Where a diff was read from (FR-3.2).
+///
+/// Part of the cache key, because the two sources are not interchangeable: GitHub
+/// truncates very large diffs, and its patch is whatever its API decided to send,
+/// while the local diff is produced by `git diff` with the flags the user chose.
+/// Serving one for the other would look like a toggle that does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DiffSource {
+    /// `gh pr diff` from the forge.
+    Forge,
+    /// `git diff` in the pull request's worktree.
+    Worktree,
+}
+
+impl DiffSource {
+    /// A short label for the status line and notices.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Forge => "github",
+            Self::Worktree => "worktree",
+        }
+    }
+
+    /// The part of a cache key that distinguishes the sources.
+    #[must_use]
+    pub fn cache_tag(self) -> &'static str {
+        match self {
+            Self::Forge => "",
+            Self::Worktree => "-wt",
+        }
+    }
+}
+
 /// A whole patch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Patch {

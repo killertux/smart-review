@@ -24,7 +24,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use crate::application::environment::{DetectRequest, detect};
 use crate::application::prs::{FetchOutcome, Prs};
 use crate::doctor::{self, Check, Context};
-use crate::domain::diff::Patch;
+use crate::domain::diff::{DiffSource, Patch};
 use crate::domain::environment::Environment;
 use crate::domain::pr::PullRequestDetail;
 use crate::domain::query::PrQuery;
@@ -192,7 +192,12 @@ pub enum Outcome {
     /// A detail arrived, or the cached one did.
     Detail(Box<FetchOutcome<PullRequestDetail>>),
     /// A diff arrived, or the cached one did.
-    Patch(Box<FetchOutcome<Patch>>),
+    Patch {
+        /// The diff.
+        outcome: Box<FetchOutcome<Patch>>,
+        /// Where it was read from (FR-3.2).
+        source: DiffSource,
+    },
     /// The environment report.
     Checks(Vec<Check>),
     /// The model catalog arrived (FR-4.7).
@@ -296,7 +301,10 @@ impl Executor {
                 Err(error) => Outcome::Failed(error.to_string()),
             },
             Job::Patch { number, head_sha } => match prs.load_patch(*number, head_sha, cancel) {
-                Ok(outcome) => Outcome::Patch(Box::new(outcome)),
+                Ok(outcome) => Outcome::Patch {
+                    outcome: Box::new(outcome),
+                    source: DiffSource::Forge,
+                },
                 Err(error) => Outcome::Failed(error.to_string()),
             },
             // A local diff is read from the worktree rather than from the forge, and
@@ -310,25 +318,53 @@ impl Executor {
             } => {
                 // Cache first, with the flags in the key: re-opening a file with the
                 // same toggles must not re-run git (FR-3.2).
-                match prs.cached_patch_with(*number, head_sha, *options) {
+                match prs.cached_patch_with(*number, head_sha, *options, DiffSource::Worktree) {
                     Ok(Some(cached)) if !cached.stale => {
-                        return Outcome::Patch(Box::new(FetchOutcome::Fresh(cached.value)));
+                        return Outcome::Patch {
+                            outcome: Box::new(FetchOutcome::Fresh(cached.value)),
+                            source: DiffSource::Worktree,
+                        };
                     }
                     Ok(_) | Err(_) => {}
                 }
+                logging::log(
+                    Level::Debug,
+                    format!(
+                        "diffing {} locally at {} (context {}, whitespace {})",
+                        request.path.display(),
+                        head_sha,
+                        options.context,
+                        if options.ignore_whitespace {
+                            "ignored"
+                        } else {
+                            "shown"
+                        }
+                    ),
+                );
                 match self.workspace.diff(request, cancel) {
                     Ok(text) => {
                         let patch = crate::domain::diff::parse_patch(&text);
                         let _ = prs.store_local_patch(*number, head_sha, *options, &patch);
-                        Outcome::Patch(Box::new(FetchOutcome::Fresh(patch)))
+                        Outcome::Patch {
+                            outcome: Box::new(FetchOutcome::Fresh(patch)),
+                            source: DiffSource::Worktree,
+                        }
                     }
                     // The worktree is gone: the caller falls back to the forge, and
                     // says so rather than showing an empty diff.
-                    Err(error) => match prs.cached_patch_with(*number, head_sha, *options) {
-                        Ok(Some(cached)) => Outcome::Patch(Box::new(FetchOutcome::Offline {
-                            value: cached.value,
-                            reason: error.to_string(),
-                        })),
+                    Err(error) => match prs.cached_patch_with(
+                        *number,
+                        head_sha,
+                        *options,
+                        DiffSource::Worktree,
+                    ) {
+                        Ok(Some(cached)) => Outcome::Patch {
+                            outcome: Box::new(FetchOutcome::Offline {
+                                value: cached.value,
+                                reason: error.to_string(),
+                            }),
+                            source: DiffSource::Worktree,
+                        },
                         _ => Outcome::Failed(error.to_string()),
                     },
                 }

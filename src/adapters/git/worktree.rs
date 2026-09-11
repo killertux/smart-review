@@ -291,9 +291,23 @@ impl GitCli {
             })
     }
 
+    /// The directory to run repository-wide commands from.
+    ///
+    /// A managed worktree resolves to the repository that owns it (its `.git` file
+    /// points at that repository's git directory), so running *inside* the worktree
+    /// is what makes `:workspace clean` work no matter which directory the app was
+    /// started in. Without this, cleaning a worktree from another checkout fails with
+    /// "not a working tree" — which is exactly what the validator caught.
+    fn repo_dir(&self, path: &Path) -> PathBuf {
+        if path.is_dir() {
+            return path.to_path_buf();
+        }
+        self.cwd.clone().unwrap_or_else(|| PathBuf::from("."))
+    }
+
     /// Removes a worktree and its fetched head ref (FR-3.1).
     pub(crate) fn drop_worktree(&self, path: &Path, cancel: &Cancel) -> Result<(), WorkspaceError> {
-        let dir = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        let dir = self.repo_dir(path);
         if path.is_dir() {
             let path_arg = path.to_string_lossy().into_owned();
             let (_, _, stderr) =

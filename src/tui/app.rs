@@ -17,6 +17,7 @@ use crate::application::models::CatalogState;
 use crate::application::prs::FetchOutcome;
 use crate::config::{Config, ConfigDocument, ModelSelection};
 use crate::doctor::{Check, Context};
+use crate::domain::diff::DiffSource;
 use crate::domain::environment::{Environment, EnvironmentError};
 use crate::domain::pr::PullRequestDetail;
 use crate::error::Result;
@@ -468,6 +469,8 @@ pub struct App {
     pub(crate) catalog_job: u64,
     /// The diff flags the review screen is using (FR-3.2).
     pub(crate) diff_options: DiffOptions,
+    /// Where the diff on screen was read from (FR-3.2).
+    pub(crate) diff_source: DiffSource,
     /// The credential store, for reading and writing provider keys (FR-4.5).
     pub(crate) secret_store: std::sync::Arc<dyn SecretStore>,
     /// The workspace port, for listing managed worktrees (FR-3.1).
@@ -581,6 +584,7 @@ impl App {
             check_job: 0,
             catalog_job: 0,
             diff_options: DiffOptions::default(),
+            diff_source: DiffSource::Forge,
             workspace: None,
             workspace_job: 0,
             diff_offline: None,
@@ -822,7 +826,9 @@ impl App {
                 self.apply_detail(*outcome);
                 Some(Effect::ReloadDiff)
             }
-            Outcome::Patch(outcome) if job == self.patch_job => self.apply_patch(*outcome),
+            Outcome::Patch { outcome, source } if job == self.patch_job => {
+                self.apply_patch(*outcome, source)
+            }
             Outcome::Catalog(load) if job == self.catalog_job => {
                 self.apply_catalog(*load);
                 None
@@ -863,7 +869,7 @@ impl App {
             | Outcome::Page(_)
             | Outcome::Count(_)
             | Outcome::Detail(_)
-            | Outcome::Patch(_)
+            | Outcome::Patch { .. }
             | Outcome::Catalog(_)
             | Outcome::Workspace(_)
             | Outcome::ModelChecked(_)
@@ -902,6 +908,9 @@ impl App {
         // describes it is here, so this is where it is resolved.
         self.resolve_active_model();
         self.notice(NoticeLevel::Info, format!("model catalog: {summary}"));
+        if let Some(picker) = self.picker.as_mut() {
+            picker.set_notice(Some(summary));
+        }
         self.refresh_picker();
     }
 
@@ -955,7 +964,12 @@ impl App {
     }
 
     /// Applies a fetched or cached patch (FR-3.3).
-    fn apply_patch(&mut self, outcome: FetchOutcome<crate::domain::diff::Patch>) -> Option<Effect> {
+    fn apply_patch(
+        &mut self,
+        outcome: FetchOutcome<crate::domain::diff::Patch>,
+        source: DiffSource,
+    ) -> Option<Effect> {
+        self.diff_source = source;
         self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
         let patch = outcome.into_value();
         let view = DiffView::with_options(
@@ -970,7 +984,12 @@ impl App {
         }
         self.notice(
             NoticeLevel::Info,
-            format!("{} · {}", files.label(), self.list.status_label()),
+            format!(
+                "{} · from the {} · {}",
+                files.label(),
+                source.label(),
+                self.list.status_label()
+            ),
         );
         None
     }
@@ -1623,6 +1642,12 @@ impl App {
         self.model_problem.as_deref()
     }
 
+    /// Where the diff on screen came from (FR-3.2).
+    #[must_use]
+    pub fn diff_source(&self) -> DiffSource {
+        self.diff_source
+    }
+
     /// The picker, when it is open.
     #[must_use]
     pub fn picker(&self) -> Option<&PickerState> {
@@ -1724,6 +1749,9 @@ impl App {
             return;
         };
         let step = picker.step();
+        // The picker says where its list came from, which is how a user can tell a
+        // stale catalog from a fresh one without opening `:catalog` (FR-4.7).
+        let source = self.catalog.as_ref().map(CatalogState::summary);
         let query = picker.query().to_owned();
         let rows = match step {
             model_picker::Step::Provider => self
@@ -1756,6 +1784,11 @@ impl App {
         };
         if let Some(picker) = self.picker.as_mut() {
             picker.set_rows(rows);
+            if let Some(source) = source
+                && picker.notice().is_none()
+            {
+                picker.set_notice(Some(source));
+            }
         }
     }
 

@@ -1,4 +1,4 @@
- smart┌ Help  [27/48] ───────────────────────────────────────────────────────────────────────┐rvice
+ smart┌ Help  [27/49] ───────────────────────────────────────────────────────────────────────┐rvice
 │ filt│ APP                                                                                  │     │
 │ sear│   <C-c>, <Space>q, q  Quit smart-review                                              │     │
 ┌ no r│   <Space>?, ?         Show the help popup                                            │─────┐
@@ -9,6 +9,7 @@
 │     │   ·                   Show environment checks                                        │     │
 │     │   ·                   Show the version                                               │     │
 │     │   ·                   Dismiss the current notification                               │     │
+│     │   <Space>m            Choose the provider, model and thinking settings               │     │
 │     │   ·                   Fetch the next page of pull requests                           │     │
 │     │ NAVIGATION                                                                           │     │
 │     │   <Up>, k             Move up                                                        │     │
@@ -24,7 +25,6 @@
 │     │ PANES                                                                                │     │
 │     │   <Tab>               Focus the next pane                                            │     │
 │     │   <S-Tab>             Focus the previous pane                                        │     │
-│     │ SEARCH                                                                               │     │
-└─────│   /                   Filter the loaded pull requests as you type                    │─────┘
- POPUP│   <CR> (search), <Esc> (search)Stop editing the search                               │mands
+└─────│ SEARCH                                                                               │─────┘
+ POPUP│   /                   Filter the loaded pull requests as you type                    │mands
       └──────────────────────────────────────────────────────────────────────────────────────┘

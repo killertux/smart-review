@@ -14,11 +14,11 @@
 │                         │  ds          Side-by-side view, when the term│                         │
 │                         │  dw          Ignore whitespace-only changes  │                         │
 │                         │  f           Add a filter chip               │                         │
+│                         │  m           Choose the provider, model and t│                         │
 │                         │  q           Quit smart-review               │                         │
 │                         │  s           Change the sort order           │                         │
 │                         │  t           Choose a theme                  │                         │
 │                         └──────────────────────────────────────────────┘                         │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

@@ -40,6 +40,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(format!("{} ", app.focus().label()), background),
         Span::styled(format!("· {} ", repository_label(app)), background),
         Span::styled(format!("· {} ", pull_request_label(app)), background),
+        // Only worth a column once a diff is on screen: which source answered is
+        // what tells the user whether the context and whitespace toggles apply.
+        Span::styled(
+            if app.review.is_some() {
+                format!("· {} ", app.diff_source().label())
+            } else {
+                String::new()
+            },
+            background,
+        ),
         // In the review screen the cursor's file is what the user is reading, so it
         // belongs in the status line beside the pane name.
         Span::styled(current_file_label(app), background),

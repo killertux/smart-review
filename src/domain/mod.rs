@@ -18,7 +18,8 @@ pub mod repo;
 pub mod time;
 
 pub use diff::{
-    DiffLine, FileDiff, FileKind, FileStatus, Hunk, LineKind, Patch, PatchStats, RelPath,
+    DiffLine, DiffSource, FileDiff, FileKind, FileStatus, Hunk, LineKind, Patch, PatchStats,
+    RelPath,
 };
 pub use environment::{Environment, EnvironmentError, GhInstall, RunMode};
 pub use model::{

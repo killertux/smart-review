@@ -187,21 +187,22 @@ thinking → paste the API key into a masked prompt (saved to `credentials.toml`
 names the active model.
 
 **Work items**
-- [ ] `WorkspacePort` + `GitCliWorkspace`: `git fetch origin <base> refs/pull/<N>/head`, `git worktree add --detach`, merge-base resolution, `remove`, `prune` (FR-3.1, DEC-1).
-- [ ] Local diff mode: `--unified=<n>` runtime-adjustable, `-w` whitespace toggle, `--find-renames`, three-dot revision (FR-3.2).
-- [ ] `--pr N` actually opens that pull request: M1 accepted the flag, showed it and never acted on it.
-- [ ] File access at the PR revision via `git show <head>:<path>` (independent of worktree state) + `git ls-files` for the tree (FR-4.6, Appendix A).
-- [ ] Workspace lifecycle: reuse for the same head SHA, transparent recreation, `:workspace clean`, stale detection (FR-3.1, DEC-15 default = ask).
-- [ ] `ModelCatalogPort` + models.dev adapter: fetch, TTL cache at `cache/models.json`, offline/manual-entry fallback, hidden-if-unmappable providers (FR-4.7, §7.5).
-- [ ] Provider mapping (DEC-17): curated native backends + OpenAI-compatible passthrough via catalog `api` base URL.
-- [ ] `CredentialsStore`: masked in-TUI entry, atomic `0600` writes, env override + source reporting, `:key clear`, mode verification on load (FR-4.5, §7.4, NFR-3.1).
-- [ ] Model picker UI: three steps, searchable, `Esc` backs out, no restart required, status-line indicator, optional presets (FR-4.5).
-- [ ] Thinking controls constrained by `reasoning_options` (`toggle` / `effort` / `budget_tokens`), explicit refusal for unmappable options, reasoning token usage displayed, **no trace promised** (FR-4.8, DEC-18).
-- [ ] `[llm.active]` written back with `toml_edit`, preserving the user's comments and formatting (FR-8.6, DEC-19).
-- [ ] `LlmPort` + `llm`-crate adapter: chat with streaming and usage, bounded concurrency, cancellation by job id, superseded results dropped (FR-4.4, ARCH-5), plus the connection check the picker runs.
-- [ ] Tests: worktree lifecycle against a real fixture repo, diff flags, catalog parsing from a committed fixture, credential file mode and env precedence, picker state machine, thinking-option mapping.
+- [x] `WorkspacePort` + `GitCliWorkspace`: `git fetch origin <base> refs/pull/<N>/head`, `git worktree add --detach`, merge-base resolution, `remove`, `prune` (FR-3.1, DEC-1).
+- [x] Local diff mode: `--unified=<n>` runtime-adjustable, `-w` whitespace toggle, `--find-renames`, three-dot revision (FR-3.2).
+- [x] `--pr N` actually opens that pull request: M1 accepted the flag, showed it and never acted on it.
+- [x] File access at the PR revision via `git show <head>:<path>` (independent of worktree state) + `git ls-files` for the tree (FR-4.6, Appendix A).
+- [x] Workspace lifecycle: reuse for the same head SHA, transparent recreation, `:workspace clean`, stale detection (FR-3.1, DEC-15 default = ask).
+- [x] `ModelCatalogPort` + models.dev adapter: fetch, TTL cache at `cache/models.json`, offline/manual-entry fallback, hidden-if-unmappable providers (FR-4.7, §7.5).
+- [x] Provider mapping (DEC-17): curated native backends + OpenAI-compatible passthrough via catalog `api` base URL.
+- [x] `CredentialsStore`: masked in-TUI entry, atomic `0600` writes, env override + source reporting, `:key clear`, mode verification on load (FR-4.5, §7.4, NFR-3.1).
+- [x] Model picker UI: three steps, searchable, `Esc` backs out, no restart required, status-line indicator, optional presets (FR-4.5).
+- [x] Thinking controls constrained by `reasoning_options` (`toggle` / `effort` / `budget_tokens`), explicit refusal for unmappable options, reasoning token usage displayed, **no trace promised** (FR-4.8, DEC-18).
+- [x] `[llm.active]` written back with `toml_edit`, preserving the user's comments and formatting (FR-8.6, DEC-19).
+- [x] `LlmPort` + `llm`-crate adapter: chat with streaming and usage, bounded concurrency, cancellation by job id, superseded results dropped (FR-4.4, ARCH-5), plus the connection check the picker runs.
+- [x] Tests: worktree lifecycle against a real fixture repo, diff flags, catalog parsing from a committed fixture, credential file mode and env precedence, picker state machine, thinking-option mapping. `scripts/validate/m2a.sh` covers the same ground end to end, with a local catalog server and a real git repository.
 
 **FR coverage:** FR-3.1, 3.2 (local), 4.5, 4.7, 4.8.
+**Outstanding from this milestone:** the optional `[llm.presets]` convenience (`:model save` / `:model use`) and the manual-entry fallback for a catalog that cannot be fetched at all (FR-4.7's MAY). Both are recorded in §6.
 **Crates (approved):** `llm` (features `openrouter`, `deepseek`, TLS), `tokio`, `reqwest`, `toml_edit`.
 **Risks:** provider/model heterogeneity is the biggest unknown (DEC-17) — the passthrough path covers most of the catalog, and a provider that cannot be mapped is hidden rather than offered. `llm` crate gaps (effort levels, no reasoning text) are accounted for in FR-4.8. Worktree creation is the first thing here that writes outside `SMART_REVIEW_HOME`'s cache, so its failure modes get their own tests.
 
