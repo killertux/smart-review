@@ -27,6 +27,27 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "notice.clear",
         "Dismiss the current notification",
     ),
+    (
+        "clear-filters",
+        "filter.clear",
+        "Reset the filters and the search",
+    ),
+    (
+        "copy-path",
+        "review.copy_path",
+        "Copy the current file path",
+    ),
+    (
+        "filter",
+        "app.command",
+        "Add a filter: :filter author:alice",
+    ),
+    (
+        "load-more",
+        "app.load_more",
+        "Fetch the next page of pull requests",
+    ),
+    ("pr", "nav.open", "Open a pull request: :pr 141"),
     ("q", "app.quit", "Quit smart-review"),
     ("qa", "app.quit", "Quit smart-review"),
     ("quit", "app.quit", "Quit smart-review"),
@@ -35,6 +56,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "set",
         "app.command",
         "Change an option: :set ui.timeoutlen=250",
+    ),
+    (
+        "sort",
+        "app.command",
+        "Change the order: :sort updated desc",
     ),
     (
         "theme",
@@ -63,6 +89,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             app.start_doctor();
             Effect::RunDoctor
         }
+        "app.load_more" => load_more(app),
         "app.theme_picker" => {
             app.open_overlay(Overlay::ThemePicker);
             Effect::None
@@ -84,12 +111,52 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "app.refresh" => {
+            // `R` means "ask again for whatever I am looking at".
+            if app.review.is_some() {
+                Effect::ReloadDiff
+            } else if app.environment.is_none() {
+                Effect::DetectEnvironment
+            } else {
+                app.list.stale = None;
+                Effect::LoadPullRequests
+            }
+        }
+        "pane.next" => switch_pane(app, true),
+        "pane.prev" => switch_pane(app, false),
+        // The groups live in their own functions so that no single match has to hold
+        // the whole command surface.
+        other
+            if other.starts_with("app.")
+                || other.starts_with("notice.")
+                || other.starts_with("theme.") =>
+        {
+            dispatch_app(app, other)
+        }
+        other if other.starts_with("diff.") || other == "review.copy_path" => {
+            dispatch_diff(app, other)
+        }
+        other
+            if other.starts_with("nav.")
+                || other.starts_with("search.")
+                || other.starts_with("filter.")
+                || other == "sort.menu" =>
+        {
+            dispatch_list(app, other)
+        }
+        other => {
             app.notice(
-                NoticeLevel::Info,
-                "nothing to refresh yet: pull requests arrive in M1",
+                NoticeLevel::Warn,
+                format!("`{other}` is not implemented in this build"),
             );
             Effect::None
         }
+    }
+}
+
+/// Changes the focused pane and remembers it (FR-8.5).
+/// The application lifecycle and view actions.
+fn dispatch_app(app: &mut App, id: &str) -> Effect {
+    match id {
         "app.version" => {
             app.notice(
                 NoticeLevel::Info,
@@ -102,35 +169,460 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "theme.toggle" => app.toggle_theme(),
-        "nav.up" => {
-            app.move_cursor(-1);
+        other => unimplemented_action(app, other),
+    }
+}
+
+/// Reports an action that reached a sub-dispatcher with no arm for it.
+///
+/// Silently returning `Effect::None` would make a missing arm look like a working
+/// no-op, and it is what the "every registered action is dispatched" test looks for.
+fn unimplemented_action(app: &mut App, id: &str) -> Effect {
+    app.notice(
+        NoticeLevel::Warn,
+        format!("`{id}` is not implemented in this build"),
+    );
+    Effect::None
+}
+
+/// The list, search and filter actions.
+fn dispatch_list(app: &mut App, id: &str) -> Effect {
+    match id {
+        "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
+            // `move_current` routes to whichever pane has the cursor: the list, or the
+            // tree/diff of an open review. Calling the list directly here is what left
+            // `j`/`k` moving a cursor nothing drew.
+            match id {
+                "nav.up" => move_current(app, Movement::Rows(-1)),
+                "nav.down" => move_current(app, Movement::Rows(1)),
+                "nav.top" => move_to_end(app, false),
+                _ => move_to_end(app, true),
+            }
             Effect::None
         }
-        "nav.down" => {
-            app.move_cursor(1);
+        "nav.open" => open_selected(app),
+        "nav.back" => go_back(app),
+        "nav.half_down" | "nav.page_down" | "nav.half_up" | "nav.page_up" => {
+            let forward = matches!(id, "nav.half_down" | "nav.page_down");
+            let direction = if forward { 1 } else { -1 };
+            let movement = match id {
+                "nav.half_down" | "nav.half_up" => Movement::Half(direction),
+                _ => Movement::Page(direction),
+            };
+            move_current(app, movement);
             Effect::None
         }
-        "nav.top" => {
-            app.move_cursor_to(false);
+        "search.open" => {
+            app.cancel_overlay();
+            app.mode = Mode::Search;
             Effect::None
         }
-        "nav.bottom" => {
-            app.move_cursor_to(true);
+        "search.close" => {
+            // Leaving the search box keeps what was typed: it is a filter, not a
+            // half-finished command, and `Esc` again on the list clears it.
+            app.mode = Mode::Normal;
             Effect::None
         }
-        "pane.next" => set_focus(app, app.focus.next()),
-        "pane.prev" => set_focus(app, app.focus.prev()),
-        other => {
-            app.notice(
-                NoticeLevel::Warn,
-                format!("`{other}` is not implemented in this build"),
-            );
+        "search.next" => {
+            move_current(app, Movement::Rows(1));
+            Effect::None
+        }
+        "search.prev" => {
+            move_current(app, Movement::Rows(-1));
+            Effect::None
+        }
+        "filter.menu" => {
+            app.open_command("filter ");
+            Effect::None
+        }
+        "sort.menu" => {
+            app.open_command("sort ");
+            Effect::None
+        }
+        "filter.clear" => {
+            app.list.clear_filters();
+            app.list.stale = None;
+            if app.environment.is_some() {
+                Effect::LoadPullRequests
+            } else {
+                Effect::None
+            }
+        }
+        other => unimplemented_action(app, other),
+    }
+}
+
+/// The diff actions, which all need the review screen to be open.
+fn dispatch_diff(app: &mut App, id: &str) -> Effect {
+    match id {
+        "diff.next_hunk" => {
+            with_diff(app, |view| view.move_hunk(true));
+            Effect::None
+        }
+        "diff.prev_hunk" => {
+            with_diff(app, |view| view.move_hunk(false));
+            Effect::None
+        }
+        "diff.next_file" => {
+            with_diff(app, |view| {
+                view.tree_focused = false;
+                view.move_file(true);
+            });
+            Effect::None
+        }
+        "diff.prev_file" => {
+            with_diff(app, |view| {
+                view.tree_focused = false;
+                view.move_file(false);
+            });
+            Effect::None
+        }
+        "diff.toggle_hunk" => {
+            with_diff(app, crate::tui::diff_view::DiffView::toggle_hunk);
+            Effect::None
+        }
+        "diff.toggle_split" => toggle_split(app),
+        "diff.cycle_context" => cycle_context(app),
+        "diff.toggle_whitespace" => toggle_whitespace(app),
+        "review.copy_path" => copy_path(app),
+        other => unimplemented_action(app, other),
+    }
+}
+
+/// Puts the path of the file under the cursor on the clipboard (FR-3.4).
+fn copy_path(app: &mut App) -> Effect {
+    let path = app
+        .review
+        .as_ref()
+        .and_then(crate::tui::diff_view::DiffView::current_path)
+        .map(ToString::to_string);
+    if let Some(path) = path {
+        Effect::CopyPath(path)
+    } else {
+        app.notice(NoticeLevel::Warn, "there is no file under the cursor");
+        Effect::None
+    }
+}
+
+/// `:load-more`, or the `app.load_more` action.
+///
+/// Three different situations, three different sentences: everything is already
+/// shown, the configured cap has been reached (which is *not* the same as having
+/// everything), or there is another page to fetch (FR-2.1).
+fn load_more(app: &mut App) -> Effect {
+    if app.review.is_some() {
+        app.notice(
+            NoticeLevel::Warn,
+            "loading more applies to the list; press Esc to go back",
+        );
+        return Effect::None;
+    }
+    if app.list.holds_everything() {
+        app.notice(
+            NoticeLevel::Info,
+            format!(
+                "all {} matching pull requests are shown",
+                app.list.items.len()
+            ),
+        );
+        return Effect::None;
+    }
+    if !app.list.can_load_more() {
+        app.notice(
+            NoticeLevel::Warn,
+            format!(
+                "the {}-pull-request cap is reached; raise [review].page_size or max_pages to see more",
+                app.list.cap
+            ),
+        );
+        return Effect::None;
+    }
+    Effect::LoadMore
+}
+
+/// `:filter-remove 2` removes one chip (FR-2.2).
+fn remove_filter(app: &mut App, argument: &str) -> Effect {
+    // The chips are the state chip plus the filters; the state chip is index one.
+    match argument.trim().parse::<usize>() {
+        Ok(index) if index >= 1 => {
+            if app.list.remove_chip(index) {
+                Effect::LoadPullRequests
+            } else {
+                app.command_error(format!("there is no chip {index}"));
+                Effect::None
+            }
+        }
+        _ => {
+            app.command_error(format!(
+                ":filter-remove needs a chip number; the chips are {}",
+                app.list.chips().join(" ")
+            ));
             Effect::None
         }
     }
 }
 
-/// Changes the focused pane and remembers it (FR-8.5).
+/// `:pr N` opens that pull request (FR-7.4).
+fn open_pr(app: &mut App, argument: &str) -> Effect {
+    let trimmed = argument.trim().trim_start_matches('#');
+    match trimmed.parse::<u64>() {
+        Ok(number) => Effect::OpenPullRequest(number),
+        Err(_) if trimmed.is_empty() => {
+            app.command_error(":pr needs a number, e.g. :pr 141");
+            Effect::None
+        }
+        Err(_) => {
+            app.command_error(format!("`{trimmed}` is not a pull request number"));
+            Effect::None
+        }
+    }
+}
+
+/// `:filter author:alice` adds a chip and re-asks GitHub (FR-2.2).
+fn add_filter(app: &mut App, argument: &str) -> Effect {
+    if argument.is_empty() {
+        app.command_error(":filter needs a qualifier, e.g. :filter author:alice");
+        return Effect::None;
+    }
+    match crate::domain::query::Filter::parse_line(argument) {
+        Ok(filter) => {
+            app.list.push_filter(filter);
+            app.list.stale = None;
+            Effect::LoadPullRequests
+        }
+        Err(error) => {
+            // Refused rather than sent: a qualifier GitHub silently ignores looks
+            // like a bug in this app.
+            app.command_error(error.to_string());
+            Effect::None
+        }
+    }
+}
+
+/// `:sort updated desc` changes the order GitHub is asked for (FR-7.4).
+fn set_sort(app: &mut App, argument: &str) -> Effect {
+    let mut parts = argument.split_whitespace();
+    let field = parts.next().unwrap_or_default();
+    let direction = parts.next().unwrap_or("desc");
+    if field.is_empty() {
+        app.command_error(":sort needs a field: created or updated, then asc or desc");
+        return Effect::None;
+    }
+    let ascending = match direction {
+        "asc" => true,
+        "desc" => false,
+        other => {
+            app.command_error(format!("`{other}` is not a direction; use asc or desc"));
+            return Effect::None;
+        }
+    };
+    if let Some(sort) = crate::domain::query::PrSort::parse(field, ascending) {
+        app.list.sort = sort;
+        app.list.stale = None;
+        return Effect::LoadPullRequests;
+    }
+    app.command_error(format!("`{field}` is not sortable; use created or updated"));
+    Effect::None
+}
+
+/// Opens whatever the cursor is on: a pull request in the list, a file in the tree.
+fn open_selected(app: &mut App) -> Effect {
+    if let Some(view) = app.review.as_mut() {
+        if view.tree_focused {
+            view.activate_tree();
+        }
+        return Effect::None;
+    }
+    if let Some(number) = app.list.selected().map(|pr| pr.number) {
+        Effect::OpenPullRequest(number)
+    } else {
+        app.notice(NoticeLevel::Warn, "there is nothing to open");
+        Effect::None
+    }
+}
+
+/// `Esc`: closes the review, or clears what is narrowing the list (FR-3.4).
+///
+/// A back press while something is loading cancels that instead: `Esc` means "stop
+/// what you are doing" first, and "go back" when there is nothing to stop (NFR-1.4).
+fn go_back(app: &mut App) -> Effect {
+    if app.loading_something() {
+        return Effect::CancelInFlight;
+    }
+    if app.review.is_some() {
+        app.close_review();
+        return Effect::None;
+    }
+    if app.list.is_filtered() {
+        let was_loading = app.list.loading;
+        app.list.clear_filters();
+        app.list.stale = None;
+        // Only re-ask GitHub if something it was asked for changed.
+        return if was_loading || app.environment.is_none() {
+            Effect::None
+        } else {
+            Effect::LoadPullRequests
+        };
+    }
+    Effect::None
+}
+
+/// How far the cursor should move.
+///
+/// Three named distances rather than a `delta` and a boolean: the boolean version
+/// conflated "half a screen" with "a whole one" and silently turned `<C-f>` into a
+/// single row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Movement {
+    /// A number of rows, signed.
+    Rows(i32),
+    /// Half a screen, signed.
+    Half(i32),
+    /// A whole screen, signed.
+    Page(i32),
+}
+
+/// Moves whatever pane has the cursor.
+fn move_current(app: &mut App, movement: Movement) {
+    if let Some(view) = app.review.as_mut() {
+        if view.tree_focused {
+            // The tree is a list of files: a screen and a row mean the same thing to
+            // it, and paging it is not worth a second notion of position.
+            view.move_tree(movement.delta());
+            return;
+        }
+        match movement {
+            Movement::Rows(delta) => view.move_by(delta),
+            Movement::Half(delta) => view.move_page(delta, true),
+            Movement::Page(delta) => view.move_page(delta, false),
+        }
+        return;
+    }
+    match movement {
+        Movement::Rows(delta) => app.list.move_cursor(delta),
+        Movement::Half(delta) => app.list.move_page(delta, true),
+        Movement::Page(delta) => app.list.move_page(delta, false),
+    }
+}
+
+impl Movement {
+    /// The signed distance, for the panes that treat every movement as rows.
+    const fn delta(self) -> i32 {
+        match self {
+            Self::Rows(delta) | Self::Half(delta) | Self::Page(delta) => delta,
+        }
+    }
+}
+
+/// Jumps the cursor of whichever pane has it to the first or last row.
+fn move_to_end(app: &mut App, last: bool) {
+    if let Some(view) = app.review.as_mut() {
+        if view.tree_focused {
+            view.tree_cursor = if last {
+                view.tree.len().saturating_sub(1)
+            } else {
+                0
+            };
+        } else {
+            view.move_to(last);
+        }
+        return;
+    }
+    app.list.move_cursor_to(last);
+}
+
+/// Runs a closure against the open review view, if there is one.
+fn with_diff(app: &mut App, action: impl FnOnce(&mut crate::tui::diff_view::DiffView)) {
+    if let Some(view) = app.review.as_mut() {
+        action(view);
+    }
+}
+
+/// Turns the side-by-side view on or off, explaining when the terminal is too
+/// narrow to honour it (DEC-4).
+fn toggle_split(app: &mut App) -> Effect {
+    let width = app.terminal_width();
+    let Some(view) = app.review.as_mut() else {
+        app.notice(NoticeLevel::Warn, "open a pull request first");
+        return Effect::None;
+    };
+    view.split = !view.split;
+    let split = view.split;
+
+    if split && width > 0 && width < crate::tui::components::review::SPLIT_MIN_WIDTH {
+        app.notice(
+            NoticeLevel::Warn,
+            format!(
+                "side-by-side needs {} columns; this terminal has {width}, so the unified view is shown",
+                crate::tui::components::review::SPLIT_MIN_WIDTH
+            ),
+        );
+    } else if split {
+        app.notice(
+            NoticeLevel::Info,
+            "side-by-side view on (it needs 140 columns)",
+        );
+    } else {
+        app.notice(NoticeLevel::Info, "unified view on");
+    }
+    Effect::None
+}
+
+/// Explains that the context size needs the local workspace, without pretending to
+/// have changed anything (FR-3.2).
+///
+/// A remote diff comes from `gh pr diff`, which always emits three lines of context
+/// and never filters whitespace. Flipping the label would tell the user the pane is
+/// showing something it is not, so in M1 these keys explain rather than lie; M2's
+/// workspace re-diffs locally, where both settings are real.
+fn cycle_context(app: &mut App) -> Effect {
+    if app.review.is_none() {
+        app.notice(NoticeLevel::Warn, "open a pull request first");
+        return Effect::None;
+    }
+    app.notice(
+        NoticeLevel::Warn,
+        format!(
+            "context is fixed at {} lines in remote mode; the local workspace in M2 makes it adjustable",
+            app.review.as_ref().map_or(3, |view| view.context)
+        ),
+    );
+    Effect::None
+}
+
+/// Explains that ignoring whitespace needs the local workspace (FR-3.2).
+fn toggle_whitespace(app: &mut App) -> Effect {
+    if app.review.is_none() {
+        app.notice(NoticeLevel::Warn, "open a pull request first");
+        return Effect::None;
+    }
+    app.notice(
+        NoticeLevel::Warn,
+        "whitespace-ignoring diffs need the local workspace, which arrives in M2",
+    );
+    Effect::None
+}
+
+/// Moves the focus on. Inside a review that means the tree and the diff in turn
+/// (FR-3.3: the two panes keep independent cursors and `Tab` moves between them).
+fn switch_pane(app: &mut App, forward: bool) -> Effect {
+    if let Some(view) = app.review.as_mut() {
+        view.tree_focused = !view.tree_focused;
+        if view.tree_focused {
+            app.notice(NoticeLevel::Info, "file tree: Enter opens, j/k moves");
+        }
+        return Effect::None;
+    }
+    set_focus(
+        app,
+        if forward {
+            app.focus.next()
+        } else {
+            app.focus.prev()
+        },
+    )
+}
+
 fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
     app.focus = pane;
     app.state.focus = Some(pane.label().to_owned());
@@ -156,6 +648,13 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "version" => dispatch(app, "app.version"),
         "messages" => dispatch(app, "notice.clear"),
         "keymap" => keymap_command(app, argument),
+        "load-more" => dispatch(app, "app.load_more"),
+        "clear-filters" => dispatch(app, "filter.clear"),
+        "copy-path" => dispatch(app, "review.copy_path"),
+        "pr" => open_pr(app, argument),
+        "filter" => add_filter(app, argument),
+        "filter-remove" => remove_filter(app, argument),
+        "sort" => set_sort(app, argument),
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
             "reload" => app.reload_theme(),
@@ -212,6 +711,24 @@ fn set_option(app: &mut App, spec: &str) -> Effect {
 
     match key {
         "ui.theme" => app.set_theme(value),
+        "mouse" | "ui.mouse" => {
+            match value {
+                "true" | "on" | "yes" => {
+                    app.show_mouse(true);
+                    app.notice(NoticeLevel::Info, "mouse capture on");
+                }
+                "false" | "off" | "no" => {
+                    app.show_mouse(false);
+                    app.notice(NoticeLevel::Info, "mouse capture off");
+                }
+                other => {
+                    app.command_error(format!("`{other}` is not a boolean; use true or false"));
+                    return Effect::None;
+                }
+            }
+            // The loop owns the terminal, so the change is applied there.
+            Effect::SetMouse(app.mouse_enabled())
+        }
         "ui.timeoutlen" => {
             if let Ok(milliseconds) = value.parse::<u64>() {
                 app.keymap.set_timeout(Duration::from_millis(milliseconds));
@@ -267,7 +784,7 @@ pub fn candidates(input: &str) -> Vec<(&'static str, &'static str)> {
             let score = if typed.is_empty() {
                 0
             } else {
-                fuzzy_score(typed, name)?
+                crate::fuzzy::score(typed, name)?
             };
             Some((score, *name, *description))
         })
@@ -278,39 +795,6 @@ pub fn candidates(input: &str) -> Vec<(&'static str, &'static str)> {
         .into_iter()
         .map(|(_, name, description)| (name, description))
         .collect()
-}
-
-/// Subsequence match with bonuses for contiguity and for matching early.
-///
-/// Returns `None` when `needle` is not a subsequence of `haystack`.
-fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-
-    let characters: Vec<char> = haystack.chars().collect();
-    let mut score: i32 = 0;
-    let mut cursor = 0;
-    let mut previous: Option<usize> = None;
-
-    for wanted in needle.chars() {
-        let found = cursor
-            + characters
-                .get(cursor..)?
-                .iter()
-                .position(|c| *c == wanted)?;
-        score += 1;
-        if previous == Some(found.wrapping_sub(1)) {
-            score += 2;
-        }
-        cursor = found + 1;
-        previous = Some(found);
-    }
-
-    // Prefer shorter candidates, then earlier matches.
-    let length_penalty = i32::try_from(haystack.chars().count()).unwrap_or(i32::MAX);
-    let cursor_penalty = i32::try_from(cursor).unwrap_or(i32::MAX);
-    Some(score * 10 - length_penalty - cursor_penalty)
 }
 
 /// Completes a partially typed command name.
@@ -347,14 +831,20 @@ fn common_prefix(names: &[&str]) -> String {
     let Some(first) = names.first() else {
         return String::new();
     };
-    let mut length = first.len();
+    // Counted in characters, not bytes: the lengths of two names are only comparable
+    // per character, and slicing a `&str` inside one would panic.
+    let mut length = first.chars().count();
     for name in names.iter().skip(1) {
-        length = length.min(name.len());
-        while length > 0 && !name.starts_with(&first[..length]) {
+        length = length.min(name.chars().count());
+        while length > 0 {
+            let candidate: String = first.chars().take(length).collect();
+            if name.starts_with(&candidate) {
+                break;
+            }
             length -= 1;
         }
     }
-    first[..length].to_owned()
+    first.chars().take(length).collect()
 }
 
 fn closest_command(typed: &str) -> Option<&'static str> {
@@ -369,6 +859,24 @@ fn closest_command(typed: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app with a fixed, short home, for tests that only care about state.
+    fn test_app() -> (crate::test_support::TempHome, App) {
+        let dir = crate::test_support::temp_home();
+        let cli = crate::cli::Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(dir.path().to_path_buf()),
+            log_level: None,
+            check: false,
+        };
+        let startup = crate::Startup::load(&cli).unwrap();
+        (dir, App::new(startup).unwrap())
+    }
 
     #[test]
     fn every_command_maps_to_a_registered_action() {
@@ -409,10 +917,10 @@ mod tests {
 
     #[test]
     fn fuzzy_scoring_prefers_contiguous_and_shorter_matches() {
-        let contiguous = fuzzy_score("doc", "doctor").unwrap();
-        let scattered = fuzzy_score("doc", "d-o-c-nonsense").unwrap();
+        let contiguous = crate::fuzzy::score("doc", "doctor").unwrap();
+        let scattered = crate::fuzzy::score("doc", "d-o-c-nonsense").unwrap();
         assert!(contiguous > scattered, "{contiguous} vs {scattered}");
-        assert!(fuzzy_score("z", "doctor").is_none());
+        assert!(crate::fuzzy::score("z", "doctor").is_none());
     }
 
     #[test]
@@ -443,11 +951,105 @@ mod tests {
     }
 
     #[test]
-    fn every_registered_command_action_has_a_dispatch_arm() {
-        // `notice.clear` and `app.version` are reached through the command line,
-        // so the catch-all must not swallow them.
-        for id in ["app.version", "notice.clear"] {
-            assert!(action::is_known(id), "{id} should be registered");
+    fn every_listed_command_is_actually_handled() {
+        // The palette comes from `COMMANDS`, so a name listed there but missing from
+        // `command` would be offered to the user and then refused — which is exactly
+        // what happened to `:filter` before this test existed.
+        for (name, _, _) in super::COMMANDS {
+            let (_dir, mut app) = test_app();
+            // Commands that take an argument are given a valid one: the point is
+            // that the name is handled, not that it needs no argument.
+            let argument = match *name {
+                "filter" => " author:alice",
+                "sort" => " updated desc",
+                "pr" => " 141",
+                "set" => " ui.timeoutlen=250",
+                _ => "",
+            };
+            super::command(&mut app, &format!("{name}{argument}"));
+            let error = app.command_error_text();
+            assert!(
+                error.is_none(),
+                "`:{name}` is listed in the palette but refused: {error:?}",
+            );
         }
+    }
+
+    #[test]
+    fn filter_and_sort_arguments_are_validated_before_anything_is_sent() {
+        let (_dir, mut app) = test_app();
+
+        // A bad qualifier is refused with the name of the problem.
+        let effect = super::command(&mut app, "filter nonsense:x");
+        assert_eq!(effect, Effect::None);
+        assert!(
+            app.command_error_text()
+                .is_some_and(|text| text.contains("nonsense")),
+            "{:?}",
+            app.command_error_text()
+        );
+
+        // A good one re-asks GitHub.
+        let effect = super::command(&mut app, "filter author:alice");
+        assert_eq!(effect, Effect::LoadPullRequests);
+        assert_eq!(app.list.chips(), vec!["is:open", "author:alice"]);
+
+        // Sorting validates both halves.
+        assert_eq!(
+            super::command(&mut app, "sort updated asc"),
+            Effect::LoadPullRequests
+        );
+        assert_eq!(app.list.sort, crate::domain::query::PrSort::UpdatedAsc);
+        assert_eq!(super::command(&mut app, "sort nonsense"), Effect::None);
+        assert!(app.command_error_text().is_some());
+        assert_eq!(
+            super::command(&mut app, "sort created sideways"),
+            Effect::None
+        );
+        assert!(
+            app.command_error_text()
+                .is_some_and(|text| text.contains("sideways")),
+            "{:?}",
+            app.command_error_text()
+        );
+    }
+
+    #[test]
+    fn copy_path_offers_the_file_under_the_cursor() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app) = test_app();
+        // Without a review there is nothing to copy, and the user is told so.
+        assert_eq!(super::command(&mut app, "copy-path"), Effect::None);
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("no file")),
+            "a warning should say why nothing was copied"
+        );
+
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        app.set_review(DiffView::new(patch));
+        assert_eq!(
+            super::command(&mut app, "copy-path"),
+            Effect::CopyPath("src/a.rs".to_owned())
+        );
+    }
+
+    #[test]
+    fn pr_opens_the_number_it_is_given() {
+        let (_dir, mut app) = test_app();
+        assert_eq!(
+            super::command(&mut app, "pr 141"),
+            Effect::OpenPullRequest(141)
+        );
+        assert_eq!(
+            super::command(&mut app, "pr #141"),
+            Effect::OpenPullRequest(141),
+            "a leading hash is how a user writes it"
+        );
+        assert_eq!(super::command(&mut app, "pr"), Effect::None);
+        assert!(app.command_error_text().is_some());
     }
 }

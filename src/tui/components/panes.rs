@@ -5,20 +5,46 @@
 //! pull request list and the right one with the diff.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
-use crate::tui::app::{App, Pane, ROADMAP};
+use crate::tui::app::App;
+use crate::tui::components::review;
 use crate::tui::layout::{self, MIN_HEIGHT, MIN_WIDTH};
 use crate::tui::theme::{Theme, element};
 
 /// Renders the body of the interface (FR-7.8).
+///
+/// Two screens share the body: the pull request list, and the review screen for the
+/// open pull request. Which one is drawn is read from the state rather than from a
+/// flag of its own, so there is no way for the two to disagree.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let columns =
-        Layout::horizontal([Constraint::Percentage(56), Constraint::Percentage(44)]).split(area);
-    render_roadmap(frame, columns[0], app);
-    render_shell_status(frame, columns[1], app);
+    if app.review_screen().is_some() {
+        review::render(frame, area, app);
+        return;
+    }
+    // The list screen is the filter bar above the list itself. Both rectangles come
+    // from the same function the event loop uses to place a mouse event, so the rows a
+    // click maps to are the rows that were drawn.
+    let (filter_bar, list) = body_split(area);
+    super::filter_bar::render(frame, filter_bar, app);
+    super::pr_list::render(frame, list, app);
+}
+
+/// Splits the body into the filter bar and the list pane.
+///
+/// One function, called by the renderer *and* by the loop that records the geometry a
+/// mouse event is tested against: two copies of this arithmetic is how a click ends up
+/// selecting the row below the one it was aimed at (FR-7.5).
+#[must_use]
+pub fn body_split(body: Rect) -> (Rect, Rect) {
+    let rows = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Length(super::filter_bar::HEIGHT),
+        ratatui::layout::Constraint::Min(3),
+    ])
+    .split(body);
+    (rows[0], rows[1])
 }
 
 /// Renders the "terminal too small" message (FR-7.8).
@@ -52,141 +78,13 @@ pub fn render_too_small(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     );
 }
 
-fn render_roadmap(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    for (index, entry) in ROADMAP.iter().enumerate() {
-        let selected = index == app.cursor;
-        let marker = if selected { ">" } else { " " };
-        let style = if selected {
-            theme.style(element::SELECTION)
-        } else {
-            theme.style(element::FG)
-        };
-        lines.push(Line::from(Span::styled(
-            format!(" {marker} {entry}"),
-            style,
-        )));
-    }
-
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        " This build is the M0 shell.".to_owned(),
-        theme.style(element::MUTED),
-    )));
-    lines.push(Line::from(Span::styled(
-        " Navigation, themes, keybindings and the".to_owned(),
-        theme.style(element::MUTED),
-    )));
-    lines.push(Line::from(Span::styled(
-        " command line are live. The list and diff".to_owned(),
-        theme.style(element::MUTED),
-    )));
-    lines.push(Line::from(Span::styled(
-        " panes arrive in M1.".to_owned(),
-        theme.style(element::MUTED),
-    )));
-
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(border_style(app, Pane::PullRequests))
-        .title(" Planned ");
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .style(theme.style(element::BG))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn render_shell_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // Paths are shortened to the pane's inner width so they never wrap.
-    let value_width = usize::from(area.width.saturating_sub(2)).saturating_sub(" home     ".len());
-
-    let row = |label: &str, value: String| {
-        Line::from(vec![
-            Span::styled(format!(" {label:<9}"), theme.style(element::HELP_KEY)),
-            Span::styled(value, theme.style(element::FG)),
-        ])
-    };
-
-    lines.push(row(
-        "home",
-        crate::paths::shorten_for_display(app.home.root(), value_width),
-    ));
-    lines.push(row(
-        "config",
-        crate::paths::shorten_for_display(&app.config_path, value_width),
-    ));
-    lines.push(row("keys", format!("{} parsed", app.document_key_count())));
-    lines.push(row(
-        "theme",
-        format!("{} ({})", app.theme.name(), app.theme_source),
-    ));
-    lines.push(row(
-        "keybinds",
-        format!("{} bindings", app.keymap.bindings().len()),
-    ));
-    lines.push(row("focus", app.focus.label().to_owned()));
-    lines.push(row("uptime", format!("{}s", app.uptime_secs())));
-    lines.push(Line::default());
-
-    if app.warnings.is_empty() {
-        lines.push(row("warnings", "none".to_owned()));
-    } else {
-        lines.push(row("warnings", app.warnings.len().to_string()));
-        for warning in app.warnings.iter().take(4) {
-            lines.push(Line::from(Span::styled(
-                format!("   · {warning}"),
-                theme.style(element::NOTICE_WARN),
-            )));
-        }
-    }
-
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        " ?  help          <leader>  action menu".to_owned(),
-        theme.style(element::MUTED),
-    )));
-    lines.push(Line::from(Span::styled(
-        " :  command       <C-c>     quit".to_owned(),
-        theme.style(element::MUTED),
-    )));
-
-    let block = Block::new()
-        .borders(Borders::ALL)
-        .border_style(border_style(app, Pane::Diff))
-        .title(" This shell ");
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .style(theme.style(element::BG))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn border_style(app: &App, pane: Pane) -> ratatui::style::Style {
-    if app.focus() == pane {
-        app.theme.style(element::BORDER_FOCUSED)
-    } else {
-        app.theme.style(element::BORDER)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::test_support::{TempHome, temp_home};
     use crate::tui::app::App;
+    use crate::tui::diff_view::DiffView;
 
     fn app() -> (TempHome, App) {
         let dir = temp_home();
@@ -219,8 +117,8 @@ mod tests {
     }
 
     #[test]
-    fn the_shell_status_reports_where_things_live() {
-        let (dir, app) = app();
+    fn the_body_shows_the_list_when_no_pull_request_is_open() {
+        let (_dir, app) = app();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         terminal
@@ -228,20 +126,27 @@ mod tests {
             .unwrap();
         let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
 
-        assert!(rendered.contains("Planned"), "{rendered}");
-        assert!(rendered.contains("This shell"), "{rendered}");
-        assert!(rendered.contains("warnings"), "{rendered}");
-        assert!(rendered.contains("home"), "{rendered}");
-        assert!(rendered.contains("config"), "{rendered}");
-        // Long paths are shortened rather than wrapped, which would wreck the
-        // pane layout (FR-7.8).
-        assert!(rendered.contains("…/"), "{rendered}");
+        assert!(rendered.contains("filters"), "{rendered}");
+        assert!(rendered.contains("[is:open]"), "{rendered}");
+        // No file tree, which belongs to the review screen.
+        assert!(!rendered.contains("Files ("), "{rendered}");
+    }
+
+    #[test]
+    fn the_body_shows_the_review_when_a_pull_request_is_open() {
+        let (_dir, mut app) = app();
+        app.set_review(DiffView::new(crate::domain::diff::Patch::default()));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), &app))
+            .unwrap();
+        let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
+
+        assert!(rendered.contains("Files (0)"), "{rendered}");
         assert!(
-            !rendered.contains(&dir.path().display().to_string()),
-            "the full path should not be rendered: {rendered}"
+            !rendered.contains("[is:open]"),
+            "the list is not drawn behind the review screen: {rendered}"
         );
-        assert!(crate::tui::layout::is_too_small(
-            ratatui::layout::Rect::new(0, 0, 60, 10)
-        ));
     }
 }

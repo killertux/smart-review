@@ -274,10 +274,49 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Normal), "G", "nav.bottom"),
     (Scope::In(Mode::Normal), "<Tab>", "pane.next"),
     (Scope::In(Mode::Normal), "<S-Tab>", "pane.prev"),
+    // Enter opens whatever the cursor is on, which is a pull request in the list and
+    // a file in the tree (FR-3.4).
+    (Scope::In(Mode::Normal), "<Enter>", "nav.open"),
+    // Esc goes *back*: it closes the review, clears what is narrowing the list, and
+    // only then does nothing. The global `<Esc>` binding stays for popups, because a
+    // mode-specific binding wins over a global one for the same key.
+    (Scope::In(Mode::Normal), "<Esc>", "nav.back"),
+    (Scope::In(Mode::Normal), "h", "nav.back"),
+    // `R` refreshes what is on screen: FR-2.3 requires it, and the list's own error
+    // state tells the user to press it.
+    (Scope::In(Mode::Normal), "R", "app.refresh"),
+    // …and `q` quits, as §5.4 says. `Esc` and `h` are the way back.
+    (Scope::In(Mode::Normal), "q", "app.quit"),
+    (Scope::In(Mode::Normal), "<C-d>", "nav.half_down"),
+    (Scope::In(Mode::Normal), "<C-u>", "nav.half_up"),
+    (Scope::In(Mode::Normal), "<C-f>", "nav.page_down"),
+    (Scope::In(Mode::Normal), "<C-b>", "nav.page_up"),
+    // `/` searches; `?` stays the help popup (DEC-20), so `n`/`N` repeat instead of
+    // there being a second entry point.
+    (Scope::In(Mode::Normal), "/", "search.open"),
+    (Scope::In(Mode::Normal), "n", "search.next"),
+    (Scope::In(Mode::Normal), "N", "search.prev"),
+    (Scope::In(Mode::Normal), "x", "filter.clear"),
+    (Scope::In(Mode::Normal), "<leader>f", "filter.menu"),
+    (Scope::In(Mode::Normal), "<leader>s", "sort.menu"),
+    (Scope::In(Mode::Normal), "]c", "diff.next_hunk"),
+    (Scope::In(Mode::Normal), "[c", "diff.prev_hunk"),
+    (Scope::In(Mode::Normal), "}", "diff.next_file"),
+    (Scope::In(Mode::Normal), "{", "diff.prev_file"),
+    (Scope::In(Mode::Normal), "za", "diff.toggle_hunk"),
+    (Scope::In(Mode::Normal), "y", "review.copy_path"),
+    (Scope::In(Mode::Normal), "<leader>ds", "diff.toggle_split"),
+    (Scope::In(Mode::Normal), "<leader>dc", "diff.cycle_context"),
+    (
+        Scope::In(Mode::Normal),
+        "<leader>dw",
+        "diff.toggle_whitespace",
+    ),
+    (Scope::In(Mode::Search), "<Enter>", "search.close"),
+    (Scope::In(Mode::Search), "<Esc>", "search.close"),
     (Scope::In(Mode::Normal), "<leader>t", "app.theme_picker"),
     (Scope::In(Mode::Normal), "<leader>T", "theme.toggle"),
     (Scope::In(Mode::Normal), "<leader>?", "app.help"),
-    (Scope::In(Mode::Normal), "<leader>r", "app.refresh"),
     (Scope::In(Mode::Normal), "<leader>q", "app.quit"),
 ];
 
@@ -866,8 +905,10 @@ mod tests {
 
     #[test]
     fn unbound_keys_resolve_to_nothing() {
+        // `z` used to be free and is now the prefix of `za`, so this uses a key
+        // that is bound to nothing at all.
         assert_eq!(
-            keymap().resolve(Mode::Normal, &[press('z')]),
+            keymap().resolve(Mode::Normal, &[press('Q')]),
             Resolution::None
         );
     }
@@ -956,7 +997,7 @@ mod tests {
             "{warnings:?}"
         );
         assert_eq!(
-            keymap.resolve(Mode::Normal, &[press('z')]),
+            keymap.resolve(Mode::Normal, &[press('Q')]),
             Resolution::None
         );
     }

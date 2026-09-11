@@ -13,17 +13,23 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 
 use crate::Startup;
+use crate::application::prs::FetchOutcome;
 use crate::config::{Config, ConfigDocument};
 use crate::doctor::{Check, Context};
+use crate::domain::environment::{Environment, EnvironmentError};
+use crate::domain::pr::PullRequestDetail;
 use crate::error::Result;
 use crate::logging::{self, Level};
 use crate::paths::Home;
 use crate::state::AppState;
 use crate::tui::action;
 use crate::tui::components;
-use crate::tui::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::tui::diff_view::DiffView;
+use crate::tui::event::{self, KeyCode, KeyEvent, KeyModifiers};
+use crate::tui::jobs::{self, Completion, Outcome};
 use crate::tui::keymap::{self, KeyCombo, Keymap, Mode, Resolution};
 use crate::tui::layout;
+use crate::tui::list_view::PrListState;
 use crate::tui::theme::{self, Theme};
 use crate::tui::update;
 
@@ -37,7 +43,7 @@ const MAX_NOTICES: usize = 3;
 pub(crate) const PALETTE_ROWS: usize = 3;
 
 /// What resolving the pending key sequence produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
     /// A binding matched; the effect is what it asked for.
     Fired(Effect),
@@ -52,7 +58,7 @@ enum Step {
 /// Actions are mutually exclusive in M0: the only action that keeps a pending
 /// sequence is the leader menu, and the only ones that need the loop are a theme
 /// change (persist it) and `:doctor` (probe off the event loop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Effect {
     /// Nothing to do; the pending key sequence is finished with.
     #[default]
@@ -63,19 +69,26 @@ pub enum Effect {
     SaveState,
     /// Collect the environment report off the event loop.
     RunDoctor,
+    /// Work out where we are running and whether the forge is usable (FR-1.1).
+    DetectEnvironment,
+    /// Fetch the first page of the current query (FR-2.1).
+    LoadPullRequests,
+    /// Fetch the next page, up to the configured cap (FR-2.1).
+    LoadMore,
+    /// Fetch the exact number of matches, which a full page makes necessary
+    /// (FR-2.1).
+    CountPullRequests,
+    /// Open a pull request: its detail, then its diff (FR-2.4, FR-3.2).
+    OpenPullRequest(u64),
+    /// Re-fetch the diff of the open pull request, for a context change (FR-3.2).
+    ReloadDiff,
+    /// Put a path on the clipboard through the terminal (FR-3.4).
+    CopyPath(String),
+    /// Turn mouse capture on or off, which only the loop can do (FR-7.5).
+    SetMouse(bool),
+    /// Give up on the work in flight for the current screen (NFR-1.4).
+    CancelInFlight,
 }
-
-/// What this build can show, so the shell is honest about being a shell.
-pub(crate) const ROADMAP: &[&str] = &[
-    "M1  browse, filter and search pull requests",
-    "M1  read the diff with vim motions and the mouse",
-    "M2  a managed worktree per pull request",
-    "M2  pick provider, model and thinking in the TUI",
-    "M2  streamed analysis and a review-ordered diff",
-    "M3  a persistent chat about the pull request",
-    "M4  inline comments and one batched review",
-    "M5  polish, docs and release builds",
-];
 
 /// The focused pane (FR-7.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -138,6 +151,49 @@ pub enum Overlay {
     Doctor,
     /// Theme selection (FR-7.7).
     ThemePicker,
+}
+
+/// A pull request being opened, and how far along that is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opening {
+    /// Which pull request.
+    pub number: u64,
+    /// Which step the fetch is on.
+    pub stage: OpeningStage,
+    /// When the fetch started, for the elapsed time.
+    started_at: u64,
+}
+
+/// The two steps of opening a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningStage {
+    /// `gh pr view`: the metadata, commits, checks and reviews.
+    Detail,
+    /// `gh pr diff`: the patch itself, which is the slow one.
+    Diff,
+}
+
+impl Opening {
+    /// The first line of the indicator.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        format!("Opening #{}", self.number)
+    }
+
+    /// The second line: what is being fetched, and for how long.
+    #[must_use]
+    pub fn detail(&self, now: u64) -> String {
+        let what = match self.stage {
+            OpeningStage::Detail => "fetching the pull request",
+            OpeningStage::Diff => "fetching the diff",
+        };
+        let elapsed = now.saturating_sub(self.started_at);
+        if elapsed < 2 {
+            what.to_owned()
+        } else {
+            format!("{what} · {elapsed}s so far")
+        }
+    }
 }
 
 /// Severity of a status line message (FR-7.6).
@@ -271,8 +327,6 @@ pub struct App {
     pub(crate) command: CommandLine,
     /// Recent notifications.
     pub(crate) notices: Vec<Notice>,
-    /// Cursor over [`ROADMAP`].
-    pub(crate) cursor: usize,
     /// Themes offered by the picker, resolved when it opens so rendering never
     /// reads the filesystem (FR-7.7).
     pub(crate) picker_items: Vec<PickerEntry>,
@@ -282,6 +336,38 @@ pub struct App {
     theme_before_picker: Option<(Theme, String)>,
     /// Restricts the help popup to one action, set by `:keymap <action>`.
     pub(crate) help_filter: Option<String>,
+    /// The first line the help popup shows: the list is longer than most terminals.
+    pub(crate) help_scroll: usize,
+    /// What detection resolved, once it has run (FR-1.1).
+    pub(crate) environment: Option<Environment>,
+    /// Why detection failed, when it did.
+    pub(crate) environment_error: Option<EnvironmentError>,
+    /// Whether detection is still running.
+    pub(crate) environment_running: bool,
+    /// The pull request list (FR-2.1).
+    pub(crate) list: PrListState,
+    /// The detail of the open pull request (FR-2.4).
+    pub(crate) detail: Option<PullRequestDetail>,
+    /// The review view, present when a pull request is open (FR-3.3).
+    pub(crate) review: Option<DiffView>,
+    /// The pull request being opened, if one is (FR-7.6).
+    opening: Option<Opening>,
+    /// Advances the opening spinner; driven by the loop's tick.
+    spinner: usize,
+    /// Whether the diff is still being fetched.
+    pub(crate) diff_loading: bool,
+    /// Why the shown diff came from the cache, when it did (DEC-14).
+    pub(crate) diff_offline: Option<String>,
+    /// The job id of the newest detection request.
+    pub(crate) environment_job: u64,
+    /// The job id of the newest list request, so a superseded answer is dropped.
+    pub(crate) list_job: u64,
+    /// The job id of the newest count request.
+    pub(crate) count_job: u64,
+    /// The job id of the newest detail request.
+    pub(crate) detail_job: u64,
+    /// The job id of the newest diff request.
+    pub(crate) patch_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
     /// The last doctor report, delivered by a job (FR-9.3).
@@ -295,6 +381,18 @@ pub struct App {
     now_unix_secs: u64,
     /// Unix time the interface started.
     started_at: u64,
+    /// The width of the last frame.
+    last_width: u16,
+    /// The filter bar's rectangle, learned from the last frame (FR-7.5).
+    filter_bar_rect: ratatui::layout::Rect,
+    /// The list pane's rectangle, learned from the last frame.
+    list_pane: ratatui::layout::Rect,
+    /// The whole body rectangle, for the bounds a click has to fall inside.
+    body_rect: ratatui::layout::Rect,
+    /// The first row of the review panes.
+    review_top: u16,
+    /// The width of the file tree, which separates the two review panes.
+    tree_width: u16,
     /// Set when the user asks to quit.
     pub(crate) quit: bool,
 }
@@ -333,6 +431,16 @@ impl App {
         // One directory read, before the terminal is taken over, so cycling
         // themes later is pure computation.
         let theme_names = theme::available(&home);
+        let list = PrListState::new(
+            u32::try_from(config.review.page_size).unwrap_or(50),
+            u32::try_from(
+                config
+                    .review
+                    .page_size
+                    .saturating_mul(config.review.max_pages.max(1)),
+            )
+            .unwrap_or(500),
+        );
 
         let mut app = Self {
             home,
@@ -346,6 +454,21 @@ impl App {
             theme_source,
             theme_request,
             theme_names,
+            environment: None,
+            environment_error: None,
+            environment_running: true,
+            list,
+            detail: None,
+            review: None,
+            opening: None,
+            spinner: 0,
+            diff_loading: false,
+            diff_offline: None,
+            environment_job: 0,
+            list_job: 0,
+            count_job: 0,
+            detail_job: 0,
+            patch_job: 0,
             state,
             warnings,
             repo,
@@ -359,17 +482,25 @@ impl App {
             leader_open: false,
             command: CommandLine::default(),
             notices: Vec::new(),
-            cursor: 0,
             picker_items: Vec::new(),
             picker_cursor: 0,
             theme_before_picker: None,
             help_filter: None,
+            help_scroll: 0,
             focus,
             checks: Vec::new(),
             doctor_running: false,
             doctor_job: 0,
             now_unix_secs: 0,
             started_at: 0,
+            // Zero until a frame has been drawn: a width that was never measured
+            // must not be used to decide anything.
+            last_width: 0,
+            filter_bar_rect: ratatui::layout::Rect::default(),
+            list_pane: ratatui::layout::Rect::default(),
+            body_rect: ratatui::layout::Rect::default(),
+            review_top: 0,
+            tree_width: 30,
             quit: false,
         };
         app.report_startup_warnings();
@@ -437,26 +568,546 @@ impl App {
             keymap: self.keymap.clone(),
             theme: self.theme.clone(),
             theme_source: self.theme_source.clone(),
+            config_keys: self.document_key_count(),
+            environment: self.environment.clone(),
+            environment_error: self.environment_error.clone(),
         }
     }
 
     /// Records the current time, called once per loop iteration by the loop.
-    pub(crate) fn set_now(&mut self, now_unix_secs: u64) {
+    /// The clock as of this loop iteration, for components that show ages.
+    #[must_use]
+    pub fn now(&self) -> crate::domain::time::Timestamp {
+        chrono::DateTime::from_timestamp(i64::try_from(self.now_unix_secs).unwrap_or(0), 0)
+            .unwrap_or_default()
+    }
+
+    /// Replaces the pull request list (FR-2.1).
+    ///
+    /// The loop reaches this through [`Self::apply_completion`]; it is public so a
+    /// rendered frame can be tested against a known list, the same way
+    /// [`Self::open_review`] makes the review screen testable.
+    pub fn set_pull_requests(&mut self, page: crate::ports::forge::PullRequestPage) {
+        self.list.replace(page);
+    }
+
+    /// Opens the review screen for a detail and its diff (FR-3.3).
+    pub fn open_review(&mut self, detail: PullRequestDetail, view: DiffView) {
+        self.detail = Some(detail);
+        self.review = Some(view);
+        self.focus = Pane::Diff;
+        self.diff_loading = false;
+        self.stop_opening();
+    }
+
+    /// Closes the review screen and returns to the list (FR-3.4).
+    pub fn close_review(&mut self) -> bool {
+        if self.review.is_none() {
+            return false;
+        }
+        self.review = None;
+        self.detail = None;
+        self.diff_offline = None;
+        self.diff_loading = false;
+        self.focus = Pane::PullRequests;
+        true
+    }
+
+    /// Whether a pull request is open, which decides which screen is drawn.
+    #[must_use]
+    pub fn review_screen(&self) -> Option<&DiffView> {
+        self.review.as_ref()
+    }
+
+    /// Replaces the review view, keeping the detail it belongs to.
+    pub fn set_review(&mut self, view: DiffView) {
+        self.review = Some(view);
+    }
+
+    /// The open review view for editing, if any.
+    pub fn review_mut(&mut self) -> Option<&mut DiffView> {
+        self.review.as_mut()
+    }
+
+    /// Remembers which job a request became, so a superseded answer can be dropped.
+    pub fn record_job(&mut self, effect: &Effect, id: u64) {
+        match effect {
+            Effect::DetectEnvironment => self.environment_job = id,
+            Effect::LoadPullRequests | Effect::LoadMore => {
+                self.list_job = id;
+                self.list.loading = true;
+                self.list.error = None;
+            }
+            Effect::CountPullRequests => {
+                self.count_job = id;
+                self.list.counting = true;
+            }
+            Effect::OpenPullRequest(number) => {
+                self.detail_job = id;
+                self.diff_loading = true;
+                // The indicator appears on the key press rather than when the first
+                // response arrives: the wait is what it exists for.
+                self.begin_opening(*number);
+            }
+            Effect::RunDoctor => self.doctor_job = id,
+            // The rest ask for no job, or are handled by `apply` rather than here.
+            _ => {}
+        }
+    }
+
+    /// Applies the result of a background job (ARCH-5).
+    ///
+    /// Returns what the loop should do next, if the result makes something else
+    /// necessary: opening a pull request needs its diff, a truncated list needs its
+    /// count, and so on. The reducer stays the only thing that decides, and it still
+    /// performs no IO.
+    ///
+    /// Every arm is gated on the job id it answers, so a superseded result — an error
+    /// as much as a success — is dropped rather than painted over a fresher answer.
+    pub fn apply_completion(&mut self, completion: jobs::Completion) -> Option<Effect> {
+        let Completion { job, outcome } = completion;
+
+        match outcome {
+            Outcome::Environment(environment) if job == self.environment_job => {
+                self.set_environment(*environment);
+                self.notice(NoticeLevel::Info, self.environment_summary());
+                Some(Effect::LoadPullRequests)
+            }
+            Outcome::EnvironmentFailed(error) if job == self.environment_job => {
+                self.set_environment_error(*error);
+                None
+            }
+            Outcome::CachedPage(cached) => {
+                // Painted before the network answers; the fetch that follows replaces
+                // it in place, keeping the cursor on the same pull request (FR-2.3).
+                let age = cached.age_secs;
+                let stale = cached.stale;
+                self.list.replace(cached.value);
+                // The age is shown as a duration of *this* kind of data rather than
+                // as a wall-clock time: "cached 12s ago" is what the user needs.
+                self.list.stale = Some(if stale {
+                    format!("cached {age}s ago")
+                } else {
+                    "cached".to_owned()
+                });
+                self.list.loading = true;
+                None
+            }
+            Outcome::Page(outcome) if job == self.list_job => self.apply_page(*outcome),
+            Outcome::Count(count) if job == self.count_job => {
+                self.list.set_total(count);
+                None
+            }
+            Outcome::Detail(outcome) if job == self.detail_job => {
+                self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
+                let detail = outcome.into_value();
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "opened #{} · {} commit(s) · {} file(s)",
+                        detail.summary.number,
+                        detail.commits.len(),
+                        detail.summary.changed_files
+                    ),
+                );
+                self.detail = Some(detail);
+                Some(Effect::ReloadDiff)
+            }
+            Outcome::Patch(outcome) if job == self.patch_job => self.apply_patch(*outcome),
+            Outcome::Checks(checks) => {
+                self.apply_checks(job, checks);
+                None
+            }
+            // A failure is gated like any other result: a superseded request's error
+            // must not be announced as if it were the newest one.
+            Outcome::Failed(message) if self.is_current_job(job) => {
+                self.report_job_failure(job, &message);
+                None
+            }
+            Outcome::Environment(_)
+            | Outcome::EnvironmentFailed(_)
+            | Outcome::Page(_)
+            | Outcome::Count(_)
+            | Outcome::Detail(_)
+            | Outcome::Patch(_)
+            | Outcome::Failed(_)
+            | Outcome::Abandoned => None,
+        }
+    }
+
+    /// A sentence naming the repository and account detection resolved.
+    fn environment_summary(&self) -> String {
+        let repo = self
+            .environment
+            .as_ref()
+            .map_or_else(String::new, |environment| environment.repo.slug());
+        let account = self
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.gh.account.clone())
+            .unwrap_or_else(|| "an unknown account".to_owned());
+        format!("reading {repo} as {account}")
+    }
+
+    /// Applies a fetched or cached page (FR-2.1).
+    fn apply_page(
+        &mut self,
+        outcome: FetchOutcome<crate::ports::forge::PullRequestPage>,
+    ) -> Option<Effect> {
+        // A full page means the total is unknown, so it is asked for separately
+        // rather than guessed at (FR-2.1).
+        let wanted_count = outcome.value().total.is_none() && outcome.value().may_have_more();
+        let offline = outcome.offline_reason().is_some();
+        self.list.stale = offline.then(|| "offline".to_owned());
+
+        match outcome {
+            FetchOutcome::Fresh(page) | FetchOutcome::Offline { value: page, .. } => {
+                self.list.replace(page);
+            }
+        }
+
+        wanted_count.then_some(Effect::CountPullRequests)
+    }
+
+    /// Applies a fetched or cached patch (FR-3.3).
+    fn apply_patch(&mut self, outcome: FetchOutcome<crate::domain::diff::Patch>) -> Option<Effect> {
+        self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
+        let patch = outcome.into_value();
+        let view = DiffView::with_options(
+            patch,
+            self.config.review.context_lines,
+            self.config.review.ignore_whitespace,
+        );
+        let files = view.patch.stats();
+        match self.detail.take() {
+            Some(detail) => self.open_review(detail, view),
+            None => self.set_review(view),
+        }
+        self.notice(
+            NoticeLevel::Info,
+            format!("{} · {}", files.label(), self.list.status_label()),
+        );
+        None
+    }
+
+    /// Notes that a pull request is being opened, which the indicator shows.
+    pub fn begin_opening(&mut self, number: u64) {
+        self.opening = Some(Opening {
+            number,
+            stage: OpeningStage::Detail,
+            started_at: self.now_unix_secs,
+        });
+    }
+
+    /// Moves the indicator on to the second step.
+    pub fn advance_opening(&mut self) {
+        if let Some(opening) = self.opening.as_mut() {
+            opening.stage = OpeningStage::Diff;
+        }
+    }
+
+    /// Stops showing the indicator.
+    pub fn stop_opening(&mut self) {
+        self.opening = None;
+    }
+
+    /// The pull request being opened, if one is.
+    #[must_use]
+    pub fn opening(&self) -> Option<Opening> {
+        self.opening
+    }
+
+    /// The spinner frame, advanced by the loop's tick.
+    #[must_use]
+    pub fn spinner(&self) -> usize {
+        self.spinner
+    }
+
+    /// The clock as of the last loop iteration.
+    #[must_use]
+    pub fn now_unix_secs(&self) -> u64 {
+        self.now_unix_secs
+    }
+
+    /// Whether anything is in flight for the screen the user is looking at.
+    #[must_use]
+    pub fn loading_something(&self) -> bool {
+        if self.environment_running || self.list.loading || self.list.counting {
+            return true;
+        }
+        self.review.is_none() && self.diff_loading
+    }
+
+    /// Forgets the work that was cancelled, so the spinners stop.
+    pub fn cancelled_in_flight(&mut self) {
+        self.stop_opening();
+        self.environment_running = false;
+        self.list.loading = false;
+        self.list.counting = false;
+        self.diff_loading = false;
+        self.notice(NoticeLevel::Info, "cancelled");
+    }
+
+    /// Whether `job` is the newest request for the slot it belongs to.
+    #[must_use]
+    pub fn is_current_job(&self, job: u64) -> bool {
+        job == self.environment_job
+            || job == self.list_job
+            || job == self.count_job
+            || job == self.detail_job
+            || job == self.patch_job
+            || job == self.doctor_job
+    }
+
+    /// Records a job failure where the user will see it.
+    fn report_job_failure(&mut self, job: u64, message: &str) {
+        if job == self.list_job {
+            self.list.loading = false;
+            self.list.counting = false;
+            self.list.error = Some(message.to_owned());
+        } else if job == self.detail_job || job == self.patch_job {
+            self.diff_loading = false;
+            self.stop_opening();
+            self.notice(NoticeLevel::Error, format!("could not open it: {message}"));
+        } else if job == self.count_job {
+            // A missing count is not worth a notification: the list already says
+            // "showing 50 of ≥50", which is true.
+            self.list.counting = false;
+        } else {
+            self.notice(NoticeLevel::Error, message.to_owned());
+        }
+        logging::log(Level::Warn, format!("job failed: {message}"));
+    }
+
+    /// Handles a mouse event (FR-7.5).
+    ///
+    /// The wheel scrolls whatever the pointer is over, and a click focuses the pane
+    /// and moves the selection to the row under the pointer.
+    pub fn on_mouse(&mut self, event: event::MouseEvent) -> Effect {
+        match event.kind {
+            event::MouseEventKind::ScrollDown => {
+                self.scroll_at(event.column, event.row, 1);
+                Effect::None
+            }
+            event::MouseEventKind::ScrollUp => {
+                self.scroll_at(event.column, event.row, -1);
+                Effect::None
+            }
+            event::MouseEventKind::Down(event::MouseButton::Left) => {
+                self.click_at(event.column, event.row);
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
+    /// Scrolls the pane under the pointer.
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) {
+        // Three rows a notch, and it scrolls the *text*: a wheel is for moving what you
+        // are reading. Moving the selection instead reads as the wheel being broken —
+        // or backwards — because the text only budges once the selection reaches the
+        // edge of the window.
+        let pane = self.pane_at(column, row).unwrap_or(self.focus);
+        match pane {
+            Pane::PullRequests => {
+                self.list.scroll_by(delta * 3);
+                self.focus = Pane::PullRequests;
+            }
+            Pane::Diff => {
+                if let Some(view) = self.review.as_mut() {
+                    // The tree and the diff share the region; the tree is the narrow
+                    // one on the left.
+                    if column < self.tree_width {
+                        view.scroll_tree_by(delta * 3);
+                    } else {
+                        view.tree_focused = false;
+                        view.scroll_by(delta * 3);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Focuses the pane under the pointer and moves its cursor to the row clicked.
+    fn click_at(&mut self, column: u16, row: u16) {
+        let Some(pane) = self.pane_at(column, row) else {
+            return;
+        };
+        self.focus = pane;
+        match pane {
+            Pane::PullRequests => {
+                // The visible row under the pointer, turned into an absolute index by
+                // the same offset the frame drew with.
+                if let Some(index) =
+                    crate::tui::components::pr_list::row_at(self.list_pane, self.list.scroll, row)
+                    && index < self.list.visible_len()
+                {
+                    self.list.select_visible(index);
+                }
+            }
+            Pane::Diff => {
+                // The visible row under the pointer, turned into an absolute index by
+                // the offset the frame drew with. Passing the offset itself to
+                // `move_by`/`move_tree` (both of which are *relative*) is what made
+                // clicks land somewhere else entirely once anything had scrolled.
+                let Some(offset) = self.review_row(row) else {
+                    return;
+                };
+                if let Some(view) = self.review.as_mut() {
+                    if column < self.tree_width {
+                        let index = view.tree_scroll + offset;
+                        // Only a row that exists: clicking the empty space below the
+                        // last file must not open it.
+                        if index < view.tree.len() {
+                            view.select_tree_row(index);
+                            // A click on a tree row does what pressing Enter on it
+                            // does: opening a file, or folding a folder (FR-7.5).
+                            view.activate_tree();
+                        }
+                    } else {
+                        let index = view.scroll + offset;
+                        if index < view.rows.len() {
+                            view.tree_focused = false;
+                            view.select_row(index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The row of a review pane a terminal row is over, as an offset into the visible
+    /// rows, or `None` when it is over a border, the tab bar, or nothing.
+    fn review_row(&self, row: u16) -> Option<usize> {
+        let first = self.review_top.saturating_add(1);
+        let last = self.body_rect.bottom().saturating_sub(2);
+        if row < first || row > last {
+            return None;
+        }
+        Some(usize::from(row - first))
+    }
+
+    /// Which pane a terminal coordinate is in, if any.
+    ///
+    /// Anything outside a pane is `None`: a click on the filter bar or on a border
+    /// must not move a cursor somewhere the user did not point at.
+    fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
+        if self.review.is_some() {
+            // The tree and the diff share the area below the tab bar.
+            return (row >= self.review_top).then_some(Pane::Diff);
+        }
+        self.list_pane
+            .contains(ratatui::layout::Position::from((column, row)))
+            .then_some(Pane::PullRequests)
+    }
+
+    /// Records the pane geometry of the last frame, so a mouse event can be placed.
+    ///
+    /// Called from `render`, which is where the sizes are known. It is arithmetic
+    /// only: the render path still performs no IO.
+    fn record_geometry(&mut self, body: ratatui::layout::Rect) {
+        self.last_width = body.width;
+        self.body_rect = body;
+        self.tree_width = crate::tui::components::review::TREE_WIDTH;
+        self.review_top = body.y + 1;
+        // The filter bar sits above the list; the pane below it is the one the mouse
+        // is tested against, and the same rectangle the renderer draws into.
+        let (filter_bar, list) = components::panes::body_split(body);
+        self.filter_bar_rect = filter_bar;
+        self.list_pane = list;
+    }
+
+    /// Recomputes the scroll offsets for the panes that are about to be drawn.
+    /// Works out the scroll offsets for the panes about to be drawn.
+    ///
+    /// The renderer and the mouse both read the result, so the row a click maps to is
+    /// the row that was drawn there.
+    fn sync_scroll(&mut self) {
+        let inner = self.review_body_height();
+        if let Some(view) = self.review.as_mut() {
+            view.prepare(inner, inner);
+        }
+        let height = crate::tui::components::pr_list::layout(self.list_pane).height;
+        let position = self.list.cursor_position().unwrap_or(0);
+        self.list.scroll = crate::tui::components::ensure_visible(
+            position,
+            self.list.scroll,
+            height,
+            self.list.visible_len(),
+        );
+        // The wheel offsets are in visible rows, and a search or a refresh can change
+        // how many there are, so the stored offset is clamped after either.
+        self.list.scroll = self
+            .list
+            .scroll
+            .min(self.list.visible_len().saturating_sub(height));
+    }
+
+    /// How tall the review panes' row area is.
+    fn review_body_height(&self) -> u16 {
+        // The body, less the tab row, less the two borders.
+        self.list_pane
+            .height
+            .saturating_add(crate::tui::components::filter_bar::HEIGHT)
+            .saturating_sub(3)
+    }
+
+    /// Opens the command line with a prefix already typed (FR-7.4).
+    ///
+    /// Used by `<leader>f` and `<leader>s`, which are shortcuts for a command rather
+    /// than a second implementation of one.
+    pub fn open_command(&mut self, prefix: &str) {
+        self.cancel_overlay();
+        self.command.clear();
+        for character in prefix.chars() {
+            self.command.push(character);
+        }
+        self.mode = Mode::Command;
+    }
+
+    /// Turns mouse capture off or on at runtime, for `:set mouse=` (FR-7.5).
+    pub fn show_mouse(&mut self, enabled: bool) {
+        self.config.ui.mouse = enabled;
+    }
+
+    /// The terminal width of the last frame.
+    ///
+    /// Wrapping a toggle needs the width the *user* has, and only the renderer knows
+    /// it; it is recorded rather than guessed at.
+    #[must_use]
+    pub fn terminal_width(&self) -> u16 {
+        self.last_width
+    }
+
+    /// Records that the environment was resolved (FR-1.1).
+    pub fn set_environment(&mut self, environment: Environment) {
+        self.environment = Some(environment);
+        self.environment_error = None;
+        self.environment_running = false;
+    }
+
+    /// Records that the environment could not be resolved (FR-1.1).
+    pub fn set_environment_error(&mut self, error: EnvironmentError) {
+        self.environment_error = Some(error);
+        self.environment_running = false;
+    }
+
+    /// Sets the clock for this iteration of the event loop.
+    ///
+    /// The reducer never reads the clock itself, so this is how "now" reaches it —
+    /// and how a test can render the same frame twice.
+    pub fn set_now(&mut self, now_unix_secs: u64) {
         if self.started_at == 0 {
             self.started_at = now_unix_secs;
         }
         self.now_unix_secs = now_unix_secs;
     }
 
-    /// Seconds since the interface started.
-    pub(crate) fn uptime_secs(&self) -> u64 {
-        self.now_unix_secs.saturating_sub(self.started_at)
-    }
-
     /// How many keys the configuration document holds, including the ones this
     /// build does not understand (FR-8.6).
-    pub(crate) fn document_key_count(&self) -> usize {
-        self.document.value().values().map(count_keys).sum()
+    #[must_use]
+    pub fn document_key_count(&self) -> usize {
+        self.document.key_count()
     }
 
     /// Adds a notification to the status line (FR-7.6).
@@ -512,6 +1163,12 @@ impl App {
     /// The command line is closed by the time a command runs, so the error also
     /// goes to the status line, which is where the user is looking (FR-7.4,
     /// FR-9.1).
+    /// The error currently shown under the command line, if any.
+    #[must_use]
+    pub fn command_error_text(&self) -> Option<&str> {
+        self.command.error.as_deref()
+    }
+
     pub(crate) fn command_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.notice(NoticeLevel::Error, message.clone());
@@ -603,6 +1260,9 @@ impl App {
     /// Anything the popup needs from the filesystem is captured here, so
     /// rendering stays pure.
     pub(crate) fn open_overlay(&mut self, overlay: Overlay) {
+        if overlay == Overlay::Help {
+            self.help_scroll = 0;
+        }
         match overlay {
             Overlay::Leader => {
                 self.overlay = Overlay::Leader;
@@ -624,40 +1284,26 @@ impl App {
         match self.overlay {
             Overlay::ThemePicker => {
                 self.theme_before_picker = Some((self.theme.clone(), self.theme_source.clone()));
-                // Resolve every candidate once, here, so moving the cursor never
-                // reads the disk and a broken theme file is reported when the
-                // picker opens rather than when it is committed (FR-7.7).
-                let mut warnings = Vec::new();
-                self.theme_names = theme::available(&self.home);
-                let entries: Vec<PickerEntry> = self
+                // One entry per theme *name*, which was read once at startup. The
+                // file behind the entry is read when the cursor lands on it, so
+                // opening the picker costs nothing and moving down one row costs one
+                // small local read (FR-7.7).
+                self.picker_items = self
                     .theme_names
                     .iter()
                     .cloned()
-                    .map(|name| match theme::load(&self.home, &name, &mut warnings) {
-                        Ok((theme, source)) => PickerEntry {
-                            name,
-                            theme: Some(theme),
-                            source: Some(source),
-                        },
-                        Err(error) => {
-                            warnings.push(error.to_string());
-                            PickerEntry {
-                                name,
-                                theme: None,
-                                source: None,
-                            }
-                        }
+                    .map(|name| PickerEntry {
+                        name,
+                        theme: None,
+                        source: None,
                     })
                     .collect();
-                self.picker_items = entries;
                 self.picker_cursor = self
                     .picker_items
                     .iter()
                     .position(|entry| entry.name == self.theme_request)
                     .unwrap_or(0);
-                for warning in warnings {
-                    self.notice(NoticeLevel::Warn, warning);
-                }
+                self.preview_picker();
             }
             Overlay::Help => self.help_filter = None,
             _ => {}
@@ -695,6 +1341,9 @@ impl App {
 
     /// Expires old notifications.
     pub fn tick(&mut self) {
+        // The indicator's spinner is driven from here: the loop already calls this once
+        // per iteration, which is exactly the cadence an animation wants.
+        self.spinner = self.spinner.wrapping_add(1);
         self.tick_at(Instant::now());
     }
 
@@ -708,22 +1357,13 @@ impl App {
         let combo = keymap::normalize(KeyCombo::from(event));
         match self.mode {
             Mode::Command => self.on_command_key(combo),
+            Mode::Search => self.on_search_key(combo),
             Mode::Popup => self.on_popup_key(combo),
-            Mode::Normal | Mode::Insert | Mode::Search | Mode::Visual => self.on_normal_key(combo),
+            Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
     }
 
     /// Scrolls the roadmap or the picker with the mouse wheel (FR-7.5).
-    pub fn on_scroll(&mut self, delta: i32) {
-        if self.mode == Mode::Popup {
-            if self.overlay == Overlay::ThemePicker {
-                self.move_picker(delta);
-            }
-            return;
-        }
-        self.move_cursor(delta);
-    }
-
     /// Fires a pending sequence once its timeout expires (FR-7.2).
     pub fn on_timeout(&mut self) -> Effect {
         self.deadline = None;
@@ -747,43 +1387,24 @@ impl App {
         }
     }
 
-    /// Marks the doctor job as started and opens the popup (FR-9.3).
-    ///
-    /// Returns the job id so the event loop can tag the report: a report from a
-    /// superseded job must not be applied.
-    pub(crate) fn start_doctor(&mut self) -> u64 {
-        self.doctor_job = self.doctor_job.wrapping_add(1);
+    /// Opens the doctor popup and marks the report as being collected (FR-9.3).
+    pub(crate) fn start_doctor(&mut self) {
         self.checks = Vec::new();
         self.doctor_running = true;
         self.open_overlay(Overlay::Doctor);
         self.notice(NoticeLevel::Info, "collecting the environment report…");
-        self.doctor_job
-    }
-
-    /// The id of the most recent doctor request.
-    pub(crate) const fn doctor_job(&self) -> u64 {
-        self.doctor_job
     }
 
     /// Delivers a doctor report collected off the event loop (FR-9.3).
+    ///
+    /// The job id is checked because a report for a superseded request must not
+    /// replace a newer one.
     pub(crate) fn apply_checks(&mut self, job: u64, checks: Vec<Check>) {
         if job != self.doctor_job {
-            return; // a superseded report
+            return;
         }
         self.checks = checks;
         self.doctor_running = false;
-    }
-
-    /// The doctor job died without reporting, so stop waiting for it.
-    pub(crate) fn abort_doctor_job(&mut self) {
-        if self.doctor_running {
-            self.doctor_running = false;
-            self.notice(
-                NoticeLevel::Error,
-                "the environment report could not be collected",
-            );
-        }
-        self.doctor_job = self.doctor_job.wrapping_add(1);
     }
 
     /// Surfaces the startup warnings without consuming them: the shell pane and
@@ -964,6 +1585,31 @@ impl App {
                 self.move_picker(-1);
                 Effect::None
             }
+            // The help list is longer than most terminals, so it scrolls.
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+                Effect::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+                Effect::None
+            }
+            KeyCode::Char('g') if self.overlay == Overlay::Help => {
+                self.help_scroll = 0;
+                Effect::None
+            }
+            KeyCode::Char('G') if self.overlay == Overlay::Help => {
+                self.help_scroll = usize::MAX;
+                Effect::None
+            }
+            KeyCode::Char('d') if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_add(10);
+                Effect::None
+            }
+            KeyCode::Char('u') if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_sub(10);
+                Effect::None
+            }
             KeyCode::Enter if self.overlay == Overlay::ThemePicker => {
                 let name = self
                     .picker_items
@@ -979,36 +1625,86 @@ impl App {
         }
     }
 
+    /// Loads the theme the picker cursor is on, and previews it.
+    ///
+    /// A file that cannot be read is reported here rather than when the choice is
+    /// committed, so the user never ends up with a theme they cannot see.
+    fn preview_picker(&mut self) {
+        let Some(entry) = self.picker_items.get(self.picker_cursor) else {
+            return;
+        };
+        if entry.theme.is_some() {
+            return;
+        }
+        let name = entry.name.clone();
+        let mut warnings = Vec::new();
+        match theme::load(&self.home, &name, &mut warnings) {
+            Ok((theme, source)) => {
+                self.theme = theme;
+                name.clone_into(&mut self.theme_request);
+                if let Some(entry) = self.picker_items.get_mut(self.picker_cursor) {
+                    entry.theme = Some(self.theme.clone());
+                    entry.source = Some(source.clone());
+                }
+                self.theme_source = source;
+            }
+            Err(error) => {
+                self.notice(NoticeLevel::Warn, format!("{name}: {error}"));
+            }
+        }
+    }
+
     fn move_picker(&mut self, delta: i32) {
         let count = self.picker_items.len();
         if count == 0 {
             return;
         }
         self.picker_cursor = clamp_cursor(self.picker_cursor, delta, count);
-        // Preview from the list resolved when the picker opened; `cancel_overlay`
-        // puts the original back.
-        if let Some(entry) = self.picker_items.get(self.picker_cursor)
-            && let Some(theme) = &entry.theme
-        {
-            self.theme = theme.clone();
-            if let Some(source) = &entry.source {
-                self.theme_source.clone_from(source);
-            }
+        // Loading the entry the cursor landed on also previews it; `cancel_overlay`
+        // puts the original theme back.
+        self.preview_picker();
+    }
+
+    /// Typing in the `/` box filters the loaded list as the user types (FR-2.2).
+    ///
+    /// Ordinary characters are text, exactly as on the command line: a search for
+    /// "n" must not jump to the next match, and a search for "x" must not clear the
+    /// filters. Only a modified key can be a binding here.
+    fn on_search_key(&mut self, combo: KeyCombo) -> Effect {
+        if let Some(action) = self.global_action(combo) {
+            return update::dispatch(self, &action);
         }
-    }
+        if combo.code == KeyCode::Esc || combo.code == KeyCode::Enter {
+            self.mode = Mode::Normal;
+            return Effect::None;
+        }
 
-    /// Moves the roadmap cursor.
-    pub(crate) fn move_cursor(&mut self, delta: i32) {
-        self.cursor = clamp_cursor(self.cursor, delta, ROADMAP.len());
-    }
-
-    /// Moves the roadmap cursor to one end.
-    pub(crate) fn move_cursor_to(&mut self, last: bool) {
-        self.cursor = if last {
-            ROADMAP.len().saturating_sub(1)
-        } else {
-            0
-        };
+        match combo.code {
+            KeyCode::Backspace => {
+                let mut text = self.list.search.clone();
+                text.pop();
+                self.list.set_search(&text);
+                self.list.stale = None;
+                Effect::None
+            }
+            // Ctrl-U clears the box, which is the one shortcut worth having while
+            // typing in it.
+            KeyCode::Char('u') if combo.modifiers == KeyModifiers::CONTROL => {
+                self.list.set_search("");
+                self.list.stale = None;
+                Effect::None
+            }
+            KeyCode::Char(value)
+                if combo.modifiers.is_empty() || combo.modifiers == KeyModifiers::SHIFT =>
+            {
+                let mut text = self.list.search.clone();
+                text.push(value);
+                self.list.set_search(&text);
+                self.list.stale = None;
+                Effect::None
+            }
+            _ => Effect::None,
+        }
     }
 
     fn on_command_key(&mut self, combo: KeyCombo) -> Effect {
@@ -1069,6 +1765,9 @@ impl App {
         ])
         .split(area);
 
+        self.record_geometry(rows[1]);
+        self.sync_scroll();
+
         components::header::render(frame, rows[0], self);
         components::panes::render(frame, rows[1], self);
         components::palette::render(frame, rows[2], self);
@@ -1098,14 +1797,6 @@ fn clamp_cursor(current: usize, delta: i32, count: usize) -> usize {
         current.saturating_add(step)
     };
     next.min(last)
-}
-
-/// Counts the keys in a value, descending into tables.
-fn count_keys(value: &toml::Value) -> usize {
-    match value.as_table() {
-        Some(table) => table.values().map(count_keys).sum(),
-        None => 1,
-    }
 }
 
 #[cfg(test)]
@@ -1197,27 +1888,51 @@ mod tests {
     }
 
     #[test]
-    fn navigation_moves_the_cursor_and_stops_at_the_ends() {
-        let (_dir, mut app) = app();
-        assert_eq!(app.cursor, 0);
+    fn navigation_moves_the_list_cursor_and_stops_at_the_ends() {
+        let (_dir, mut app) = list_app();
+        assert_eq!(app.list.selected().unwrap().number, 1);
+
         press(&mut app, "j");
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.list.selected().unwrap().number, 2);
+        press(&mut app, "j");
+        assert_eq!(app.list.selected().unwrap().number, 3);
         press(&mut app, "k");
         press(&mut app, "k");
-        assert_eq!(app.cursor, 0, "the cursor should not go negative");
+        assert_eq!(app.list.selected().unwrap().number, 1);
+        press(&mut app, "k");
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            1,
+            "and not past the top"
+        );
+
         press(&mut app, "G");
-        assert_eq!(app.cursor, ROADMAP.len() - 1);
+        assert_eq!(app.list.selected().unwrap().number, 5);
         press(&mut app, "gg");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.list.selected().unwrap().number, 1);
+    }
+
+    #[test]
+    fn the_page_keys_move_the_list_too() {
+        let (_dir, mut app) = list_app();
+        app.list.viewport = 2;
+        // A two-row viewport: half a screen is one row, a whole screen is two.
+        press(&mut app, "<C-d>");
+        assert_eq!(app.list.selected().unwrap().number, 2, "half a screen");
+        press(&mut app, "<C-f>");
+        assert_eq!(app.list.selected().unwrap().number, 4, "a whole screen");
+        press(&mut app, "<C-u>");
+        assert_eq!(app.list.selected().unwrap().number, 3, "half a screen back");
     }
 
     #[test]
     fn an_unbound_key_reports_itself_and_clears_the_sequence() {
         let (_dir, mut app) = app();
-        press(&mut app, "z");
+        // `z` is the prefix of `za` now, so this uses a key bound to nothing.
+        press(&mut app, "Q");
         assert!(app.pending.is_empty());
         let notice = app.latest_notice().expect("a notice should be shown");
-        assert!(notice.text.contains('z'), "{:?}", notice.text);
+        assert!(notice.text.contains('Q'), "{:?}", notice.text);
         assert_eq!(notice.level, NoticeLevel::Warn);
     }
 
@@ -1258,17 +1973,35 @@ mod tests {
         let startup = Startup::load(&cli).unwrap();
         let mut app = App::new(startup).unwrap();
         app.set_now(1_000);
-        app.cursor = 3;
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=5).map(summary).collect(),
+            50,
+        ));
+        app.list.move_cursor(3);
+        assert_eq!(app.list.selected().unwrap().number, 4);
 
         // `g` is bound and is also a prefix of `gg`, so it waits rather than
         // firing immediately: only hints short-circuit the timeout.
         press(&mut app, "g");
-        assert_eq!(app.cursor, 3, "the shorter binding must not fire yet");
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            4,
+            "the shorter binding must not fire yet"
+        );
         app.on_timeout();
-        assert_eq!(app.cursor, 0, "the timeout fires `g`");
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            1,
+            "the timeout fires `g`, which is nav.top"
+        );
 
+        app.list.move_cursor(3);
         press(&mut app, "gg");
-        assert_eq!(app.cursor, ROADMAP.len() - 1);
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            5,
+            "the longer binding is the one that fires"
+        );
     }
 
     #[test]
@@ -1400,7 +2133,10 @@ mod tests {
         assert!(app.doctor_running);
         assert!(app.checks().is_empty());
 
-        let job = app.doctor_job();
+        // The job id is what the loop stamps on the request and what the report
+        // carries back.
+        let job = 7;
+        app.record_job(&Effect::RunDoctor, job);
         app.apply_checks(
             job,
             vec![Check {
@@ -1421,7 +2157,7 @@ mod tests {
             press(&mut app, &character.to_string());
         }
         press(&mut app, "<CR>");
-        let first = app.doctor_job();
+        app.record_job(&Effect::RunDoctor, 1);
 
         // A second request supersedes the first.
         press(&mut app, ":");
@@ -1429,15 +2165,16 @@ mod tests {
             press(&mut app, &character.to_string());
         }
         press(&mut app, "<CR>");
+        app.record_job(&Effect::RunDoctor, 2);
 
-        app.apply_checks(first, Vec::new());
+        app.apply_checks(1, Vec::new());
         assert!(
             app.doctor_running,
             "the stale report must not resolve the job"
         );
 
         app.apply_checks(
-            app.doctor_job(),
+            2,
             vec![Check {
                 name: "home",
                 status: crate::doctor::Status::Ok,
@@ -1448,24 +2185,12 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_doctor_job_stops_waiting() {
-        let (_dir, mut app) = app();
-        press(&mut app, ":");
-        for character in "doctor".chars() {
-            press(&mut app, &character.to_string());
-        }
-        press(&mut app, "<CR>");
-        assert!(app.doctor_running);
-        app.abort_doctor_job();
-        assert!(!app.doctor_running);
-    }
-
-    #[test]
     fn a_leader_binding_closes_the_menu_when_it_fires() {
+        // Needs rows, because the assertion is about what the cursor did afterwards.
         // The menu opens on the ambiguity timeout, so a test that fires
         // <leader>t without waiting would never have opened it and would miss
         // this (FR-7.3).
-        let (_dir, mut app) = app();
+        let (_dir, mut app) = list_app();
         press(&mut app, "<Space>");
         app.on_timeout();
         assert_eq!(app.overlay(), Overlay::Leader);
@@ -1481,7 +2206,7 @@ mod tests {
 
         // And the cursor is reachable again.
         press(&mut app, "j");
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.list.selected().map(|pr| pr.number), Some(2));
     }
 
     #[test]
@@ -1681,13 +2406,265 @@ mod tests {
         assert_eq!(app.command.input, "doctor");
     }
 
+    /// Draws a frame and hands back the terminal, so a test can ask where something
+    /// actually appeared.
+    fn drawn(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+    }
+
+    /// The terminal row whose text contains `needle`.
+    fn row_of(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>, needle: &str) -> u16 {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area();
+        for y in area.top()..area.bottom() {
+            let mut line = String::new();
+            for x in area.left()..area.right() {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            if line.contains(needle) {
+                return y;
+            }
+        }
+        panic!("`{needle}` is not on screen");
+    }
+
+    /// Draws a frame so the pane geometry the mouse arithmetic needs is real.
+    fn frame(app: &mut App, width: u16, height: u16) {
+        let _ = drawn(app, width, height);
+    }
+
+    /// One pull request summary, for tests that only need rows to exist.
+    fn summary(number: u64) -> crate::domain::pr::PullRequestSummary {
+        crate::domain::pr::PullRequestSummary {
+            number,
+            title: format!("PR {number}"),
+            author: "alice".to_owned(),
+            state: crate::domain::pr::PrState::Open,
+            is_draft: false,
+            base_ref: "main".to_owned(),
+            head_ref: "topic".to_owned(),
+            head_sha: "abc".to_owned(),
+            created_at: crate::domain::time::Timestamp::default(),
+            updated_at: crate::domain::time::Timestamp::default(),
+            additions: 1,
+            deletions: 1,
+            changed_files: 1,
+            labels: Vec::new(),
+            review_decision: None,
+            checks: crate::domain::pr::CheckSummary::default(),
+            url: String::new(),
+            is_cross_repository: false,
+        }
+    }
+
+    fn click(column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn wheel(column: u16, row: u16, down: bool) -> event::MouseEvent {
+        event::MouseEvent {
+            kind: if down {
+                event::MouseEventKind::ScrollDown
+            } else {
+                event::MouseEventKind::ScrollUp
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn list_app() -> (TempHome, App) {
+        let (dir, mut app) = app();
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=5).map(summary).collect(),
+            50,
+        ));
+        (dir, app)
+    }
+
     #[test]
-    fn the_mouse_wheel_moves_the_cursor() {
-        let (_dir, mut app) = app();
-        app.on_scroll(1);
-        assert_eq!(app.cursor, 1);
-        app.on_scroll(-1);
-        assert_eq!(app.cursor, 0);
+    fn a_click_on_a_list_row_selects_that_row() {
+        let (_dir, mut app) = list_app();
+        let terminal = drawn(&mut app, 100, 30);
+
+        // The row is found in the *rendered frame*, not from the geometry constants
+        // the click handler uses: a test that shares the implementation's arithmetic
+        // passes with the implementation's mistakes (this one did, when the handler
+        // was two rows out).
+        let row = row_of(&terminal, "PR 3");
+        app.on_mouse(click(10, row));
+        assert_eq!(app.list.selected().unwrap().number, 3);
+
+        let row = row_of(&terminal, "PR 5");
+        app.on_mouse(click(10, row));
+        assert_eq!(app.list.selected().unwrap().number, 5);
+
+        // The filter bar is not a row: a click there must not move the cursor.
+        app.on_mouse(click(10, app.filter_bar_rect.y));
+        assert_eq!(app.list.selected().unwrap().number, 5);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_right_row_when_the_list_is_scrolled() {
+        // More pull requests than fit even in a full-height pane, so the list has to
+        // scroll for the test to mean anything.
+        let (dir, mut app) = app();
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=40).map(summary).collect(),
+            50,
+        ));
+        let _ = &dir;
+        press(&mut app, "G");
+        let terminal = drawn(&mut app, 100, 24);
+
+        let row = row_of(&terminal, "PR 40");
+        assert!(
+            app.list.scroll > 0,
+            "the list scrolled to reach the last row"
+        );
+
+        app.on_mouse(click(10, row));
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            40,
+            "a click maps through the scroll offset"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_list_rather_than_only_moving_the_cursor() {
+        // More rows than fit, so the wheel has something to scroll.
+        let (dir, mut app) = app();
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=40).map(summary).collect(),
+            50,
+        ));
+        let _ = &dir;
+        drawn(&mut app, 100, 24);
+        assert_eq!(app.list.scroll, 0);
+
+        app.on_mouse(wheel(10, 10, true));
+        assert!(app.list.scroll > 0, "a wheel-down event moves the text");
+
+        let scrolled = app.list.scroll;
+        app.on_mouse(wheel(10, 10, false));
+        assert!(
+            app.list.scroll < scrolled,
+            "and a wheel-up event moves it back"
+        );
+        assert_eq!(app.list.scroll, 0, "back to the top");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_diff_and_the_tree() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app) = review_app();
+        // A diff that is taller than the pane, so the wheel has somewhere to go.
+        let patch = crate::domain::diff::parse_patch(include_str!(
+            "../../tests/fixtures/gh/pr-diff-large.patch"
+        ));
+        app.set_review(DiffView::new(patch));
+        frame(&mut app, 120, 30);
+        assert_eq!(app.review.as_ref().unwrap().scroll, 0);
+
+        app.on_mouse(wheel(60, app.review_top + 4, true));
+        let after = app.review.as_ref().unwrap().scroll;
+        assert!(after > 0, "the wheel moves the diff text");
+
+        app.on_mouse(wheel(60, app.review_top + 4, false));
+        assert!(
+            app.review.as_ref().unwrap().scroll < after,
+            "and moves it back"
+        );
+    }
+
+    #[test]
+    fn a_click_below_the_last_tree_row_does_nothing() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+        let before = app.review.as_ref().unwrap().current_path().cloned();
+
+        // Far below the two-line tree, inside the pane's rectangle.
+        app.on_mouse(click(5, app.review_top + 12));
+        assert_eq!(
+            app.review.as_ref().unwrap().current_path().cloned(),
+            before,
+            "the empty space under the tree is not a row"
+        );
+    }
+
+    /// A review with a directory, so the tree has a folder row to click.
+    fn review_app() -> (TempHome, App) {
+        use crate::tui::diff_view::DiffView;
+
+        let (dir, mut app) = list_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n\
+             diff --git a/src/two.rs b/src/two.rs\n--- a/src/two.rs\n+++ b/src/two.rs\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        app.set_review(DiffView::new(patch));
+        (dir, app)
+    }
+
+    #[test]
+    fn a_click_on_a_file_row_opens_that_file() {
+        let (_dir, mut app) = review_app();
+        let terminal = drawn(&mut app, 120, 30);
+
+        // Row two of the tree is `src/two.rs`: the row is found on screen, so the test
+        // does not depend on how the pane's rows are counted.
+        let row = row_of(&terminal, "two.rs");
+        app.on_mouse(click(5, row));
+        assert_eq!(
+            app.review
+                .as_ref()
+                .unwrap()
+                .current_path()
+                .unwrap()
+                .as_str(),
+            "src/two.rs"
+        );
+        assert!(app.review.as_ref().unwrap().current_file_label().is_some());
+    }
+
+    #[test]
+    fn a_click_on_a_directory_row_folds_it_and_keeps_the_tree_focused() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+
+        app.on_mouse(click(5, app.review_top + 1));
+        let view = app.review.as_ref().unwrap();
+        assert!(view.tree_focused, "the tree has the cursor");
+        assert!(view.folded_dirs.contains("src"), "the folder folded");
+        assert!(
+            !view.tree.iter().any(|row| row.label == "one.rs"),
+            "and its files are hidden"
+        );
+    }
+
+    #[test]
+    fn a_click_in_the_diff_moves_the_diff_cursor() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+
+        app.on_mouse(click(80, app.review_top + 3));
+        let view = app.review.as_ref().unwrap();
+        assert!(!view.tree_focused);
+        assert_eq!(view.cursor, 2, "the row under the pointer");
     }
 
     #[test]

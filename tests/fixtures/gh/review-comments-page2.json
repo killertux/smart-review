@@ -1,0 +1,15 @@
+[
+  {
+    "id": 2001,
+    "user": { "login": "carol" },
+    "path": "src/infra/pg.rs",
+    "line": 88,
+    "original_line": 88,
+    "side": "RIGHT",
+    "body": "This query is called once per invoice.",
+    "created_at": "2026-09-11T02:00:00Z",
+    "in_reply_to_id": null,
+    "diff_hunk": "@@ -80,6 +80,7 @@",
+    "html_url": "https://github.com/acme/service/pull/141#discussion_r2001"
+  }
+]

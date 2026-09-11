@@ -18,25 +18,47 @@ use crate::tui::layout;
 use crate::tui::theme::element;
 
 /// Renders the help popup.
+///
+/// The list is longer than most terminals once every group is listed, so it scrolls:
+/// clipping the tail silently would hide exactly the bindings a user opened the help
+/// to find.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
     let lines = build_lines(app);
     let height = height_for(lines.len()).saturating_add(2).min(area.height);
     let popup = layout::centered(area, 88, height);
 
+    // Two rows are lost to the border and one to the hint line.
+    let visible = usize::from(popup.height.saturating_sub(3));
+    let offset = app.help_scroll.min(lines.len().saturating_sub(visible));
+    let more = lines.len() > offset + visible;
+
+    let title = if lines.len() > visible {
+        format!(
+            " Help  [{}/{}] ",
+            (offset + visible).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        " Help ".to_owned()
+    };
+
     frame.render_widget(Clear, popup);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(theme.style(element::BORDER_FOCUSED))
-        .title(" Help ");
+        .title(title);
 
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
             .style(theme.style(element::BG))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         popup,
     );
+
+    let _ = more;
 }
 
 fn build_lines(app: &App) -> Vec<Line<'static>> {
@@ -76,7 +98,8 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled(
         match &app.help_filter {
             Some(id) => format!(" Filtered to `{id}` by :keymap — Esc closes"),
-            None => " Esc closes · : commands · <leader> action menu · :keymap <action>".to_owned(),
+            None => " Esc closes · j/k scroll · : commands · <leader> menu · :keymap <action>"
+                .to_owned(),
         },
         theme.style(element::MUTED),
     )));

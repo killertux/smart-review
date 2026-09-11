@@ -52,6 +52,31 @@ impl TempHome {
         let _ = std::fs::write(&path, contents);
         path
     }
+
+    /// Writes an executable script and returns its path.
+    ///
+    /// The contents go to a temporary name and are renamed into place, because writing
+    /// the script and then `exec`ing it is racy: another thread's `fork` inherits the
+    /// open write descriptor, and the kernel refuses to execute a file that any
+    /// process still holds open for writing — "Text file busy". The rename gives the
+    /// exec target an inode that was never open for writing anywhere.
+    #[cfg(unix)]
+    pub(crate) fn write_executable(&self, name: &str, contents: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let final_path = self.path.join(name);
+        let temporary = self.path.join(format!("{name}.pending"));
+        let _ = std::fs::write(&temporary, contents);
+        let _ = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::rename(&temporary, &final_path);
+        final_path
+    }
+
+    /// Writes an executable script; on platforms without modes this is [`Self::write`].
+    #[cfg(not(unix))]
+    pub(crate) fn write_executable(&self, name: &str, contents: &str) -> PathBuf {
+        self.write(name, contents)
+    }
 }
 
 impl Default for TempHome {
@@ -69,6 +94,59 @@ impl Drop for TempHome {
 /// Shorthand for [`TempHome::new`].
 pub(crate) fn temp_home() -> TempHome {
     TempHome::new()
+}
+
+/// An in-memory [`CacheStore`](crate::ports::CacheStore) for tests.
+///
+/// Exists so the cache-first and offline paths of the application layer can be
+/// exercised without touching a disk (NFR-5.2).
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryCache {
+    entries: Mutex<std::collections::BTreeMap<String, crate::ports::Stored>>,
+}
+
+impl crate::ports::CacheStore for InMemoryCache {
+    fn read(&self, key: &crate::ports::CacheKey) -> crate::Result<Option<crate::ports::Stored>> {
+        let guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(guard.get(key.as_str()).cloned())
+    }
+
+    fn write(&self, key: &crate::ports::CacheKey, body: &str, now: u64) -> crate::Result<()> {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(
+            key.as_str().to_owned(),
+            crate::ports::Stored {
+                body: body.to_owned(),
+                fetched_at: now,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove(&self, key: &crate::ports::CacheKey) -> crate::Result<()> {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(key.as_str());
+        Ok(())
+    }
+
+    fn clear_prefix(&self, prefix: &str) -> crate::Result<u32> {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = guard.len();
+        guard.retain(|key, _| !key.starts_with(prefix));
+        Ok(u32::try_from(before - guard.len()).unwrap_or(u32::MAX))
+    }
 }
 
 /// An in-memory [`StateStore`](crate::ports::StateStore) for tests.

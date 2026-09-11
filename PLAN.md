@@ -134,25 +134,38 @@ $ cd ~/code/some-repo && smart-review
 List open PRs (newest first, paginated), type `/` to filter, press `Enter` to open, walk files and hunks with `j/k`, `]c`, `}`, `Tab` between tree and diff, click with the mouse, `R` to refresh, `:doctor` to see environment health. Still no LLM.
 
 **Work items**
-- [ ] `ForgePort` + `GhCliForge`: `list_pull_requests`, `get_pull_request`, `list_reviews`, `list_review_comments`, `list_checks` (FR-2.1, FR-2.4).
-- [ ] Process runner: argv arrays only, no shell, stdout/stderr separated and size-capped, timeout, exit code + stderr tail in errors, `--repo` always passed (ARCH-3, NFR-3.3).
-- [ ] Environment detection + four distinct actionable failures (not a git repo / no GitHub remote / no `gh` / `gh` unauthenticated) (FR-1.1).
-- [ ] Remote resolution (`origin` → first GitHub remote → `--remote`/config) and repository identity key (FR-1.1, FR-1.3).
-- [ ] PR list UI: rows, draft marker, author, relative time, ±stats, check summary, review decision; explicit pagination with `:load-more` and an honest "showing 50 of ≥137" (FR-2.1).
-- [ ] Filter chips → `gh --search` query builder + local fuzzy incremental search (FR-2.2).
-- [ ] Disk cache with TTLs, cache-first first paint, revalidate-in-place preserving cursor/scroll, offline indicator (FR-2.3, DEC-14 default).
-- [ ] Diff acquisition: remote mode via `gh pr diff --patch` (local mode arrives in M2) (FR-3.2).
-- [ ] **Unified diff parser** as a pure, exhaustively unit-tested function: renames, binary, mode-only, submodule, CRLF, `\ No newline at end of file`, missing trailing newline, malformed input (FR-3.2).
-- [ ] Diff rendering: file tree with per-file stats and folder grouping, hunk headers, dual line numbers, add/del/context styles, cursor line, **virtualized** (only visible lines laid out) (FR-3.3).
-- [ ] Side-by-side toggle at width ≥ 140, unavailable below with an explanation (DEC-4, FR-3.3).
-- [ ] Navigation set + hunk/file folding + `:copy-path` via OSC 52 (FR-3.4).
-- [ ] Mouse: wheel scroll, click-to-focus, click-to-position in tree/diff (FR-7.5).
-- [ ] `:doctor` full checklist incl. gh version/scopes, config parse status, paths, terminal info (FR-9.3).
+- [x] `ForgePort` + `GhCliForge`: `list_pull_requests`, `get_pull_request`, `list_reviews`, `list_review_comments`, `list_checks` (FR-2.1, FR-2.4).
+- [x] Process runner: argv arrays only, no shell, stdout/stderr separated and size-capped, timeout, exit code + stderr tail in errors, `--repo` always passed (ARCH-3, NFR-3.3).
+- [x] Environment detection + four distinct actionable failures (not a git repo / no GitHub remote / no `gh` / `gh` unauthenticated) (FR-1.1).
+- [x] Remote resolution (`origin` → first GitHub remote → `--remote`/config) and repository identity key (FR-1.1, FR-1.3).
+- [x] PR list UI: rows, draft marker, author, relative time, ±stats, check summary, review decision; explicit pagination with `:load-more` and an honest "showing 50 of ≥137" (FR-2.1).
+- [x] Filter chips → `gh --search` query builder + local fuzzy incremental search (FR-2.2).
+- [x] Disk cache with TTLs, cache-first first paint, revalidate-in-place preserving cursor/scroll, offline indicator (FR-2.3, DEC-14 default).
+- [x] Diff acquisition: remote mode via `gh pr diff --patch` (local mode arrives in M2) (FR-3.2).
+- [x] **Unified diff parser** as a pure, exhaustively unit-tested function: renames, binary, mode-only, submodule, CRLF, `\ No newline at end of file`, missing trailing newline, malformed input (FR-3.2).
+- [x] Diff rendering: file tree with per-file stats and folder grouping, hunk headers, dual line numbers, add/del/context styles, cursor line, **virtualized** (only visible lines laid out) (FR-3.3).
+- [x] Side-by-side toggle at width ≥ 140, unavailable below with an explanation (DEC-4, FR-3.3).
+- [x] Navigation set + hunk/file folding + `:copy-path` via OSC 52 (FR-3.4).
+- [x] Mouse: wheel scroll, click-to-focus, click-to-position in tree/diff (FR-7.5).
+- [x] `:doctor` full checklist incl. gh version/scopes, config parse status, paths, terminal info (FR-9.3).
 - [ ] Tests: parser units; snapshot tests for list, diff (unified/split/empty/huge), too-small; application tests with a **fake `ForgePort`**; a fake `gh` executable on `PATH` asserting exact argv.
 
 **FR coverage:** FR-1.1, 1.3, 2.1–2.4, 3.2–3.4, 7.5, 7.7 (on real content), 9.3.
-**Crates to approve:** `serde_json`, one date/time crate (`time` preferred over `chrono` — justify at approval), `unicode-width`.
-**Risks:** diff virtualization and the parser's edge cases are where time disappears; the fake-`gh` harness must land early so no test needs the network (NFR-5.2).
+**Crates approved:** `serde_json`, `chrono` (with `serde`) in place of `time` — the
+user's choice, and its `DateTime<Utc>` is the type the fixtures and the cache use —
+`unicode-width`, and `signal-hook` for the terminal restore on a signal.
+**Risks:** diff virtualization and the parser's edge cases are where time disappears;
+the fake-`gh` harness must land early so no test needs the network (NFR-5.2).
+
+**Delivered.** `scripts/validate/m1.sh` drives the whole chain through a fake `gh`
+and asserts what the *screen* shows, with a small terminal emulator
+(`scripts/validate/screen.py`) reconstructing the final frame from the pty capture,
+because the raw stream contains only the cells that changed.
+
+Two things M1 does not do, both stated in the interface rather than hidden:
+`<leader>dc`/`<leader>dw` (context lines and whitespace ignoring) need the local
+workspace that M2 creates, and they say so when pressed; and the inline comments are
+fetched and cached but not yet drawn on the diff, which is M4's publishing flow.
 
 ---
 

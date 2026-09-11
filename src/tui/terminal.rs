@@ -2,7 +2,12 @@
 //!
 //! Entering raw mode, the alternate screen and mouse capture is expressed as one
 //! RAII guard, so there is exactly one place that can put the terminal back. A
-//! panic hook restores it before the panic message is printed.
+//! panic hook restores it before the panic message is printed, and a signal handler
+//! does the same for `SIGTERM`/`SIGHUP`, which would otherwise leave the user with a
+//! terminal that no longer echoes (NFR-4.2).
+//!
+//! `SIGINT` needs no handler: in raw mode it arrives as a key event, which is how
+//! `Ctrl-C` already quits cleanly.
 //!
 //! The takeover flag is set as soon as raw mode is on — before any escape
 //! sequence — so a failure *during* the takeover still has a way back. That is
@@ -63,6 +68,8 @@ static HOOK: Once = Once::new();
 #[derive(Debug)]
 pub(crate) struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// Whether mouse capture is on, so a runtime toggle keeps the restore honest.
+    mouse: bool,
 }
 
 impl TerminalGuard {
@@ -72,12 +79,13 @@ impl TerminalGuard {
     /// returning the error (FR-9.1).
     pub(crate) fn enter(mouse: bool) -> io::Result<Self> {
         install_panic_hook();
+        install_signal_handlers();
         enable_raw_mode()?;
         // From here on the terminal must be given back on every path.
         TAKEOVER.begin();
 
         match setup(mouse) {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => Ok(Self { terminal, mouse }),
             Err(error) => {
                 restore();
                 Err(error)
@@ -88,6 +96,21 @@ impl TerminalGuard {
     /// Draws one frame.
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
         self.terminal.draw(render).map(|_| ())
+    }
+
+    /// Turns mouse reporting on or off while the interface is running (FR-7.5).
+    ///
+    /// Only this type may do it: it is the one that knows whether capture was ever
+    /// asked for, and the restore path has to stay correct either way.
+    pub(crate) fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        if enabled {
+            execute!(stdout, EnableMouseCapture)?;
+        } else {
+            execute!(stdout, DisableMouseCapture)?;
+        }
+        self.mouse = enabled;
+        Ok(())
     }
 }
 
@@ -124,6 +147,35 @@ pub(crate) fn restore() {
 #[cfg(test)]
 pub(crate) fn is_active() -> bool {
     TAKEOVER.is_active()
+}
+
+/// Restores the terminal when the process is asked to stop by a signal.
+///
+/// Without this, `kill` (or a closed terminal, which sends `SIGHUP`) leaves the
+/// terminal in raw mode on the alternate screen: the shell looks broken until the
+/// user runs `reset`. The handler restores first and then re-raises, so the exit
+/// status still says what happened rather than being swallowed.
+fn install_signal_handlers() {
+    use signal_hook::consts::{SIGHUP, SIGTERM};
+
+    for signal in [SIGTERM, SIGHUP] {
+        // A failure here is not worth stopping for: the app still works, it just
+        // loses the courtesy of a tidy exit on that signal.
+        let _ = signal_hook::iterator::Signals::new([signal]).map(|mut signals| {
+            std::thread::spawn(move || {
+                if signals.forever().next().is_some() {
+                    crate::logging::log(
+                        crate::logging::Level::Warn,
+                        format!("received signal {signal}; restoring the terminal"),
+                    );
+                    restore();
+                    // The default disposition is restored before re-raising, so the
+                    // process dies of the signal as its parent expects.
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                }
+            });
+        });
+    }
 }
 
 fn install_panic_hook() {

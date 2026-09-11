@@ -1,0 +1,39 @@
+{
+  "number": 141,
+  "title": "WIP refactor of billing domain",
+  "body": "Splits `Invoice` into a domain object and a projection.\n\n- [x] domain types\n- [ ] api wiring\n",
+  "author": { "id": "MDQ6VXNlcjI=", "is_bot": false, "login": "bruno", "name": "Bruno Silva" },
+  "state": "OPEN",
+  "isDraft": true,
+  "baseRefName": "main",
+  "headRefName": "refactor/billing",
+  "headRefOid": "ba6c89f0a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  "isCrossRepository": false,
+  "createdAt": "2026-09-09T14:02:00Z",
+  "updatedAt": "2026-09-11T06:05:00Z",
+  "mergeStateStatus": "BLOCKED",
+  "additions": 412,
+  "deletions": 96,
+  "changedFiles": 12,
+  "labels": [ { "id": "LA_3", "name": "refactor", "description": "", "color": "5319e7" } ],
+  "reviewDecision": "CHANGES_REQUESTED",
+  "url": "https://github.com/acme/service/pull/141",
+  "reviewRequests": [
+    { "__typename": "User", "login": "alice" },
+    { "__typename": "Team", "name": "platform", "slug": "platform" }
+  ],
+  "reviews": [
+    { "author": { "login": "alice" }, "state": "CHANGES_REQUESTED", "body": "The discount path needs a test.", "submittedAt": "2026-09-10T10:00:00Z" },
+    { "author": { "login": "carol" }, "state": "APPROVED", "body": "", "submittedAt": "2026-09-10T11:30:00Z" },
+    { "author": { "login": "dave" }, "state": "COMMENTED", "body": "nit: naming", "submittedAt": null }
+  ],
+  "commits": [
+    { "oid": "1111111111111111111111111111111111111111", "messageHeadline": "Split Invoice into domain and projection", "messageBody": "The projection keeps the old shape for the API.", "committedDate": "2026-09-09T14:00:00Z", "authors": [ { "login": "bruno", "name": "Bruno Silva", "email": "bruno@example.com" } ] },
+    { "oid": "2222222222222222222222222222222222222222", "messageHeadline": "Subtract the discount from gross", "messageBody": "", "committedDate": "2026-09-11T05:00:00Z", "authors": [ { "login": "bruno", "name": "Bruno Silva", "email": "bruno@example.com" } ] }
+  ],
+  "statusCheckRollup": [
+    { "__typename": "CheckRun", "name": "ci / test (ubuntu-latest)", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/acme/service/actions/runs/3", "workflowName": "CI" },
+    { "__typename": "CheckRun", "name": "ci / test (macos-latest)", "status": "IN_PROGRESS", "conclusion": "", "detailsUrl": "https://github.com/acme/service/actions/runs/4", "workflowName": "CI" },
+    { "__typename": "CheckRun", "name": "ci / integration", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/acme/service/actions/runs/5", "workflowName": "CI" }
+  ]
+}

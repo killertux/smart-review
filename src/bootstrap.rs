@@ -6,14 +6,20 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
+use crate::adapters::cache::DiskCache;
 use crate::adapters::clock::SystemClock;
 use crate::adapters::fs::{TomlConfigStore, TomlStateStore};
+use crate::adapters::gh::GhForgeFactory;
+use crate::adapters::gh::probe::GhCliProbe;
+use crate::adapters::git::GitCli;
 use crate::cli::Cli;
 use crate::config::{Config, ConfigDocument};
 use crate::doctor::Context;
 use crate::error::Result;
 use crate::paths::Home;
-use crate::ports::{ConfigStore, StateStore};
+use crate::ports::{CacheStore, ConfigStore, ForgeFactory, ForgeProbe, StateStore, WorkspacePort};
 use crate::state::AppState;
 use crate::tui::keymap::{self, Keymap};
 use crate::tui::theme::{self, Theme};
@@ -56,8 +62,25 @@ pub struct Startup {
     pub remote: Option<String>,
     /// Injected time source.
     pub clock: SystemClock,
+    /// The checkout the app is running in (ARCH-2).
+    pub workspace: Arc<dyn WorkspacePort>,
+    /// The forge probe, which needs no repository (FR-1.1).
+    pub probe: Arc<dyn ForgeProbe>,
+    /// Builds the forge once detection has resolved a repository.
+    pub forge_factory: Arc<dyn ForgeFactory>,
+    /// Where answers are cached (FR-2.3).
+    pub cache: Arc<dyn CacheStore>,
     /// The state store in use.
     pub state_store: TomlStateStore,
+}
+
+/// Resolves which repository to read: the flag wins, then the environment.
+///
+/// A blank value counts as unset, because `SMART_REVIEW_REPO=` in a shell script is
+/// almost always a variable that was never given a value.
+#[must_use]
+pub fn resolve_repo(flag: Option<String>, environment: Option<String>) -> Option<String> {
+    flag.or_else(|| environment.filter(|value| !value.trim().is_empty()))
 }
 
 impl Startup {
@@ -74,6 +97,10 @@ impl Startup {
             keymap: self.keymap.clone(),
             theme: self.theme.clone(),
             theme_source: self.theme_source.clone(),
+            config_keys: self.document.key_count(),
+            // Detection has not run yet when the startup is built.
+            environment: None,
+            environment_error: None,
         }
     }
 
@@ -90,6 +117,10 @@ impl Startup {
         let home = Home::resolve(cli.home.as_deref())?;
         home.ensure()?;
         home.write_readme()?;
+
+        // `SMART_REVIEW_REPO` is the environment spelling of `--repo` (FR-1.1):
+        // useful in a shell that is not in a clone, and in a CI job.
+        let repo = resolve_repo(cli.repo.clone(), std::env::var("SMART_REVIEW_REPO").ok());
 
         let config_path = cli.config.clone().unwrap_or_else(|| home.config());
         let config_store = TomlConfigStore::new(config_path.clone());
@@ -142,6 +173,18 @@ impl Startup {
 
         let keymap = keymap::load(&home, &loaded.config.ui, &mut warnings)?;
 
+        // The composition root: this is the only place that names an adapter, so the
+        // presentation layer can depend on the ports alone (ARCH-1).
+        let workspace: Arc<dyn WorkspacePort> = Arc::new(match &cli.path {
+            Some(path) => GitCli::new().in_dir(path.clone()),
+            None => GitCli::new(),
+        });
+        let probe: Arc<dyn ForgeProbe> =
+            Arc::new(GhCliProbe::new(loaded.config.forge.gh_path.clone()));
+        let forge_factory: Arc<dyn ForgeFactory> =
+            Arc::new(GhForgeFactory::new(loaded.config.forge.gh_path.clone()));
+        let cache: Arc<dyn CacheStore> = Arc::new(DiskCache::new(home.cache()));
+
         Ok(Self {
             home,
             config: loaded.config,
@@ -155,11 +198,15 @@ impl Startup {
             theme_request,
             state,
             warnings,
-            repo: cli.repo.clone(),
+            repo,
             pr: cli.pr,
             path: cli.path.clone(),
             remote: cli.remote.clone(),
             clock: SystemClock,
+            workspace,
+            probe,
+            forge_factory,
+            cache,
             state_store,
         })
     }
@@ -257,6 +304,24 @@ mod tests {
         let startup = Startup::load(&cli_for(dir.path())).unwrap();
         assert!(startup.warnings.iter().any(|w| w.contains("timeoutlen")));
         assert_eq!(startup.config.ui.timeoutlen, 500);
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_environment_and_a_blank_value_is_unset() {
+        // Tested as a function rather than by writing the variable: setting an
+        // environment variable is `unsafe` in edition 2024 and would leak into every
+        // test running in parallel, so the precedence is separated from the read.
+        assert_eq!(
+            resolve_repo(Some("acme/flag".to_owned()), Some("acme/env".to_owned())).as_deref(),
+            Some("acme/flag")
+        );
+        assert_eq!(
+            resolve_repo(None, Some("acme/env".to_owned())).as_deref(),
+            Some("acme/env")
+        );
+        assert_eq!(resolve_repo(None, Some(String::new())), None);
+        assert_eq!(resolve_repo(None, Some("   ".to_owned())), None);
+        assert_eq!(resolve_repo(None, None), None);
     }
 
     #[test]

@@ -1,29 +1,30 @@
- smart-review v0.1.0 config: built-in defaults                                         acme/service
-┌ Planned ─────────────────────────────────────────────┐┌ This shell ──────────────────────────────┐
-│ > M1┌ Help ────────────────────────────────────────────────────────────────────────────────┐     │
-│   M1│ APP                                                                                  │     │
-│   M2│   <C-c>, <Space>q     Quit smart-review                                              │     │
-│   M2│   <Space>?, ?         Show the help popup                                            │     │
-│   M2│   :                   Open the command line                                          │     │
-│   M3│   <Space>             Show the available leader bindings                             │     │
-│   M4│   <Esc>               Close the current popup, or cancel pending keys                │     │
-│   M5│   <Space>r            Refresh the current view                                       │     │
+ smart┌ Help  [27/48] ───────────────────────────────────────────────────────────────────────┐rvice
+│ filt│ APP                                                                                  │     │
+│ sear│   <C-c>, <Space>q, q  Quit smart-review                                              │     │
+┌ no r│   <Space>?, ?         Show the help popup                                            │─────┐
+│Looki│   :                   Open the command line                                          │     │
+│     │   <Space>             Show the available leader bindings                             │     │
+│     │   <Esc>               Close the current popup, or cancel pending keys                │     │
+│     │   R                   Refresh the current view                                       │     │
 │     │   ·                   Show environment checks                                        │     │
-│ This│   ·                   Show the version                                               │     │
-│ Navi│   ·                   Dismiss the current notification                               │nu   │
-│ comm│ NAVIGATION                                                                           │     │
-│ pane│   <Up>, k             Move up                                                        │     │
+│     │   ·                   Show the version                                               │     │
+│     │   ·                   Dismiss the current notification                               │     │
+│     │   ·                   Fetch the next page of pull requests                           │     │
+│     │ NAVIGATION                                                                           │     │
+│     │   <Up>, k             Move up                                                        │     │
 │     │   <Down>, j           Move down                                                      │     │
 │     │   gg                  Jump to the first item                                         │     │
 │     │   G                   Jump to the last item                                          │     │
+│     │   <CR>                Open the selected pull request, or the selected file           │     │
+│     │   <C-d>               Move half a screen down                                        │     │
+│     │   <C-u>               Move half a screen up                                          │     │
+│     │   <C-f>               Move a screen down                                             │     │
+│     │   <C-b>               Move a screen up                                               │     │
+│     │   <Esc>, h            Close the review, or clear the search and filters              │     │
 │     │ PANES                                                                                │     │
 │     │   <Tab>               Focus the next pane                                            │     │
 │     │   <S-Tab>             Focus the previous pane                                        │     │
-│     │ THEME                                                                                │     │
-│     │   <Space>t            Choose a theme                                                 │     │
-│     │   <Space>T            Switch to the next theme                                       │     │
-│     │                                                                                      │     │
-│     │ Esc closes · : commands · <leader> action menu · :keymap <action>                    │     │
-│     └──────────────────────────────────────────────────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- POPUP list · acme/service · — · — · 0 drafts                ? help · <leader> actions · : commands
+│     │ SEARCH                                                                               │     │
+└─────│   /                   Filter the loaded pull requests as you type                    │─────┘
+ POPUP│   <CR> (search), <Esc> (search)Stop editing the search                               │mands
+      └──────────────────────────────────────────────────────────────────────────────────────┘

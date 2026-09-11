@@ -11,7 +11,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::error::Error;
@@ -34,10 +34,17 @@ pub struct Context {
     pub config_path: PathBuf,
     /// Whether a config file was read.
     pub config_exists: bool,
+    /// How many keys the config file declares, which is what makes "parsed" a
+    /// checkable statement rather than an absence of errors (FR-9.3).
+    pub config_keys: usize,
     /// Warnings collected while loading configuration and keybindings.
     pub warnings: Vec<String>,
     /// The keybinding engine.
     pub keymap: Keymap,
+    /// What detection resolved, when it has run (FR-1.1).
+    pub environment: Option<crate::domain::environment::Environment>,
+    /// Why detection failed, when it did.
+    pub environment_error: Option<crate::domain::environment::EnvironmentError>,
     /// The active theme.
     pub theme: Theme,
     /// Where the theme came from.
@@ -115,9 +122,33 @@ pub fn collect_local(context: &Context) -> Vec<Check> {
             status: Status::Ok,
             detail: log_detail(context),
         },
+        directory_check("cache", &context.home.cache()),
         terminal_check(),
+        locale_check(),
         llm_check(context),
     ];
+
+    // The detection result is a requirement in its own right (FR-1.1): the report
+    // has to say which repository was found, through which remote, and in which
+    // mode — or why it was not found at all.
+    checks.push(repository_check(context));
+    if let Some(environment) = &context.environment {
+        checks.push(Check {
+            name: "forge",
+            status: if environment.gh.is_supported() && environment.gh.has_repo_scope() {
+                Status::Ok
+            } else {
+                Status::Warn
+            },
+            detail: format!(
+                "{} at {} · account {} · scopes {}",
+                environment.gh.version,
+                environment.gh.path.display(),
+                environment.gh.account.as_deref().unwrap_or("unknown"),
+                environment.gh.scope_label()
+            ),
+        });
+    }
 
     checks.sort_by_key(|check| check.name);
     checks
@@ -287,6 +318,30 @@ fn read_tail(path: &Path, bytes: u64) -> std::io::Result<String> {
     Ok(buffer)
 }
 
+/// Locale information (FR-9.3): it decides how the app's own output is encoded.
+fn locale_check() -> Check {
+    let mut parts: Vec<String> = Vec::new();
+    for name in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Ok(value) = std::env::var(name)
+            && !value.is_empty()
+        {
+            parts.push(format!("{name}={value}"));
+        }
+    }
+    if parts.is_empty() {
+        return Check {
+            name: "locale",
+            status: Status::Warn,
+            detail: "LANG and LC_* are unset; the terminal's encoding is unknown".to_owned(),
+        };
+    }
+    Check {
+        name: "locale",
+        status: Status::Ok,
+        detail: parts.join(" "),
+    }
+}
+
 fn config_check(context: &Context) -> Check {
     let origin = if context.config_exists {
         context.config_path.display().to_string()
@@ -360,6 +415,47 @@ fn tool_check(name: &'static str, program: &str, args: &[&str]) -> Check {
 /// Reporting it as a warning keeps `--check` exit code 1 ("degraded, will still
 /// work") on a fresh machine or a CI runner, which is the truth for M0: nothing
 /// the shell does needs GitHub. It becomes a failure once M1 depends on it.
+/// The repository detection resolved, or the reason it did not (FR-1.1).
+fn repository_check(context: &Context) -> Check {
+    if let Some(error) = &context.environment_error {
+        return Check {
+            name: "repository",
+            status: if error.is_recoverable() {
+                Status::Warn
+            } else {
+                Status::Fail
+            },
+            detail: format!("{error}; {}", error.advice()),
+        };
+    }
+
+    match &context.environment {
+        Some(environment) => Check {
+            name: "repository",
+            status: if environment.mode.has_workspace() {
+                Status::Ok
+            } else {
+                Status::Warn
+            },
+            detail: format!(
+                "{} via {} ({}){}",
+                environment.repo.key(),
+                environment.remote.as_deref().unwrap_or("no remote"),
+                environment.mode.label(),
+                environment
+                    .root
+                    .as_ref()
+                    .map_or(String::new(), |root| format!(" · {}", root.display()))
+            ),
+        },
+        None => Check {
+            name: "repository",
+            status: Status::Warn,
+            detail: "not resolved yet; run :doctor once the interface has started".to_owned(),
+        },
+    }
+}
+
 fn gh_check(program: &str) -> Check {
     let version = match run_tool(program, &["--version"]) {
         Ok(output) => first_line(&output),
@@ -368,8 +464,8 @@ fn gh_check(program: &str) -> Check {
                 name: "gh",
                 status: Status::Warn,
                 detail: format!(
-                    "{detail}; not needed until M1, then install it from \
-                     https://cli.github.com or set [forge].gh_path"
+                    "{detail}; install it from https://cli.github.com or set \
+                     [forge].gh_path"
                 ),
             };
         }
@@ -384,7 +480,7 @@ fn gh_check(program: &str) -> Check {
         Err(_) => Check {
             name: "gh",
             status: Status::Warn,
-            detail: format!("{version}, not authenticated; run `gh auth login` before M1"),
+            detail: format!("{version}, not authenticated; run `gh auth login`"),
         },
     }
 }
@@ -410,16 +506,18 @@ fn llm_check(context: &Context) -> Check {
 
 /// Runs an external command and returns its combined output.
 fn run_tool(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
+    // Through the shared runner, not `Command::output`: `gh auth status` reaches
+    // GitHub, and without a timeout a hung client would occupy its job slot for the
+    // rest of the session (ARCH-3).
+    let spec = crate::adapters::process::CommandSpec::new(program).args(args);
+    let output = crate::adapters::process::ProcessRunner::new()
+        .with_timeout(Duration::from_secs(15))
+        .with_output_cap(64 * 1024)
+        .run(&spec, &crate::ports::Cancel::new())
         .map_err(|error| format!("could not run `{program}`: {error}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-
-    if output.status.success() {
+    let combined = format!("{}{}", output.stdout, output.stderr);
+    if output.success() {
         Ok(combined.trim().to_owned())
     } else {
         let reason = first_line(&combined);
@@ -538,10 +636,73 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_gh_is_a_warning_while_m0_does_not_need_it() {
+    fn a_missing_gh_is_a_warning_with_where_to_get_it() {
         let check = gh_check("smart-review-no-such-binary");
         assert_eq!(check.status, Status::Warn);
-        assert!(check.detail.contains("M1"), "{}", check.detail);
+        assert!(check.detail.contains("cli.github.com"), "{}", check.detail);
+        assert!(check.detail.contains("[forge].gh_path"), "{}", check.detail);
+    }
+
+    #[test]
+    fn the_report_says_which_repository_was_found_and_in_which_mode() {
+        use crate::domain::environment::{Environment, GhInstall, RunMode};
+        use crate::domain::repo::RepoId;
+
+        let mut base = context().1;
+        base.environment = Some(Environment {
+            repo: RepoId::parse("acme/service").unwrap(),
+            mode: RunMode::InRepo,
+            remote: Some("origin".to_owned()),
+            root: Some(std::path::PathBuf::from("/src/service")),
+            default_branch: Some("main".to_owned()),
+            git_version: "2.43.0".to_owned(),
+            gh: GhInstall {
+                path: std::path::PathBuf::from("/usr/bin/gh"),
+                version: "2.45.0".to_owned(),
+                account: Some("bruno".to_owned()),
+                scopes: vec!["repo".to_owned()],
+            },
+        });
+
+        let check = collect_local(&base)
+            .into_iter()
+            .find(|check| check.name == "repository")
+            .unwrap();
+        assert_eq!(check.status, Status::Ok);
+        assert!(
+            check.detail.contains("github.com/acme/service"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("via origin"), "{}", check.detail);
+        assert!(check.detail.contains("repository"), "{}", check.detail);
+
+        let forge = collect_local(&base)
+            .into_iter()
+            .find(|check| check.name == "forge")
+            .unwrap();
+        assert_eq!(forge.status, Status::Ok);
+        assert!(forge.detail.contains("2.45.0"), "{}", forge.detail);
+        assert!(forge.detail.contains("bruno"), "{}", forge.detail);
+        assert!(forge.detail.contains("repo"), "{}", forge.detail);
+    }
+
+    #[test]
+    fn a_failed_detection_is_reported_with_its_next_step() {
+        use crate::domain::environment::EnvironmentError;
+
+        let mut base = context().1;
+        base.environment_error = Some(EnvironmentError::GhMissing {
+            tried: std::path::PathBuf::from("gh"),
+            advice: "install it from https://cli.github.com".to_owned(),
+        });
+
+        let check = collect_local(&base)
+            .into_iter()
+            .find(|check| check.name == "repository")
+            .unwrap();
+        assert_eq!(check.status, Status::Fail, "nothing works without gh");
+        assert!(check.detail.contains("cli.github.com"), "{}", check.detail);
     }
 
     #[test]

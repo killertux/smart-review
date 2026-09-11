@@ -378,6 +378,24 @@ pub struct ConfigDocument {
 }
 
 impl ConfigDocument {
+    /// How many keys the file declares, counting nested tables as one each.
+    ///
+    /// `:doctor` reports this so that "the configuration parsed" is a statement with
+    /// something behind it rather than the absence of an error (FR-9.3).
+    #[must_use]
+    pub fn key_count(&self) -> usize {
+        fn walk(table: &toml::Table) -> usize {
+            table
+                .values()
+                .map(|value| match value {
+                    toml::Value::Table(nested) => 1 + walk(nested),
+                    _ => 1,
+                })
+                .sum()
+        }
+        walk(&self.value)
+    }
+
     /// Parses `text` as a TOML document.
     ///
     /// # Errors

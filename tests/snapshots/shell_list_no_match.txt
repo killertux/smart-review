@@ -1,0 +1,23 @@
+ smart-review v0.1.0 config: built-in defaults                                                   acme/service
+│ filters [is:open] <leader>f add · x clear                                                                  │
+│ / postgres_                                                                                                │
+┌ acme/service · open · matching 0 of 3 loaded · 137 total ──────────────────────────────────────────────────┐
+│Nothing matches.                                                                                            │
+│                                                                                                            │
+│query: is:open · search "postgres"                                                                          │
+│                                                                                                            │
+│Esc clears the search · :clear-filters resets the filters                                                   │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ SEARCH list · acme/service · — · — · 0 drafts                         ? help · <leader> actions · : commands

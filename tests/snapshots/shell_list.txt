@@ -1,0 +1,23 @@
+ smart-review v0.1.0 config: built-in defaults                                                   acme/service
+│ filters [is:open] <leader>f adds one                                                                       │
+│ search / filters what has been fetched; :filter asks GitHub                                                │
+┌ acme/service · open · showing 3 of 137 ────────────────────────────────────────────────────────────────────┐
+│  #      T  Title                                              Size          Author       Updated Checks Dec│
+│────────────────────────────────────────────────────────────────────────────────────────────────────────────│
+│▶    142   Add retry to the webhook dispatcher                +218 −43      alice        2h      3/3    ok  │
+│     141 ◌ WIP refactor of billing domain                     +218 −43      bruno        2h      1/3    no  │
+│     138   Bump tokio to 1.53                                 +218 −43      dependabot   2h      —          │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ NORMAL list · acme/service · — · — · 0 drafts                         ? help · <leader> actions · : commands

@@ -1,0 +1,23 @@
+ smart-review v0.1.0 config: built-in defaults                                                   acme/service
+ #141 WIP refactor of billing domain [1 Diff] 2 Checks (0) 3 Reviews (0) 4 Chat 5 Analysis (0, 0) · no comment
+┌ Files (3) ─────────────────────┐┌ 3 files +2 −1 · unified · ctx 3 ─────────────────────────────────────────┐
+│ ▾ docs (1)                     ││── M src/domain/invoice.rs                                                │
+│    B logo.png                  ││@@ -12,4 +14,5 @@ impl Invoice {                                          │
+│ ▾ scripts (1)                  ││   12   14      pub fn total(&self) -> Money {                            │
+│    M build.sh                  ││   13     -         self.lines.sum()                                      │
+│ ▾ src (1)                      ││        15+         let gross = self.lines.sum();                         │
+│   ▾ domain (1)                 ││        16+         gross - self.discount                                 │
+│     ·M invoice.rs       +2 −1  ││   14   17      }                                                         │
+│                                ││   15   18  }                                                             │
+│                                ││── A docs/logo.png                                                        │
+│                                ││   binary file, not shown                                                 │
+│                                ││── M scripts/build.sh                                                     │
+│                                ││   mode changed 100644 → 100755, contents unchanged                       │
+│                                ││                                                                          │
+│                                ││                                                                          │
+│                                ││                                                                          │
+│                                ││                                                                          │
+│                                ││                                                                          │
+│                                ││                                                                          │
+└────────────────────────────────┘└──────────────────────────────────────────────────────────────────────────┘
+ NORMAL diff · acme/service · — · M src/domain/invoice.rs +2 −1 · — · 0 drafts ? help · <leader> actions · : c
