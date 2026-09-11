@@ -200,6 +200,12 @@ pub enum Filter {
     Draft(bool),
     /// `review:...`.
     Review(ReviewFilter),
+    /// `is:open|is:closed|is:merged|is:all`.
+    ///
+    /// Parsed like any other chip so `:filter is:merged` works, but never *stored* as
+    /// one: `PrQuery::push` folds it into [`PrQuery::state`], which keeps the header,
+    /// `--state` and the search string from disagreeing (FR-2.1).
+    State(PrStateFilter),
 }
 
 /// Why a filter line was refused.
@@ -280,6 +286,13 @@ impl Filter {
                     expected: "true or false",
                 }),
             },
+            "is" => PrStateFilter::parse(value).map(Self::State).ok_or({
+                FilterError::InvalidValue {
+                    name: "is".to_owned(),
+                    value: value.to_owned(),
+                    expected: "open, closed, merged or all",
+                }
+            }),
             "review" => ReviewFilter::parse(value).map(Self::Review).ok_or({
                 FilterError::InvalidValue {
                     name: "review".to_owned(),
@@ -320,6 +333,7 @@ impl Filter {
             Self::Draft(true) => "draft:true".to_owned(),
             Self::Draft(false) => "draft:false".to_owned(),
             Self::Review(review) => review.qualifier().to_owned(),
+            Self::State(state) => format!("is:{}", state.label()),
         }
     }
 
@@ -333,7 +347,9 @@ impl Filter {
             Self::Title(text) => format!("in:title {}", quoted(text)),
             Self::Body(text) => format!("in:body {}", quoted(text)),
             Self::Author(author) => format!("author:{}", quoted(author)),
-            Self::Number(_) => return None,
+            // Two qualifiers are not emitted from here: a number is resolved by
+            // fetching the PR, and the state is emitted once, from `PrQuery::state`.
+            Self::Number(_) | Self::State(_) => return None,
             Self::Label(label) => format!("label:{}", quoted(label)),
             Self::Base(base) => format!("base:{}", quoted(base)),
             Self::Draft(true) => "draft:true".to_owned(),
@@ -394,6 +410,7 @@ impl PrQuery {
     /// list.
     pub fn push(&mut self, filter: Filter) {
         match filter {
+            Filter::State(state) => self.state = state,
             Filter::Number(number) => {
                 self.filters
                     .retain(|existing| !matches!(existing, Filter::Number(_)));
@@ -586,6 +603,28 @@ mod tests {
 
         let filter = Filter::parse_line("label:needs review").unwrap();
         assert_eq!(filter.qualifier().unwrap(), "label:\"needs review\"");
+    }
+
+    #[test]
+    fn a_state_chip_sets_the_state_rather_than_becoming_a_filter() {
+        // Otherwise the header, `--state` and the search string could disagree.
+        let mut query = PrQuery::default();
+        query.push(Filter::parse_line("is:merged").unwrap());
+        assert_eq!(query.state, PrStateFilter::Merged);
+        assert!(query.filters.is_empty(), "the state is not a filter");
+        assert_eq!(query.server_search(), "is:merged sort:created-desc");
+        assert_eq!(query.canonical(), "state=merged;sort=newest;limit=50");
+
+        // The label round-trips, so `:filter is:all` reads back as it was typed.
+        assert_eq!(Filter::parse_line("is:all").unwrap().label(), "is:all");
+    }
+
+    #[test]
+    fn an_unknown_state_is_refused_with_the_accepted_values() {
+        let error = Filter::parse_line("is:whatever").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("merged"), "{text}");
+        assert!(text.contains("whatever"), "{text}");
     }
 
     #[test]

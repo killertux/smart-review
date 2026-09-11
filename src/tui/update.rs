@@ -301,6 +301,69 @@ fn copy_path(app: &mut App) -> Effect {
     }
 }
 
+/// `:pr N` opens that pull request (FR-7.4).
+fn open_pr(app: &mut App, argument: &str) -> Effect {
+    let trimmed = argument.trim().trim_start_matches('#');
+    match trimmed.parse::<u64>() {
+        Ok(number) => Effect::OpenPullRequest(number),
+        Err(_) if trimmed.is_empty() => {
+            app.command_error(":pr needs a number, e.g. :pr 141");
+            Effect::None
+        }
+        Err(_) => {
+            app.command_error(format!("`{trimmed}` is not a pull request number"));
+            Effect::None
+        }
+    }
+}
+
+/// `:filter author:alice` adds a chip and re-asks GitHub (FR-2.2).
+fn add_filter(app: &mut App, argument: &str) -> Effect {
+    if argument.is_empty() {
+        app.command_error(":filter needs a qualifier, e.g. :filter author:alice");
+        return Effect::None;
+    }
+    match crate::domain::query::Filter::parse_line(argument) {
+        Ok(filter) => {
+            app.list.push_filter(filter);
+            app.list.offline = None;
+            Effect::LoadPullRequests
+        }
+        Err(error) => {
+            // Refused rather than sent: a qualifier GitHub silently ignores looks
+            // like a bug in this app.
+            app.command_error(error.to_string());
+            Effect::None
+        }
+    }
+}
+
+/// `:sort updated desc` changes the order GitHub is asked for (FR-7.4).
+fn set_sort(app: &mut App, argument: &str) -> Effect {
+    let mut parts = argument.split_whitespace();
+    let field = parts.next().unwrap_or_default();
+    let direction = parts.next().unwrap_or("desc");
+    if field.is_empty() {
+        app.command_error(":sort needs a field: created or updated, then asc or desc");
+        return Effect::None;
+    }
+    let ascending = match direction {
+        "asc" => true,
+        "desc" => false,
+        other => {
+            app.command_error(format!("`{other}` is not a direction; use asc or desc"));
+            return Effect::None;
+        }
+    };
+    if let Some(sort) = crate::domain::query::PrSort::parse(field, ascending) {
+        app.list.sort = sort;
+        app.list.offline = None;
+        return Effect::LoadPullRequests;
+    }
+    app.command_error(format!("`{field}` is not sortable; use created or updated"));
+    Effect::None
+}
+
 /// Opens whatever the cursor is on: a pull request in the list, a file in the tree.
 fn open_selected(app: &mut App) -> Effect {
     if let Some(view) = app.review.as_mut() {
@@ -459,6 +522,12 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "version" => dispatch(app, "app.version"),
         "messages" => dispatch(app, "notice.clear"),
         "keymap" => keymap_command(app, argument),
+        "load-more" => dispatch(app, "app.load_more"),
+        "clear-filters" => dispatch(app, "filter.clear"),
+        "copy-path" => dispatch(app, "review.copy_path"),
+        "pr" => open_pr(app, argument),
+        "filter" => add_filter(app, argument),
+        "sort" => set_sort(app, argument),
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
             "reload" => app.reload_theme(),
@@ -640,6 +709,24 @@ fn closest_command(typed: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// An app with a fixed, short home, for tests that only care about state.
+    fn test_app() -> (crate::test_support::TempHome, App) {
+        let dir = crate::test_support::temp_home();
+        let cli = crate::cli::Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(dir.path().to_path_buf()),
+            log_level: None,
+            check: false,
+        };
+        let startup = crate::Startup::load(&cli).unwrap();
+        (dir, App::new(startup).unwrap())
+    }
+
     #[test]
     fn every_command_maps_to_a_registered_action() {
         for (name, id, description) in COMMANDS {
@@ -719,5 +806,85 @@ mod tests {
         for id in ["app.version", "notice.clear"] {
             assert!(action::is_known(id), "{id} should be registered");
         }
+    }
+
+    #[test]
+    fn every_listed_command_is_actually_handled() {
+        // The palette comes from `COMMANDS`, so a name listed there but missing from
+        // `command` would be offered to the user and then refused — which is exactly
+        // what happened to `:filter` before this test existed.
+        for (name, _, _) in super::COMMANDS {
+            let (_dir, mut app) = test_app();
+            // Commands that take an argument are given a valid one: the point is
+            // that the name is handled, not that it needs no argument.
+            let argument = match *name {
+                "filter" => " author:alice",
+                "sort" => " updated desc",
+                "pr" => " 141",
+                "set" => " ui.timeoutlen=250",
+                _ => "",
+            };
+            super::command(&mut app, &format!("{name}{argument}"));
+            let error = app.command_error_text();
+            assert!(
+                error.is_none(),
+                "`:{name}` is listed in the palette but refused: {error:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn filter_and_sort_arguments_are_validated_before_anything_is_sent() {
+        let (_dir, mut app) = test_app();
+
+        // A bad qualifier is refused with the name of the problem.
+        let effect = super::command(&mut app, "filter nonsense:x");
+        assert_eq!(effect, Effect::None);
+        assert!(
+            app.command_error_text()
+                .is_some_and(|text| text.contains("nonsense")),
+            "{:?}",
+            app.command_error_text()
+        );
+
+        // A good one re-asks GitHub.
+        let effect = super::command(&mut app, "filter author:alice");
+        assert_eq!(effect, Effect::LoadPullRequests);
+        assert_eq!(app.list.chips(), vec!["is:open", "author:alice"]);
+
+        // Sorting validates both halves.
+        assert_eq!(
+            super::command(&mut app, "sort updated asc"),
+            Effect::LoadPullRequests
+        );
+        assert_eq!(app.list.sort, crate::domain::query::PrSort::UpdatedAsc);
+        assert_eq!(super::command(&mut app, "sort nonsense"), Effect::None);
+        assert!(app.command_error_text().is_some());
+        assert_eq!(
+            super::command(&mut app, "sort created sideways"),
+            Effect::None
+        );
+        assert!(
+            app.command_error_text()
+                .is_some_and(|text| text.contains("sideways")),
+            "{:?}",
+            app.command_error_text()
+        );
+    }
+
+    #[test]
+    fn pr_opens_the_number_it_is_given() {
+        let (_dir, mut app) = test_app();
+        assert_eq!(
+            super::command(&mut app, "pr 141"),
+            Effect::OpenPullRequest(141)
+        );
+        assert_eq!(
+            super::command(&mut app, "pr #141"),
+            Effect::OpenPullRequest(141),
+            "a leading hash is how a user writes it"
+        );
+        assert_eq!(super::command(&mut app, "pr"), Effect::None);
+        assert!(app.command_error_text().is_some());
     }
 }

@@ -40,6 +40,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(format!("{} ", app.focus().label()), background),
         Span::styled(format!("· {} ", repository_label(app)), background),
         Span::styled(format!("· {} ", pull_request_label(app)), background),
+        // In the review screen the cursor's file is what the user is reading, so it
+        // belongs in the status line beside the pane name.
+        Span::styled(current_file_label(app), background),
         Span::styled(format!("· {} ", model_label(app)), background),
         Span::styled("· 0 drafts ", background),
     ];
@@ -63,6 +66,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn repository_label(app: &App) -> String {
     app.repo.clone().unwrap_or_else(|| PLACEHOLDER.to_owned())
+}
+
+/// The file under the cursor in the review screen, with its stats.
+fn current_file_label(app: &App) -> String {
+    app.review_screen()
+        .and_then(crate::tui::diff_view::DiffView::current_file_label)
+        .map_or_else(String::new, |label| format!("· {label} "))
 }
 
 fn pull_request_label(app: &App) -> String {

@@ -20,3 +20,9 @@ diff --git a/old/name.rs b/new/name.rs
 similarity index 100%
 rename from old/name.rs
 rename to new/name.rs
+@@ -30,3 +32,4 @@ impl Billing {
+     pub fn overdue(&self) -> bool {
+-        self.due_at < now
++        let grace = Duration::hours(1);
++        self.due_at + grace < now
+     }

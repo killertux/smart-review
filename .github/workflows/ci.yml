@@ -63,10 +63,14 @@ jobs:
           echo "exit code: $code"
           test "$code" -eq 0 -o "$code" -eq 1
 
-      # The project's own gate: formatting, lints, tests, first-run layout,
-      # permissions, configuration robustness and the pty check that the
-      # interface renders and restores the terminal. Ubuntu only, because the pty
-      # step needs GNU script.
-      - name: Milestone validation
+      # The milestones' own gates: formatting, lints, tests, first-run layout,
+      # permissions, configuration robustness, and — for M1 — the whole browsing
+      # and diff chain driven through a fake `gh`, with the screen reconstructed
+      # from the pty capture. Ubuntu only, because the pty steps need GNU script.
+      - name: Milestone validation (M0)
         if: runner.os == 'Linux'
         run: bash scripts/validate/m0.sh
+
+      - name: Milestone validation (M1)
+        if: runner.os == 'Linux'
+        run: bash scripts/validate/m1.sh

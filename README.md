@@ -4,10 +4,10 @@ A terminal client for reviewing GitHub pull requests, with LLM-assisted analysis
 and a review order that follows the project's architecture instead of the
 filesystem.
 
-> **Status: M0 — the shell.** Navigation, themes, keybindings, configuration, the
-> command line and the environment report are live. The pull request list, the
-> diff, the LLM analysis, chat and review publishing arrive in M1–M4 (see
-> [`PLAN.md`](PLAN.md)). The app tells you this on its first screen.
+> **Status: M1 — browsing and reading.** List, filter and search pull requests,
+> then read the diff with vim motions, folding, mouse and a side-by-side view. The
+> managed worktree, the model picker, the LLM analysis, chat and review publishing
+> arrive in M2–M4 (see [`PLAN.md`](PLAN.md)).
 
 ## Prerequisites
 
@@ -17,8 +17,8 @@ filesystem.
 | `git` | 2.30 | Repository and worktree operations (M2) |
 | `gh` | 2.40, authenticated | Pull requests, review submission |
 
-`gh` is only needed once M1 lands; M0 runs without it and `--check` tells you
-what is missing.
+`--check` runs the same detection the interface does and exits 0 ready / 1 degraded
+/ 2 unusable, naming the first thing to fix.
 
 ## Quick start
 
@@ -34,16 +34,33 @@ Inside the app:
 |---|---|
 | `j` / `k`, `<Down>` / `<Up>` | move |
 | `gg` / `G` | first / last |
-| `<Tab>` / `<S-Tab>` | next / previous pane |
+| `<C-d>` / `<C-u>`, `<C-f>` / `<C-b>` | half page, whole page |
+| `<Enter>` | open the selected pull request, or the file under the tree cursor |
+| `Esc` | close the review; on the list, clear the search and filters |
+| `/` | filter what has been fetched (client side, as you type) |
+| `n` / `N` | next / previous match |
+| `<Tab>` / `<S-Tab>` | tree ↔ diff |
+| `]c` / `[c` | next / previous hunk |
+| `}` / `{` | next / previous file |
+| `za` | fold the hunk (or the whole file, from its banner) |
+| `y` | copy the current file path (OSC 52) |
+| `<Space>f` / `<Space>s` | add a filter / change the order |
+| `<Space>d` then `s` `c` `w` | split view, context lines, whitespace |
+| `<Space>t` / `<Space>T` | theme picker / next theme |
 | `?` | help |
 | `<Space>` | leader menu |
-| `<Space>t` | theme picker, previewed live |
-| `<Space>T` | next theme (wraps through all of them) |
 | `:` | command line |
 | `<C-c>`, `:q`, `<Space>q` | quit |
 
-`:help`, `:doctor`, `:theme <name>|next|reload`, `:set ui.timeoutlen=250`, `:keymap`,
-`:version`. `Esc` closes a popup or cancels a half-typed key sequence.
+`:help`, `:doctor`, `:pr 141`, `:filter author:alice`, `:clear-filters`,
+`:sort updated desc`, `:load-more`, `:copy-path`, `:theme <name>|next|reload`,
+`:set ui.timeoutlen=250`, `:keymap`, `:version`. `Esc` closes a popup or cancels a
+half-typed key sequence.
+
+Two mechanisms filter the list, and the interface keeps them visibly apart: the
+**chips** change what GitHub is asked (`gh pr list --search`), while the `/` box
+filters what has already arrived, so 300 cached pull requests narrow without a
+round trip.
 
 ## Where things live
 

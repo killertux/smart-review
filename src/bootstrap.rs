@@ -75,6 +75,9 @@ impl Startup {
             theme: self.theme.clone(),
             theme_source: self.theme_source.clone(),
             config_keys: self.document.key_count(),
+            // Detection has not run yet when the startup is built.
+            environment: None,
+            environment_error: None,
         }
     }
 

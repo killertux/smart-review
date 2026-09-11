@@ -520,6 +520,8 @@ impl App {
             theme: self.theme.clone(),
             theme_source: self.theme_source.clone(),
             config_keys: self.document_key_count(),
+            environment: self.environment.clone(),
+            environment_error: self.environment_error.clone(),
         }
     }
 
@@ -944,6 +946,12 @@ impl App {
     /// The command line is closed by the time a command runs, so the error also
     /// goes to the status line, which is where the user is looking (FR-7.4,
     /// FR-9.1).
+    /// The error currently shown under the command line, if any.
+    #[must_use]
+    pub fn command_error_text(&self) -> Option<&str> {
+        self.command.error.as_deref()
+    }
+
     pub(crate) fn command_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.notice(NoticeLevel::Error, message.clone());
