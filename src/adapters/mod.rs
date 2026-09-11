@@ -5,6 +5,7 @@
 //! layout matches `ARCHITECTURE.md`, and are filled in by the milestone named in
 //! each file.
 
+pub mod cache;
 pub mod clock;
 pub mod fs;
 pub mod gh;

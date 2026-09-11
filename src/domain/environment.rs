@@ -165,7 +165,7 @@ pub enum EnvironmentError {
     },
 
     /// `gh` is missing or not executable.
-    #[error("the GitHub CLI (gh) was not found")]
+    #[error("the GitHub CLI was not found (looked for {tried})")]
     GhMissing {
         /// The path that was tried.
         tried: PathBuf,

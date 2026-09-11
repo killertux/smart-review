@@ -98,6 +98,58 @@ impl PullRequestPage {
     }
 }
 
+/// What probing the forge installation found (FR-1.1).
+///
+/// Three states rather than "installed or an error", because "not installed" and
+/// "installed but not logged in" need different sentences and different next steps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgeStatus {
+    /// No `gh` (or not executable).
+    Missing,
+    /// `gh` is there but not logged in; the detail is what it said.
+    Unauthenticated {
+        /// What is installed, so `:doctor` can still report the version.
+        install: crate::domain::environment::GhInstall,
+        /// `gh`'s own message, which distinguishes "logged out" from
+        /// "logged in to another host".
+        detail: String,
+    },
+    /// `gh` is installed and logged in.
+    Ready(crate::domain::environment::GhInstall),
+}
+
+impl ForgeStatus {
+    /// The installation, whichever state it is in.
+    #[must_use]
+    pub fn install(&self) -> Option<&crate::domain::environment::GhInstall> {
+        match self {
+            Self::Missing => None,
+            Self::Unauthenticated { install, .. } | Self::Ready(install) => Some(install),
+        }
+    }
+
+    /// Whether the forge is usable.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+}
+
+/// Probes the forge client without needing a repository.
+///
+/// Separate from [`ForgePort`] because detection runs *before* the repository is
+/// known: it may come from `--repo`, and the user still has to be told that `gh` is
+/// missing.
+pub trait ForgeProbe: std::fmt::Debug + Send + Sync {
+    /// Checks what is installed and whether it is logged in.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the probe itself could not be run, which is rarer
+    /// than a missing or logged-out client and is reported separately.
+    fn probe(&self, cancel: &Cancel) -> Result<ForgeStatus, String>;
+}
+
 /// Anything that can answer questions about a pull request.
 pub trait ForgePort: std::fmt::Debug + Send + Sync {
     /// What this forge supports.

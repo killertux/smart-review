@@ -44,6 +44,9 @@ pub enum Error {
 
     #[error("{message}")]
     Forge { command: String, message: String },
+
+    #[error("{0}")]
+    Cache(String),
 }
 
 impl Error {
@@ -56,6 +59,11 @@ impl Error {
             command: command.into(),
             message: message.into(),
         }
+    }
+
+    /// Builds an [`Error::Cache`] for a payload that cannot be trusted.
+    pub fn cache(message: impl Into<String>) -> Self {
+        Self::Cache(message.into())
     }
 
     /// The command that produced this error, when there was one.

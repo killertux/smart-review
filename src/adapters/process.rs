@@ -45,6 +45,7 @@ pub struct CommandSpec {
     program: PathBuf,
     args: Vec<OsString>,
     timeout: Option<Duration>,
+    cwd: Option<PathBuf>,
 }
 
 impl CommandSpec {
@@ -54,6 +55,7 @@ impl CommandSpec {
             program: program.into(),
             args: Vec::new(),
             timeout: None,
+            cwd: None,
         }
     }
 
@@ -82,6 +84,16 @@ impl CommandSpec {
         self
     }
 
+    /// Runs the child in a different directory.
+    ///
+    /// Used by `--path` and by every `git` call that must run inside a checkout
+    /// rather than wherever the user started the app.
+    #[must_use]
+    pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
     /// The program.
     #[must_use]
     pub fn program(&self) -> &Path {
@@ -100,7 +112,13 @@ impl CommandSpec {
     /// invocation never goes through a shell.
     #[must_use]
     pub fn render(&self) -> String {
-        let mut line = quote(&self.program.display().to_string());
+        let mut line = String::new();
+        if let Some(dir) = &self.cwd {
+            line.push_str("cd ");
+            line.push_str(&quote(&dir.display().to_string()));
+            line.push_str(" && ");
+        }
+        line.push_str(&quote(&self.program.display().to_string()));
         for arg in &self.args {
             line.push(' ');
             line.push_str(&quote(&arg.to_string_lossy()));
@@ -244,7 +262,11 @@ impl ProcessRunner {
     /// exceeds its timeout, or when it is cancelled.
     pub fn run(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<Output, ProcessError> {
         let program = spec.program.display().to_string();
-        if !is_executable_file(&spec.program) {
+        // Only a program given *as a path* is pre-checked. A bare name is meant to
+        // be found on PATH, and the operating system is the only thing that can do
+        // that resolution correctly (NFR-3.3 validates configured paths, not
+        // names). Skipping the check keeps the nicer "not found" error for both.
+        if is_explicit_path(&spec.program) && !is_executable_file(&spec.program) {
             // Distinguish "not there" from "there but not runnable": the fix is
             // different for each.
             if spec.program.exists() {
@@ -260,8 +282,12 @@ impl ProcessRunner {
         }
 
         let started = Instant::now();
-        let mut child = Command::new(&spec.program)
-            .args(&spec.args)
+        let mut command = Command::new(&spec.program);
+        command.args(&spec.args);
+        if let Some(dir) = &spec.cwd {
+            command.current_dir(dir);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -392,6 +418,14 @@ fn read_capped(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
     }
 
     (kept, truncated)
+}
+
+/// Whether a program was given as a path rather than as a name to look up.
+fn is_explicit_path(program: &Path) -> bool {
+    program.components().count() > 1
+        || program
+            .to_string_lossy()
+            .contains(std::path::MAIN_SEPARATOR)
 }
 
 /// Whether `path` is a file the current user may execute (NFR-3.3).
@@ -589,5 +623,53 @@ mod tests {
         assert!(is_executable_file(Path::new("/bin/sh")));
         assert!(!is_executable_file(Path::new("/definitely/not/here")));
         assert!(!is_executable_file(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn a_bare_program_name_is_looked_up_on_path() {
+        // `sh` is on PATH everywhere this runs; the point is that the runner does
+        // not demand it be an existing file path before spawning it.
+        assert!(!is_explicit_path(Path::new("sh")));
+        assert!(is_explicit_path(Path::new("/bin/sh")));
+        assert!(is_explicit_path(Path::new("./sh")));
+
+        let output = runner()
+            .run(
+                &CommandSpec::new("sh").args(["-c", "echo path-ok"]),
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert_eq!(output.stdout.trim(), "path-ok");
+    }
+
+    #[test]
+    fn a_child_runs_where_it_is_told_to() {
+        let dir = crate::test_support::temp_home();
+        let spec = CommandSpec::new("/bin/sh")
+            .args(["-c", "pwd"])
+            .current_dir(dir.path());
+        let output = runner().run(&spec, &Cancel::new()).unwrap();
+        // macOS reports /private/tmp for /tmp, so compare the tail.
+        assert!(
+            output
+                .stdout
+                .trim()
+                .ends_with(dir.path().file_name().unwrap().to_string_lossy().as_ref()),
+            "{} should be inside {}",
+            output.stdout.trim(),
+            dir.path().display()
+        );
+    }
+
+    #[test]
+    fn a_command_with_a_directory_renders_a_reproducible_line() {
+        let spec = CommandSpec::new("/usr/bin/gh")
+            .args(["pr", "list"])
+            .current_dir("/srv/service");
+        assert_eq!(
+            spec.render(),
+            "cd /srv/service && /usr/bin/gh pr list",
+            "a copyable command has to say where it runs"
+        );
     }
 }

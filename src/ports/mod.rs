@@ -12,6 +12,7 @@
 //! | [`Cancel`] | M1 |
 //! | [`ForgePort`] | M1 |
 //! | [`CacheStore`] | M1 |
+//! | [`WorkspacePort`] | M1 (detection) / M2 (worktrees) |
 //! | `WorkspacePort` | M2 |
 //! | `ModelCatalogPort` | M2 |
 //! | `CredentialsStore` | M2 |
@@ -20,10 +21,12 @@
 pub mod cache;
 pub mod cancel;
 pub mod forge;
+pub mod workspace;
 
 pub use cache::{CacheKey, CacheKeyError, CacheStore, Stored};
 pub use cancel::Cancel;
-pub use forge::{ForgeCapabilities, ForgePort, PullRequestPage};
+pub use forge::{ForgeCapabilities, ForgePort, ForgeProbe, ForgeStatus, PullRequestPage};
+pub use workspace::{Remote, RepoInfo, WorkspaceError, WorkspacePort};
 
 use crate::config::Loaded;
 use crate::error::Result;

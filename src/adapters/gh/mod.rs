@@ -19,6 +19,7 @@
 //! a PR with more than 100 inline comments work on gh 2.40 and on 2.45 alike.
 
 pub mod json;
+pub mod probe;
 
 use std::path::PathBuf;
 
