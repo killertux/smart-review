@@ -338,7 +338,14 @@ pub fn suggest(id: &str) -> Option<&'static ActionDef> {
 /// Groups in display order.
 #[must_use]
 pub fn groups() -> &'static [Group] {
-    &[Group::App, Group::Navigation, Group::Pane, Group::Theme]
+    &[
+        Group::App,
+        Group::Navigation,
+        Group::Pane,
+        Group::Search,
+        Group::Diff,
+        Group::Theme,
+    ]
 }
 
 /// Levenshtein distance, used only for suggestions.
@@ -395,6 +402,21 @@ mod tests {
             assert!(
                 all().iter().any(|action| action.group == *group),
                 "{group:?} is empty"
+            );
+        }
+    }
+
+    #[test]
+    fn every_action_belongs_to_a_group_the_help_popup_lists() {
+        // The other direction: deriving the check from `groups()` alone meant a new
+        // group could be registered and never appear in `?` or `:keymap`, which is
+        // how the whole Search and Diff surface went undiscoverable.
+        for action in all() {
+            assert!(
+                groups().contains(&action.group),
+                "{} is in {:?}, which the help popup does not list",
+                action.id,
+                action.group
             );
         }
     }

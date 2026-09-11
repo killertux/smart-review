@@ -12,8 +12,8 @@
 //!   the answer is returned as [`FetchOutcome::Offline`] so the UI can say so
 //!   instead of showing an empty screen (DEC-14).
 
-use crate::domain::diff::{Patch, RelPath};
-use crate::domain::pr::{PullRequestDetail, PullRequestSummary};
+use crate::domain::diff::Patch;
+use crate::domain::pr::PullRequestDetail;
 use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::error::Result;
@@ -370,52 +370,10 @@ fn read_cached<T: serde::de::DeserializeOwned>(
     Ok(None)
 }
 
-/// The PRs a client-side search should show, in list order (FR-2.2).
-///
-/// Cheap on purpose: this runs on every keystroke over the cached list, so it does
-/// no allocation beyond the result and no IO at all.
-#[must_use]
-pub fn filter_client_side<'a>(
-    items: &'a [PullRequestSummary],
-    search: &str,
-) -> Vec<&'a PullRequestSummary> {
-    if search.trim().is_empty() {
-        return items.iter().collect();
-    }
-    items
-        .iter()
-        .filter(|pull_request| pull_request.matches(search))
-        .collect()
-}
-
-/// Everything the review screen needs about one PR, loaded in the order it is
-/// needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrsRequest {
-    /// Which repository.
-    pub repo: RepoId,
-    /// Which PR.
-    pub number: u64,
-}
-
-impl PrsRequest {
-    /// A request for one pull request.
-    #[must_use]
-    pub fn new(repo: RepoId, number: u64) -> Self {
-        Self { repo, number }
-    }
-}
-
-/// Whether a patch contains a path, for `:copy-path` and for jumping to a file.
-#[must_use]
-pub fn patch_contains(patch: &Patch, file: &RelPath) -> bool {
-    patch.find(file).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::diff::parse_patch;
+    use crate::domain::pr::PullRequestSummary;
     use crate::domain::pr::{CheckRun, CheckSummary, PrState, Review, ReviewComment};
     use crate::domain::query::Filter;
     use crate::ports::forge::ForgeCapabilities;
@@ -719,25 +677,6 @@ mod tests {
     }
 
     #[test]
-    fn client_side_search_filters_the_cached_list_without_any_io() {
-        let items = vec![
-            summary(142, "Add retry to the webhook dispatcher"),
-            summary(141, "WIP refactor of billing domain"),
-            summary(138, "Bump tokio to 1.53"),
-        ];
-
-        assert_eq!(filter_client_side(&items, "").len(), 3);
-        assert_eq!(filter_client_side(&items, "   ").len(), 3);
-
-        let webhook = filter_client_side(&items, "webhook");
-        assert_eq!(webhook.len(), 1);
-        assert_eq!(webhook[0].number, 142);
-
-        assert_eq!(filter_client_side(&items, "141").len(), 1);
-        assert_eq!(filter_client_side(&items, "nothing matches").len(), 0);
-    }
-
-    #[test]
     fn cache_keys_are_stable_and_safe_as_paths() {
         let repo = RepoId::parse("acme/service").unwrap();
         let key = list_key(&repo, &PrQuery::default()).unwrap();
@@ -781,21 +720,6 @@ mod tests {
             "fdbc429f5ab07d3f",
             "the expected value of the hash for a known input"
         );
-    }
-
-    #[test]
-    fn a_patch_can_be_asked_whether_it_contains_a_path() {
-        let patch = parse_patch(PATCH);
-        assert!(patch_contains(&patch, &RelPath::parse("a.txt").unwrap()));
-        assert!(!patch_contains(&patch, &RelPath::parse("b.txt").unwrap()));
-    }
-
-    #[test]
-    fn a_request_carries_what_the_review_screen_needs() {
-        let repo = RepoId::parse("acme/service").unwrap();
-        let request = PrsRequest::new(repo, 141);
-        assert_eq!(request.number, 141);
-        assert_eq!(request.repo.slug(), "acme/service");
     }
 
     #[test]

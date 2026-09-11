@@ -59,25 +59,6 @@ impl CacheKey {
     pub fn to_path(&self) -> std::path::PathBuf {
         self.0.split('/').collect()
     }
-
-    /// The first component, which is the host, and the Namespace used for
-    /// invalidation.
-    #[must_use]
-    pub fn namespace(&self) -> &str {
-        self.0.split('/').next().unwrap_or_default()
-    }
-
-    /// Replaces the last component with `variant`, keeping the repository prefix.
-    ///
-    /// Used to store a second kind of payload for the same PR without rebuilding
-    /// the key from scratch.
-    #[must_use]
-    pub fn with_variant(&self, variant: &str) -> Self {
-        let mut parts: Vec<&str> = self.0.split('/').collect();
-        parts.pop();
-        parts.push(variant);
-        Self(parts.join("/"))
-    }
 }
 
 impl fmt::Display for CacheKey {
@@ -152,7 +133,6 @@ mod tests {
     #[test]
     fn a_repository_key_is_accepted_and_mapped_to_a_path() {
         let key = CacheKey::new("github.com/acme/service/list/4f2a1b.json").unwrap();
-        assert_eq!(key.namespace(), "github.com");
         assert_eq!(
             key.to_path(),
             std::path::PathBuf::from("github.com/acme/service/list/4f2a1b.json")
@@ -174,15 +154,6 @@ mod tests {
         ] {
             assert!(CacheKey::new(key).is_err(), "{key} should be refused");
         }
-    }
-
-    #[test]
-    fn a_variant_keeps_the_repository_prefix() {
-        let key = CacheKey::new("github.com/acme/service/pr-141/detail.json").unwrap();
-        assert_eq!(
-            key.with_variant("diff.json").as_str(),
-            "github.com/acme/service/pr-141/diff.json"
-        );
     }
 
     #[test]

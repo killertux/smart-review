@@ -7,7 +7,7 @@
 │    M build.sh                  ││   13     -         self.lines.sum()                                      │
 │ ▾ src (1)                      ││        15+         let gross = self.lines.sum();                         │
 │   ▾ domain (1)                 ││        16+         gross - self.discount                                 │
-│     ·M invoice.rs        +2 −1 ││   14   17      }                                                         │
+│     ·M invoice.rs       +2 −1  ││   14   17      }                                                         │
 │                                ││   15   18  }                                                             │
 │                                ││── A docs/logo.png                                                        │
 │                                ││   binary file, not shown                                                 │

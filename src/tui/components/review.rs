@@ -172,10 +172,18 @@ fn tree_line(
             };
             let stats = file.map_or_else(String::new, crate::domain::diff::FileDiff::size_label);
             let cursor = if current_file { "·" } else { " " };
+            // A file whose hunks are all folded says so, so the tree and the diff
+            // pane cannot disagree about what is hidden (FR-3.3).
+            let folded = if view.file_is_folded(*index) {
+                "▸"
+            } else {
+                ""
+            };
             Line::from(vec![
-                Span::styled(format!(" {indent}{cursor}{marker} "), tint(style)),
+                Span::styled(format!(" {indent}{cursor}{marker}{folded}"), tint(style)),
+                Span::styled(" ".to_owned(), base),
                 Span::styled(
-                    text::pad(&row.label, 18),
+                    text::pad(&row.label, 17),
                     if current_file {
                         tint(theme.style(element::ACCENT))
                     } else {
@@ -249,16 +257,16 @@ fn diff_title(theme: &Theme, view: &DiffView, width: u16, app: &App) -> String {
     } else {
         "unified"
     };
-    let mut title = format!(" {} · {} · ctx {} ", stats.label(), mode, view.context);
-    if view.ignore_whitespace {
-        title.push_str("· -w ");
-    }
+    // Only the context size in force is named: in remote mode `gh pr diff` always
+    // sends three lines, so printing a configured 10 would be a claim about the pane
+    // that is not true (FR-3.2).
+    let title = format!(" {} · {} · ctx {} ", stats.label(), mode, view.context);
+    let mut title = title;
     if app.diff_loading {
         title.push_str("· loading… ");
     }
-    if let Some(offline) = &app.diff_offline {
-        let _ = offline;
-        title.push_str("· offline ");
+    if app.diff_offline.is_some() {
+        title.push_str("· cached ");
     }
     let _ = theme;
     title

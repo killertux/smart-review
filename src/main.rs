@@ -48,6 +48,10 @@ fn run(cli: &Cli) -> Result<ExitCode, Error> {
         );
         let request = smart_review::application::DetectRequest {
             repo: startup.repo.clone(),
+            remote: startup
+                .remote
+                .clone()
+                .or_else(|| startup.config.forge.remote.clone()),
             gh_program: Some(startup.config.forge.gh_path.clone()),
         };
         match smart_review::application::detect(

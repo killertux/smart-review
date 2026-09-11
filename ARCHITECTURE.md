@@ -51,6 +51,7 @@ src/
     event.rs         façade over crossterm's event types
     action.rs        the action registry (the spine of help, leader and keymaps)
     update.rs        dispatch of actions and `:` commands
+    jobs.rs          the only part of the UI that spawns work
     keymap/          the keybinding engine (FR-7.2)
     theme/           the theme engine (FR-7.7)
     layout.rs        rectangles and the minimum terminal size
@@ -94,11 +95,18 @@ crossterm event ─▶ App::on_key ─▶ Keymap::resolve ─▶ update::dispatc
    starts a timer; when it expires, `App::on_timeout` fires the shorter binding.
    The leader menu is a binding whose action returns `Effect::KeepPending`, which
    keeps the sequence alive so the next key can complete it.
-3. `update::dispatch` mutates state and returns an [`Effect`] — it never performs
-   IO. `tui::run` is the only place that turns an effect into work: persisting
-   `state.toml`, or starting the doctor job on a background thread whose result
-   comes back over a channel. That is what keeps rendering a pure function of
-   state and the loop under the 50 ms budget (NFR-1.2).
+3. `update::dispatch` mutates state and returns an [`Effect`] — it performs no IO
+   on behalf of the *world*: no process is spawned, no network is touched, and every
+   such job runs on a worker thread (`tui/jobs.rs`) whose result comes back over a
+   channel. `tui::run` is the only place that turns an effect into work: persisting
+   `state.toml`, applying a terminal change, or starting a job.
+   **The one documented exception** is reading the user's own configuration files:
+   `:theme`, `:set`, `:keymap` and opening the theme picker read small local files
+   (`theme.toml`, `keybinds.toml`) from `<home>`, bounded by the number of files the
+   user has written. That is deliberate — the data is needed to answer the key that
+   was just pressed, it is local and tiny, and putting it behind a job would make a
+   theme change flicker. Everything that could block for tens of milliseconds goes
+   through a job.
 4. `App::render` reads state and draws. It never reads a file, spawns a process,
    or blocks — anything it needs from disk (the theme list, for instance) was
    captured when the relevant action ran.

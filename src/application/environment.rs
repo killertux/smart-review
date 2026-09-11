@@ -20,6 +20,9 @@ use crate::ports::workspace::{RepoInfo, WorkspacePort};
 pub struct DetectRequest {
     /// `--repo OWNER/NAME` or `SMART_REVIEW_REPO`.
     pub repo: Option<String>,
+    /// `--remote NAME` or `[forge].remote`: which remote to read the repository
+    /// from, when `origin` is not the one that hosts the pull requests.
+    pub remote: Option<String>,
     /// The configured `gh` program, when it is not just `gh`.
     pub gh_program: Option<String>,
 }
@@ -30,7 +33,16 @@ impl DetectRequest {
     pub fn with_repo(repo: impl Into<String>) -> Self {
         Self {
             repo: Some(repo.into()),
-            gh_program: None,
+            ..Self::default()
+        }
+    }
+
+    /// A request that reads a named remote.
+    #[must_use]
+    pub fn with_remote(remote: impl Into<String>) -> Self {
+        Self {
+            remote: Some(remote.into()),
+            ..Self::default()
         }
     }
 }
@@ -48,10 +60,12 @@ pub fn detect(
     cancel: &Cancel,
 ) -> Result<Environment, EnvironmentError> {
     let info = workspace.detect().map_err(|error| match error {
+        // Naming the wrong tool would send the user to install the wrong thing: a
+        // missing `git` is not a missing `gh`.
         crate::ports::workspace::WorkspaceError::GitUnavailable(detail) => {
-            EnvironmentError::GhMissing {
-                tried: std::path::PathBuf::from("git"),
-                advice: detail,
+            EnvironmentError::GitMissing {
+                detail,
+                advice: "install git and make sure it is on PATH".to_owned(),
             }
         }
         other @ crate::ports::workspace::WorkspaceError::Failed(_) => {
@@ -165,11 +179,40 @@ fn resolve_repository(
         })
         .collect();
 
-    let Some((name, repo)) = github_remotes
-        .iter()
-        .find(|(name, _)| name.as_str() == "origin")
-        .or_else(|| github_remotes.first())
-    else {
+    // `--remote` wins over the automatic order, and naming one that is not a GitHub
+    // remote is an error with the list of what *is* there: advice that silently does
+    // nothing is worse than a refusal.
+    let chosen = if let Some(named) = request.remote.as_deref() {
+        if let Some(found) = github_remotes
+            .iter()
+            .find(|(name, _)| name.as_str() == named)
+        {
+            Some(found)
+        } else {
+            let remotes: Vec<String> = info
+                .remotes
+                .iter()
+                .map(|remote| format!("{} ({})", remote.name, remote.url))
+                .collect();
+            return Err(EnvironmentError::NoGitHubRemote {
+                path: info
+                    .root
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                remotes,
+                advice: format!(
+                    "`{named}` is not a GitHub remote here; pass --remote with one of the names above, or --repo OWNER/NAME"
+                ),
+            });
+        }
+    } else {
+        github_remotes
+            .iter()
+            .find(|(name, _)| name.as_str() == "origin")
+            .or_else(|| github_remotes.first())
+    };
+
+    let Some((name, repo)) = chosen else {
         let remotes: Vec<String> = info
             .remotes
             .iter()
@@ -300,6 +343,43 @@ mod tests {
     }
 
     #[test]
+    fn a_named_remote_is_used_instead_of_origin() {
+        let workspace = repo_with(vec![
+            github_remote("origin", "git@github.com:acme/mirror.git"),
+            github_remote("upstream", "git@github.com:acme/service.git"),
+        ]);
+        let environment = detect_with(
+            &workspace,
+            &ready("2.45.0"),
+            &DetectRequest::with_remote("upstream"),
+        )
+        .unwrap();
+        assert_eq!(environment.repo.slug(), "acme/service");
+        assert_eq!(environment.remote.as_deref(), Some("upstream"));
+    }
+
+    #[test]
+    fn a_named_remote_that_is_not_github_is_refused_with_what_is_available() {
+        let workspace = repo_with(vec![
+            github_remote("origin", "git@github.com:acme/service.git"),
+            github_remote("mirror", "git@gitlab.com:acme/service.git"),
+        ]);
+        let error = detect_with(
+            &workspace,
+            &ready("2.45.0"),
+            &DetectRequest::with_remote("mirror"),
+        )
+        .unwrap_err();
+        match &error {
+            EnvironmentError::NoGitHubRemote { advice, .. } => {
+                assert!(advice.contains("mirror"), "{advice}");
+                assert!(advice.contains("--remote"), "{advice}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_github_remote_lists_the_ones_that_exist_and_says_what_to_do() {
         let workspace = repo_with(vec![github_remote(
             "origin",
@@ -420,8 +500,8 @@ mod tests {
             "git@github.com:acme/service.git",
         )]);
         let request = DetectRequest {
-            repo: None,
             gh_program: Some("/opt/gh/bin/gh".to_owned()),
+            ..DetectRequest::default()
         };
         let error =
             detect_with(&workspace, &FakeProbe(ForgeStatus::Missing), &request).unwrap_err();

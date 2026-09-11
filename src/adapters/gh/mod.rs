@@ -32,7 +32,7 @@ use crate::domain::repo::RepoId;
 use crate::error::{Error, Result};
 use crate::logging::{self, Level};
 use crate::ports::Cancel;
-use crate::ports::forge::{ForgeCapabilities, ForgePort, PullRequestPage};
+use crate::ports::forge::{ForgeCapabilities, ForgeFactory, ForgePort, PullRequestPage};
 
 use json::{
     DETAIL_FIELDS, GhDetail, GhReview, GhReviewComment, GhSummary, GraphQlResponse, LIST_FIELDS,
@@ -50,6 +50,28 @@ pub struct GhCliForge {
     runner: ProcessRunner,
     program: PathBuf,
     repo: RepoId,
+}
+
+/// Builds [`GhCliForge`] instances for whatever repository detection resolves.
+#[derive(Debug, Clone)]
+pub struct GhForgeFactory {
+    program: PathBuf,
+}
+
+impl GhForgeFactory {
+    /// Uses the configured `gh` program.
+    #[must_use]
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+}
+
+impl ForgeFactory for GhForgeFactory {
+    fn forge(&self, repo: &RepoId) -> std::sync::Arc<dyn ForgePort> {
+        std::sync::Arc::new(GhCliForge::new(&self.program, repo.clone()))
+    }
 }
 
 impl std::fmt::Debug for GhCliForge {
@@ -246,16 +268,18 @@ impl ForgePort for GhCliForge {
         // A GraphQL variable rather than an interpolated string: the search text
         // can contain quotes (`in:title "retry webhook"`), which would otherwise
         // end the GraphQL string literal early.
+        // `gh -f key=value` is *one* argv element: passing the value as a separate
+        // argument makes gh reject the call ("accepts 1 arg(s), received 2"), which
+        // is a silent failure because a missing count is not fatal (FR-2.1 only
+        // degrades to "showing 50 of ≥50").
         let spec = CommandSpec::new(&self.program)
             .args([
                 "api",
                 "graphql",
                 "-f",
                 "query=query($q:String!){search(query:$q,type:ISSUE,first:1){issueCount}}",
-                "-f",
-                "q=",
             ])
-            .arg(self.search_query(query));
+            .arg(format!("q={}", self.search_query(query)));
 
         let response: GraphQlResponse = self.json(&spec, cancel)?;
         if let Some(errors) = response.errors.as_ref().filter(|errors| !errors.is_empty()) {
@@ -459,7 +483,6 @@ mod tests {
         let page = forge.list_pull_requests(&query, &Cancel::new()).unwrap();
         assert_eq!(page.items.len(), 3);
         assert_eq!(page.total, Some(3));
-        assert_eq!(page.status_label(), "3 pull requests");
 
         let call = fake.last_call();
         assert_eq!(
@@ -491,8 +514,7 @@ mod tests {
             .list_pull_requests(&PrQuery::with_limit(3), &Cancel::new())
             .unwrap();
         assert!(page.may_have_more());
-        assert_eq!(page.total, None);
-        assert_eq!(page.status_label(), "showing 3 of ≥3");
+        assert_eq!(page.total, None, "the total is unknown until it is counted");
     }
 
     #[test]
@@ -611,13 +633,25 @@ mod tests {
             call[query_index + 1].contains("($q:String!)"),
             "the search text must go through a variable: {call:?}"
         );
-        // The search text itself is its own argument, untouched.
+        // `gh -f key=value` is one argument; passing the value separately is
+        // rejected by gh ("accepts 1 arg(s), received 2"). These assertions pin the
+        // shape — a test that only inspected the last element would have passed with
+        // the broken argv and the count would silently never have worked.
         let search = call.last().unwrap();
+        assert_eq!(
+            search.split('=').next(),
+            Some("q"),
+            "the search text must be the value of `q`: {search}"
+        );
         assert!(
-            search.starts_with("repo:acme/service is:pr is:open"),
+            search.starts_with("q=repo:acme/service is:pr is:open"),
             "{search}"
         );
         assert!(search.contains("in:title"), "{search}");
+        assert!(
+            !call.iter().any(|arg| arg == "q="),
+            "an empty value plus a separate argument is the shape gh rejects: {call:?}"
+        );
     }
 
     #[test]

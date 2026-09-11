@@ -25,7 +25,9 @@ pub mod workspace;
 
 pub use cache::{CacheKey, CacheKeyError, CacheStore, Stored};
 pub use cancel::Cancel;
-pub use forge::{ForgeCapabilities, ForgePort, ForgeProbe, ForgeStatus, PullRequestPage};
+pub use forge::{
+    ForgeCapabilities, ForgeFactory, ForgePort, ForgeProbe, ForgeStatus, PullRequestPage,
+};
 pub use workspace::{Remote, RepoInfo, WorkspaceError, WorkspacePort};
 
 use crate::config::Loaded;

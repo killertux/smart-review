@@ -21,6 +21,7 @@ use crate::tui::theme::{Theme, element};
 struct Columns {
     number: usize,
     title: usize,
+    size: usize,
     author: usize,
     updated: usize,
     checks: usize,
@@ -34,16 +35,18 @@ impl Columns {
         // Every fixed column is as wide as its own heading, so no heading is ever
         // cut off; the title takes what remains, and at least ten columns.
         let number = 6;
+        let size = 13; // "±218 −43" and its sign characters
         let author = 12;
         let updated = 7; // "Updated"
         let checks = 6; // "Checks"
         let decision = 4; // "Dec"
-        let gaps = 5; // one space after each of the five middle columns
-        let fixed = 2 + number + 2 + gaps + author + updated + checks + decision;
+        let gaps = 6; // one space after each of the six middle columns
+        let fixed = 2 + number + 2 + gaps + size + author + updated + checks + decision;
         let title = width.saturating_sub(fixed).max(10);
         Self {
             number,
             title,
+            size,
             author,
             updated,
             checks,
@@ -151,6 +154,7 @@ fn header_row(theme: &Theme, columns: &Columns) -> Line<'static> {
         ("#", columns.number),
         ("T", 2),
         ("Title", columns.title),
+        ("Size", columns.size),
         ("Author", columns.author),
         ("Updated", columns.updated),
         ("Checks", columns.checks),
@@ -205,6 +209,12 @@ fn item_row(
     spans.push(Span::styled(
         format!("{} ", text::pad(&pr.title, columns.title)),
         title_style,
+    ));
+    // The size is what makes a list scannable for "which of these is a big change"
+    // (FR-2.1), and the sign characters sort the two halves apart visually.
+    spans.push(Span::styled(
+        format!("{} ", text::pad(&pr.size_label(), columns.size)),
+        tint(theme.style(element::MUTED)),
     ));
     spans.push(Span::styled(
         format!("{} ", text::pad(&pr.author, columns.author)),
@@ -492,6 +502,7 @@ mod tests {
         assert!(rendered.contains('◌'), "the draft marker: {rendered}");
         assert!(rendered.contains("bruno"), "{rendered}");
         assert!(rendered.contains("3/3"), "{rendered}");
+        assert!(rendered.contains("+10 −2"), "the size column: {rendered}");
         assert!(rendered.contains("1/3"), "{rendered}");
         assert!(rendered.contains("ok"), "an approval marker: {rendered}");
         assert!(

@@ -1,11 +1,11 @@
- smart┌ Help ────────────────────────────────────────────────────────────────────────────────┐rvice
+ smart┌ Help  [27/48] ───────────────────────────────────────────────────────────────────────┐rvice
 │ filt│ APP                                                                                  │     │
-│ sear│   <C-c>, <Space>q     Quit smart-review                                              │     │
+│ sear│   <C-c>, <Space>q, q  Quit smart-review                                              │     │
 ┌ no r│   <Space>?, ?         Show the help popup                                            │─────┐
 │Looki│   :                   Open the command line                                          │     │
 │     │   <Space>             Show the available leader bindings                             │     │
 │     │   <Esc>               Close the current popup, or cancel pending keys                │     │
-│     │   <Space>r            Refresh the current view                                       │     │
+│     │   R                   Refresh the current view                                       │     │
 │     │   ·                   Show environment checks                                        │     │
 │     │   ·                   Show the version                                               │     │
 │     │   ·                   Dismiss the current notification                               │     │
@@ -20,11 +20,11 @@
 │     │   <C-u>               Move half a screen up                                          │     │
 │     │   <C-f>               Move a screen down                                             │     │
 │     │   <C-b>               Move a screen up                                               │     │
-│     │   ·                   Close the review, or clear the search and filters              │     │
+│     │   <Esc>, h            Close the review, or clear the search and filters              │     │
 │     │ PANES                                                                                │     │
 │     │   <Tab>               Focus the next pane                                            │     │
 │     │   <S-Tab>             Focus the previous pane                                        │     │
-│     │ THEME                                                                                │     │
-└─────│   <Space>t            Choose a theme                                                 │─────┘
- POPUP│   <Space>T            Switch to the next theme                                       │mands
+│     │ SEARCH                                                                               │     │
+└─────│   /                   Filter the loaded pull requests as you type                    │─────┘
+ POPUP│   <CR> (search), <Esc> (search)Stop editing the search                               │mands
       └──────────────────────────────────────────────────────────────────────────────────────┘

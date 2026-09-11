@@ -46,6 +46,8 @@ pub const MAX_IN_FLIGHT: usize = 4;
 pub enum Slot {
     /// Detection, which happens once.
     Environment,
+    /// The cached page, painted while the network is asked (FR-2.3).
+    CachedList,
     /// A page of the list.
     List,
     /// The count of matches.
@@ -63,6 +65,11 @@ pub enum Slot {
 pub enum Job {
     /// Work out where we are running (FR-1.1).
     Detect,
+    /// Read the cached page, if there is one (FR-2.3).
+    CachedList {
+        /// The query.
+        query: PrQuery,
+    },
     /// Fetch a page of the list (FR-2.1).
     List {
         /// The query.
@@ -99,6 +106,7 @@ impl Job {
     pub fn slot(&self) -> Slot {
         match self {
             Self::Detect => Slot::Environment,
+            Self::CachedList { .. } => Slot::CachedList,
             Self::List { .. } => Slot::List,
             Self::Count { .. } => Slot::Count,
             Self::Detail { .. } => Slot::Detail,
@@ -127,6 +135,8 @@ pub enum Outcome {
     EnvironmentFailed(Box<crate::domain::environment::EnvironmentError>),
     /// A page arrived, or the cached one did.
     Page(Box<FetchOutcome<PullRequestPage>>),
+    /// A cached page, painted before the network was asked (FR-2.3).
+    CachedPage(Box<crate::application::prs::Cached<PullRequestPage>>),
     /// A count arrived.
     Count(u32),
     /// A detail arrived, or the cached one did.
@@ -198,6 +208,13 @@ impl Executor {
         .with_policy(self.policy);
 
         match job {
+            Job::CachedList { query } => match prs.cached_list(query) {
+                Ok(Some(cached)) => Outcome::CachedPage(Box::new(cached)),
+                // A miss is not a finding to report: the fetch that follows is what
+                // the user is waiting for.
+                Ok(None) => Outcome::Abandoned,
+                Err(error) => Outcome::Failed(error.to_string()),
+            },
             Job::List { query } => match prs.load_list(query, cancel) {
                 Ok(outcome) => Outcome::Page(Box::new(outcome)),
                 Err(error) => Outcome::Failed(error.to_string()),
@@ -267,7 +284,9 @@ impl JobRunner {
             request,
             queue: VecDeque::new(),
             running: Vec::new(),
-            next_id: 0,
+            // Job ids start at one so that the `Option`-free "no job yet" sentinel of
+            // zero in the app can never collide with a real id.
+            next_id: 1,
             sender,
             receiver,
         }
@@ -324,6 +343,13 @@ impl JobRunner {
         self.queue.clear();
     }
 
+    /// Whether a slot has a job running or waiting.
+    #[must_use]
+    pub fn is_busy_in(&self, slot: Slot) -> bool {
+        self.running.iter().any(|running| running.slot == slot)
+            || self.queue.iter().any(|(_, job)| job.slot() == slot)
+    }
+
     /// Cancels every job in a slot, for `Esc` on the screen that owns it.
     pub fn cancel(&mut self, slot: Slot) {
         self.cancel_slot(slot);
@@ -340,8 +366,8 @@ impl JobRunner {
             completions.push(completion);
         }
 
-        // A job whose thread died without sending would otherwise hold its slot
-        // forever, so the running list is reconciled against what actually came back.
+        // Every job sends exactly one completion, including one that panicked, so
+        // the running list is exactly "jobs that have not answered yet".
         self.pump();
         completions
     }
@@ -373,7 +399,11 @@ impl JobRunner {
         let spawned = std::thread::Builder::new()
             .name(format!("smart-review-job-{id}"))
             .spawn(move || {
-                let outcome = match &job {
+                // A job that unwinds would never send a completion, and its slot
+                // would be occupied for the rest of the session: four such workers
+                // and nothing is ever fetched again, with nothing on screen to say
+                // why. Catching it here means every job sends exactly one answer.
+                let body = std::panic::AssertUnwindSafe(|| match &job {
                     Job::Detect => {
                         match detect(workspace.as_ref(), probe.as_ref(), &request, &worker_cancel) {
                             Ok(environment) => Outcome::Environment(Box::new(environment)),
@@ -387,7 +417,14 @@ impl JobRunner {
                             "the repository is not known yet; run :doctor to see why".to_owned(),
                         ),
                     },
-                };
+                });
+                let outcome = std::panic::catch_unwind(body).unwrap_or_else(|_| {
+                    logging::log(
+                        Level::Error,
+                        format!("job {id} panicked; reporting it as a failure"),
+                    );
+                    Outcome::Failed("the job crashed; this is a bug".to_owned())
+                });
 
                 // A cancelled job reports itself as abandoned rather than as a
                 // failure: the user asked for it to stop, which is not an error.
@@ -448,6 +485,8 @@ pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<
         }),
         // A diff reload needs the head SHA, which the caller knows and this does not.
         Effect::ReloadDiff
+        | Effect::CancelInFlight
+        | Effect::SetMouse(_)
         | Effect::None
         | Effect::KeepPending
         | Effect::SaveState
@@ -850,6 +889,94 @@ mod tests {
         let _ = wait_for_completion(&mut runner);
     }
 
+    /// A job whose body panics, to prove the slot is not lost.
+    #[derive(Debug)]
+    struct PanicForge;
+
+    impl ForgePort for PanicForge {
+        fn capabilities(&self) -> ForgeCapabilities {
+            ForgeCapabilities::default()
+        }
+
+        fn list_pull_requests(&self, _q: &PrQuery, _c: &Cancel) -> crate::Result<PullRequestPage> {
+            panic!("this forge panics on purpose");
+        }
+
+        fn count_pull_requests(&self, _q: &PrQuery, _c: &Cancel) -> crate::Result<u32> {
+            Ok(0)
+        }
+
+        fn get_pull_request(&self, _n: u64, _c: &Cancel) -> crate::Result<PullRequestDetail> {
+            Err(crate::Error::forge("gh", "not needed"))
+        }
+
+        fn list_reviews(
+            &self,
+            _n: u64,
+            _c: &Cancel,
+        ) -> crate::Result<Vec<crate::domain::pr::Review>> {
+            Ok(Vec::new())
+        }
+
+        fn list_review_comments(
+            &self,
+            _n: u64,
+            _c: &Cancel,
+        ) -> crate::Result<Vec<crate::domain::pr::ReviewComment>> {
+            Ok(Vec::new())
+        }
+
+        fn list_checks(&self, _n: u64, _c: &Cancel) -> crate::Result<Vec<CheckRun>> {
+            Ok(Vec::new())
+        }
+
+        fn pull_request_diff(&self, _n: u64, _c: &Cancel) -> crate::Result<String> {
+            Err(crate::Error::forge("gh", "not needed"))
+        }
+    }
+
+    #[test]
+    fn a_panicking_job_still_answers_and_frees_its_slot() {
+        let mut runner = JobRunner::new(
+            Arc::new(FakeWorkspace),
+            Arc::new(FakeProbe {
+                delay: Duration::ZERO,
+            }),
+            DetectRequest::default(),
+        );
+        runner.set_executor(Arc::new(Executor::new(
+            Arc::new(PanicForge) as Arc<dyn ForgePort>,
+            Arc::new(InMemoryCache::default()),
+            Arc::new(FakeClock),
+            RepoId::parse("acme/service").unwrap(),
+            crate::application::prs::CachePolicy::default(),
+        )));
+
+        // Three panicking jobs in a row: if a panic lost its slot, the third submit
+        // would never start and this would time out.
+        for round in 1..=3 {
+            runner.submit(Job::List {
+                query: PrQuery::default(),
+            });
+
+            let mut collected = Vec::new();
+            for _ in 0..400 {
+                collected.extend(runner.poll());
+                if !collected.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            assert_eq!(collected.len(), 1, "round {round}: one answer per job");
+            assert!(
+                matches!(collected[0].outcome, Outcome::Failed(_)),
+                "round {round}: the panic is reported rather than swallowed: {collected:?}"
+            );
+            assert!(!runner.is_busy(), "round {round}: the slot is free again");
+        }
+    }
+
     #[test]
     fn a_report_job_runs_without_a_repository() {
         let (mut runner, _forge) = runner_with(Duration::ZERO);
@@ -859,10 +986,22 @@ mod tests {
         });
         let completions = wait_for_completion(&mut runner);
         match &completions[0].outcome {
-            Outcome::Checks(checks) => assert!(
-                checks.iter().any(|check| check.name == "home"),
-                "the report should have run: {checks:?}"
-            ),
+            Outcome::Checks(checks) => {
+                assert!(
+                    checks.iter().any(|check| check.name == "home"),
+                    "the report should have run: {checks:?}"
+                );
+                assert!(
+                    checks.iter().any(|check| check.name == "gh"),
+                    "and it should have reported gh: {checks:?}"
+                );
+                assert!(
+                    !checks
+                        .iter()
+                        .any(|check| check.name == "gh" && check.detail.contains("(authenticated)")),
+                    "the probe must not reach the real gh: {checks:?}"
+                );
+            }
             other => panic!("expected a report, got {other:?}"),
         }
     }
@@ -931,6 +1070,11 @@ mod tests {
             log_level: None,
             check: false,
         };
-        crate::Startup::load(&cli).unwrap().doctor_context()
+        let mut startup = crate::Startup::load(&cli).unwrap();
+        // The report probes git and gh; pointing it at a binary that cannot exist
+        // keeps the test off the network and independent of the machine's own gh
+        // (AGENTS §8, NFR-5.2).
+        startup.config.forge.gh_path = "smart-review-no-such-binary".to_owned();
+        startup.doctor_context()
     }
 }

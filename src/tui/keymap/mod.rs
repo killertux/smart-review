@@ -277,6 +277,16 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     // Enter opens whatever the cursor is on, which is a pull request in the list and
     // a file in the tree (FR-3.4).
     (Scope::In(Mode::Normal), "<Enter>", "nav.open"),
+    // Esc goes *back*: it closes the review, clears what is narrowing the list, and
+    // only then does nothing. The global `<Esc>` binding stays for popups, because a
+    // mode-specific binding wins over a global one for the same key.
+    (Scope::In(Mode::Normal), "<Esc>", "nav.back"),
+    (Scope::In(Mode::Normal), "h", "nav.back"),
+    // `R` refreshes what is on screen: FR-2.3 requires it, and the list's own error
+    // state tells the user to press it.
+    (Scope::In(Mode::Normal), "R", "app.refresh"),
+    // …and `q` quits, as §5.4 says. `Esc` and `h` are the way back.
+    (Scope::In(Mode::Normal), "q", "app.quit"),
     (Scope::In(Mode::Normal), "<C-d>", "nav.half_down"),
     (Scope::In(Mode::Normal), "<C-u>", "nav.half_up"),
     (Scope::In(Mode::Normal), "<C-f>", "nav.page_down"),
@@ -307,7 +317,6 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Normal), "<leader>t", "app.theme_picker"),
     (Scope::In(Mode::Normal), "<leader>T", "theme.toggle"),
     (Scope::In(Mode::Normal), "<leader>?", "app.help"),
-    (Scope::In(Mode::Normal), "<leader>r", "app.refresh"),
     (Scope::In(Mode::Normal), "<leader>q", "app.quit"),
 ];
 

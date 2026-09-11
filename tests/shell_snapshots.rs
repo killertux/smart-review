@@ -56,7 +56,11 @@ const SNAPSHOT_HOME: &str = "smart-review-snapshot";
 /// Takes the suite lock and returns a fresh home directory of a fixed length.
 fn snapshot_home() -> (MutexGuard<'static, ()>, PathBuf) {
     let guard = lock();
-    let home = PathBuf::from(SNAPSHOT_HOME);
+    // The tests in this binary are serialised, but two *runs* of the suite (a
+    // developer's and a validation run, or two checkouts) would delete each other's
+    // home mid-test, so the directory is per process. The length is fixed either way,
+    // which is what keeps the rendered paths stable.
+    let home = PathBuf::from(format!("{}-{}", SNAPSHOT_HOME, std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("create the snapshot home");
     (guard, home)

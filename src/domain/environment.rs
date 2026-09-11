@@ -196,6 +196,15 @@ pub enum EnvironmentError {
         advice: String,
     },
 
+    /// `git` is missing or not executable.
+    #[error("git was not found or could not be run")]
+    GitMissing {
+        /// What git reported.
+        detail: String,
+        /// The next step.
+        advice: String,
+    },
+
     /// A command could not be run at all.
     #[error("{0}")]
     Failed(String),
@@ -210,6 +219,7 @@ impl EnvironmentError {
             | Self::NoGitHubRemote { advice, .. }
             | Self::GhMissing { advice, .. }
             | Self::GhOutdated { advice, .. }
+            | Self::GitMissing { advice, .. }
             | Self::GhUnauthenticated { advice, .. } => advice,
             Self::Failed(_) => "run `gh auth status` to see what gh reports",
         }

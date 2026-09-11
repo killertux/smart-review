@@ -7,6 +7,8 @@
 use crate::domain::diff::Patch;
 use crate::domain::pr::{CheckRun, PullRequestDetail, PullRequestSummary, Review, ReviewComment};
 use crate::domain::query::PrQuery;
+use std::sync::Arc;
+
 use crate::ports::Cancel;
 
 /// What the forge can do, so the UI can hide what it cannot (ARCH-2).
@@ -70,32 +72,6 @@ impl PullRequestPage {
     pub fn may_have_more(&self) -> bool {
         u32::try_from(self.items.len()).is_ok_and(|count| count >= self.limit)
     }
-
-    /// The phrase the status line shows: "showing 50 of ≥137" and friends
-    /// (FR-2.1).
-    #[must_use]
-    pub fn status_label(&self) -> String {
-        let shown = self.items.len();
-        match self.total {
-            Some(total) if usize::try_from(total).unwrap_or(usize::MAX) > shown => {
-                format!("showing {shown} of {total}")
-            }
-            Some(total) => format!("{total} pull requests"),
-            None if self.may_have_more() => format!("showing {shown} of ≥{shown}"),
-            None => format!("showing {shown}"),
-        }
-    }
-
-    /// Adds another page, keeping the first page's total.
-    #[must_use]
-    pub fn extended_with(mut self, mut next: Self) -> Self {
-        self.items.append(&mut next.items);
-        self.limit = next.limit;
-        if next.total.is_some() {
-            self.total = next.total;
-        }
-        self
-    }
 }
 
 /// What probing the forge installation found (FR-1.1).
@@ -133,6 +109,16 @@ impl ForgeStatus {
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
+}
+
+/// Builds a forge for a repository.
+///
+/// The forge cannot be constructed until detection has resolved *which* repository,
+/// so the composition root supplies a factory instead of an instance. That is what
+/// keeps `tui` from having to name `GhCliForge` (ARCH-1).
+pub trait ForgeFactory: std::fmt::Debug + Send + Sync {
+    /// A forge bound to `repo`.
+    fn forge(&self, repo: &crate::domain::repo::RepoId) -> Arc<dyn ForgePort>;
 }
 
 /// Probes the forge client without needing a repository.
@@ -257,11 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn a_page_below_the_limit_is_complete_and_says_how_many() {
+    fn a_page_below_the_limit_is_complete_and_known_to_be_so() {
         let page = PullRequestPage::complete(vec![summary(1), summary(2)], 50);
         assert_eq!(page.total, Some(2));
         assert!(!page.may_have_more());
-        assert_eq!(page.status_label(), "2 pull requests");
     }
 
     #[test]
@@ -272,34 +257,12 @@ mod tests {
         let page = PullRequestPage::possibly_truncated(items, 50);
         assert_eq!(page.total, None);
         assert!(page.may_have_more());
-        assert_eq!(page.status_label(), "showing 50 of ≥50");
     }
 
     #[test]
-    fn a_known_total_renders_the_sentence_the_requirement_asks_for() {
-        let items: Vec<PullRequestSummary> = (1..=50).map(summary).collect();
-        let page = PullRequestPage {
-            items,
-            limit: 50,
-            total: Some(137),
-        };
-        assert_eq!(page.status_label(), "showing 50 of 137");
-    }
-
-    #[test]
-    fn loading_more_keeps_the_known_total_and_appends() {
-        let first = PullRequestPage::possibly_truncated((1..=50).map(summary).collect(), 50);
-        let second = PullRequestPage::complete((51..=80).map(summary).collect(), 100);
-        let combined = first.extended_with(second);
-        assert_eq!(combined.items.len(), 80);
-        assert_eq!(combined.total, Some(30), "the second page was not full");
-        assert_eq!(combined.limit, 100);
-    }
-
-    #[test]
-    fn an_empty_page_is_reported_as_zero_rather_than_as_unknown() {
+    fn an_empty_page_is_complete_rather_than_unknown() {
         let page = PullRequestPage::complete(Vec::new(), 50);
-        assert_eq!(page.status_label(), "0 pull requests");
+        assert_eq!(page.total, Some(0));
         assert!(!page.may_have_more());
     }
 }

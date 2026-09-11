@@ -15,10 +15,10 @@
 │                         │  dw          Ignore whitespace-only changes  │                         │
 │                         │  f           Add a filter chip               │                         │
 │                         │  q           Quit smart-review               │                         │
-│                         │  r           Refresh the current view        │                         │
 │                         │  s           Change the sort order           │                         │
 │                         │  t           Choose a theme                  │                         │
 │                         └──────────────────────────────────────────────┘                         │
+│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

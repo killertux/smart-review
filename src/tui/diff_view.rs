@@ -218,12 +218,13 @@ pub struct DiffView {
     /// Whether the split (side-by-side) view is asked for. Whether it can be
     /// *shown* is a width question, answered at draw time (DEC-4).
     pub split: bool,
-    /// How many lines of context the diff was produced with (FR-3.2).
+    /// How many lines of context the diff was produced with (FR-3.2). Read-only in
+    /// M1: a remote diff always carries three, and M2's local re-diff is what makes
+    /// it adjustable.
     pub context: u32,
-    /// Whether the diff was produced with whitespace ignored.
+    /// Whether the diff was produced with whitespace ignored. Read-only in M1, for
+    /// the same reason as [`Self::context`].
     pub ignore_whitespace: bool,
-    /// The number of files whose hunks are all folded, for the header.
-    pub files: usize,
 }
 
 impl DiffView {
@@ -240,7 +241,6 @@ impl DiffView {
     #[must_use]
     pub fn new(patch: Patch) -> Self {
         let mut view = Self {
-            files: patch.files.len(),
             patch,
             rows: Vec::new(),
             split_rows: Vec::new(),
@@ -448,6 +448,14 @@ impl DiffView {
         self.rebuild();
     }
 
+    /// Whether every hunk of `file` is folded, which is what the tree shows so a
+    /// collapsed file is visible without opening it (FR-3.3).
+    #[must_use]
+    pub fn file_is_folded(&self, file: usize) -> bool {
+        let hunks = self.patch.files.get(file).map_or(0, |f| f.hunks.len());
+        hunks > 0 && (0..hunks).all(|hunk| self.folded_hunks.contains(&(file, hunk)))
+    }
+
     /// Whether the hunk under the cursor is folded.
     #[must_use]
     pub fn current_hunk_is_folded(&self) -> bool {
@@ -527,14 +535,7 @@ impl DiffView {
     pub fn status_label(&self) -> String {
         let stats = self.patch.stats();
         let mode = if self.split { "split" } else { "unified" };
-        let mut label = format!("{} · {mode}", stats.label());
-        if self.ignore_whitespace {
-            label.push_str(" · -w");
-        }
-        if label.len() > 60 {
-            label.truncate(60);
-        }
-        label
+        crate::tui::text::truncate(&format!("{} · {mode}", stats.label()), 60)
     }
 
     /// What the file under the cursor is, for the status line.
@@ -1010,6 +1011,26 @@ Binary files /dev/null and b/docs/logo.png differ
     }
 
     #[test]
+    fn a_folded_file_is_visible_as_folded() {
+        let mut view = view();
+        assert!(!view.file_is_folded(0));
+        // The cursor starts on the first file banner, so `za` folds the whole file.
+        view.toggle_hunk();
+        assert!(view.file_is_folded(0), "the tree can show it as collapsed");
+        assert!(!view.file_is_folded(1), "the other file is not folded");
+
+        // A file with no hunks is not "folded": there is nothing hidden.
+        let empty = DiffView::new(crate::domain::diff::parse_patch(
+            "diff --git a/a.txt b/a.txt
+new file mode 100644
+index 0000000..2222222
+Binary files /dev/null and b/a.txt differ
+",
+        ));
+        assert!(!empty.file_is_folded(0));
+    }
+
+    #[test]
     fn folding_a_file_banner_folds_every_hunk_in_it() {
         let mut view = view();
         // The cursor starts on the first file banner.
@@ -1083,7 +1104,7 @@ Binary files /dev/null and b/docs/logo.png differ
     }
 
     #[test]
-    fn the_status_line_names_the_mode_and_the_whitespace_setting() {
+    fn the_status_line_names_the_mode_it_is_actually_in() {
         let mut view = view();
         assert!(
             view.status_label().ends_with("· unified"),
@@ -1092,8 +1113,14 @@ Binary files /dev/null and b/docs/logo.png differ
         );
         view.split = true;
         assert!(view.status_label().contains("· split"));
+        // The whitespace setting is *not* named: a remote diff cannot honour it, and
+        // printing "-w" would claim the pane is showing something it is not (FR-3.2).
         view.ignore_whitespace = true;
-        assert!(view.status_label().contains("· -w"));
+        assert!(
+            !view.status_label().contains("-w"),
+            "{}",
+            view.status_label()
+        );
     }
 
     #[test]

@@ -40,8 +40,10 @@ pub struct PrListState {
     pub viewport: u16,
     /// Whether a fetch is in flight.
     pub loading: bool,
-    /// Why the shown data is stale, when the forge could not be reached (DEC-14).
-    pub offline: Option<String>,
+    /// Why the shown list is not fresh: `offline` when the forge could not be
+    /// reached (DEC-14), or `cached …` while the network is still being asked
+    /// (FR-2.3). Absent means what is on screen came from the network.
+    pub stale: Option<String>,
     /// The last failure, shown in the pane until something replaces it.
     pub error: Option<String>,
     /// Whether the count job is still outstanding.
@@ -70,9 +72,38 @@ impl PrListState {
     }
 
     /// Whether more pages can still be fetched.
+    ///
+    /// False at the cap *and* when the list is already known to be complete, which
+    /// are different situations: the caller asks [`Self::holds_everything`] to tell
+    /// them apart before claiming there is nothing left.
     #[must_use]
     pub fn can_load_more(&self) -> bool {
-        self.load_more_limit().is_some()
+        !self.holds_everything() && self.load_more_limit().is_some()
+    }
+
+    /// Whether everything the query matches is already here.
+    #[must_use]
+    pub fn holds_everything(&self) -> bool {
+        self.total
+            .is_some_and(|total| u32::try_from(self.items.len()).unwrap_or(u32::MAX) >= total)
+    }
+
+    /// Removes one chip by the number the filter bar shows, 1 being the first
+    /// filter after the state chip (FR-2.2).
+    ///
+    /// Returns whether a chip was removed.
+    pub fn remove_chip(&mut self, number: usize) -> bool {
+        if number == 0 {
+            // Chip zero is `is:open` and friends: removing it means going back to the
+            // default state rather than dropping a filter.
+            self.state_filter = PrStateFilter::Open;
+            return true;
+        }
+        if number > self.filters.len() {
+            return false;
+        }
+        self.remove_filter(number - 1);
+        true
     }
 
     /// The query the list currently describes.
@@ -302,12 +333,11 @@ impl PrListState {
         // from how many exist, so the sentence changes rather than mixing the two
         // numbers into something that reads like a contradiction.
         if !self.search.trim().is_empty() {
-            let offline = if self.offline.is_some() {
-                " · offline"
-            } else {
-                ""
-            };
-            return format!("matching {shown} of {fetched} loaded{total}{offline}");
+            let stale = self
+                .stale
+                .as_ref()
+                .map_or(String::new(), |reason| format!(" · {reason}"));
+            return format!("matching {shown} of {fetched} loaded{total}{stale}");
         }
 
         let counts = match self.total {
@@ -320,12 +350,12 @@ impl PrListState {
             None => format!("showing {shown}"),
         };
 
-        let offline = self
-            .offline
+        let stale = self
+            .stale
             .as_ref()
-            .map_or(String::new(), |_| " · offline".to_owned());
+            .map_or(String::new(), |reason| format!(" · {reason}"));
 
-        format!("{counts}{offline}")
+        format!("{counts}{stale}")
     }
 
     /// Whether the empty pane should explain that the search matched nothing.
@@ -571,7 +601,7 @@ mod tests {
     #[test]
     fn the_offline_indicator_appears_in_the_status_line() {
         let mut list = list_of(&[1]);
-        list.offline = Some("could not resolve host".to_owned());
+        list.stale = Some("offline".to_owned());
         assert!(
             list.status_label().ends_with("· offline"),
             "{}",
@@ -650,6 +680,44 @@ mod tests {
         assert_eq!(list.cursor_position(), Some(5));
         list.move_page(-1, true);
         assert_eq!(list.cursor_position(), Some(0), "and it stops at the top");
+    }
+
+    #[test]
+    fn a_complete_list_needs_no_more_pages_and_says_so() {
+        let mut list = PrListState::new(50, 500);
+        list.replace(PullRequestPage::complete(vec![summary(1, "one")], 50));
+        assert!(list.holds_everything());
+        assert!(
+            !list.can_load_more(),
+            "everything is here, so :load-more has nothing to do"
+        );
+
+        // The cap is a different situation from being complete.
+        let mut capped = PrListState::new(50, 50);
+        capped.replace(PullRequestPage::possibly_truncated(
+            (1..=50).map(|number| summary(number, "x")).collect(),
+            50,
+        ));
+        capped.set_total(1374);
+        assert!(!capped.holds_everything());
+        assert!(!capped.can_load_more(), "the cap is reached");
+    }
+
+    #[test]
+    fn a_chip_can_be_removed_by_its_number() {
+        let mut list = PrListState::new(50, 500);
+        list.push_filter(Filter::Author("alice".to_owned()));
+        list.push_filter(Filter::Label("bug".to_owned()));
+        assert_eq!(list.chips(), vec!["is:open", "author:alice", "label:bug"]);
+
+        assert!(list.remove_chip(2), "the second chip is label:bug");
+        assert_eq!(list.chips(), vec!["is:open", "author:alice"]);
+
+        // Chip zero is the state chip: removing it returns to the default state.
+        assert!(list.remove_chip(0));
+        assert_eq!(list.chips(), vec!["is:open", "author:alice"]);
+
+        assert!(!list.remove_chip(9), "there is no ninth chip");
     }
 
     #[test]

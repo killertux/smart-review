@@ -26,6 +26,10 @@ FIXTURES="$ROOT/tests/fixtures/gh"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# Captured before anything runs, so the last step can tell whether the run wrote into
+# the checkout rather than comparing two reads taken at the same moment.
+BEFORE="$(git status --porcelain --ignored=no | sort)"
+
 # ---------------------------------------------------------------------------
 # A fake `gh` that answers the probes and the PR calls from the fixtures.
 #
@@ -84,6 +88,7 @@ run_tui() {
   local home="$1" keys="$2" fake="$3" log="$4"
   # `~` separates groups of keys by a pause, because opening a pull request is a
   # background job: a `:q` sent in the same breath quits before the diff arrives.
+  set +e
   (sleep 1
    IFS='~' read -ra groups <<<"$keys"
    for group in "${groups[@]}"; do
@@ -94,6 +99,18 @@ run_tui() {
     | PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" timeout 30 \
       script -qefc "stty rows 40 cols 160 2>/dev/null; '$ROOT/$BIN' --repo acme/service" /dev/null \
     >"$log" 2>&1
+  TUI_STATUS=$?
+  set -e
+
+  # A crash on the way out — a panic while restoring the terminal, a worker that
+  # deadlocks — must be visible even though the screen looked right beforehand.
+  if [ "$TUI_STATUS" -ne 0 ] && [ "$TUI_STATUS" -ne 124 ]; then
+    printf '  note: the interface exited %s; see %s\n' "$TUI_STATUS" "$log"
+  fi
+  if grep -q 'panicked' "$log" 2>/dev/null; then
+    printf '  note: the interface panicked; see %s\n' "$log"
+  fi
+
   # The capture is every frame concatenated, and the app only writes the cells that
   # changed, so the raw stream is not what was on screen. Replaying the escape
   # sequences reconstructs the final screen instead.
@@ -103,8 +120,17 @@ run_tui() {
 # Matches text on the reconstructed screen, ignoring the padding between columns.
 saw() { grep -q "$1"; }
 
+# The screen checks need a pty (`script`), a replayable capture (`python3`) and a
+# bounded run (`timeout`). Missing any of them is a skip with a reason, not a crash
+# half way through the run.
 HAVE_PTY=0
-if script --version 2>&1 | grep -q util-linux; then
+if ! script --version 2>&1 | grep -q util-linux; then
+  printf 'note: GNU script not found; the screen checks will be skipped\n'
+elif ! command -v python3 >/dev/null 2>&1; then
+  printf 'note: python3 not found; the screen checks will be skipped\n'
+elif ! command -v timeout >/dev/null 2>&1; then
+  printf 'note: timeout not found; the screen checks will be skipped\n'
+else
   HAVE_PTY=1
 fi
 
@@ -207,7 +233,7 @@ fi
 step "5/6 the list, the diff and the filters on screen"
 
 if [ "$HAVE_PTY" -eq 0 ]; then
-  printf '  SKIP  no pty tool available (GNU script not found)\n'
+  printf '  SKIP  no pty tool available (needs GNU script, python3 and timeout)\n'
 else
   FAKE="$TMP/fake-gh"
   make_fake_gh "$FAKE"
@@ -312,6 +338,35 @@ else
     printf '%s\n' "$SCREEN" | tail -8
   fi
 
+  # `:copy-path` writes the OSC 52 sequence, which *is* the feature: a path on the
+  # clipboard with no clipboard dependency (FR-3.4).
+  HOME_COPY="$TMP/home-copy"
+  run_tui "$HOME_COPY" '\r~y~:q\r' "$FAKE" /tmp/m1-copy.log >/dev/null
+  if grep -q ']52;c;' /tmp/m1-copy.log; then
+    ok ":copy-path puts the file path on the terminal clipboard"
+  else
+    bad ":copy-path wrote no OSC 52 sequence"
+  fi
+
+  # A signal must give the terminal back (NFR-4.2). `SIGINT` arrives as a key in raw
+  # mode, so this is about the signals a `kill` sends.
+  HOME_SIGNAL="$TMP/home-signal"
+  set +e
+  (sleep 6) | PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$HOME_SIGNAL" timeout 20 \
+    script -qefc "stty rows 40 cols 160 2>/dev/null; '$ROOT/$BIN' --repo acme/service" /dev/null \
+    >/tmp/m1-signal.log 2>&1 &
+  SIGNAL_JOB=$!
+  sleep 4
+  pkill -TERM -f 'target/release/smart-review' 2>/dev/null
+  wait "$SIGNAL_JOB" 2>/dev/null
+  set -e
+
+  if grep -q 'restoring the terminal' "$HOME_SIGNAL/logs/smart-review.log" 2>/dev/null; then
+    ok "SIGTERM restores the terminal"
+  else
+    bad "SIGTERM did not restore the terminal"
+  fi
+
   # The cache-first path: the same home, but the list call now fails, so what is
   # shown must come from the cache with an honest offline marker (FR-2.3, DEC-14).
   FAKE_FAILING="$TMP/fake-gh-offline"
@@ -333,7 +388,6 @@ fi
 
 # ---------------------------------------------------------------------------
 step "6/6 nothing was written inside the repository"
-BEFORE="$(git status --porcelain --ignored=no | sort)"
 AFTER="$(git status --porcelain --ignored=no | sort)"
 if [ "$BEFORE" = "$AFTER" ]; then
   ok "the validation run wrote nothing into the repository"
@@ -344,6 +398,13 @@ fi
 
 if [ -d "$ROOT/target" ]; then
   ok "build output stays in target/"
+fi
+
+# The application owns its own home; nothing may appear in the checkout (FR-8.1).
+if [ ! -e "$ROOT/.smart-review" ]; then
+  ok "no application state was created in the checkout"
+else
+  bad "the application wrote state into the checkout"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

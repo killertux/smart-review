@@ -504,7 +504,7 @@ tui (presentation)  →  application (use cases)  →  domain
                              ↑ implemented by
 adapters (gh, git, llm, fs, clock, config)
 ```
-- `domain` MUST NOT depend on any crate except `std`/`serde`/`thiserror`-class utilities, and MUST NOT know about terminals, processes or HTTP.
+- `domain` MUST NOT depend on any crate except `std`/`serde`/`chrono`/`thiserror`-class utilities (data formats and time, not IO), and MUST NOT know about terminals, processes or HTTP. `chrono` was approved in M1 in place of `time`; its `DateTime<Utc>` is the `Timestamp` type the fixtures, the cache and the tests share.
 - `application` orchestrates use cases in terms of ports and emits domain events; it MUST NOT import `ratatui`, `crossterm`, or `tokio::process`.
 - `adapters` implement ports and MUST NOT be imported by `application`/`domain`.
 - `tui` MUST be a pure function of application state + a stream of events; it MUST NOT call adapters directly.
@@ -659,7 +659,7 @@ See DEV-1/DEP-1 in §8. Baseline expected dependencies (each still requires appr
 | `command` | `:` | `Esc`, `<CR>` | line editor with completion |
 | `search` | `/`, `?` | `Esc`, `<CR>` | incremental; `n`/`N` repeat |
 | `popup` | any popup | `Esc` | keys scoped to the popup |
-| `visual` | `v` (M1) | `Esc` | line/range selection for comments |
+| `visual` | `v` (M5: line/range selection for comments, with publishing) | `Esc` | reserved; no action is bound yet |
 
 Default bindings (all remappable; this is the compiled-in default set):
 | Keys | Action | Scope |

@@ -89,23 +89,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             app.start_doctor();
             Effect::RunDoctor
         }
-        "app.load_more" => {
-            if app.review.is_some() {
-                app.notice(
-                    NoticeLevel::Warn,
-                    "loading more applies to the list; press Esc to go back",
-                );
-                Effect::None
-            } else if !app.list.can_load_more() {
-                app.notice(
-                    NoticeLevel::Warn,
-                    "that is every pull request the current filters match",
-                );
-                Effect::None
-            } else {
-                Effect::LoadMore
-            }
-        }
+        "app.load_more" => load_more(app),
         "app.theme_picker" => {
             app.open_overlay(Overlay::ThemePicker);
             Effect::None
@@ -133,12 +117,12 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             } else if app.environment.is_none() {
                 Effect::DetectEnvironment
             } else {
-                app.list.offline = None;
+                app.list.stale = None;
                 Effect::LoadPullRequests
             }
         }
-        "pane.next" => set_focus(app, app.focus.next()),
-        "pane.prev" => set_focus(app, app.focus.prev()),
+        "pane.next" => switch_pane(app, true),
+        "pane.prev" => switch_pane(app, false),
         // The groups live in their own functions so that no single match has to hold
         // the whole command surface.
         other
@@ -185,8 +169,20 @@ fn dispatch_app(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "theme.toggle" => app.toggle_theme(),
-        _ => Effect::None,
+        other => unimplemented_action(app, other),
     }
+}
+
+/// Reports an action that reached a sub-dispatcher with no arm for it.
+///
+/// Silently returning `Effect::None` would make a missing arm look like a working
+/// no-op, and it is what the "every registered action is dispatched" test looks for.
+fn unimplemented_action(app: &mut App, id: &str) -> Effect {
+    app.notice(
+        NoticeLevel::Warn,
+        format!("`{id}` is not implemented in this build"),
+    );
+    Effect::None
 }
 
 /// The list, search and filter actions.
@@ -238,14 +234,14 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
         }
         "filter.clear" => {
             app.list.clear_filters();
-            app.list.offline = None;
+            app.list.stale = None;
             if app.environment.is_some() {
                 Effect::LoadPullRequests
             } else {
                 Effect::None
             }
         }
-        _ => Effect::None,
+        other => unimplemented_action(app, other),
     }
 }
 
@@ -282,7 +278,7 @@ fn dispatch_diff(app: &mut App, id: &str) -> Effect {
         "diff.cycle_context" => cycle_context(app),
         "diff.toggle_whitespace" => toggle_whitespace(app),
         "review.copy_path" => copy_path(app),
-        _ => Effect::None,
+        other => unimplemented_action(app, other),
     }
 }
 
@@ -298,6 +294,64 @@ fn copy_path(app: &mut App) -> Effect {
     } else {
         app.notice(NoticeLevel::Warn, "there is no file under the cursor");
         Effect::None
+    }
+}
+
+/// `:load-more`, or the `app.load_more` action.
+///
+/// Three different situations, three different sentences: everything is already
+/// shown, the configured cap has been reached (which is *not* the same as having
+/// everything), or there is another page to fetch (FR-2.1).
+fn load_more(app: &mut App) -> Effect {
+    if app.review.is_some() {
+        app.notice(
+            NoticeLevel::Warn,
+            "loading more applies to the list; press Esc to go back",
+        );
+        return Effect::None;
+    }
+    if app.list.holds_everything() {
+        app.notice(
+            NoticeLevel::Info,
+            format!(
+                "all {} matching pull requests are shown",
+                app.list.items.len()
+            ),
+        );
+        return Effect::None;
+    }
+    if !app.list.can_load_more() {
+        app.notice(
+            NoticeLevel::Warn,
+            format!(
+                "the {}-pull-request cap is reached; raise [review].page_size or max_pages to see more",
+                app.list.cap
+            ),
+        );
+        return Effect::None;
+    }
+    Effect::LoadMore
+}
+
+/// `:filter-remove 2` removes one chip (FR-2.2).
+fn remove_filter(app: &mut App, argument: &str) -> Effect {
+    // The chips are the state chip plus the filters; the state chip is index one.
+    match argument.trim().parse::<usize>() {
+        Ok(index) if index >= 1 => {
+            if app.list.remove_chip(index) {
+                Effect::LoadPullRequests
+            } else {
+                app.command_error(format!("there is no chip {index}"));
+                Effect::None
+            }
+        }
+        _ => {
+            app.command_error(format!(
+                ":filter-remove needs a chip number; the chips are {}",
+                app.list.chips().join(" ")
+            ));
+            Effect::None
+        }
     }
 }
 
@@ -326,7 +380,7 @@ fn add_filter(app: &mut App, argument: &str) -> Effect {
     match crate::domain::query::Filter::parse_line(argument) {
         Ok(filter) => {
             app.list.push_filter(filter);
-            app.list.offline = None;
+            app.list.stale = None;
             Effect::LoadPullRequests
         }
         Err(error) => {
@@ -357,7 +411,7 @@ fn set_sort(app: &mut App, argument: &str) -> Effect {
     };
     if let Some(sort) = crate::domain::query::PrSort::parse(field, ascending) {
         app.list.sort = sort;
-        app.list.offline = None;
+        app.list.stale = None;
         return Effect::LoadPullRequests;
     }
     app.command_error(format!("`{field}` is not sortable; use created or updated"));
@@ -381,7 +435,13 @@ fn open_selected(app: &mut App) -> Effect {
 }
 
 /// `Esc`: closes the review, or clears what is narrowing the list (FR-3.4).
+///
+/// A back press while something is loading cancels that instead: `Esc` means "stop
+/// what you are doing" first, and "go back" when there is nothing to stop (NFR-1.4).
 fn go_back(app: &mut App) -> Effect {
+    if app.loading_something() {
+        return Effect::CancelInFlight;
+    }
     if app.review.is_some() {
         app.close_review();
         return Effect::None;
@@ -389,7 +449,7 @@ fn go_back(app: &mut App) -> Effect {
     if app.list.is_filtered() {
         let was_loading = app.list.loading;
         app.list.clear_filters();
-        app.list.offline = None;
+        app.list.stale = None;
         // Only re-ask GitHub if something it was asked for changed.
         return if was_loading || app.environment.is_none() {
             Effect::None
@@ -450,51 +510,59 @@ fn toggle_split(app: &mut App) -> Effect {
     Effect::None
 }
 
-/// Cycles the diff context between the sizes the requirement names (FR-3.2).
+/// Explains that the context size needs the local workspace, without pretending to
+/// have changed anything (FR-3.2).
+///
+/// A remote diff comes from `gh pr diff`, which always emits three lines of context
+/// and never filters whitespace. Flipping the label would tell the user the pane is
+/// showing something it is not, so in M1 these keys explain rather than lie; M2's
+/// workspace re-diffs locally, where both settings are real.
 fn cycle_context(app: &mut App) -> Effect {
-    let Some(view) = app.review.as_mut() else {
+    if app.review.is_none() {
         app.notice(NoticeLevel::Warn, "open a pull request first");
         return Effect::None;
-    };
-    view.context = match view.context {
-        0 => 3,
-        3 => 10,
-        _ => 0,
-    };
-    let context = view.context;
-    // Only a local workspace can re-diff without refetching; in remote mode the fix
-    // is a new `gh pr diff`, which is what `R` does.
+    }
     app.notice(
-        NoticeLevel::Info,
+        NoticeLevel::Warn,
         format!(
-            "context {context} lines; press R to refetch ({})",
-            if context == 0 {
-                "0 needs the local workspace from M2"
-            } else {
-                "10 is a preference, 3 is what GitHub sends"
-            }
+            "context is fixed at {} lines in remote mode; the local workspace in M2 makes it adjustable",
+            app.review.as_ref().map_or(3, |view| view.context)
         ),
     );
     Effect::None
 }
 
-/// Toggles whitespace-ignoring, which needs the local workspace (FR-3.2).
+/// Explains that ignoring whitespace needs the local workspace (FR-3.2).
 fn toggle_whitespace(app: &mut App) -> Effect {
-    let Some(view) = app.review.as_mut() else {
+    if app.review.is_none() {
         app.notice(NoticeLevel::Warn, "open a pull request first");
         return Effect::None;
-    };
-    view.ignore_whitespace = !view.ignore_whitespace;
-    let ignoring = view.ignore_whitespace;
-    if ignoring {
-        app.notice(
-            NoticeLevel::Warn,
-            "whitespace-ignoring diffs need the local workspace, which arrives in M2",
-        );
-    } else {
-        app.notice(NoticeLevel::Info, "showing whitespace changes");
     }
+    app.notice(
+        NoticeLevel::Warn,
+        "whitespace-ignoring diffs need the local workspace, which arrives in M2",
+    );
     Effect::None
+}
+
+/// Moves the focus on. Inside a review that means the tree and the diff in turn
+/// (FR-3.3: the two panes keep independent cursors and `Tab` moves between them).
+fn switch_pane(app: &mut App, forward: bool) -> Effect {
+    if let Some(view) = app.review.as_mut() {
+        view.tree_focused = !view.tree_focused;
+        if view.tree_focused {
+            app.notice(NoticeLevel::Info, "file tree: Enter opens, j/k moves");
+        }
+        return Effect::None;
+    }
+    set_focus(
+        app,
+        if forward {
+            app.focus.next()
+        } else {
+            app.focus.prev()
+        },
+    )
 }
 
 fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
@@ -527,6 +595,7 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "copy-path" => dispatch(app, "review.copy_path"),
         "pr" => open_pr(app, argument),
         "filter" => add_filter(app, argument),
+        "filter-remove" => remove_filter(app, argument),
         "sort" => set_sort(app, argument),
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
@@ -584,6 +653,24 @@ fn set_option(app: &mut App, spec: &str) -> Effect {
 
     match key {
         "ui.theme" => app.set_theme(value),
+        "mouse" | "ui.mouse" => {
+            match value {
+                "true" | "on" | "yes" => {
+                    app.show_mouse(true);
+                    app.notice(NoticeLevel::Info, "mouse capture on");
+                }
+                "false" | "off" | "no" => {
+                    app.show_mouse(false);
+                    app.notice(NoticeLevel::Info, "mouse capture off");
+                }
+                other => {
+                    app.command_error(format!("`{other}` is not a boolean; use true or false"));
+                    return Effect::None;
+                }
+            }
+            // The loop owns the terminal, so the change is applied there.
+            Effect::SetMouse(app.mouse_enabled())
+        }
         "ui.timeoutlen" => {
             if let Ok(milliseconds) = value.parse::<u64>() {
                 app.keymap.set_timeout(Duration::from_millis(milliseconds));
@@ -686,14 +773,20 @@ fn common_prefix(names: &[&str]) -> String {
     let Some(first) = names.first() else {
         return String::new();
     };
-    let mut length = first.len();
+    // Counted in characters, not bytes: the lengths of two names are only comparable
+    // per character, and slicing a `&str` inside one would panic.
+    let mut length = first.chars().count();
     for name in names.iter().skip(1) {
-        length = length.min(name.len());
-        while length > 0 && !name.starts_with(&first[..length]) {
+        length = length.min(name.chars().count());
+        while length > 0 {
+            let candidate: String = first.chars().take(length).collect();
+            if name.starts_with(&candidate) {
+                break;
+            }
             length -= 1;
         }
     }
-    first[..length].to_owned()
+    first.chars().take(length).collect()
 }
 
 fn closest_command(typed: &str) -> Option<&'static str> {
@@ -800,15 +893,6 @@ mod tests {
     }
 
     #[test]
-    fn every_registered_command_action_has_a_dispatch_arm() {
-        // `notice.clear` and `app.version` are reached through the command line,
-        // so the catch-all must not swallow them.
-        for id in ["app.version", "notice.clear"] {
-            assert!(action::is_known(id), "{id} should be registered");
-        }
-    }
-
-    #[test]
     fn every_listed_command_is_actually_handled() {
         // The palette comes from `COMMANDS`, so a name listed there but missing from
         // `command` would be offered to the user and then refused — which is exactly
@@ -869,6 +953,29 @@ mod tests {
                 .is_some_and(|text| text.contains("sideways")),
             "{:?}",
             app.command_error_text()
+        );
+    }
+
+    #[test]
+    fn copy_path_offers_the_file_under_the_cursor() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app) = test_app();
+        // Without a review there is nothing to copy, and the user is told so.
+        assert_eq!(super::command(&mut app, "copy-path"), Effect::None);
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("no file")),
+            "a warning should say why nothing was copied"
+        );
+
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        app.set_review(DiffView::new(patch));
+        assert_eq!(
+            super::command(&mut app, "copy-path"),
+            Effect::CopyPath("src/a.rs".to_owned())
         );
     }
 

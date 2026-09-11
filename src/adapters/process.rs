@@ -337,8 +337,8 @@ impl ProcessRunner {
             thread::sleep(POLL_INTERVAL);
         };
 
-        let (stdout, stdout_truncated) = join_reader(stdout_reader);
-        let (stderr, stderr_truncated) = join_reader(stderr_reader);
+        let (stdout, stdout_truncated) = join_reader(stdout_reader, GRACE);
+        let (stderr, stderr_truncated) = join_reader(stderr_reader, GRACE);
 
         Ok(Output {
             status,
@@ -379,13 +379,35 @@ impl ProcessRunner {
     }
 }
 
-/// Collects a reader thread's result, treating a panic as empty output rather
-/// than propagating it (a reader thread has no reason to panic).
-fn join_reader(handle: Option<thread::JoinHandle<(Vec<u8>, bool)>>) -> (Vec<u8>, bool) {
-    handle.map_or_else(
-        || (Vec::new(), false),
-        |handle| handle.join().unwrap_or_default(),
-    )
+/// How long the reader threads are given to finish after the child is gone.
+///
+/// The child has already exited, so its pipes close immediately *unless* something it
+/// spawned inherited them — `git fetch` spawns helpers, and one of those holding the
+/// pipe open would otherwise block this thread, and the job slot it occupies,
+/// indefinitely.
+const GRACE: Duration = Duration::from_millis(500);
+
+/// Collects a reader thread's result, giving up after `grace`.
+///
+/// A thread that is still reading when the grace expires is left to finish on its
+/// own; its output is treated as truncated, which is honest: the child is gone and
+/// what it wrote is incomplete.
+fn join_reader(
+    handle: Option<thread::JoinHandle<(Vec<u8>, bool)>>,
+    grace: Duration,
+) -> (Vec<u8>, bool) {
+    let Some(handle) = handle else {
+        return (Vec::new(), false);
+    };
+
+    // A channel rather than `join`, because `join` has no timeout.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let result = handle.join().unwrap_or_default();
+        let _ = sender.send(result);
+    });
+
+    receiver.recv_timeout(grace).unwrap_or((Vec::new(), true))
 }
 
 /// Reads a stream, keeping at most `cap` bytes but always draining it.
@@ -552,6 +574,22 @@ mod tests {
         assert!(output.success());
         assert_eq!(output.stdout.len(), 1000);
         assert!(output.stdout_truncated);
+    }
+
+    #[test]
+    fn a_reader_that_never_finishes_is_abandoned_rather_than_waited_for() {
+        // A grandchild holding the pipe open looks exactly like this: the reader
+        // never sees EOF. Waiting for it would hang the job thread, so the wait is
+        // bounded and the output is reported as incomplete.
+        let stuck = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(30));
+            (Vec::new(), false)
+        });
+        let started = Instant::now();
+        let (kept, truncated) = join_reader(Some(stuck), Duration::from_millis(50));
+        assert!(kept.is_empty());
+        assert!(truncated, "the caller is told the output is incomplete");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

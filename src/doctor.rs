@@ -11,7 +11,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::error::Error;
@@ -122,7 +122,9 @@ pub fn collect_local(context: &Context) -> Vec<Check> {
             status: Status::Ok,
             detail: log_detail(context),
         },
+        directory_check("cache", &context.home.cache()),
         terminal_check(),
+        locale_check(),
         llm_check(context),
     ];
 
@@ -316,6 +318,30 @@ fn read_tail(path: &Path, bytes: u64) -> std::io::Result<String> {
     Ok(buffer)
 }
 
+/// Locale information (FR-9.3): it decides how the app's own output is encoded.
+fn locale_check() -> Check {
+    let mut parts: Vec<String> = Vec::new();
+    for name in ["LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Ok(value) = std::env::var(name)
+            && !value.is_empty()
+        {
+            parts.push(format!("{name}={value}"));
+        }
+    }
+    if parts.is_empty() {
+        return Check {
+            name: "locale",
+            status: Status::Warn,
+            detail: "LANG and LC_* are unset; the terminal's encoding is unknown".to_owned(),
+        };
+    }
+    Check {
+        name: "locale",
+        status: Status::Ok,
+        detail: parts.join(" "),
+    }
+}
+
 fn config_check(context: &Context) -> Check {
     let origin = if context.config_exists {
         context.config_path.display().to_string()
@@ -480,16 +506,18 @@ fn llm_check(context: &Context) -> Check {
 
 /// Runs an external command and returns its combined output.
 fn run_tool(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
+    // Through the shared runner, not `Command::output`: `gh auth status` reaches
+    // GitHub, and without a timeout a hung client would occupy its job slot for the
+    // rest of the session (ARCH-3).
+    let spec = crate::adapters::process::CommandSpec::new(program).args(args);
+    let output = crate::adapters::process::ProcessRunner::new()
+        .with_timeout(Duration::from_secs(15))
+        .with_output_cap(64 * 1024)
+        .run(&spec, &crate::ports::Cancel::new())
         .map_err(|error| format!("could not run `{program}`: {error}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-
-    if output.status.success() {
+    let combined = format!("{}{}", output.stdout, output.stderr);
+    if output.success() {
         Ok(combined.trim().to_owned())
     } else {
         let reason = first_line(&combined);

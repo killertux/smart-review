@@ -84,6 +84,10 @@ pub enum Effect {
     ReloadDiff,
     /// Put a path on the clipboard through the terminal (FR-3.4).
     CopyPath(String),
+    /// Turn mouse capture on or off, which only the loop can do (FR-7.5).
+    SetMouse(bool),
+    /// Give up on the work in flight for the current screen (NFR-1.4).
+    CancelInFlight,
 }
 
 /// What this build can show, so the shell is honest about being a shell.
@@ -303,6 +307,8 @@ pub struct App {
     theme_before_picker: Option<(Theme, String)>,
     /// Restricts the help popup to one action, set by `:keymap <action>`.
     pub(crate) help_filter: Option<String>,
+    /// The first line the help popup shows: the list is longer than most terminals.
+    pub(crate) help_scroll: usize,
     /// What detection resolved, once it has run (FR-1.1).
     pub(crate) environment: Option<Environment>,
     /// Why detection failed, when it did.
@@ -319,6 +325,8 @@ pub struct App {
     pub(crate) diff_loading: bool,
     /// Why the shown diff came from the cache, when it did (DEC-14).
     pub(crate) diff_offline: Option<String>,
+    /// The job id of the newest detection request.
+    pub(crate) environment_job: u64,
     /// The job id of the newest list request, so a superseded answer is dropped.
     pub(crate) list_job: u64,
     /// The job id of the newest count request.
@@ -418,6 +426,7 @@ impl App {
             review: None,
             diff_loading: false,
             diff_offline: None,
+            environment_job: 0,
             list_job: 0,
             count_job: 0,
             detail_job: 0,
@@ -440,6 +449,7 @@ impl App {
             picker_cursor: 0,
             theme_before_picker: None,
             help_filter: None,
+            help_scroll: 0,
             focus,
             checks: Vec::new(),
             doctor_running: false,
@@ -582,6 +592,7 @@ impl App {
     /// Remembers which job a request became, so a superseded answer can be dropped.
     pub fn record_job(&mut self, effect: &Effect, id: u64) {
         match effect {
+            Effect::DetectEnvironment => self.environment_job = id,
             Effect::LoadPullRequests | Effect::LoadMore => {
                 self.list_job = id;
                 self.list.loading = true;
@@ -596,8 +607,7 @@ impl App {
                 self.diff_loading = true;
             }
             Effect::RunDoctor => self.doctor_job = id,
-            // Detection has no id to remember (there is only ever one, and its result
-            // is applied regardless), and the rest ask for no job at all.
+            // The rest ask for no job, or are handled by `apply` rather than here.
             _ => {}
         }
     }
@@ -608,54 +618,45 @@ impl App {
     /// necessary: opening a pull request needs its diff, a truncated list needs its
     /// count, and so on. The reducer stays the only thing that decides, and it still
     /// performs no IO.
+    ///
+    /// Every arm is gated on the job id it answers, so a superseded result — an error
+    /// as much as a success — is dropped rather than painted over a fresher answer.
     pub fn apply_completion(&mut self, completion: jobs::Completion) -> Option<Effect> {
         let Completion { job, outcome } = completion;
 
         match outcome {
-            Outcome::Environment(environment) => {
-                // A stale detection result cannot happen: there is only ever one.
+            Outcome::Environment(environment) if job == self.environment_job => {
                 self.set_environment(*environment);
-                self.notice(
-                    NoticeLevel::Info,
-                    format!(
-                        "reading {} as {}",
-                        self.environment
-                            .as_ref()
-                            .map_or_else(String::new, |env| env.repo.slug()),
-                        self.environment
-                            .as_ref()
-                            .and_then(|env| env.gh.account.clone())
-                            .unwrap_or_else(|| "an unknown account".to_owned())
-                    ),
-                );
+                self.notice(NoticeLevel::Info, self.environment_summary());
                 Some(Effect::LoadPullRequests)
             }
-            Outcome::EnvironmentFailed(error) => {
+            Outcome::EnvironmentFailed(error) if job == self.environment_job => {
                 self.set_environment_error(*error);
                 None
             }
-            Outcome::Page(outcome) if job == self.list_job => {
-                // A full page means the total is unknown, so it is asked for
-                // separately rather than guessed at (FR-2.1).
-                let wanted_count =
-                    outcome.value().total.is_none() && outcome.value().may_have_more();
-                self.list.offline = outcome.offline_reason().map(str::to_owned);
-                match *outcome {
-                    FetchOutcome::Fresh(page) => self.list.replace(page),
-                    FetchOutcome::Offline { value, .. } => self.list.replace(value),
-                }
-                if wanted_count {
-                    Some(Effect::CountPullRequests)
+            Outcome::CachedPage(cached) => {
+                // Painted before the network answers; the fetch that follows replaces
+                // it in place, keeping the cursor on the same pull request (FR-2.3).
+                let age = cached.age_secs;
+                let stale = cached.stale;
+                self.list.replace(cached.value);
+                // The age is shown as a duration of *this* kind of data rather than
+                // as a wall-clock time: "cached 12s ago" is what the user needs.
+                self.list.stale = Some(if stale {
+                    format!("cached {age}s ago")
                 } else {
-                    None
-                }
+                    "cached".to_owned()
+                });
+                self.list.loading = true;
+                None
             }
+            Outcome::Page(outcome) if job == self.list_job => self.apply_page(*outcome),
             Outcome::Count(count) if job == self.count_job => {
                 self.list.set_total(count);
                 None
             }
             Outcome::Detail(outcome) if job == self.detail_job => {
-                self.diff_offline = outcome.offline_reason().map(str::to_owned);
+                self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
                 let detail = outcome.into_value();
                 self.notice(
                     NoticeLevel::Info,
@@ -669,42 +670,110 @@ impl App {
                 self.detail = Some(detail);
                 Some(Effect::ReloadDiff)
             }
-            Outcome::Patch(outcome) if job == self.patch_job => {
-                self.diff_offline = outcome.offline_reason().map(str::to_owned);
-                let patch = outcome.into_value();
-                let view = DiffView::with_options(
-                    patch,
-                    self.config.review.context_lines,
-                    self.config.review.ignore_whitespace,
-                );
-                let files = view.patch.stats();
-                match self.detail.take() {
-                    Some(detail) => self.open_review(detail, view),
-                    None => self.set_review(view),
-                }
-                self.notice(
-                    NoticeLevel::Info,
-                    format!("{} · {}", files.label(), self.list.status_label()),
-                );
-                None
-            }
+            Outcome::Patch(outcome) if job == self.patch_job => self.apply_patch(*outcome),
             Outcome::Checks(checks) => {
                 self.apply_checks(job, checks);
                 None
             }
-            Outcome::Failed(message) => {
+            // A failure is gated like any other result: a superseded request's error
+            // must not be announced as if it were the newest one.
+            Outcome::Failed(message) if self.is_current_job(job) => {
                 self.report_job_failure(job, &message);
                 None
             }
-            // A result whose id has been superseded, or a job the user abandoned:
-            // dropped rather than painted over a fresher answer. The arms that carry
-            // an id are above, with their guards.
-            Outcome::Page(_)
+            Outcome::Environment(_)
+            | Outcome::EnvironmentFailed(_)
+            | Outcome::Page(_)
             | Outcome::Count(_)
             | Outcome::Detail(_)
             | Outcome::Patch(_)
+            | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
+    }
+
+    /// A sentence naming the repository and account detection resolved.
+    fn environment_summary(&self) -> String {
+        let repo = self
+            .environment
+            .as_ref()
+            .map_or_else(String::new, |environment| environment.repo.slug());
+        let account = self
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.gh.account.clone())
+            .unwrap_or_else(|| "an unknown account".to_owned());
+        format!("reading {repo} as {account}")
+    }
+
+    /// Applies a fetched or cached page (FR-2.1).
+    fn apply_page(
+        &mut self,
+        outcome: FetchOutcome<crate::ports::forge::PullRequestPage>,
+    ) -> Option<Effect> {
+        // A full page means the total is unknown, so it is asked for separately
+        // rather than guessed at (FR-2.1).
+        let wanted_count = outcome.value().total.is_none() && outcome.value().may_have_more();
+        let offline = outcome.offline_reason().is_some();
+        self.list.stale = offline.then(|| "offline".to_owned());
+
+        match outcome {
+            FetchOutcome::Fresh(page) | FetchOutcome::Offline { value: page, .. } => {
+                self.list.replace(page);
+            }
+        }
+
+        wanted_count.then_some(Effect::CountPullRequests)
+    }
+
+    /// Applies a fetched or cached patch (FR-3.3).
+    fn apply_patch(&mut self, outcome: FetchOutcome<crate::domain::diff::Patch>) -> Option<Effect> {
+        self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
+        let patch = outcome.into_value();
+        let view = DiffView::with_options(
+            patch,
+            self.config.review.context_lines,
+            self.config.review.ignore_whitespace,
+        );
+        let files = view.patch.stats();
+        match self.detail.take() {
+            Some(detail) => self.open_review(detail, view),
+            None => self.set_review(view),
+        }
+        self.notice(
+            NoticeLevel::Info,
+            format!("{} · {}", files.label(), self.list.status_label()),
+        );
+        None
+    }
+
+    /// Whether anything is in flight for the screen the user is looking at.
+    #[must_use]
+    pub fn loading_something(&self) -> bool {
+        if self.environment_running || self.list.loading || self.list.counting {
+            return true;
+        }
+        self.review.is_none() && self.diff_loading
+    }
+
+    /// Forgets the work that was cancelled, so the spinners stop.
+    pub fn cancelled_in_flight(&mut self) {
+        self.environment_running = false;
+        self.list.loading = false;
+        self.list.counting = false;
+        self.diff_loading = false;
+        self.notice(NoticeLevel::Info, "cancelled");
+    }
+
+    /// Whether `job` is the newest request for the slot it belongs to.
+    #[must_use]
+    pub fn is_current_job(&self, job: u64) -> bool {
+        job == self.environment_job
+            || job == self.list_job
+            || job == self.count_job
+            || job == self.detail_job
+            || job == self.patch_job
+            || job == self.doctor_job
     }
 
     /// Records a job failure where the user will see it.
@@ -793,6 +862,9 @@ impl App {
                         view.tree_focused = true;
                         let offset = row.saturating_sub(self.review_top + 1);
                         view.move_tree(i32::from(offset));
+                        // A click on a tree row does what pressing Enter on it does:
+                        // opening a file, or folding a folder (FR-7.5).
+                        view.activate_tree();
                     } else {
                         view.tree_focused = false;
                         let offset = row.saturating_sub(self.review_top + 1);
@@ -851,6 +923,11 @@ impl App {
             self.command.push(character);
         }
         self.mode = Mode::Command;
+    }
+
+    /// Turns mouse capture off or on at runtime, for `:set mouse=` (FR-7.5).
+    pub fn show_mouse(&mut self, enabled: bool) {
+        self.config.ui.mouse = enabled;
     }
 
     /// The terminal width of the last frame.
@@ -1043,6 +1120,9 @@ impl App {
     /// Anything the popup needs from the filesystem is captured here, so
     /// rendering stays pure.
     pub(crate) fn open_overlay(&mut self, overlay: Overlay) {
+        if overlay == Overlay::Help {
+            self.help_scroll = 0;
+        }
         match overlay {
             Overlay::Leader => {
                 self.overlay = Overlay::Leader;
@@ -1064,40 +1144,26 @@ impl App {
         match self.overlay {
             Overlay::ThemePicker => {
                 self.theme_before_picker = Some((self.theme.clone(), self.theme_source.clone()));
-                // Resolve every candidate once, here, so moving the cursor never
-                // reads the disk and a broken theme file is reported when the
-                // picker opens rather than when it is committed (FR-7.7).
-                let mut warnings = Vec::new();
-                self.theme_names = theme::available(&self.home);
-                let entries: Vec<PickerEntry> = self
+                // One entry per theme *name*, which was read once at startup. The
+                // file behind the entry is read when the cursor lands on it, so
+                // opening the picker costs nothing and moving down one row costs one
+                // small local read (FR-7.7).
+                self.picker_items = self
                     .theme_names
                     .iter()
                     .cloned()
-                    .map(|name| match theme::load(&self.home, &name, &mut warnings) {
-                        Ok((theme, source)) => PickerEntry {
-                            name,
-                            theme: Some(theme),
-                            source: Some(source),
-                        },
-                        Err(error) => {
-                            warnings.push(error.to_string());
-                            PickerEntry {
-                                name,
-                                theme: None,
-                                source: None,
-                            }
-                        }
+                    .map(|name| PickerEntry {
+                        name,
+                        theme: None,
+                        source: None,
                     })
                     .collect();
-                self.picker_items = entries;
                 self.picker_cursor = self
                     .picker_items
                     .iter()
                     .position(|entry| entry.name == self.theme_request)
                     .unwrap_or(0);
-                for warning in warnings {
-                    self.notice(NoticeLevel::Warn, warning);
-                }
+                self.preview_picker();
             }
             Overlay::Help => self.help_filter = None,
             _ => {}
@@ -1386,6 +1452,31 @@ impl App {
                 self.move_picker(-1);
                 Effect::None
             }
+            // The help list is longer than most terminals, so it scrolls.
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_add(1);
+                Effect::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+                Effect::None
+            }
+            KeyCode::Char('g') if self.overlay == Overlay::Help => {
+                self.help_scroll = 0;
+                Effect::None
+            }
+            KeyCode::Char('G') if self.overlay == Overlay::Help => {
+                self.help_scroll = usize::MAX;
+                Effect::None
+            }
+            KeyCode::Char('d') if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_add(10);
+                Effect::None
+            }
+            KeyCode::Char('u') if self.overlay == Overlay::Help => {
+                self.help_scroll = self.help_scroll.saturating_sub(10);
+                Effect::None
+            }
             KeyCode::Enter if self.overlay == Overlay::ThemePicker => {
                 let name = self
                     .picker_items
@@ -1401,22 +1492,44 @@ impl App {
         }
     }
 
+    /// Loads the theme the picker cursor is on, and previews it.
+    ///
+    /// A file that cannot be read is reported here rather than when the choice is
+    /// committed, so the user never ends up with a theme they cannot see.
+    fn preview_picker(&mut self) {
+        let Some(entry) = self.picker_items.get(self.picker_cursor) else {
+            return;
+        };
+        if entry.theme.is_some() {
+            return;
+        }
+        let name = entry.name.clone();
+        let mut warnings = Vec::new();
+        match theme::load(&self.home, &name, &mut warnings) {
+            Ok((theme, source)) => {
+                self.theme = theme;
+                name.clone_into(&mut self.theme_request);
+                if let Some(entry) = self.picker_items.get_mut(self.picker_cursor) {
+                    entry.theme = Some(self.theme.clone());
+                    entry.source = Some(source.clone());
+                }
+                self.theme_source = source;
+            }
+            Err(error) => {
+                self.notice(NoticeLevel::Warn, format!("{name}: {error}"));
+            }
+        }
+    }
+
     fn move_picker(&mut self, delta: i32) {
         let count = self.picker_items.len();
         if count == 0 {
             return;
         }
         self.picker_cursor = clamp_cursor(self.picker_cursor, delta, count);
-        // Preview from the list resolved when the picker opened; `cancel_overlay`
-        // puts the original back.
-        if let Some(entry) = self.picker_items.get(self.picker_cursor)
-            && let Some(theme) = &entry.theme
-        {
-            self.theme = theme.clone();
-            if let Some(source) = &entry.source {
-                self.theme_source.clone_from(source);
-            }
-        }
+        // Loading the entry the cursor landed on also previews it; `cancel_overlay`
+        // puts the original theme back.
+        self.preview_picker();
     }
 
     /// Moves the roadmap cursor.
@@ -1452,14 +1565,14 @@ impl App {
                 let mut text = self.list.search.clone();
                 text.pop();
                 self.list.set_search(&text);
-                self.list.offline = None;
+                self.list.stale = None;
                 Effect::None
             }
             // Ctrl-U clears the box, which is the one shortcut worth having while
             // typing in it.
             KeyCode::Char('u') if combo.modifiers == KeyModifiers::CONTROL => {
                 self.list.set_search("");
-                self.list.offline = None;
+                self.list.stale = None;
                 Effect::None
             }
             KeyCode::Char(value)
@@ -1468,7 +1581,7 @@ impl App {
                 let mut text = self.list.search.clone();
                 text.push(value);
                 self.list.set_search(&text);
-                self.list.offline = None;
+                self.list.stale = None;
                 Effect::None
             }
             _ => Effect::None,
@@ -2132,13 +2245,205 @@ mod tests {
         assert_eq!(app.command.input, "doctor");
     }
 
+    /// Draws a frame so the pane geometry the mouse arithmetic needs is real.
+    fn frame(app: &mut App, width: u16, height: u16) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    fn click(column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn wheel(column: u16, row: u16, down: bool) -> event::MouseEvent {
+        event::MouseEvent {
+            kind: if down {
+                event::MouseEventKind::ScrollDown
+            } else {
+                event::MouseEventKind::ScrollUp
+            },
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn list_app() -> (TempHome, App) {
+        let (dir, mut app) = app();
+        app.set_pull_requests(crate::ports::forge::PullRequestPage::complete(
+            (1..=5)
+                .map(|number| {
+                    let mut summary = crate::domain::pr::PullRequestSummary {
+                        number,
+                        title: format!("PR {number}"),
+                        author: "alice".to_owned(),
+                        state: crate::domain::pr::PrState::Open,
+                        is_draft: false,
+                        base_ref: "main".to_owned(),
+                        head_ref: "topic".to_owned(),
+                        head_sha: "abc".to_owned(),
+                        created_at: crate::domain::time::Timestamp::default(),
+                        updated_at: crate::domain::time::Timestamp::default(),
+                        additions: 1,
+                        deletions: 1,
+                        changed_files: 1,
+                        labels: Vec::new(),
+                        review_decision: None,
+                        checks: crate::domain::pr::CheckSummary::default(),
+                        url: String::new(),
+                        is_cross_repository: false,
+                    };
+                    summary.number = number;
+                    summary
+                })
+                .collect(),
+            50,
+        ));
+        (dir, app)
+    }
+
     #[test]
-    fn the_mouse_wheel_moves_the_cursor() {
+    fn escape_cancels_work_in_flight_before_going_back() {
+        let (_dir, mut app) = list_app();
+        app.environment_running = false;
+        app.list.loading = true;
+
+        // A back press while a fetch is running asks for the fetch to stop, and the
+        // screen stays where it is (NFR-1.4).
+        assert_eq!(press(&mut app, "<Esc>"), Effect::CancelInFlight);
+        assert!(app.review.is_none());
+
+        app.cancelled_in_flight();
+        assert!(!app.list.loading);
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("cancelled")),
+            "the user is told the work stopped"
+        );
+
+        // With nothing in flight it goes back instead.
+        assert_eq!(press(&mut app, "<Esc>"), Effect::None);
+    }
+
+    #[test]
+    fn escape_leaves_the_review_and_h_does_the_same() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app) = list_app();
+        app.environment_running = false;
+        app.set_review(DiffView::new(crate::domain::diff::parse_patch(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        )));
+        assert!(app.review_screen().is_some());
+
+        press(&mut app, "<Esc>");
+        assert!(app.review_screen().is_none(), "Esc closes the review");
+
+        app.set_review(DiffView::new(crate::domain::diff::parse_patch(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        )));
+        press(&mut app, "h");
+        assert!(app.review_screen().is_none(), "and so does h");
+    }
+
+    #[test]
+    fn q_quits_and_the_list_is_reachable_again_after_a_review() {
         let (_dir, mut app) = app();
-        app.on_scroll(1);
-        assert_eq!(app.cursor, 1);
-        app.on_scroll(-1);
-        assert_eq!(app.cursor, 0);
+        press(&mut app, "q");
+        assert!(app.should_quit(), "q quits, as the keymap table says");
+    }
+
+    #[test]
+    fn a_click_on_a_list_row_selects_that_row() {
+        let (_dir, mut app) = list_app();
+        frame(&mut app, 100, 30);
+        let first_row = app.list_top + 3;
+
+        // The first row of the table, then the second.
+        app.on_mouse(click(10, first_row));
+        assert_eq!(app.list.selected().unwrap().number, 1);
+        app.on_mouse(click(10, first_row + 1));
+        assert_eq!(app.list.selected().unwrap().number, 2);
+
+        // A click on the filter bar is above the list and changes nothing.
+        app.on_mouse(click(10, 1));
+        assert_eq!(app.list.selected().unwrap().number, 2);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_pane_under_the_pointer() {
+        let (_dir, mut app) = list_app();
+        frame(&mut app, 100, 30);
+
+        app.on_mouse(wheel(10, app.list_top + 3, true));
+        assert_eq!(
+            app.list.selected().unwrap().number,
+            4,
+            "three rows at a time in the list"
+        );
+        app.on_mouse(wheel(10, app.list_top + 3, false));
+        assert_eq!(app.list.selected().unwrap().number, 1);
+    }
+
+    /// A review with a directory, so the tree has a folder row to click.
+    fn review_app() -> (TempHome, App) {
+        use crate::tui::diff_view::DiffView;
+
+        let (dir, mut app) = list_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n\
+             diff --git a/src/two.rs b/src/two.rs\n--- a/src/two.rs\n+++ b/src/two.rs\n@@ -1 +1 @@\n-c\n+d\n",
+        );
+        app.set_review(DiffView::new(patch));
+        (dir, app)
+    }
+
+    #[test]
+    fn a_click_on_a_tree_row_opens_the_file() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+
+        // Row one is the `src` directory, row two the first file: clicking a file
+        // does what pressing Enter on it does (FR-7.5).
+        app.on_mouse(click(5, app.review_top + 2));
+        let view = app.review.as_ref().unwrap();
+        assert_eq!(view.current_path().unwrap().as_str(), "src/one.rs");
+        assert!(
+            !view.tree_focused,
+            "opening a file moves the focus to the diff"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_directory_row_folds_it_and_keeps_the_tree_focused() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+
+        app.on_mouse(click(5, app.review_top + 1));
+        let view = app.review.as_ref().unwrap();
+        assert!(view.tree_focused, "the tree has the cursor");
+        assert!(view.folded_dirs.contains("src"), "the folder folded");
+        assert!(
+            !view.tree.iter().any(|row| row.label == "one.rs"),
+            "and its files are hidden"
+        );
+    }
+
+    #[test]
+    fn a_click_in_the_diff_moves_the_diff_cursor() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+
+        app.on_mouse(click(80, app.review_top + 3));
+        let view = app.review.as_ref().unwrap();
+        assert!(!view.tree_focused);
+        assert_eq!(view.cursor, 2, "the row under the pointer");
     }
 
     #[test]

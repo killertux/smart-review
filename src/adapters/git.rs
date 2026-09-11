@@ -186,6 +186,7 @@ pub fn is_repository(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::repo::RepoId;
     use crate::test_support::temp_home;
 
     #[test]
@@ -243,19 +244,53 @@ mod tests {
 
     #[test]
     fn a_real_repository_is_detected_end_to_end() {
-        // Uses the checkout this test is compiled in: no fixture, no network.
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        if !is_repository(&manifest) {
-            // A source tarball without git metadata: nothing to assert.
+        // A repository built by the test, not the checkout it happens to be compiled
+        // in: an assertion that can silently skip itself is not an assertion, and a
+        // source tarball has no `.git` at all.
+        let dir = temp_home();
+        let root = dir.path().join("checkout");
+        std::fs::create_dir_all(&root).unwrap();
+        let ok = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !ok(&["init", "--quiet"]) {
+            // No git on this machine: the adapter's own "git is unavailable" path is
+            // covered by another test.
             return;
         }
-        let info = GitCli::new().in_dir(&manifest).detect().unwrap();
-        assert_eq!(info.root.as_deref(), Some(manifest.as_path()));
+        let _ = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output();
+        assert!(ok(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:acme/service.git"
+        ]));
+
+        let info = GitCli::new().in_dir(&root).detect().unwrap();
+        assert_eq!(info.root.as_deref(), Some(root.as_path()));
         assert!(!info.git_version.is_empty());
+        assert_eq!(info.remotes.len(), 1);
+        assert_eq!(info.remotes[0].name, "origin");
+        assert_eq!(info.remotes[0].url, "git@github.com:acme/service.git");
         assert!(
-            info.remotes.iter().any(|remote| remote.name == "origin"),
-            "{:?}",
-            info.remotes
+            RepoId::from_remote_url(&info.remotes[0].url).is_some_and(|repo| repo.is_github()),
+            "the URL must be usable as a repository identity"
         );
     }
 }

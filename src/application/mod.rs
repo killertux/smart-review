@@ -14,6 +14,4 @@ pub mod environment;
 pub mod prs;
 
 pub use environment::{DetectRequest, detect, gh_program};
-pub use prs::{
-    CachePolicy, Cached, FetchOutcome, Prs, PrsRequest, filter_client_side, patch_contains,
-};
+pub use prs::{CachePolicy, Cached, FetchOutcome, Prs};

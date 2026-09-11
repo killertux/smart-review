@@ -32,11 +32,6 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::Startup;
-use crate::adapters::cache::DiskCache;
-use crate::adapters::clock::SystemClock;
-use crate::adapters::gh::GhCliForge;
-use crate::adapters::gh::probe::GhCliProbe;
-use crate::adapters::git::GitCli;
 use crate::application::environment::DetectRequest;
 use crate::application::prs::CachePolicy;
 use crate::domain::repo::RepoId;
@@ -56,27 +51,40 @@ pub fn run(startup: Startup) -> Result<()> {
     // The loop owns the clock, the state file and the background jobs so the reducer
     // can stay a pure function of state.
     let clock = startup.clock;
+    let clock_source: Arc<dyn Clock> = Arc::new(clock);
+    let cache = startup.cache.clone();
+    let forge_factory = startup.forge_factory.clone();
     let state_store: Box<dyn StateStore> = Box::new(startup.state_store.clone());
 
-    let workspace = Arc::new(if let Some(path) = startup.path.clone() {
-        GitCli::new().in_dir(path)
-    } else {
-        GitCli::new()
-    });
-    let probe = Arc::new(GhCliProbe::new(startup.config.forge.gh_path.clone()));
+    let workspace = startup.workspace.clone();
+    let probe = startup.probe.clone();
     let request = DetectRequest {
         repo: startup.repo.clone(),
+        // `--remote` beats `[forge].remote`, which beats automatic detection
+        // (FR-8.1's precedence order).
+        remote: startup
+            .remote
+            .clone()
+            .or_else(|| startup.config.forge.remote.clone()),
         gh_program: Some(startup.config.forge.gh_path.clone()),
     };
-    let cache_root = startup.home.cache();
-
     let mut app = App::new(startup)?;
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
     let mut runner = JobRunner::new(workspace, probe, request);
 
     // Detection is a job, not a startup step: it runs `gh auth status`, which reaches
     // the network, and the first frame must not wait for it (NFR-1.1).
-    runner.submit(Job::Detect);
+    //
+    // Submitted through `apply` rather than directly, so its job id is recorded: the
+    // completion is matched against that id, and a result nobody recorded is dropped
+    // (which is exactly what happened while this was a bare `runner.submit`).
+    apply(
+        Effect::DetectEnvironment,
+        &mut app,
+        state_store.as_ref(),
+        &mut runner,
+        &mut terminal,
+    );
 
     while !app.should_quit() {
         app.set_now(clock.now_unix_secs());
@@ -90,15 +98,35 @@ pub fn run(startup: Startup) -> Result<()> {
             // that need one are built at that moment and kept for the session.
             let detected = matches!(completion.outcome, Outcome::Environment(_));
             let effect = app.apply_completion(completion);
-            if detected && let Some(executor) = executor_for(&app, &cache_root) {
+            if detected
+                && let Some(executor) = executor_for(
+                    &app,
+                    forge_factory.as_ref(),
+                    cache.clone(),
+                    clock_source.clone(),
+                )
+            {
                 runner.set_executor(executor);
+                // Cache first: painting what is already on disk before asking the
+                // network is the difference between an instant first list and a
+                // `gh` round trip (FR-2.3). The fetch this triggers replaces it in
+                // place, keeping the cursor on the same pull request.
+                runner.submit(Job::CachedList {
+                    query: app.list.query(),
+                });
             }
             if let Some(effect) = effect {
                 follow_ups.push(effect);
             }
         }
         for effect in follow_ups {
-            apply(effect, &mut app, state_store.as_ref(), &mut runner);
+            apply(
+                effect,
+                &mut app,
+                state_store.as_ref(),
+                &mut runner,
+                &mut terminal,
+            );
         }
 
         let effect = if event::poll(app.poll_timeout())? {
@@ -115,7 +143,13 @@ pub fn run(startup: Startup) -> Result<()> {
             app.on_timeout()
         };
 
-        apply(effect, &mut app, state_store.as_ref(), &mut runner);
+        apply(
+            effect,
+            &mut app,
+            state_store.as_ref(),
+            &mut runner,
+            &mut terminal,
+        );
     }
 
     runner.cancel_all();
@@ -132,6 +166,7 @@ pub(crate) fn apply(
     app: &mut App,
     state_store: &dyn StateStore,
     runner: &mut JobRunner,
+    terminal: &mut terminal::TerminalGuard,
 ) {
     match effect {
         Effect::None | Effect::KeepPending => {}
@@ -155,6 +190,27 @@ pub(crate) fn apply(
             if let Some(job) = jobs::job_for(&effect, &app.list, context) {
                 let id = runner.submit(job);
                 app.record_job(&effect, id);
+            }
+        }
+
+        Effect::CancelInFlight => {
+            // Cancelling the slot rather than the process only: whichever job is
+            // running for this screen kills its child within a poll interval
+            // (NFR-1.4).
+            runner.cancel(jobs::Slot::List);
+            runner.cancel(jobs::Slot::Count);
+            runner.cancel(jobs::Slot::Detail);
+            runner.cancel(jobs::Slot::Patch);
+            app.cancelled_in_flight();
+        }
+
+        Effect::SetMouse(enabled) => {
+            // Only the loop owns the terminal, so the toggle is applied here.
+            if let Err(error) = terminal.set_mouse(enabled) {
+                app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not change the mouse setting: {error}"),
+                );
             }
         }
 
@@ -199,14 +255,17 @@ pub(crate) fn apply(
 }
 
 /// Builds the ports a repository-scoped job needs, once detection has resolved one.
-pub(crate) fn executor_for(app: &App, cache_root: &std::path::Path) -> Option<Arc<Executor>> {
-    let environment = app.environment.as_ref()?;
-    let repo: RepoId = environment.repo.clone();
-    let forge = GhCliForge::new(&app.config.forge.gh_path, repo.clone());
+pub(crate) fn executor_for(
+    app: &App,
+    factory: &dyn crate::ports::ForgeFactory,
+    cache: Arc<dyn crate::ports::CacheStore>,
+    clock: Arc<dyn Clock>,
+) -> Option<Arc<Executor>> {
+    let repo: RepoId = app.environment.as_ref()?.repo.clone();
     Some(Arc::new(Executor::new(
-        Arc::new(forge),
-        Arc::new(DiskCache::new(cache_root)),
-        Arc::new(SystemClock),
+        factory.forge(&repo),
+        cache,
+        clock,
         repo,
         CachePolicy {
             list_ttl_secs: app.config.cache.ttl_list_secs,
