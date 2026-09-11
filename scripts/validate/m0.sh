@@ -79,12 +79,22 @@ SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >/tmp/m0-check.log 2>&1
 CHECK_CODE=$?
 set -e
 
-# No model configured is a warning, so the expected code is 1 (degraded).
-if [ "$CHECK_CODE" -eq 0 ] || [ "$CHECK_CODE" -eq 1 ]; then
-  ok "--check exits with $CHECK_CODE (0 ready / 1 degraded)"
+# `--check` runs the same detection the interface does (FR-1.2), so on a machine
+# without an authenticated `gh` the honest answer is 2 — the app cannot read a pull
+# request at all. What matters here is that a report is produced and the code is one of
+# the three documented ones.
+case "$CHECK_CODE" in
+  0 | 1 | 2) ok "--check exits with $CHECK_CODE (0 ready / 1 degraded / 2 unusable)" ;;
+  *)
+    bad "--check exited with $CHECK_CODE; expected 0, 1 or 2"
+    cat /tmp/m0-check.log
+    ;;
+esac
+
+if grep -q 'repository' /tmp/m0-check.log; then
+  ok "the report says which repository was found, or why not"
 else
-  bad "--check exited with $CHECK_CODE; expected 0 or 1"
-  cat /tmp/m0-check.log
+  bad "the report did not mention the repository"
 fi
 
 for name in config home keybinds llm log terminal theme; do
