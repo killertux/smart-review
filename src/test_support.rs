@@ -5,6 +5,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Hands out a distinct number per temporary directory in this process.
+///
+/// The clock alone is not enough: macOS reports time at microsecond resolution,
+/// so two tests starting in the same microsecond would share a directory, and one
+/// deleting it on drop would pull the ground out from under the other (which is
+/// exactly what happened on the macOS runner).
+static NEXT_HOME: AtomicU64 = AtomicU64::new(0);
 
 /// A unique temporary directory that removes itself when dropped.
 #[derive(Debug)]
@@ -16,12 +25,13 @@ impl TempHome {
     /// Creates a fresh temporary directory.
     pub(crate) fn new() -> Self {
         let unique = format!(
-            "smart-review-test-{}-{}",
+            "smart-review-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            NEXT_HOME.fetch_add(1, Ordering::Relaxed)
         );
         let path = std::env::temp_dir().join(unique);
         let _ = std::fs::create_dir_all(&path);
