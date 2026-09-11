@@ -4,41 +4,44 @@
 //! Exit codes: `0` ready, `1` degraded (usable, but some features are
 //! unavailable), `2` unusable.
 //!
-//! Nothing here writes to the terminal directly; output goes to a writer so it
-//! can be captured in tests and rendered in a popup.
+//! The report is split in two on purpose: [`collect_local`] inspects the
+//! application and needs no external process, while [`collect`] adds the `git`
+//! and `gh` probes. Tests use the former, so they stay hermetic (AGENTS.md §8)
+//! and pass on a machine without `gh`.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::logging;
 use crate::paths::Home;
 use crate::tui::keymap::Keymap;
 use crate::tui::theme::Theme;
 
-/// The pieces of the running application the checks need.
+/// Everything the checks need.
 ///
-/// Taking this instead of the whole [`crate::Startup`] lets the same code serve
-/// both `--check` and the `:doctor` popup once the startup has been consumed.
-#[derive(Debug, Clone, Copy)]
-pub struct Context<'a> {
+/// Owned rather than borrowed so the same value can be handed to a background
+/// thread while the interface keeps running.
+#[derive(Debug, Clone)]
+pub struct Context {
     /// The application's private directory.
-    pub home: &'a Home,
+    pub home: Home,
     /// Effective settings.
-    pub config: &'a Config,
+    pub config: Config,
     /// Where the config file lives.
-    pub config_path: &'a Path,
+    pub config_path: PathBuf,
     /// Whether a config file was read.
     pub config_exists: bool,
     /// Warnings collected while loading configuration and keybindings.
-    pub warnings: &'a [String],
+    pub warnings: Vec<String>,
     /// The keybinding engine.
-    pub keymap: &'a Keymap,
+    pub keymap: Keymap,
     /// The active theme.
-    pub theme: &'a Theme,
+    pub theme: Theme,
     /// Where the theme came from.
-    pub theme_source: &'a str,
+    pub theme_source: String,
 }
 
 /// Overall outcome of the checks.
@@ -86,9 +89,9 @@ pub struct Check {
     pub detail: String,
 }
 
-/// Runs every check and returns the report.
+/// Checks that inspect the application only (no external processes).
 #[must_use]
-pub fn collect(context: &Context<'_>) -> Vec<Check> {
+pub fn collect_local(context: &Context) -> Vec<Check> {
     let mut checks = vec![
         directory_check("home", context.home.root()),
         config_check(context),
@@ -110,13 +113,23 @@ pub fn collect(context: &Context<'_>) -> Vec<Check> {
         Check {
             name: "log",
             status: Status::Ok,
-            detail: context.home.log_file().display().to_string(),
+            detail: log_detail(context),
         },
         terminal_check(),
-        tool_check("git", "git", &["--version"]),
-        gh_check(&context.config.forge.gh_path),
         llm_check(context),
     ];
+
+    checks.sort_by_key(|check| check.name);
+    checks
+}
+
+/// The full report, including the `git` and `gh` probes (FR-9.3).
+#[must_use]
+pub fn collect(context: &Context) -> Vec<Check> {
+    let mut checks = collect_local(context);
+
+    checks.push(tool_check("git", "git", &["--version"]));
+    checks.push(gh_check(&context.config.forge.gh_path));
 
     checks.sort_by_key(|check| check.name);
     checks
@@ -161,7 +174,7 @@ pub fn lines(checks: &[Check]) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error when the report cannot be written to `out`.
-pub fn run(out: &mut impl Write, context: &Context<'_>) -> Result<Health, Error> {
+pub fn run(out: &mut impl Write, context: &Context) -> Result<Health, Error> {
     let checks = collect(context);
     for line in lines(&checks) {
         writeln!(out, "{line}").map_err(Error::Terminal)?;
@@ -197,7 +210,52 @@ fn directory_check(name: &'static str, path: &Path) -> Check {
     }
 }
 
-fn config_check(context: &Context<'_>) -> Check {
+/// The log path, the active level, and what the tail of the file says (FR-9.2).
+fn log_detail(context: &Context) -> String {
+    let path = context.home.log_file();
+    let level = logging::level().map_or_else(|| "not initialised".to_owned(), |l| l.to_string());
+    format!(
+        "{} (level {level}), {}",
+        path.display(),
+        tail_summary(&path, LOG_TAIL_LINES)
+    )
+}
+
+/// How many lines of the log the doctor looks at.
+const LOG_TAIL_LINES: usize = 200;
+
+/// Summarises the warnings and errors at the end of the log.
+///
+/// The log is read from its end: only the tail matters for "what went wrong just
+/// now", and it keeps the read bounded regardless of how big the file grew.
+fn tail_summary(path: &Path, lines: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "no log yet".to_owned();
+    };
+
+    let recent: Vec<&str> = text.lines().rev().take(lines).collect();
+    let warnings = recent.iter().filter(|line| line.contains(" warn ")).count();
+    let errors = recent
+        .iter()
+        .filter(|line| line.contains(" error "))
+        .count();
+
+    if warnings == 0 && errors == 0 {
+        return format!("no warnings or errors in the last {lines} lines");
+    }
+
+    let last = recent
+        .iter()
+        .find(|line| line.contains(" warn ") || line.contains(" error "))
+        .map(|line| line.trim())
+        .unwrap_or_default();
+
+    format!(
+        "{warnings} warning(s) and {errors} error(s) in the last {lines} lines; most recent: {last}"
+    )
+}
+
+fn config_check(context: &Context) -> Check {
     let origin = if context.config_exists {
         context.config_path.display().to_string()
     } else {
@@ -265,16 +323,21 @@ fn tool_check(name: &'static str, program: &str, args: &[&str]) -> Check {
     }
 }
 
+/// `gh` is not used until M1.
+///
+/// Reporting it as a warning keeps `--check` exit code 1 ("degraded, will still
+/// work") on a fresh machine or a CI runner, which is the truth for M0: nothing
+/// the shell does needs GitHub. It becomes a failure once M1 depends on it.
 fn gh_check(program: &str) -> Check {
     let version = match run_tool(program, &["--version"]) {
         Ok(output) => first_line(&output),
         Err(detail) => {
             return Check {
                 name: "gh",
-                status: Status::Fail,
+                status: Status::Warn,
                 detail: format!(
-                    "{detail}; install the GitHub CLI (https://cli.github.com) or set \
-                     [forge].gh_path"
+                    "{detail}; not needed until M1, then install it from \
+                     https://cli.github.com or set [forge].gh_path"
                 ),
             };
         }
@@ -288,13 +351,13 @@ fn gh_check(program: &str) -> Check {
         },
         Err(_) => Check {
             name: "gh",
-            status: Status::Fail,
-            detail: format!("{version}, not authenticated; run `gh auth login`"),
+            status: Status::Warn,
+            detail: format!("{version}, not authenticated; run `gh auth login` before M1"),
         },
     }
 }
 
-fn llm_check(context: &Context<'_>) -> Check {
+fn llm_check(context: &Context) -> Check {
     let Some(active) = context.config.llm.active.as_ref() else {
         return Check {
             name: "llm",
@@ -347,9 +410,9 @@ mod tests {
     use crate::cli::Cli;
     use crate::test_support::{TempHome, temp_home};
 
-    /// Returns the temporary home alongside the startup so the directory outlives
+    /// Returns the temporary home alongside the context so the directory outlives
     /// the assertions.
-    fn startup() -> (TempHome, Startup) {
+    fn context() -> (TempHome, Context) {
         let dir = temp_home();
         let cli = Cli {
             repo: None,
@@ -363,13 +426,13 @@ mod tests {
             check: false,
         };
         let startup = Startup::load(&cli).unwrap();
-        (dir, startup)
+        (dir, startup.doctor_context())
     }
 
     #[test]
-    fn reports_the_expected_names() {
-        let (_dir, startup) = startup();
-        let checks = collect(&startup.doctor_context());
+    fn reports_the_expected_local_names() {
+        let (_dir, context) = context();
+        let checks = collect_local(&context);
         let names: Vec<&str> = checks.iter().map(|check| check.name).collect();
         for expected in [
             "config", "home", "keybinds", "llm", "log", "terminal", "theme",
@@ -379,11 +442,26 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_home_reports_degraded() {
-        let (_dir, startup) = startup();
-        let checks = collect(&startup.doctor_context());
-        // No model configured is a warning, not a failure.
+    fn no_model_configured_is_degraded_not_broken() {
+        // DEC-6: a fresh install has no model, and that must not stop the app.
+        let (_dir, context) = context();
+        let checks = collect_local(&context);
         assert_eq!(health(&checks), Health::Degraded);
+    }
+
+    #[test]
+    fn the_full_report_adds_the_tool_probes() {
+        let (_dir, context) = context();
+        let names: Vec<&str> = collect(&context).iter().map(|check| check.name).collect();
+        assert!(names.contains(&"git"), "{names:?}");
+        assert!(names.contains(&"gh"), "{names:?}");
+    }
+
+    #[test]
+    fn a_missing_gh_is_a_warning_while_m0_does_not_need_it() {
+        let check = gh_check("smart-review-no-such-binary");
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.detail.contains("M1"), "{}", check.detail);
     }
 
     #[test]
@@ -415,8 +493,8 @@ mod tests {
 
     #[test]
     fn lines_are_aligned_and_use_markers() {
-        let (_dir, startup) = startup();
-        let rendered = lines(&collect(&startup.doctor_context()));
+        let (_dir, context) = context();
+        let rendered = lines(&collect_local(&context));
         assert!(!rendered.is_empty());
         assert!(
             rendered.iter().all(|line| line.starts_with('[')),
@@ -429,5 +507,32 @@ mod tests {
         let check = directory_check("home", Path::new("/nonexistent/smart-review"));
         assert_eq!(check.status, Status::Fail);
         assert!(check.detail.contains("does not exist"));
+    }
+
+    #[test]
+    fn the_log_tail_summary_counts_and_quotes() {
+        let dir = temp_home();
+        let path = dir.write(
+            "smart-review.log",
+            "2026-01-01T00:00:00Z info  started\n\
+             2026-01-01T00:00:01Z warn  something is off\n\
+             2026-01-01T00:00:02Z error something broke\n",
+        );
+        let summary = tail_summary(&path, 200);
+        assert!(summary.contains("1 warning(s) and 1 error(s)"), "{summary}");
+        assert!(summary.contains("something broke"), "{summary}");
+    }
+
+    #[test]
+    fn a_clean_log_tail_says_so() {
+        let dir = temp_home();
+        let path = dir.write("smart-review.log", "2026-01-01T00:00:00Z info  started\n");
+        assert!(tail_summary(&path, 200).contains("no warnings or errors"));
+    }
+
+    #[test]
+    fn a_missing_log_is_not_an_error() {
+        let dir = temp_home();
+        assert_eq!(tail_summary(&dir.path().join("nope.log"), 10), "no log yet");
     }
 }

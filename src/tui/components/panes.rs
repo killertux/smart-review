@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::tui::app::{App, Pane, ROADMAP};
-use crate::tui::layout::{MIN_HEIGHT, MIN_WIDTH};
+use crate::tui::layout::{self, MIN_HEIGHT, MIN_WIDTH};
 use crate::tui::theme::{Theme, element};
 
 /// Renders the body of the interface (FR-7.8).
@@ -37,9 +37,18 @@ pub fn render_too_small(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             theme.style(element::MUTED),
         )),
     ];
+
+    // Centred, per FR-7.8, rather than pinned to the top-left corner.
+    let width = message.iter().map(Line::width).max().unwrap_or(0);
+    let popup = layout::centered(
+        area,
+        u16::try_from(width).unwrap_or(u16::MAX),
+        u16::try_from(message.len()).unwrap_or(u16::MAX),
+    );
+
     frame.render_widget(
         Paragraph::new(message).style(theme.style(element::BG)),
-        area,
+        popup,
     );
 }
 

@@ -58,23 +58,22 @@ pub struct Startup {
 }
 
 impl Startup {
-    /// Everything the doctor needs, borrowed from this startup.
+    /// Everything the doctor needs, owned so it can be handed to a background
+    /// thread while the interface keeps running (FR-9.3).
     #[must_use]
-    pub fn doctor_context(&self) -> Context<'_> {
+    pub fn doctor_context(&self) -> Context {
         Context {
-            home: &self.home,
-            config: &self.config,
-            config_path: &self.config_path,
+            home: self.home.clone(),
+            config: self.config.clone(),
+            config_path: self.config_path.clone(),
             config_exists: self.config_exists,
-            warnings: &self.warnings,
-            keymap: &self.keymap,
-            theme: &self.theme,
-            theme_source: &self.theme_source,
+            warnings: self.warnings.clone(),
+            keymap: self.keymap.clone(),
+            theme: self.theme.clone(),
+            theme_source: self.theme_source.clone(),
         }
     }
-}
 
-impl Startup {
     /// Resolves the home, reads configuration, and builds the theme and keymap.
     ///
     /// A missing or broken *theme* never stops startup: it falls back to the

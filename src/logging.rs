@@ -65,7 +65,6 @@ impl fmt::Display for Level {
 
 #[derive(Debug)]
 struct Logger {
-    path: PathBuf,
     level: Level,
     file: Mutex<std::fs::File>,
 }
@@ -104,7 +103,6 @@ pub fn init(home: &Home, configured: &str, override_level: Option<&str>) -> Resu
     }
 
     let _ = LOGGER.set(Logger {
-        path,
         level,
         file: Mutex::new(file),
     });
@@ -121,16 +119,6 @@ pub fn log(level: Level, message: impl AsRef<str>) {
     if let Some(logger) = LOGGER.get() {
         logger.write(level, message.as_ref());
     }
-}
-
-/// Whether a level would currently be written.
-pub fn is_enabled(level: Level) -> bool {
-    LOGGER.get().is_some_and(|logger| level <= logger.level)
-}
-
-/// The active log file, if logging has been initialised.
-pub fn path() -> Option<&'static std::path::Path> {
-    LOGGER.get().map(|logger| logger.path.as_path())
 }
 
 /// The active level, if logging has been initialised.

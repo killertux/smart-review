@@ -101,9 +101,13 @@ Inside the TUI: switch modes (`:` command line), open `?` help, press `<leader>`
 
 *Modes & commands*
 - [ ] Mode state machine `normal|insert|command|search|popup` with the active mode in the status line; `Esc` returns to `normal`, second `Esc` cancels (FR-7.1).
-- [ ] Command line with completion over the action registry; `:q`/`:qa`/`:help`/`:theme`/`:set`/`:keymap`/`:doctor` implemented, unknown commands error inline (FR-7.4).
-- [ ] Status line: mode · repo (placeholder) · PR (placeholder) · provider/model (placeholder) · notifications with levels and auto-expiry (FR-7.6).
-- [ ] Structured logging to `$SMART_REVIEW_HOME/logs/` with rotation and a level from config/`RUST_LOG`; a `:logs`-style path shown by `:doctor` (FR-9.2).
+- [ ] Command line with fuzzy completion over the command table and a candidate palette rendered above the prompt; `:q`/`:qa`/`:help`/`:theme [name|reload]`/`:set`/`:keymap [action]`/`:doctor`/`:messages` implemented, unknown commands error inline **and** on the status line (FR-7.3, FR-7.4).
+- [ ] Status line with the FR-7.6 segments — mode, focus, repository, pull request, model, draft count — rendering an em dash where the data arrives in a later milestone, plus notifications with levels, deduplication and persistent errors (FR-7.6).
+- [ ] Structured logging to `$SMART_REVIEW_HOME/logs/` with rotation and a level from config/`RUST_LOG`; the path and level are shown by `:doctor` (FR-9.2).
+
+*The one job M0 needs*
+- [ ] The reducer returns an `Effect` instead of performing IO, and `tui::run` is the only place that acts on it, so `App::render` stays pure and nothing blocks the loop (ARCH-1, NFR-1.2).
+- [ ] `:doctor` collects its report on a background thread and delivers it over a channel, with the popup showing a "collecting…" state meanwhile (FR-9.3).
 
 *Tests*
 - [ ] First unit tests: config parse + defaults + unknown-key preservation; keymap sequence resolution and ambiguity; theme inheritance.

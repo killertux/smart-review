@@ -44,14 +44,20 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     for group in action::groups() {
+        let definitions: Vec<&action::ActionDef> = action::all()
+            .iter()
+            .filter(|definition| definition.group == *group)
+            .filter(|definition| matches_filter(app, definition.id))
+            .collect();
+        if definitions.is_empty() {
+            continue;
+        }
+
         lines.push(Line::from(Span::styled(
             format!(" {}", group.label().to_uppercase()),
             theme.style(element::HELP_GROUP),
         )));
-        for definition in action::all()
-            .iter()
-            .filter(|definition| definition.group == *group)
-        {
+        for definition in definitions {
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(
@@ -68,11 +74,21 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
 
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        " Esc closes · : commands · <leader> action menu · q quits from a popup".to_owned(),
+        match &app.help_filter {
+            Some(id) => format!(" Filtered to `{id}` by :keymap — Esc closes"),
+            None => " Esc closes · : commands · <leader> action menu · :keymap <action>".to_owned(),
+        },
         theme.style(element::MUTED),
     )));
 
     lines
+}
+
+/// Whether an action is shown, given `:keymap <action>`.
+fn matches_filter(app: &App, action_id: &str) -> bool {
+    app.help_filter
+        .as_deref()
+        .is_none_or(|filter| filter == action_id)
 }
 
 /// Every key sequence bound to an action, with the mode when it is not `normal`.

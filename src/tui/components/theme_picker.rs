@@ -13,7 +13,8 @@ use crate::tui::theme::element;
 /// Renders the list of themes the user can choose from.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
-    let names = app.theme_names();
+    // Captured when the picker opened, so rendering never reads the filesystem.
+    let names = &app.picker_items;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, name) in names.iter().enumerate() {

@@ -354,6 +354,12 @@ pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
     let document = ConfigDocument::parse(&text, path)?;
     let mut warnings = Vec::new();
     let config = document.to_config(&mut warnings);
+    // Name the file: "which config am I actually loading?" is the first question
+    // a warning should answer (FR-8.6).
+    let warnings = warnings
+        .into_iter()
+        .map(|warning| format!("{}: {warning}", path.display()))
+        .collect();
 
     Ok(Loaded {
         config,
@@ -662,7 +668,7 @@ impl ConfigDocument {
                 match value.clone().try_into::<String>() {
                     Ok(path) => config.log.path = Some(path),
                     Err(error) => {
-                        warnings.push(format!("config: [log].path {error}; using the default"));
+                        warnings.push(format!("[log].path {error}; using the default"));
                     }
                 }
             }
@@ -715,7 +721,7 @@ fn read_selection_value(
                 "config: [{label}] is incomplete ({reason}); no model is configured"
             )),
         },
-        Err(error) => warnings.push(format!("config: [{label}] {error}; no model is configured")),
+        Err(error) => warnings.push(format!("[{label}] {error}; no model is configured")),
     }
 }
 

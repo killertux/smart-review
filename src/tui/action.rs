@@ -83,6 +83,16 @@ pub const ACTIONS: &[ActionDef] = &[
         group: Group::App,
     },
     ActionDef {
+        id: "app.version",
+        description: "Show the version",
+        group: Group::App,
+    },
+    ActionDef {
+        id: "notice.clear",
+        description: "Dismiss the current notification",
+        group: Group::App,
+    },
+    ActionDef {
         id: "app.theme_picker",
         description: "Choose a theme",
         group: Group::Theme,

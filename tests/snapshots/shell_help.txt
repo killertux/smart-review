@@ -1,18 +1,19 @@
  smart-review v0.1.0 config: built-in defaults                                         acme/service
 ┌ Planned ─────────────────────────────────────────────┐┌ This shell ──────────────────────────────┐
-│ > M1  browse, filter and search pull requests        ││ home     …/target/snapshot-home          │
-│   M1┌ Help ────────────────────────────────────────────────────────────────────────────────┐     │
-│   M2│ APP                                                                                  │     │
+│ > M1┌ Help ────────────────────────────────────────────────────────────────────────────────┐     │
+│   M1│ APP                                                                                  │     │
 │   M2│   <C-c>, <Space>q     Quit smart-review                                              │     │
 │   M2│   <Space>?, ?         Show the help popup                                            │     │
-│   M3│   :                   Open the command line                                          │     │
-│   M4│   <Space>             Show the available leader bindings                             │     │
-│   M5│   <Esc>               Close the current popup, or cancel pending keys                │     │
-│     │   <Space>r            Refresh the current view                                       │     │
-│ This│   ·                   Show environment checks                                        │     │
-│ Navi│ NAVIGATION                                                                           │nu   │
-│ comm│   <Up>, k             Move up                                                        │     │
-│ pane│   <Down>, j           Move down                                                      │     │
+│   M2│   :                   Open the command line                                          │     │
+│   M3│   <Space>             Show the available leader bindings                             │     │
+│   M4│   <Esc>               Close the current popup, or cancel pending keys                │     │
+│   M5│   <Space>r            Refresh the current view                                       │     │
+│     │   ·                   Show environment checks                                        │     │
+│ This│   ·                   Show the version                                               │     │
+│ Navi│   ·                   Dismiss the current notification                               │nu   │
+│ comm│ NAVIGATION                                                                           │     │
+│ pane│   <Up>, k             Move up                                                        │     │
+│     │   <Down>, j           Move down                                                      │     │
 │     │   gg                  Jump to the first item                                         │     │
 │     │   G                   Jump to the last item                                          │     │
 │     │ PANES                                                                                │     │
@@ -23,7 +24,6 @@
 │     │   <Space>d            Switch to the dark theme                                       │     │
 │     │   <Space>l            Switch to the light theme                                      │     │
 │     │                                                                                      │     │
-│     │ Esc closes · : commands · <leader> action menu · q quits from a popup                │     │
-│     └──────────────────────────────────────────────────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- POPUP list · dark · leader <Space> · 19 keys                ? help · <leader> actions · : commands
+│     │ Esc closes · : commands · <leader> action menu · :keymap <action>                    │     │
+└─────└──────────────────────────────────────────────────────────────────────────────────────┘─────┘
+ POPUP list · acme/service · — · — · 0 drafts                ? help · <leader> actions · : commands

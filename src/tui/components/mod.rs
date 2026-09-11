@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod header;
 pub mod help;
 pub mod leader;
+pub mod palette;
 pub mod panes;
 pub mod status_line;
 pub mod theme_picker;

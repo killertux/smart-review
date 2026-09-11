@@ -1,20 +1,24 @@
 //! Actions and the `:` command line (FR-7.2, FR-7.3, FR-7.4).
 //!
 //! Every action in the registry is dispatched from here, so adding a feature
-//! means adding a registry entry, a default binding, and a match arm.
+//! means adding a registry entry, a default binding and a match arm. Dispatch
+//! returns an [`Effect`] rather than performing IO, so the reducer stays pure.
 
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::tui::action;
-use crate::tui::app::{App, NoticeLevel, Overlay};
+use crate::tui::app::{App, Effect, NoticeLevel, Overlay};
 use crate::tui::keymap::{self, KeyCombo, Mode};
 
 /// Commands accepted by the `:` line, with the action each one triggers.
+///
+/// Aliases live here; the action ids themselves all come from the registry
+/// (`action::ACTIONS`), which a test enforces.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("doctor", "app.doctor"),
     ("help", "app.help"),
     ("keymap", "app.help"),
+    ("messages", "notice.clear"),
     ("q", "app.quit"),
     ("qa", "app.quit"),
     ("quit", "app.quit"),
@@ -26,97 +30,99 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 /// Runs an action.
 ///
-/// Returns whether the pending key sequence should be kept. Only the leader menu
-/// returns `true`, because it stays open so the next key can complete the
-/// sequence (FR-7.3).
-pub fn dispatch(app: &mut App, id: &str) -> bool {
+/// The returned [`Effect`] tells the event loop what it has to do; only the
+/// leader menu asks to keep the pending key sequence so the next key can
+/// complete it (FR-7.3).
+pub fn dispatch(app: &mut App, id: &str) -> Effect {
     match id {
         "app.quit" => {
             app.quit();
-            false
+            Effect::None
         }
         "app.help" => {
             app.open_overlay(Overlay::Help);
-            false
+            Effect::None
         }
         "app.doctor" => {
-            app.open_overlay(Overlay::Doctor);
-            false
+            app.start_doctor();
+            Effect::RunDoctor
         }
         "app.theme_picker" => {
             app.open_overlay(Overlay::ThemePicker);
-            false
+            Effect::None
         }
         "app.leader_menu" => {
             app.open_overlay(Overlay::Leader);
-            true
+            Effect::KeepPending
         }
         "app.command" => {
             app.command.clear();
             app.mode = Mode::Command;
-            false
+            Effect::None
         }
         "app.cancel" => {
-            app.close_overlay();
-            false
+            app.cancel_overlay();
+            Effect::None
         }
         "app.refresh" => {
             app.notice(
                 NoticeLevel::Info,
                 "nothing to refresh yet: pull requests arrive in M1",
             );
-            false
+            Effect::None
         }
         "app.version" => {
             app.notice(
                 NoticeLevel::Info,
                 format!("smart-review {}", env!("CARGO_PKG_VERSION")),
             );
-            false
+            Effect::None
         }
-        "theme.use_dark" => {
-            app.set_theme("dark");
-            false
+        "notice.clear" => {
+            app.dismiss_notices();
+            Effect::None
         }
-        "theme.use_light" => {
-            app.set_theme("light");
-            false
-        }
+        "theme.use_dark" => app.set_theme("dark"),
+        "theme.use_light" => app.set_theme("light"),
         "nav.up" => {
             app.move_cursor(-1);
-            false
+            Effect::None
         }
         "nav.down" => {
             app.move_cursor(1);
-            false
+            Effect::None
         }
         "nav.top" => {
             app.move_cursor_to(false);
-            false
+            Effect::None
         }
         "nav.bottom" => {
             app.move_cursor_to(true);
-            false
+            Effect::None
         }
-        "pane.next" | "pane.prev" => {
-            app.focus = app.focus.next();
-            false
-        }
+        "pane.next" | "pane.prev" => set_focus(app, app.focus.next()),
         other => {
             app.notice(
                 NoticeLevel::Warn,
                 format!("`{other}` is not implemented in this build"),
             );
-            false
+            Effect::None
         }
     }
 }
 
+/// Changes the focused pane and remembers it (FR-8.5).
+fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
+    app.focus = pane;
+    app.state.focus = Some(pane.label().to_owned());
+    Effect::SaveState
+}
+
 /// Runs a `:` command.
-pub fn command(app: &mut App, input: &str) {
+pub fn command(app: &mut App, input: &str) -> Effect {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return;
+        return Effect::None;
     }
 
     let mut parts = trimmed.splitn(2, char::is_whitespace);
@@ -124,59 +130,77 @@ pub fn command(app: &mut App, input: &str) {
     let argument = parts.next().unwrap_or_default().trim();
 
     match name {
-        "q" | "qa" | "quit" => {
-            dispatch(app, "app.quit");
-        }
-        "help" | "keymap" => {
-            dispatch(app, "app.help");
-        }
-        "doctor" => {
-            dispatch(app, "app.doctor");
-        }
-        "refresh" => {
-            dispatch(app, "app.refresh");
-        }
-        "version" => {
-            dispatch(app, "app.version");
-        }
-        "theme" => {
-            if argument.is_empty() {
-                dispatch(app, "app.theme_picker");
-            } else {
-                app.set_theme(argument);
-            }
-        }
+        "q" | "qa" | "quit" => dispatch(app, "app.quit"),
+        "help" => dispatch(app, "app.help"),
+        "doctor" => dispatch(app, "app.doctor"),
+        "refresh" => dispatch(app, "app.refresh"),
+        "version" => dispatch(app, "app.version"),
+        "messages" => dispatch(app, "notice.clear"),
+        "keymap" => keymap_command(app, argument),
+        "theme" => match argument {
+            "" => dispatch(app, "app.theme_picker"),
+            "reload" => app.reload_theme(),
+            name => app.set_theme(name),
+        },
         "set" => set_option(app, argument),
         other => {
             let mut message = format!("`{other}` is not a command");
             if let Some(suggestion) = closest_command(other) {
-                let _ = write!(message, "; did you mean `{suggestion}`?");
+                let _ = std::fmt::Write::write_fmt(
+                    &mut message,
+                    format_args!("; did you mean `{suggestion}`?"),
+                );
             }
             app.command_error(message);
+            Effect::None
         }
     }
 }
 
+/// `:keymap` and `:keymap <action>` (FR-7.2).
+fn keymap_command(app: &mut App, argument: &str) -> Effect {
+    if argument.is_empty() {
+        return dispatch(app, "app.help");
+    }
+
+    if let Some(definition) = action::find(argument) {
+        app.open_overlay(Overlay::Help);
+        // `open_overlay` resets the filter, so set it afterwards.
+        app.help_filter = Some(definition.id.to_owned());
+        return Effect::None;
+    }
+
+    let mut message = format!("`{argument}` is not an action");
+    if let Some(suggestion) = action::suggest(argument) {
+        let _ = std::fmt::Write::write_fmt(
+            &mut message,
+            format_args!("; did you mean `{}`?", suggestion.id),
+        );
+    }
+    app.command_error(message);
+    Effect::None
+}
+
 /// Applies `:set <key>=<value>` for the options that can change at runtime.
-fn set_option(app: &mut App, spec: &str) {
+fn set_option(app: &mut App, spec: &str) -> Effect {
     let Some((key, value)) = spec.split_once('=') else {
         app.command_error("usage: :set <key>=<value>, for example :set ui.timeoutlen=250");
-        return;
+        return Effect::None;
     };
     let key = key.trim();
     let value = value.trim();
 
     match key {
         "ui.theme" => app.set_theme(value),
-        "ui.timeoutlen" => match value.parse::<u64>() {
-            Ok(milliseconds) => {
+        "ui.timeoutlen" => {
+            if let Ok(milliseconds) = value.parse::<u64>() {
                 app.keymap.set_timeout(Duration::from_millis(milliseconds));
                 app.notice(NoticeLevel::Info, format!("timeoutlen = {milliseconds} ms"));
+                return Effect::None;
             }
-            Err(_) => {
-                app.command_error(format!("`{value}` is not a number of milliseconds"));
-            }
-        },
+            app.command_error(format!("`{value}` is not a number of milliseconds"));
+            Effect::None
+        }
         "ui.leader" => match keymap::parse_keys(value, &KeyCombo::char(' ')) {
             Ok(keys) if keys.len() == 1 => {
                 value.clone_into(&mut app.config.ui.leader);
@@ -185,33 +209,103 @@ fn set_option(app: &mut App, spec: &str) {
                     NoticeLevel::Info,
                     format!("leader = {}", keys[0].describe()),
                 );
+                Effect::None
             }
-            Ok(_) => app.command_error(format!(
-                "`{value}` must be a single key, for example <Space> or ,"
-            )),
-            Err(error) => app.command_error(error.to_string()),
+            Ok(_) => {
+                app.command_error(format!(
+                    "`{value}` must be a single key, for example <Space> or ,"
+                ));
+                Effect::None
+            }
+            Err(error) => {
+                app.command_error(error.to_string());
+                Effect::None
+            }
         },
-        _ => app.command_error(format!(
-            "`{key}` cannot be changed at runtime yet; edit {}",
-            app.config_path.display()
-        )),
+        _ => {
+            app.command_error(format!(
+                "`{key}` cannot be changed at runtime yet; edit {}",
+                app.config_path.display()
+            ));
+            Effect::None
+        }
     }
 }
 
+/// Commands matching what has been typed so far, best match first.
+///
+/// Matching is fuzzy: the typed characters must appear in order, and contiguous
+/// or earlier matches rank higher (FR-7.3).
+#[must_use]
+pub fn candidates(input: &str) -> Vec<(&'static str, &'static str)> {
+    let typed = input.trim();
+
+    let mut scored: Vec<(i32, &'static str, &'static str)> = COMMANDS
+        .iter()
+        .filter_map(|(name, action)| {
+            let score = if typed.is_empty() {
+                0
+            } else {
+                fuzzy_score(typed, name)?
+            };
+            Some((score, *name, *action))
+        })
+        .collect();
+
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+    scored
+        .into_iter()
+        .map(|(_, name, action)| (name, action))
+        .collect()
+}
+
+/// Subsequence match with bonuses for contiguity and for matching early.
+///
+/// Returns `None` when `needle` is not a subsequence of `haystack`.
+fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    let characters: Vec<char> = haystack.chars().collect();
+    let mut score: i32 = 0;
+    let mut cursor = 0;
+    let mut previous: Option<usize> = None;
+
+    for wanted in needle.chars() {
+        let found = cursor
+            + characters
+                .get(cursor..)?
+                .iter()
+                .position(|c| *c == wanted)?;
+        score += 1;
+        if previous == Some(found.wrapping_sub(1)) {
+            score += 2;
+        }
+        cursor = found + 1;
+        previous = Some(found);
+    }
+
+    // Prefer shorter candidates, then earlier matches.
+    let length_penalty = i32::try_from(haystack.chars().count()).unwrap_or(i32::MAX);
+    let cursor_penalty = i32::try_from(cursor).unwrap_or(i32::MAX);
+    Some(score * 10 - length_penalty - cursor_penalty)
+}
+
 /// Completes a partially typed command name.
+#[must_use]
 pub fn complete_command(input: &str) -> String {
     let typed = input.trim_start();
-    if typed.is_empty() || typed.contains(char::is_whitespace) {
+    if typed.contains(char::is_whitespace) {
         return input.to_owned();
     }
 
-    let matches: Vec<&str> = COMMANDS
-        .iter()
-        .map(|(name, _)| *name)
-        .filter(|name| name.starts_with(typed))
+    let names: Vec<&str> = candidates(typed)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect();
 
-    match matches.as_slice() {
+    match names.as_slice() {
         [] => input.to_owned(),
         [single] => (*single).to_owned(),
         several => common_prefix(several),
@@ -246,11 +340,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_command_maps_to_a_known_action() {
+    fn every_command_maps_to_a_registered_action() {
         for (name, id) in COMMANDS {
-            if *id == "app.version" {
-                continue;
-            }
             assert!(
                 action::is_known(id),
                 "command `{name}` maps to unknown action `{id}`"
@@ -261,14 +352,13 @@ mod tests {
     #[test]
     fn completion_fills_in_a_unique_command() {
         assert_eq!(complete_command("doc"), "doctor");
-        assert_eq!(complete_command("q"), "q");
         assert_eq!(complete_command(""), "");
         assert_eq!(complete_command("bogus"), "bogus");
     }
 
     #[test]
     fn completion_uses_the_common_prefix_for_ambiguous_input() {
-        // "q", "qa" and "quit" all start with "q", so the prefix is just "q".
+        // "q", "qa" and "quit" all match, so only the shared prefix is filled in.
         assert_eq!(complete_command("q"), "q");
         assert_eq!(common_prefix(&["theme", "the"]), "the");
     }
@@ -279,8 +369,40 @@ mod tests {
     }
 
     #[test]
+    fn completion_is_fuzzy() {
+        // Not a prefix, but a subsequence: t-h-m-e.
+        assert_eq!(complete_command("thm"), "theme");
+        assert_eq!(complete_command("msg"), "messages");
+    }
+
+    #[test]
+    fn fuzzy_scoring_prefers_contiguous_and_shorter_matches() {
+        let contiguous = fuzzy_score("doc", "doctor").unwrap();
+        let scattered = fuzzy_score("doc", "d-o-c-nonsense").unwrap();
+        assert!(contiguous > scattered, "{contiguous} vs {scattered}");
+        assert!(fuzzy_score("z", "doctor").is_none());
+    }
+
+    #[test]
+    fn candidates_are_ranked_and_bounded() {
+        let all = candidates("");
+        assert_eq!(all.len(), COMMANDS.len());
+        let typed = candidates("thm");
+        assert_eq!(typed.first().map(|(name, _)| *name), Some("theme"));
+    }
+
+    #[test]
     fn near_miss_commands_are_suggested() {
         assert_eq!(closest_command("docotr"), Some("doctor"));
         assert_eq!(closest_command("zzzzzz"), None);
+    }
+
+    #[test]
+    fn every_registered_command_action_has_a_dispatch_arm() {
+        // `notice.clear` and `app.version` are reached through the command line,
+        // so the catch-all must not swallow them.
+        for id in ["app.version", "notice.clear"] {
+            assert!(action::is_known(id), "{id} should be registered");
+        }
     }
 }

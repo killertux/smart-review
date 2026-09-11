@@ -65,12 +65,14 @@ Implemented so far:
 
 | Port | Adapter | Notes |
 |---|---|---|
-| `Clock` | `SystemClock` | Injected so cache lifetimes and relative timestamps are testable |
+| `Clock` | `SystemClock` | Injected so cache lifetimes and relative timestamps are testable. The event loop owns it and hands the reducer a timestamp. |
 | `ConfigStore` | `TomlConfigStore` | Reading only; writing arrives with M2 and DEC-19 |
-| `StateStore` | `TomlStateStore` | Atomic writes |
+| `StateStore` | `TomlStateStore`, plus an in-memory fake in tests | Atomic writes; the fake proves the port is a real seam |
 
 Arriving with the milestone that needs them: `ForgePort` (M1), `WorkspacePort`
 (M2), `ModelCatalogPort` (M2), `CredentialsStore` (M2), `LlmPort` (M2).
+Application-layer fakes (a fake forge and a fake LLM) arrive with the use cases in
+M1 and M2.
 
 The rule of thumb: a port exists when there is a second implementation (a test
 fake) or a real alternative. Empty abstractions are not written "for later".
@@ -79,27 +81,40 @@ fake) or a real alternative. Empty abstractions are not written "for later".
 
 ```
 crossterm event ─▶ App::on_key ─▶ Keymap::resolve ─▶ update::dispatch ─▶ App state
-                                                                          │
-                                                    ratatui Frame ◀───────┘
+                            │                              │
+                            │                              ▼
+                            │                            Effect
+                            │                              │
+                    ratatui Frame ◀──────── tui::run applies it (IO)
 ```
 
 1. `App::on_key` normalises the key press (uppercase implies Shift, `BackTab` is
    `Shift+Tab`) and appends it to the pending sequence.
 2. `Keymap::resolve` reports `Match`, `Ambiguous`, `Prefix` or `None`. `Ambiguous`
    starts a timer; when it expires, `App::on_timeout` fires the shorter binding.
-   The leader menu is a binding whose action returns `true` from `dispatch`,
-   which keeps the pending sequence alive so the next key can complete it.
-3. `update::dispatch` mutates state. It is the only place that knows what an
-   action id means, and the registry in `action.rs` is the only place that knows
-   which action ids exist. A default binding naming an action outside the registry
-   is reported as a startup warning rather than silently doing nothing.
+   The leader menu is a binding whose action returns `Effect::KeepPending`, which
+   keeps the sequence alive so the next key can complete it.
+3. `update::dispatch` mutates state and returns an [`Effect`] — it never performs
+   IO. `tui::run` is the only place that turns an effect into work: persisting
+   `state.toml`, or starting the doctor job on a background thread whose result
+   comes back over a channel. That is what keeps rendering a pure function of
+   state and the loop under the 50 ms budget (NFR-1.2).
 4. `App::render` reads state and draws. It never reads a file, spawns a process,
-   or blocks.
+   or blocks — anything it needs from disk (the theme list, for instance) was
+   captured when the relevant action ran.
+5. The registry in `action.rs` is the only place that knows which action ids
+   exist, and `update.rs` is the only place that knows what they mean. A default
+   binding naming an action outside the registry is a startup warning; a registry
+   entry with no dispatch arm falls through to the catch-all, which a test
+   catches.
 
 ## 5. Concurrency
 
-M0 is deliberately synchronous: there is no background work yet, so the event loop
-is a plain `poll`/`read`/`draw` cycle and there is nothing that can block it.
+M0 is deliberately synchronous except for one job, so the loop is a plain
+`poll`/`read`/`draw`/`apply-effect` cycle. The doctor probe (`git --version`,
+`gh auth status`) already runs on a background thread and reports back over a
+channel, because running it inline would block the loop for seconds — the first
+instance of the pattern everything else will use.
 
 From M2 the shape is fixed by `REQUIREMENTS.md` (ARCH-5):
 

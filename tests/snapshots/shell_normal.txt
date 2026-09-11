@@ -26,4 +26,4 @@
 │                                                      ││                                          │
 │                                                      ││                                          │
 └──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- NORMAL list · dark · leader <Space> · 19 keys               ? help · <leader> actions · : commands
+ NORMAL list · acme/service · — · — · 0 drafts               ? help · <leader> actions · : commands

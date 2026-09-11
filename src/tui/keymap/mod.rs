@@ -359,6 +359,36 @@ impl Keymap {
             .collect()
     }
 
+    /// Resolves `sequence` against global bindings only.
+    ///
+    /// Text-entry modes handle ordinary keys themselves, but a global binding
+    /// such as `<C-c>` must still work everywhere (FR-8.3).
+    #[must_use]
+    pub fn resolve_global(&self, sequence: &[KeyCombo]) -> Resolution<'_> {
+        let mut best: Option<&Binding> = None;
+        let mut extendable = false;
+
+        for binding in &self.bindings {
+            if binding.scope != Scope::Global {
+                continue;
+            }
+            if binding.keys.len() > sequence.len() && binding.keys.starts_with(sequence) {
+                extendable = true;
+                continue;
+            }
+            if binding.keys == sequence {
+                best = Some(binding);
+            }
+        }
+
+        match (best, extendable) {
+            (Some(binding), true) => Resolution::Ambiguous(binding),
+            (Some(binding), false) => Resolution::Match(binding),
+            (None, true) => Resolution::Prefix,
+            (None, false) => Resolution::None,
+        }
+    }
+
     /// Resolves the keys pressed so far (FR-7.2).
     #[must_use]
     pub fn resolve(&self, mode: Mode, sequence: &[KeyCombo]) -> Resolution<'_> {
@@ -390,8 +420,8 @@ impl Keymap {
         }
     }
 
-    /// Applies a user override: an action id binds the keys, `none` unbinds
-    /// whatever was there.
+    /// Applies a user override: an action id binds the keys, `none` or `nop`
+    /// unbinds whatever was there.
     pub fn apply_override(
         &mut self,
         scope: Scope,
@@ -400,7 +430,7 @@ impl Keymap {
         origin: Origin,
         warnings: &mut Vec<String>,
     ) {
-        if action == "none" {
+        if action == "none" || action == "nop" {
             let before = self.bindings.len();
             self.bindings
                 .retain(|binding| !(binding.scope == scope && binding.keys == keys));
@@ -864,20 +894,36 @@ mod tests {
 
     #[test]
     fn a_binding_can_be_unbound() {
-        let mut keymap = keymap();
-        let mut warnings = Vec::new();
-        keymap.apply_override(
-            Scope::In(Mode::Normal),
-            &[press('j')],
-            "none",
-            Origin::Default,
-            &mut warnings,
-        );
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            keymap.resolve(Mode::Normal, &[press('j')]),
-            Resolution::None
-        );
+        for spelling in ["none", "nop"] {
+            let mut keymap = keymap();
+            let mut warnings = Vec::new();
+            keymap.apply_override(
+                Scope::In(Mode::Normal),
+                &[press('j')],
+                spelling,
+                Origin::Default,
+                &mut warnings,
+            );
+            assert!(warnings.is_empty(), "{spelling}: {warnings:?}");
+            assert_eq!(
+                keymap.resolve(Mode::Normal, &[press('j')]),
+                Resolution::None,
+                "`{spelling}` should unbind"
+            );
+        }
+    }
+
+    #[test]
+    fn global_bindings_are_resolvable_on_their_own() {
+        let keymap = keymap();
+        let ctrl_c = KeyCombo::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        match keymap.resolve_global(&[ctrl_c]) {
+            Resolution::Match(binding) => assert_eq!(binding.action, "app.quit"),
+            other => panic!("expected a global match, got {other:?}"),
+        }
+        // A normal-mode-only binding must not leak into the global lookup.
+        assert_eq!(keymap.resolve_global(&[press('j')]), Resolution::None);
+        assert_eq!(keymap.resolve_global(&[press('z')]), Resolution::None);
     }
 
     #[test]

@@ -22,9 +22,9 @@
 │                                                      ││                                          │
 │                                                      ││                                          │
 │                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
 └──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- COMMAND list · dark · leader <Space> · 19 keys              ? help · <leader> actions · : commands
+ theme     Choose a theme
+
+
+ COMMAND list · acme/service · — · — · 0 drafts              ? help · <leader> actions · : commands
 : them

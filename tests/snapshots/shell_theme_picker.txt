@@ -26,4 +26,4 @@
 │                                                      ││                                          │
 │                                                      ││                                          │
 └──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- POPUP list · dark · leader <Space> · 19 keys                ? help · <leader> actions · : commands
+ POPUP list · acme/service · — · — · 0 drafts                ? help · <leader> actions · : commands

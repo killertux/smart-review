@@ -136,6 +136,14 @@ else
   cat /tmp/m0-bad-config.log
 fi
 
+# The warning has to say which file it is about (FR-8.6).
+if grep -q "$TMP_HOME/config.toml" /tmp/m0-bad-config.log; then
+  ok "the warning names the configuration file"
+else
+  bad "the warning does not name the configuration file"
+  cat /tmp/m0-bad-config.log
+fi
+
 # Broken TOML is unrecoverable and must be a clean, explained failure (exit 2).
 printf '[ui\ntheme =' >"$TMP_HOME/config.toml"
 set +e
@@ -162,8 +170,14 @@ step "7/7 terminal lifecycle in a real pty"
 if script --version 2>&1 | grep -q util-linux; then
   PTY_HOME="$(mktemp -d)"
   set +e
-  (sleep 1; printf ':q\r'; sleep 2) \
-    | SMART_REVIEW_HOME="$PTY_HOME" timeout 20 script -qec "$ROOT/$BIN" /dev/null \
+  # `script` gives the command a pty whose window size is 0x0 when there is no
+  # controlling terminal, which makes the app render an empty screen; `stty`
+  # inside the pty fixes the size so this check actually exercises rendering.
+  # Type an unknown command first: it must be reported on screen, not swallowed
+  # (FR-7.4), and then quit normally.
+  (sleep 1; printf ':bogus\r'; sleep 1; printf ':q\r'; sleep 2) \
+    | SMART_REVIEW_HOME="$PTY_HOME" timeout 20 \
+      script -qefc "stty rows 40 cols 120 2>/dev/null; '$ROOT/$BIN'" /dev/null \
     >/tmp/m0-tui.log 2>&1
   TUI_CODE=$?
   set -e
@@ -178,6 +192,30 @@ if script --version 2>&1 | grep -q util-linux; then
     ok "the shutdown was logged"
   else
     bad "no clean shutdown was logged"
+  fi
+
+  # The screen is a stream of escape sequences; strip them so the text can be
+  # matched as the user would see it.
+  sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\][^\x07]*\x07//g' /tmp/m0-tui.log >/tmp/m0-tui-text.log
+
+  # Prove the screen was painted at all, otherwise the checks below would pass
+  # vacuously on an empty render.
+  if grep -q 'smart-review' /tmp/m0-tui-text.log && grep -q 'NORMAL' /tmp/m0-tui-text.log; then
+    ok "the interface painted the header and the status line"
+  else
+    bad "the interface rendered nothing"
+  fi
+
+  if grep -q 'bogus' /tmp/m0-tui-text.log; then
+    ok "an unknown command is reported on screen"
+  else
+    bad "an unknown command produced no visible output"
+  fi
+
+  if grep -q 'not a command' /tmp/m0-tui-text.log; then
+    ok "the unknown command error names the problem"
+  else
+    bad "the unknown command error is missing"
   fi
 
   if grep -q $'\x1b\[?1049l' /tmp/m0-tui.log; then

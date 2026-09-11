@@ -15,6 +15,7 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -25,14 +26,26 @@ use smart_review::tui::event::KeyEvent;
 use smart_review::tui::keymap::parse_keys;
 use smart_review::{Startup, tui::App};
 
-/// A fixed home directory so the snapshots do not depend on the machine.
-fn snapshot_home() -> PathBuf {
+/// The snapshots share one home directory, which each case deletes on entry, so
+/// the suite must not run its cases concurrently.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn lock() -> MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Takes the suite lock and returns a fresh, fixed home directory, so the
+/// snapshots do not depend on the machine.
+fn snapshot_home() -> (MutexGuard<'static, ()>, PathBuf) {
+    let guard = lock();
     let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("snapshot-home");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("create the snapshot home");
-    home
+    (guard, home)
 }
 
 fn build(home: &Path) -> App {
@@ -137,7 +150,7 @@ fn assert_snapshot(name: &str, actual: &str) {
 
 #[test]
 fn shell_in_normal_mode() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     let frame = normalize(&render(&mut app, 100, 30), &home);
     assert_snapshot("shell_normal", &frame);
@@ -145,7 +158,7 @@ fn shell_in_normal_mode() {
 
 #[test]
 fn shell_with_help_open() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     press(&mut app, "?");
     let frame = normalize(&render(&mut app, 100, 30), &home);
@@ -154,7 +167,7 @@ fn shell_with_help_open() {
 
 #[test]
 fn shell_with_leader_menu_open() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     press(&mut app, "<Space>");
     app.on_timeout();
@@ -164,7 +177,7 @@ fn shell_with_leader_menu_open() {
 
 #[test]
 fn shell_with_theme_picker_open() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     press(&mut app, "<Space>t");
     let frame = normalize(&render(&mut app, 100, 30), &home);
@@ -173,7 +186,7 @@ fn shell_with_theme_picker_open() {
 
 #[test]
 fn shell_in_light_theme() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     press(&mut app, "<Space>l");
     let frame = normalize(&render(&mut app, 100, 30), &home);
@@ -182,7 +195,7 @@ fn shell_in_light_theme() {
 
 #[test]
 fn shell_on_a_small_terminal() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     let frame = normalize(&render(&mut app, 60, 12), &home);
     assert_snapshot("shell_too_small", &frame);
@@ -190,7 +203,7 @@ fn shell_on_a_small_terminal() {
 
 #[test]
 fn shell_with_the_command_line_open() {
-    let home = snapshot_home();
+    let (_serial, home) = snapshot_home();
     let mut app = build(&home);
     press(&mut app, ":them");
     let frame = normalize(&render(&mut app, 100, 30), &home);

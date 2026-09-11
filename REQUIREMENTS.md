@@ -320,7 +320,7 @@ No network-mutating action may occur without an explicit user confirmation. Dest
 Modes: `normal` (navigation), `insert` (chat/comment composition), `command` (`:`), `search` (`/` and `?`), `popup` (help, leader menu, pickers, modals), `visual` (SHOULD, M1, for line/range selection). The active mode MUST be visible in the status line; `Esc` always returns to `normal` (a second `Esc` cancels the current operation).
 
 **FR-7.2 Keybindings engine** — MUST — M0
-Requirements: multi-key sequences with a configurable ambiguity timeout (`timeoutlen`, default 500 ms); `<leader>` expansion; per-mode tables plus a `global` table; unknown action IDs and duplicate bindings reported at startup as warnings with the offending file/line; the effective map is dumpable via `:keymap`.
+Requirements: multi-key sequences with a configurable ambiguity timeout (`timeoutlen`, default 500 ms); `<leader>` expansion; per-mode tables plus a `global` table; unknown action IDs and duplicate bindings reported at startup as warnings naming the file, the section and the key (line numbers would need span-preserving parsing, `toml_edit` — DEC-19); the effective map is dumpable via `:keymap`. A `global` binding applies in every mode, except that inside a text-entry mode only combinations with a real modifier (`<C-…>`, `<A-…>`) are treated as bindings so that ordinary characters — including the leader key, `?` and `:` — are typed as text.
 Acceptance criteria:
 - [ ] Defaults are compiled in; user file only overrides (it never has to repeat defaults).
 - [ ] A user binding can unbind a default (`"x" = "none"` or `action = "nop"`).
@@ -452,7 +452,7 @@ timeoutlen = 500
 - [ ] Action IDs are validated against the action registry; a typo fails loudly at startup with a "did you mean" suggestion.
 - [ ] The default map is documented in `docs/keymaps.md` generated from the registry.
 
-**FR-8.4 Themes** — MUST — M1
+**FR-8.4 Themes** — MUST — M0
 ```toml
 name = "my-dark"
 base = "dark"          # inherit, then override

@@ -26,4 +26,4 @@
 │                                                      ││                                          │
 │                                                      ││                                          │
 └──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
- NORMAL list · light · leader <Space> · 19 keys                                        theme: light
+ NORMAL list · acme/service · — · — · 0 drafts                                         theme: light
