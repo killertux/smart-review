@@ -44,6 +44,9 @@ Inside the app:
 | `}` / `{` | next / previous file |
 | `za` | fold the hunk (or the whole file, from its banner) |
 | `y` | copy the current file path (OSC 52) |
+| `<leader>m` | choose the provider, model and thinking settings |
+| `<leader>dc` | cycle the diff context: 3, 10, 0 lines |
+| `<leader>dw` | ignore whitespace-only changes |
 | wheel | scroll the pane under the pointer |
 | click | focus a pane and put the cursor on the row you clicked |
 | `<Space>f` / `<Space>s` | add a filter / change the order |
@@ -58,6 +61,18 @@ Inside the app:
 `:sort updated desc`, `:load-more`, `:copy-path`, `:theme <name>|next|reload`,
 `:set ui.timeoutlen=250`, `:keymap`, `:version`. `Esc` closes a popup or cancels a
 half-typed key sequence.
+
+Opening a pull request also materialises it as a managed git worktree under
+`~/.smart-review/worktrees/`, so the diff can be produced locally: the context and
+whitespace toggles only mean something for a locally produced diff, and the status
+line says which source answered (`worktree` or `github`). Your checkout's `HEAD`,
+branches, index and working tree are never touched.
+
+Choosing a model happens in the TUI (`<leader>m`): pick a provider, search the models
+the [models.dev](https://models.dev) catalog lists for it, choose a thinking mode, and
+paste the key into a masked prompt. The key goes to `credentials.toml` (mode 0600) and
+nowhere else; the choice is written back to `config.toml` without disturbing your
+comments, and is then checked against the provider.
 
 Opening a pull request fetches its detail and then its diff, so the wait shows a
 centred indicator naming the pull request, which step it is on and how long it has

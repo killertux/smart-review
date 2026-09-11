@@ -40,6 +40,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(format!("{} ", app.focus().label()), background),
         Span::styled(format!("· {} ", repository_label(app)), background),
         Span::styled(format!("· {} ", pull_request_label(app)), background),
+        // Only worth a column once a diff is on screen: which source answered is
+        // what tells the user whether the context and whitespace toggles apply.
+        Span::styled(
+            if app.review.is_some() {
+                format!("· {} ", app.diff_source().label())
+            } else {
+                String::new()
+            },
+            background,
+        ),
         // In the review screen the cursor's file is what the user is reading, so it
         // belongs in the status line beside the pane name.
         Span::styled(current_file_label(app), background),
@@ -80,11 +90,24 @@ fn pull_request_label(app: &App) -> String {
         .map_or_else(|| PLACEHOLDER.to_owned(), |number| format!("#{number}"))
 }
 
+/// The active model and its thinking setting (FR-4.5, FR-4.8).
+///
+/// Three states, each said plainly: nothing chosen yet, chosen and verified, chosen
+/// but unusable — and the last names the reason, because "the model is set but the
+/// key is missing" is the one a user has to act on.
 fn model_label(app: &App) -> String {
-    app.config.llm.active.as_ref().map_or_else(
-        || PLACEHOLDER.to_owned(),
-        |active| format!("{}/{}", active.provider, active.model),
-    )
+    if let Some(resolved) = app.active_model() {
+        return format!(
+            "{} thinking:{}",
+            resolved.label(),
+            resolved.thinking_label()
+        );
+    }
+    match (app.config.llm.active.as_ref(), app.model_problem()) {
+        (Some(_), Some(problem)) => format!("{PLACEHOLDER} ({problem})"),
+        (Some(active), None) => format!("{}/{} (unverified)", active.provider, active.model),
+        (None, _) => PLACEHOLDER.to_owned(),
+    }
 }
 
 fn notice_style(theme: &Theme, level: NoticeLevel) -> Style {

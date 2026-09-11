@@ -12,23 +12,31 @@
 //! | [`Cancel`] | M1 |
 //! | [`ForgePort`] | M1 |
 //! | [`CacheStore`] | M1 |
-//! | [`WorkspacePort`] | M1 (detection) / M2 (worktrees) |
-//! | `WorkspacePort` | M2 |
-//! | `ModelCatalogPort` | M2 |
-//! | `CredentialsStore` | M2 |
-//! | `LlmPort` | M2 |
+//! | [`WorkspacePort`] | M1 (detection) / M2a (worktrees, local diff) |
+//! | [`ModelCatalogPort`] | M2a |
+//! | [`SecretStore`] | M2a |
+//! | [`LlmPort`] | M2a (connection check) / M2b (analysis) |
 
 pub mod cache;
 pub mod cancel;
+pub mod catalog;
 pub mod forge;
+pub mod llm;
+pub mod secret;
 pub mod workspace;
 
 pub use cache::{CacheKey, CacheKeyError, CacheStore, Stored};
 pub use cancel::Cancel;
+pub use catalog::{CatalogFetchError, CatalogLoad, CatalogPolicy, CatalogSource, ModelCatalogPort};
 pub use forge::{
     ForgeCapabilities, ForgeFactory, ForgePort, ForgeProbe, ForgeStatus, PullRequestPage,
 };
-pub use workspace::{Remote, RepoInfo, WorkspaceError, WorkspacePort};
+pub use llm::{ChatOutcome, ChatRequest, DeltaHandler, LlmError, LlmPort, TokenUsage};
+pub use secret::{ApiKey, KeySource, KeyStatus, SecretError, SecretStore};
+pub use workspace::{
+    DiffOptions, DiffRequest, Remote, RepoInfo, Workspace, WorkspaceEntry, WorkspaceError,
+    WorkspacePort, WorkspaceRequest,
+};
 
 use crate::config::Loaded;
 use crate::error::Result;

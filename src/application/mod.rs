@@ -11,7 +11,13 @@
 //! what to do with the answer.
 
 pub mod environment;
+pub mod models;
 pub mod prs;
 
 pub use environment::{DetectRequest, detect, gh_program};
+pub use models::{
+    CatalogState, ModelChoice, ProviderChoice, ResolvedSelection, SelectionError, check_thinking,
+    clear_key, connection_check, key_status, load_catalog, model_choices, provider_choices,
+    resolve_selection, save_key,
+};
 pub use prs::{CachePolicy, Cached, FetchOutcome, Prs};

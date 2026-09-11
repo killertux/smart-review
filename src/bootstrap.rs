@@ -9,17 +9,24 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapters::cache::DiskCache;
+use crate::adapters::catalog::ModelsDevCatalog;
 use crate::adapters::clock::SystemClock;
+use crate::adapters::credentials::{FileSecrets, RealEnv};
 use crate::adapters::fs::{TomlConfigStore, TomlStateStore};
 use crate::adapters::gh::GhForgeFactory;
 use crate::adapters::gh::probe::GhCliProbe;
 use crate::adapters::git::GitCli;
+use crate::adapters::http::ReqwestFetcher;
+use crate::adapters::llm::LlmCrate;
 use crate::cli::Cli;
 use crate::config::{Config, ConfigDocument};
 use crate::doctor::Context;
 use crate::error::Result;
 use crate::paths::Home;
-use crate::ports::{CacheStore, ConfigStore, ForgeFactory, ForgeProbe, StateStore, WorkspacePort};
+use crate::ports::{
+    CacheStore, Clock, ConfigStore, ForgeFactory, ForgeProbe, LlmPort, ModelCatalogPort,
+    SecretStore, StateStore, WorkspacePort,
+};
 use crate::state::AppState;
 use crate::tui::keymap::{self, Keymap};
 use crate::tui::theme::{self, Theme};
@@ -72,6 +79,14 @@ pub struct Startup {
     pub cache: Arc<dyn CacheStore>,
     /// The state store in use.
     pub state_store: TomlStateStore,
+    /// Provider keys (FR-4.5).
+    pub secret_store: Arc<dyn SecretStore>,
+    /// The workspace port, which the interface also uses to list worktrees (FR-3.1).
+    pub workspace_port: Arc<dyn WorkspacePort>,
+    /// The model catalog (FR-4.7).
+    pub catalog: Arc<dyn ModelCatalogPort>,
+    /// The LLM client (FR-4.4).
+    pub llm: Arc<dyn LlmPort>,
 }
 
 /// Resolves which repository to read: the flag wins, then the environment.
@@ -175,15 +190,32 @@ impl Startup {
 
         // The composition root: this is the only place that names an adapter, so the
         // presentation layer can depend on the ports alone (ARCH-1).
+        // The worktree root is wired in here, and only here: everything that creates
+        // a worktree writes inside the app's own directory (FR-3.1, DEC-1).
+        let workspace_root = home.worktrees();
         let workspace: Arc<dyn WorkspacePort> = Arc::new(match &cli.path {
-            Some(path) => GitCli::new().in_dir(path.clone()),
-            None => GitCli::new(),
+            Some(path) => GitCli::new()
+                .in_dir(path.clone())
+                .with_worktrees(workspace_root),
+            None => GitCli::new().with_worktrees(workspace_root),
         });
         let probe: Arc<dyn ForgeProbe> =
             Arc::new(GhCliProbe::new(loaded.config.forge.gh_path.clone()));
         let forge_factory: Arc<dyn ForgeFactory> =
             Arc::new(GhForgeFactory::new(loaded.config.forge.gh_path.clone()));
+        let workspace_port = Arc::clone(&workspace);
         let cache: Arc<dyn CacheStore> = Arc::new(DiskCache::new(home.cache()));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let secret_store: Arc<dyn SecretStore> =
+            Arc::new(FileSecrets::new(home.credentials(), Arc::new(RealEnv)));
+        let catalog: Arc<dyn ModelCatalogPort> = Arc::new(ModelsDevCatalog::new(
+            loaded.config.catalog.url.clone(),
+            home.catalog_cache(),
+            u64::from(loaded.config.catalog.ttl_hours) * 3600,
+            Arc::new(ReqwestFetcher::new()),
+            clock,
+        ));
+        let llm: Arc<dyn LlmPort> = Arc::new(LlmCrate::new());
 
         Ok(Self {
             home,
@@ -208,6 +240,10 @@ impl Startup {
             forge_factory,
             cache,
             state_store,
+            secret_store,
+            workspace_port,
+            catalog,
+            llm,
         })
     }
 }

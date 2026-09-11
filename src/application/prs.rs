@@ -12,13 +12,14 @@
 //!   the answer is returned as [`FetchOutcome::Offline`] so the UI can say so
 //!   instead of showing an empty screen (DEC-14).
 
-use crate::domain::diff::Patch;
+use crate::domain::diff::{DiffSource, Patch};
 use crate::domain::pr::PullRequestDetail;
 use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::error::Result;
 use crate::ports::cache::{CacheKey, CacheStore};
 use crate::ports::forge::{ForgePort, PullRequestPage};
+use crate::ports::workspace::DiffOptions;
 use crate::ports::{Cancel, Clock};
 
 /// How long a cached answer may be trusted (FR-2.3).
@@ -127,8 +128,56 @@ pub fn detail_key(repo: &RepoId, number: u64) -> Result<CacheKey> {
 ///
 /// As [`list_key`].
 pub fn diff_key(repo: &RepoId, number: u64, head_sha: &str) -> Result<CacheKey> {
+    diff_key_with(
+        repo,
+        number,
+        head_sha,
+        DiffOptions::default(),
+        DiffSource::Forge,
+    )
+}
+
+/// The cache key for a diff produced with specific flags (FR-3.2).
+///
+/// The flags are part of the key because they change the bytes: serving a
+/// whitespace-ignored diff to a request that did not ask for one would look like a
+/// diff that is missing changes. The default options keep the key they had before
+/// the flags existed, so a cache written by an older build is still read.
+///
+/// # Errors
+///
+/// Returns an error when the key cannot be built, which means the repository
+/// identity is not usable as a path.
+pub fn diff_key_with(
+    repo: &RepoId,
+    number: u64,
+    head_sha: &str,
+    options: DiffOptions,
+    source: DiffSource,
+) -> Result<CacheKey> {
     let short: String = head_sha.chars().take(12).collect();
-    key(repo, number, &format!("diff-{short}.patch.json"))
+    let flags = options_suffix(options);
+    let tag = source.cache_tag();
+    key(
+        repo,
+        number,
+        &format!("diff-{short}{flags}{tag}.patch.json"),
+    )
+}
+
+/// The part of a diff cache key that describes non-default flags.
+fn options_suffix(options: DiffOptions) -> String {
+    let mut flags = String::new();
+    if options.context != DiffOptions::default().context {
+        let _ = std::fmt::Write::write_fmt(&mut flags, format_args!("-c{}", options.context));
+    }
+    if options.ignore_whitespace {
+        flags.push_str("-w");
+    }
+    if !options.find_renames {
+        flags.push_str("-norenames");
+    }
+    flags
 }
 
 fn key(repo: &RepoId, number: u64, name: &str) -> Result<CacheKey> {
@@ -229,12 +278,60 @@ impl<'a> Prs<'a> {
     ///
     /// As [`Self::cached_list`].
     pub fn cached_patch(&self, number: u64, head_sha: &str) -> Result<Option<Cached<Patch>>> {
+        self.cached_patch_with(number, head_sha, DiffOptions::default(), DiffSource::Forge)
+    }
+
+    /// The same, for a specific set of flags and a specific source (FR-3.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache cannot be read.
+    pub fn cached_patch_with(
+        &self,
+        number: u64,
+        head_sha: &str,
+        options: DiffOptions,
+        source: DiffSource,
+    ) -> Result<Option<Cached<Patch>>> {
         read_cached(
             self.cache,
             self.clock,
-            &diff_key(self.repo, number, head_sha)?,
+            &diff_key_with(self.repo, number, head_sha, options, source)?,
             self.policy.diff_ttl_secs,
         )
+    }
+
+    /// Stores a diff that was produced locally (FR-3.2).
+    ///
+    ///
+    /// The local worktree and the forge produce the same shape, so both are cached
+    /// under the same key: whichever source answered, the next open is instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache cannot be written.
+    pub fn store_local_patch(
+        &self,
+        number: u64,
+        head_sha: &str,
+        options: DiffOptions,
+        patch: &Patch,
+    ) -> Result<()> {
+        let key = diff_key_with(self.repo, number, head_sha, options, DiffSource::Worktree)?;
+        let body = serde_json::to_string(patch).map_err(|error| {
+            crate::error::Error::Cache(format!("could not encode the diff: {error}"))
+        })?;
+        self.cache.write(&key, &body, self.clock.now_unix_secs())
+    }
+
+    /// The key a diff with these flags is cached under, for callers that read the
+    /// cache themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key cannot be built.
+    pub fn patch_key(&self, number: u64, head_sha: &str, options: DiffOptions) -> Result<CacheKey> {
+        diff_key_with(self.repo, number, head_sha, options, DiffSource::Forge)
     }
 
     /// Fetches the PR list, falling back to the cache when the forge is
@@ -734,5 +831,62 @@ mod tests {
         };
         assert_eq!(offline.offline_reason(), Some("no network"));
         assert_eq!(offline.value(), &2);
+    }
+    #[test]
+    fn a_diff_is_cached_per_source_and_per_flag() {
+        // Three ways the same head SHA can produce different bytes: a different
+        // source, different context, and whitespace handling. Serving one for another
+        // is what made the worktree's diff look like GitHub's, so the keys must
+        // differ — and they must keep differing for the default case, so a cache
+        // written by an older build is still read.
+        let repo = RepoId::parse("acme/service").expect("a repository");
+        let default = diff_key_with(
+            &repo,
+            7,
+            "abcdef012345",
+            DiffOptions::default(),
+            DiffSource::Forge,
+        )
+        .expect("a key");
+        let worktree = diff_key_with(
+            &repo,
+            7,
+            "abcdef012345",
+            DiffOptions::default(),
+            DiffSource::Worktree,
+        )
+        .expect("a key");
+        let wider = diff_key_with(
+            &repo,
+            7,
+            "abcdef012345",
+            DiffOptions {
+                context: 10,
+                ..DiffOptions::default()
+            },
+            DiffSource::Forge,
+        )
+        .expect("a key");
+        let ignored = diff_key_with(
+            &repo,
+            7,
+            "abcdef012345",
+            DiffOptions {
+                ignore_whitespace: true,
+                ..DiffOptions::default()
+            },
+            DiffSource::Worktree,
+        )
+        .expect("a key");
+
+        assert_ne!(default, worktree, "the source is part of the key");
+        assert_ne!(default, wider, "the context is part of the key");
+        assert_ne!(worktree, ignored, "whitespace handling is part of the key");
+        assert_eq!(
+            default.as_str(),
+            "github.com/acme/service/pr-7/diff-abcdef012345.patch.json",
+            "the default key is the one older builds wrote"
+        );
+        assert!(worktree.as_str().ends_with("-wt.patch.json"), "{worktree}");
     }
 }

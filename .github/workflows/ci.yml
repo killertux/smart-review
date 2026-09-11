@@ -87,3 +87,10 @@ jobs:
       - name: Milestone validation (M1)
         if: runner.os == 'Linux'
         run: bash scripts/validate/m1.sh
+
+      # M2a adds a managed worktree, a local diff and the model picker: the validator
+      # builds a real repository with a pull request ref, serves the catalog from a
+      # local HTTP server, and drives the picker through a pty.
+      - name: Milestone validation (M2a)
+        if: runner.os == 'Linux'
+        run: bash scripts/validate/m2a.sh

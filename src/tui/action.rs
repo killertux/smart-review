@@ -118,6 +118,12 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
+        id: "app.model_picker",
+        description: "Choose the provider, model and thinking settings",
+        group: Group::App,
+        hint: false,
+    },
+    ActionDef {
         id: "theme.toggle",
         description: "Switch to the next theme",
         group: Group::Theme,

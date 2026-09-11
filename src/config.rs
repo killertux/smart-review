@@ -187,9 +187,15 @@ pub struct ModelSelection {
     pub temperature: Option<f32>,
     /// Response token cap; falls back to the catalog's `limit.output`.
     pub max_tokens: Option<u32>,
-    /// Thinking settings. The shape depends on the model's `reasoning_options`,
-    /// so it is kept as an untyped value until the picker (M2) owns it.
-    pub reasoning: Option<toml::Value>,
+    /// Thinking settings, in the shape the catalog uses for `reasoning_options`
+    /// (FR-4.8): `{ type = "toggle", value = true }`, `{ type = "effort", value =
+    /// "high" }` or `{ type = "budget_tokens", value = 4096 }`.
+    ///
+    /// A value the model no longer declares is reported by the picker rather than
+    /// rejected here: the model's capabilities are the catalog's to change, and a
+    /// file that parsed yesterday should not stop the app from starting today.
+    #[serde(default)]
+    pub reasoning: Option<crate::domain::model::Thinking>,
 }
 
 impl ModelSelection {
@@ -207,6 +213,144 @@ impl ModelSelection {
         }
         Ok(())
     }
+}
+
+/// The backup that is written before the first change to a config file.
+pub const CONFIG_BACKUP_SUFFIX: &str = ".bak";
+
+/// Writes `[llm.active]` back into the config file, leaving everything else alone
+/// (FR-8.6, DEC-19).
+///
+/// The document is edited in place with `toml_edit`, so comments, key order and
+/// unknown keys survive — a user's file is not ours to reformat. One thing is
+/// deliberately not preserved: comments *inside* `[llm.active]` itself, because the
+/// table is replaced wholesale. Anything a user wants to keep should live outside
+/// that one table, and the loader warns about unknown keys there anyway.
+///
+/// A copy of the previous file is written to `config.toml.bak` before the first
+/// change, so a bad edit is always recoverable by hand.
+///
+/// # Errors
+///
+/// Returns [`ConfigWriteError`] when the file exists but is not valid TOML, when its
+/// `[llm]` section is not a table, or when the write fails.
+pub fn write_selection(
+    path: &std::path::Path,
+    selection: &ModelSelection,
+) -> std::result::Result<(), ConfigWriteError> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut document = if existing.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        existing
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|error| ConfigWriteError::NotToml {
+                path: path.display().to_string(),
+                reason: error.to_string(),
+            })?
+    };
+
+    if path.exists() {
+        let backup = path.with_extension(format!(
+            "{}{}",
+            path.extension()
+                .map(|extension| extension.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            CONFIG_BACKUP_SUFFIX
+        ));
+        // Best effort: a backup that cannot be written must not stop the setting
+        // from being saved, or the picker would be unusable on a read-only mount
+        // that somehow allowed the original write.
+        let _ = std::fs::write(backup, &existing);
+    }
+
+    let llm = document
+        .entry("llm")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let llm = llm
+        .as_table_mut()
+        .ok_or_else(|| ConfigWriteError::NotATable {
+            path: path.display().to_string(),
+        })?;
+    // Implicit, so a config that had no `[llm]` section does not gain an empty one:
+    // only the `[llm.active]` table the user actually set appears.
+    llm.set_implicit(true);
+    llm.insert("active", toml_edit::Item::Table(selection_table(selection)));
+
+    crate::adapters::fs::write_atomic(path, &document.to_string()).map_err(|error| {
+        ConfigWriteError::Write {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        }
+    })
+}
+
+/// Why the active selection could not be saved (FR-8.6).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConfigWriteError {
+    /// The existing file is not valid TOML, so nothing was touched.
+    #[error("{path} is not valid TOML, so it was not changed: {reason}")]
+    NotToml {
+        /// The file.
+        path: String,
+        /// What the parser said.
+        reason: String,
+    },
+
+    /// `[llm]` exists but is not a table.
+    #[error("{path} has an [llm] section that is not a table; it was not changed")]
+    NotATable {
+        /// The file.
+        path: String,
+    },
+
+    /// The file could not be written.
+    #[error("could not write {path}: {reason}")]
+    Write {
+        /// The file.
+        path: String,
+        /// The underlying message.
+        reason: String,
+    },
+}
+
+/// The `[llm.active]` table for a selection.
+fn selection_table(selection: &ModelSelection) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table.insert("provider", toml_edit::value(&selection.provider));
+    table.insert("model", toml_edit::value(&selection.model));
+    if let Some(temperature) = selection.temperature {
+        table.insert("temperature", toml_edit::value(f64::from(temperature)));
+    }
+    if let Some(max_tokens) = selection.max_tokens {
+        table.insert("max_tokens", toml_edit::value(i64::from(max_tokens)));
+    }
+    if let Some(thinking) = &selection.reasoning {
+        table.insert(
+            "reasoning",
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(thinking_table(thinking))),
+        );
+    }
+    table
+}
+
+/// The inline `{ type = …, value = … }` a thinking setting serialises to.
+fn thinking_table(thinking: &crate::domain::model::Thinking) -> toml_edit::InlineTable {
+    use crate::domain::model::Thinking;
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("type", thinking.kind().into());
+    match thinking {
+        Thinking::Toggle { value } => {
+            table.insert("value", (*value).into());
+        }
+        Thinking::Effort { value } => {
+            table.insert("value", value.as_str().into());
+        }
+        Thinking::BudgetTokens { value } => {
+            table.insert("value", i64::from(*value).into());
+        }
+    }
+    table
 }
 
 /// `[catalog]` (FR-4.7).
@@ -915,14 +1059,19 @@ mod tests {
             provider = "deepseek"
             model = "deepseek-chat"
             temperature = 0.2
-            reasoning = { enabled = true, effort = "medium" }
+            reasoning = { type = "effort", value = "medium" }
             "#,
         );
         assert!(warnings.is_empty(), "{warnings:?}");
         let active = config.llm.active.expect("a selection should be read");
         assert_eq!(active.provider, "deepseek");
         assert_eq!(active.model, "deepseek-chat");
-        assert!(active.reasoning.is_some());
+        assert_eq!(
+            active.reasoning,
+            Some(crate::domain::model::Thinking::Effort {
+                value: "medium".to_owned()
+            })
+        );
     }
 
     #[test]

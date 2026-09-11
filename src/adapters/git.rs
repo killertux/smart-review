@@ -1,17 +1,25 @@
 //! The `git` adapter (ARCH-3).
 //!
-//! M1 uses it to answer "where am I running": the work tree root, the remotes, the
-//! default branch and the git version. M2 adds the worktree operations that
-//! materialise a pull request.
+//! This file answers "where am I running": the work tree root, the remotes, the
+//! default branch and the git version, plus the trait implementation that ties
+//! detection and the worktree operations together. The worktree operations
+//! themselves live in `git/worktree.rs`.
 //!
-//! Every call is read-only. Nothing here can change the user's working tree, index,
-//! HEAD or branches (DEC-1).
+//! Nothing here can change the user's working tree, index, HEAD or branches
+//! (DEC-1); see the module comment in `worktree.rs` for what a managed worktree
+//! does touch.
+
+mod worktree;
 
 use std::path::{Path, PathBuf};
 
 use crate::adapters::process::{CommandSpec, ProcessError, ProcessRunner};
 use crate::logging::{self, Level};
-use crate::ports::workspace::{Remote, RepoInfo, WorkspaceError, WorkspacePort};
+use crate::ports::Cancel;
+use crate::ports::workspace::{
+    DiffRequest, Remote, RepoInfo, Workspace, WorkspaceEntry, WorkspaceError, WorkspacePort,
+    WorkspaceRequest,
+};
 
 /// Runs `git` in a directory.
 #[derive(Debug, Clone)]
@@ -19,6 +27,9 @@ pub struct GitCli {
     runner: ProcessRunner,
     program: PathBuf,
     cwd: Option<PathBuf>,
+    /// Where managed worktrees are created. Absent until the composition root
+    /// wires it in, which is what keeps the M1 detection path working unchanged.
+    worktrees_root: Option<PathBuf>,
 }
 
 impl Default for GitCli {
@@ -35,6 +46,7 @@ impl GitCli {
             runner: ProcessRunner::new().with_timeout(std::time::Duration::from_secs(30)),
             program: PathBuf::from("git"),
             cwd: None,
+            worktrees_root: None,
         }
     }
 
@@ -52,6 +64,13 @@ impl GitCli {
         self
     }
 
+    /// Creates managed worktrees under this directory (FR-3.1, DEC-1).
+    #[must_use]
+    pub fn with_worktrees(mut self, root: impl Into<PathBuf>) -> Self {
+        self.worktrees_root = Some(root.into());
+        self
+    }
+
     /// Builds a command, applying the configured directory.
     fn spec(&self, args: &[&str]) -> CommandSpec {
         let spec = CommandSpec::new(&self.program).args(args);
@@ -59,6 +78,16 @@ impl GitCli {
             Some(dir) => spec.current_dir(dir),
             None => spec,
         }
+    }
+
+    /// The same, with an explicit timeout: `rev-parse` and a network fetch do not
+    /// deserve the same patience (FR-3.1).
+    pub(crate) fn spec_with_timeout(
+        &self,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> CommandSpec {
+        self.spec(args).timeout(timeout)
     }
 
     /// Runs a command, returning `None` when git exits non-zero.
@@ -78,8 +107,13 @@ impl GitCli {
     }
 }
 
-impl WorkspacePort for GitCli {
-    fn detect(&self) -> std::result::Result<RepoInfo, WorkspaceError> {
+impl GitCli {
+    /// Inspects the directory this adapter runs in (FR-1.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError`] when `git` cannot be run at all.
+    pub fn detect(&self) -> std::result::Result<RepoInfo, WorkspaceError> {
         // `--show-toplevel` also fails outside a work tree, which is the answer we
         // want rather than an error.
         let root = self
@@ -137,6 +171,111 @@ impl WorkspacePort for GitCli {
             default_branch,
             git_version,
         })
+    }
+}
+
+impl WorkspacePort for GitCli {
+    fn detect(&self) -> std::result::Result<RepoInfo, WorkspaceError> {
+        Self::detect(self)
+    }
+
+    fn ensure(
+        &self,
+        request: &WorkspaceRequest,
+        cancel: &Cancel,
+    ) -> std::result::Result<Workspace, WorkspaceError> {
+        self.ensure_workspace(request, cancel)
+    }
+
+    fn diff(
+        &self,
+        request: &DiffRequest,
+        cancel: &Cancel,
+    ) -> std::result::Result<String, WorkspaceError> {
+        self.diff_workspace(request, cancel)
+    }
+
+    fn read_file(
+        &self,
+        _repo: &Path,
+        rev: &str,
+        path: &str,
+        cancel: &Cancel,
+    ) -> std::result::Result<Vec<u8>, WorkspaceError> {
+        // `git show <rev>:<path>` reads from the object database, so the answer does
+        // not depend on the worktree's state or on the file still being there
+        // (FR-4.6). A path that is not in the revision is a named error rather than
+        // an empty file, so callers can skip it deliberately.
+        let spec = format!("{rev}:{path}");
+        let command = self
+            .spec(&["show", &spec])
+            .timeout(std::time::Duration::from_secs(60));
+        let output = self
+            .runner
+            .run(&command, cancel)
+            .map_err(ProcessError::into_workspace);
+        match output {
+            Ok(output) if output.success() => Ok(output.stdout_bytes),
+            Ok(_) => Err(WorkspaceError::NotFound {
+                path: path.to_owned(),
+                rev: rev.to_owned(),
+            }),
+            Err(WorkspaceError::Failed(detail)) => {
+                if detail.contains("does not exist")
+                    || detail.contains("exists on disk, but not in")
+                    || detail.contains("unknown revision")
+                    || detail.contains("invalid object name")
+                {
+                    Err(WorkspaceError::NotFound {
+                        path: path.to_owned(),
+                        rev: rev.to_owned(),
+                    })
+                } else {
+                    Err(WorkspaceError::Failed(detail))
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    fn list_files(
+        &self,
+        repo: &Path,
+        rev: &str,
+        cancel: &Cancel,
+    ) -> std::result::Result<Vec<String>, WorkspaceError> {
+        let (ok, stdout, stderr) =
+            self.run_in(repo, &["ls-tree", "-r", "--name-only", rev], cancel)?;
+        if !ok {
+            return Err(WorkspaceError::Failed(stderr.trim().to_owned()));
+        }
+        Ok(stdout
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    fn list(&self) -> std::result::Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        self.list_workspaces()
+    }
+
+    fn remove(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        number: u64,
+        cancel: &Cancel,
+    ) -> std::result::Result<(), WorkspaceError> {
+        let path = self.worktree_path(repo, number).ok_or_else(|| {
+            WorkspaceError::Failed("no worktree directory is configured".to_owned())
+        })?;
+        // The ref is deleted first, while the worktree still resolves to the
+        // repository that owns both: afterwards there is nothing left to run git in
+        // when the app was started from a different checkout.
+        self.delete_head_ref(repo, number, cancel);
+        self.drop_worktree(&path, cancel)?;
+        Ok(())
     }
 }
 

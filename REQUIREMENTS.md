@@ -1,6 +1,6 @@
 # Smart Review — Requirements Specification
 
-**Status:** Draft v0.7 (DEC-1 … DEC-6, DEC-20, DEC-21 resolved; DEC-7 … DEC-19 pending, each with a proposed default). M1 is implemented; §5's keymap reflects it.
+**Status:** Draft v0.8 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M1 and M2a are implemented; §5's keymap reflects them. M2b (analysis and review order) is next.
 **Scope:** v1 (MVP) + post-v1 backlog
 **Source of truth:** this file. If code and this file disagree, the file wins or the file is updated in the same change.
 
@@ -256,7 +256,7 @@ Acceptance criteria:
 - [ ] The picker offers only the controls the model declares in `reasoning_options`: `toggle` → on/off, `effort` → only the declared values, `budget_tokens` → a token-budget input. A model with `reasoning: false` MUST NOT offer any thinking control.
 - [ ] Mapping onto the `llm` crate is explicit and documented (Appendix B): toggle → `.reasoning(bool)`, effort → `.reasoning_effort(..)`, budget → `.reasoning_budget_tokens(u32)`. Where the crate cannot express a catalog option (e.g. an `effort` value the crate does not model), the app MUST refuse the combination with an explanation instead of silently downgrading it.
 - [ ] Reasoning token consumption from the provider is displayed alongside the response's token usage (the crate exposes `usage.reasoning_tokens`).
-- [ ] **v1 does not display the reasoning/thinking trace.** The `llm` crate returns only assistant text and tool calls (`StreamDelta` carries `content` and `tool_calls` only), so the UI MUST NOT imply a trace is viewable when thinking is on. (Displaying it is DEC-18.)
+- [ ] **v1 does not display the reasoning/thinking trace.** Nothing streams reasoning (`StreamDelta` carries `content` and `tool_calls` only), and only the Anthropic backend's non-streamed response exposes one, so the UI MUST NOT imply a trace is viewable when thinking is on. (Displaying it is DEC-18; Appendix B records what the pinned crate exposes as of M2a.)
 - [ ] Thinking settings are part of the analysis cache key (FR-4.3), so flipping thinking never yields a stale cache hit.
 - [ ] Thinking changes are shown in the status line so the user can never be unsure which mode produced an answer.
 
@@ -891,9 +891,9 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | **DEC-14** | Offline behavior: read-only cached mode (proposed) or hard failure with a retry? | **Cached read-only mode** with an offline indicator; publishing and analysis disabled. | FR-2.3, NFR-4.1, user trust. |
 | **DEC-15** | When a workspace must be re-fetched after new commits, do we auto-refresh the analysis (costs money) or ask? | **Ask**, showing the new commit range and the cost implication. | FR-4.3, UX trust. |
 | **DEC-16** | Scope of comment targets: PR conversation comments (top-level) in addition to inline and review-body? | Inline + review body in v1; top-level PR comments are M5. | FR-6.1/6.3, `gh` surface. |
-| **DEC-17** | How do catalog provider ids (213 of them) map onto `llm` crate backends? | **Curated mapping** for the crate's native backends (openrouter, deepseek, openai, anthropic, google, groq, mistral, xai, ollama, …), and **OpenAI-compatible passthrough** using the catalog's `api` base URL + `env` key for the rest. Providers needing special auth (Bedrock, Vertex, Azure) are excluded in v1. | FR-4.5, FR-4.7, ARCH-2 `ModelCatalogPort`, surface area and support burden. |
+| **DEC-17** | *(decided)* How do catalog provider ids (213 of them) map onto `llm` crate backends? | **Curated mapping** for the crate's native backends (openrouter, deepseek, openai, anthropic, google, groq, mistral, xai, ollama, …), and **OpenAI-compatible passthrough** using the catalog's `api` base URL + `env` key for the rest. Providers needing special auth (Bedrock, Vertex, Azure) are excluded in v1. | FR-4.5, FR-4.7, ARCH-2 `ModelCatalogPort`, surface area and support burden. |
 | **DEC-18** | Should the reasoning/thinking trace be displayed in the UI? | **No in v1** — the `llm` crate exposes only assistant text and tool calls. Revisit if upstream surfaces `reasoning_content`, or via a dedicated provider adapter. Until then the UI shows thinking *settings* and *token counts* only. | FR-4.8, prompt/UX expectations, possible upstream contribution. |
-| **DEC-19** | How does the model picker write `[llm.active]` back without destroying the user's file? | **Add `toml_edit` in M2** and edit the document in place, so comments and formatting survive. Alternative: keep never writing configuration and require the user to edit it by hand. `toml` 1.x has no comment-preserving API (verified at M0). | FR-4.5, FR-8.2, FR-8.6, the M2 dependency ledger in PLAN.md §5. |
+| **DEC-19** | *(decided)* How does the model picker write `[llm.active]` back without destroying the user's file? | **Add `toml_edit` in M2** and edit the document in place, so comments and formatting survive. Alternative: keep never writing configuration and require the user to edit it by hand. `toml` 1.x has no comment-preserving API (verified at M0). | FR-4.5, FR-8.2, FR-8.6, the M2 dependency ledger in PLAN.md §5. |
 | **DEC-20** | `?` was listed both as help and as backward search. Which wins? | **Help.** `?` is the TUI convention for the keybinding popup and the app already shows `? help` in its status line. Backward search entry is dropped; `N` repeats a search backwards, and `/` re-opens the prompt. Recorded because the same key cannot mean two things and silently picking one later would change a habit. | FR-7.3, FR-7.4, the §5.4 keymap. |
 | **DEC-21** | Are the diff options a submenu popup or leader continuations? | **Continuations**: `<leader>d s`, `<leader>d c`, `<leader>d w`. The keymap engine already resolves multi-key sequences and the leader menu lists them, so a popup would add a mode for no gain. The cost is that `<leader>d` alone does nothing (like vim's `g`), which the leader menu makes discoverable. | FR-3.2, FR-3.3, FR-7.2, the §5.4 keymap. |
 
@@ -906,7 +906,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | — | DEC-4 | Unified diff by default, side-by-side toggle at ≥140 cols, no syntax highlighting in v1. | owner |
 | — | DEC-5 | Provider/model/thinking are configured **inside the TUI**; keys are entered there and saved to `credentials.toml` (0600), with env vars as an override. | owner |
 | — | DEC-6 | No default provider or model. The user must configure one; the model list comes from `https://models.dev/api.json`, which also drives thinking options, limits and cost. | owner |
-| — | DEC-19 (proposed) | Config write-back in M2 needs `toml_edit` to preserve comments; recorded here so the dependency is approved with the M2 batch rather than discovered mid-implementation. | — |
+| — | DEC-19 (decided) | Config write-back in M2a needs `toml_edit` to preserve comments; recorded here so the dependency is approved with the M2 batch rather than discovered mid-implementation. | — |
 
 ---
 
@@ -941,9 +941,9 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 - Features include `openrouter` and `deepseek` (plus `openai`, `anthropic`, `google`, `groq`, `mistral`, `xai`, `ollama`, `cohere`, `huggingface`, `azure_openai`, `bedrock`, …). The crate is async and needs a tokio runtime (ARCH-5).
 - Metadata is provided by `src/bin/llm-cli/provider/registry.rs` and `capabilities.rs`; check the `SUPPORTS_REASONING_EFFORT` capability flag before offering effort for a provider.
 - **Reasoning is supported outbound:** `LLMBuilder::reasoning(bool)`, `.reasoning_effort(ReasoningEffort::{Low,Medium,High})`, `.reasoning_budget_tokens(u32)`; `Usage.reasoning_tokens` reports reasoning consumption. `ReasoningEffort` lives in `llm::chat`.
-- **Reasoning text is not returned.** `StreamDelta` has only `content` and `tool_calls`; there is no `reasoning_content` field on the response or stream types. This is why FR-4.8 forbids promising a visible thinking trace (DEC-18).
+- **Reasoning text is returned by *some* backends, verified at M2a against 1.3.8.** `StreamDelta` has only `content` and `tool_calls`, so nothing streams reasoning; the non-streamed `ChatResponse` trait has a `thinking()` hook that the **Anthropic** backend implements (from `type: "thinking"` content blocks) and the OpenAI-compatible path does not. `adapters/llm.rs` therefore passes a trace through when one is present and never claims one exists. FR-4.8's rule stands as written: the UI MUST NOT imply a trace is viewable (DEC-18), and this is the state to revisit if a `reasoning_content` field appears upstream — models.dev already publishes which providers stream it (`interleaved.field`).
 - Note the crate offers only three effort levels, while the catalog may advertise values such as `max` or `budget_tokens`. The mapping and its refusals are specified in FR-4.8.
-- Re-export paths and the streaming API MUST be re-verified at M2 against the pinned version and recorded here.
+- Re-export paths and the streaming API were re-verified at M2a against `llm` 1.3.8 and are as recorded here. `LLMBuilder` is reached at `llm::builder::{LLMBuilder, LLMBackend}` and the chat traits at `llm::chat::*`; the crate's `providers::openai_compatible` module is the shared implementation behind the passthrough route (DEC-17), which is why `LLMBackend::OpenAI` with an explicit `base_url` covers the OpenAI-compatible providers.
 
 ### B.2 Request shaping
 - Analysis = one async request returning JSON (schema §7.1) with a repair retry; per-file explanation = one small request per file, cached individually (FR-4.1); chat = streaming, history trimmed per FR-4.6.
