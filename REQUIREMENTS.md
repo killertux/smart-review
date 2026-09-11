@@ -1,6 +1,6 @@
 # Smart Review — Requirements Specification
 
-**Status:** Draft v0.5 (DEC-1 … DEC-6 resolved; DEC-7 … DEC-19 pending, each with a proposed default)
+**Status:** Draft v0.6 (DEC-1 … DEC-6, DEC-20, DEC-21 resolved; DEC-7 … DEC-19 pending, each with a proposed default)
 **Scope:** v1 (MVP) + post-v1 backlog
 **Source of truth:** this file. If code and this file disagree, the file wins or the file is updated in the same change.
 
@@ -670,15 +670,21 @@ Default bindings (all remappable; this is the compiled-in default set):
 | `<C-d>` `<C-u>` | `nav.half_down` / `nav.half_up` | |
 | `<C-f>` `<C-b>` | `nav.page_down` / `nav.page_up` | |
 | `Enter` | `nav.open` | open PR / open file |
-| `Esc`, `q` | `nav.back` | popup/file → list → (confirms) quit |
-| `/` `?` | `search.open` (forward/back) | |
+| `Esc` | `nav.back` | popup → diff → list; on the list it clears filters and search |
+| `/` | `search.open` | incremental, client side (DEC-20) |
+| `Esc` | `search.close` | |
 | `n` `N` | `search.next` / `search.prev` | |
 | `:` | `app.command` | |
-| `?` | `app.help` | (also `<leader>?`) |
-| `<leader>` | `app.leader_menu` | on timeout, no continuation |
+| `?` | `app.help` | also `<leader>?`; `?` is *not* backward search (DEC-20) |
+| `<leader>` | `app.leader_menu` | shown immediately, sequence stays open (FR-7.3) |
+| `Enter` | `nav.open` | open the selected PR |
+| `<Tab>` | `pane.next` | tree ↔ diff (in the review screen) |
 | `] c` `[ c` | `diff.next_hunk` / `diff.prev_hunk` | diff |
 | `} {` | `diff.next_file` / `diff.prev_file` | diff |
-| `z a` | `diff.toggle_hunk` | diff |
+| `z a` | `diff.toggle_hunk` | diff; on a file banner, the whole file |
+| `<leader> d s` | `diff.toggle_split` | needs ≥ 140 columns (DEC-4, DEC-21) |
+| `<leader> d c` | `diff.cycle_context` | 3 → 10 → 0 → 3; 0/3 are local-mode only |
+| `<leader> d w` | `diff.toggle_whitespace` | local mode only; explains itself otherwise |
 | `o` | `review_order.toggle` | diff |
 | `c` | `review.comment_line` | diff (normal) |
 | `v` | `visual.start` | diff |
@@ -686,16 +692,15 @@ Default bindings (all remappable; this is the compiled-in default set):
 | `q` / `:q` / `:qa` | `app.quit` | |
 | `<leader> a` | `llm.analyze` | |
 | `<leader> c` | `chat.open` | |
-| `<leader> d` | `diff.menu` | split/context/whitespace |
 | `<leader> T` | `theme.toggle` | next theme, wrapping |
-| `<leader> f` | `filter.menu` | |
+| `<leader> f` | `filter.menu` | opens `:filter ` on the command line |
 | `<leader> l` | `review_order.menu` | |
 | `<leader> r r` | `review.publish` | |
 | `<leader> r a` | `review.approve` | sets decision |
 | `<leader> r c` | `review.request_changes` | |
 | `<leader> r m` | `review.comment_only` | |
 | `<leader> r x` | `review.discard` | with confirmation |
-| `<leader> s` | `sort.menu` | |
+| `<leader> s` | `sort.menu` | opens `:sort ` on the command line |
 | `<leader> m` | `model.picker` | provider → model → thinking |
 | `<leader> t` | `theme.picker` | |
 | `<leader> w` | `workspace.menu` | refresh/clean |
@@ -889,6 +894,8 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | **DEC-17** | How do catalog provider ids (213 of them) map onto `llm` crate backends? | **Curated mapping** for the crate's native backends (openrouter, deepseek, openai, anthropic, google, groq, mistral, xai, ollama, …), and **OpenAI-compatible passthrough** using the catalog's `api` base URL + `env` key for the rest. Providers needing special auth (Bedrock, Vertex, Azure) are excluded in v1. | FR-4.5, FR-4.7, ARCH-2 `ModelCatalogPort`, surface area and support burden. |
 | **DEC-18** | Should the reasoning/thinking trace be displayed in the UI? | **No in v1** — the `llm` crate exposes only assistant text and tool calls. Revisit if upstream surfaces `reasoning_content`, or via a dedicated provider adapter. Until then the UI shows thinking *settings* and *token counts* only. | FR-4.8, prompt/UX expectations, possible upstream contribution. |
 | **DEC-19** | How does the model picker write `[llm.active]` back without destroying the user's file? | **Add `toml_edit` in M2** and edit the document in place, so comments and formatting survive. Alternative: keep never writing configuration and require the user to edit it by hand. `toml` 1.x has no comment-preserving API (verified at M0). | FR-4.5, FR-8.2, FR-8.6, the M2 dependency ledger in PLAN.md §5. |
+| **DEC-20** | `?` was listed both as help and as backward search. Which wins? | **Help.** `?` is the TUI convention for the keybinding popup and the app already shows `? help` in its status line. Backward search entry is dropped; `N` repeats a search backwards, and `/` re-opens the prompt. Recorded because the same key cannot mean two things and silently picking one later would change a habit. | FR-7.3, FR-7.4, the §5.4 keymap. |
+| **DEC-21** | Are the diff options a submenu popup or leader continuations? | **Continuations**: `<leader>d s`, `<leader>d c`, `<leader>d w`. The keymap engine already resolves multi-key sequences and the leader menu lists them, so a popup would add a mode for no gain. The cost is that `<leader>d` alone does nothing (like vim's `g`), which the leader menu makes discoverable. | FR-3.2, FR-3.3, FR-7.2, the §5.4 keymap. |
 
 ### 11.1 Decision log
 | Date | ID | Decision | By |
