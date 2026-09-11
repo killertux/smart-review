@@ -54,7 +54,12 @@ impl Columns {
         }
     }
 
-    /// Total columns the table needs, which a narrow pane is not allowed to exceed.
+    /// Total columns the table needs, which a narrow pane must not exceed.
+    ///
+    /// Only the tests ask: the rule under the header spans the pane, so the table's
+    /// own width is never needed to draw, but it *is* what a narrow terminal has to
+    /// fit into.
+    #[cfg(test)]
     fn total(&self) -> usize {
         2 + self.number
             + 1
