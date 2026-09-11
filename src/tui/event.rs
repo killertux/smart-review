@@ -5,5 +5,6 @@
 //! and never handled here (ARCH-5).
 
 pub use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind, poll, read,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    poll, read,
 };

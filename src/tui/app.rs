@@ -13,17 +13,23 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 
 use crate::Startup;
+use crate::application::prs::FetchOutcome;
 use crate::config::{Config, ConfigDocument};
 use crate::doctor::{Check, Context};
+use crate::domain::environment::{Environment, EnvironmentError};
+use crate::domain::pr::PullRequestDetail;
 use crate::error::Result;
 use crate::logging::{self, Level};
 use crate::paths::Home;
 use crate::state::AppState;
 use crate::tui::action;
 use crate::tui::components;
-use crate::tui::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::tui::diff_view::DiffView;
+use crate::tui::event::{self, KeyCode, KeyEvent, KeyModifiers};
+use crate::tui::jobs::{self, Completion, Outcome};
 use crate::tui::keymap::{self, KeyCombo, Keymap, Mode, Resolution};
 use crate::tui::layout;
+use crate::tui::list_view::PrListState;
 use crate::tui::theme::{self, Theme};
 use crate::tui::update;
 
@@ -37,7 +43,7 @@ const MAX_NOTICES: usize = 3;
 pub(crate) const PALETTE_ROWS: usize = 3;
 
 /// What resolving the pending key sequence produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
     /// A binding matched; the effect is what it asked for.
     Fired(Effect),
@@ -52,7 +58,7 @@ enum Step {
 /// Actions are mutually exclusive in M0: the only action that keeps a pending
 /// sequence is the leader menu, and the only ones that need the loop are a theme
 /// change (persist it) and `:doctor` (probe off the event loop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Effect {
     /// Nothing to do; the pending key sequence is finished with.
     #[default]
@@ -63,6 +69,21 @@ pub enum Effect {
     SaveState,
     /// Collect the environment report off the event loop.
     RunDoctor,
+    /// Work out where we are running and whether the forge is usable (FR-1.1).
+    DetectEnvironment,
+    /// Fetch the first page of the current query (FR-2.1).
+    LoadPullRequests,
+    /// Fetch the next page, up to the configured cap (FR-2.1).
+    LoadMore,
+    /// Fetch the exact number of matches, which a full page makes necessary
+    /// (FR-2.1).
+    CountPullRequests,
+    /// Open a pull request: its detail, then its diff (FR-2.4, FR-3.2).
+    OpenPullRequest(u64),
+    /// Re-fetch the diff of the open pull request, for a context change (FR-3.2).
+    ReloadDiff,
+    /// Put a path on the clipboard through the terminal (FR-3.4).
+    CopyPath(String),
 }
 
 /// What this build can show, so the shell is honest about being a shell.
@@ -282,6 +303,30 @@ pub struct App {
     theme_before_picker: Option<(Theme, String)>,
     /// Restricts the help popup to one action, set by `:keymap <action>`.
     pub(crate) help_filter: Option<String>,
+    /// What detection resolved, once it has run (FR-1.1).
+    pub(crate) environment: Option<Environment>,
+    /// Why detection failed, when it did.
+    pub(crate) environment_error: Option<EnvironmentError>,
+    /// Whether detection is still running.
+    pub(crate) environment_running: bool,
+    /// The pull request list (FR-2.1).
+    pub(crate) list: PrListState,
+    /// The detail of the open pull request (FR-2.4).
+    pub(crate) detail: Option<PullRequestDetail>,
+    /// The review view, present when a pull request is open (FR-3.3).
+    pub(crate) review: Option<DiffView>,
+    /// Whether the diff is still being fetched.
+    pub(crate) diff_loading: bool,
+    /// Why the shown diff came from the cache, when it did (DEC-14).
+    pub(crate) diff_offline: Option<String>,
+    /// The job id of the newest list request, so a superseded answer is dropped.
+    pub(crate) list_job: u64,
+    /// The job id of the newest count request.
+    pub(crate) count_job: u64,
+    /// The job id of the newest detail request.
+    pub(crate) detail_job: u64,
+    /// The job id of the newest diff request.
+    pub(crate) patch_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
     /// The last doctor report, delivered by a job (FR-9.3).
@@ -295,6 +340,15 @@ pub struct App {
     now_unix_secs: u64,
     /// Unix time the interface started.
     started_at: u64,
+    /// The width of the last frame.
+    last_width: u16,
+    /// The first row of the list pane, in terminal coordinates, learned from the
+    /// last frame so a click can be placed (FR-7.5).
+    list_top: u16,
+    /// The first row of the review panes.
+    review_top: u16,
+    /// The width of the file tree, which separates the two review panes.
+    tree_width: u16,
     /// Set when the user asks to quit.
     pub(crate) quit: bool,
 }
@@ -333,6 +387,16 @@ impl App {
         // One directory read, before the terminal is taken over, so cycling
         // themes later is pure computation.
         let theme_names = theme::available(&home);
+        let list = PrListState::new(
+            u32::try_from(config.review.page_size).unwrap_or(50),
+            u32::try_from(
+                config
+                    .review
+                    .page_size
+                    .saturating_mul(config.review.max_pages.max(1)),
+            )
+            .unwrap_or(500),
+        );
 
         let mut app = Self {
             home,
@@ -346,6 +410,18 @@ impl App {
             theme_source,
             theme_request,
             theme_names,
+            environment: None,
+            environment_error: None,
+            environment_running: true,
+            list,
+            detail: None,
+            review: None,
+            diff_loading: false,
+            diff_offline: None,
+            list_job: 0,
+            count_job: 0,
+            detail_job: 0,
+            patch_job: 0,
             state,
             warnings,
             repo,
@@ -370,6 +446,12 @@ impl App {
             doctor_job: 0,
             now_unix_secs: 0,
             started_at: 0,
+            // Zero until a frame has been drawn: a width that was never measured
+            // must not be used to decide anything.
+            last_width: 0,
+            list_top: 0,
+            review_top: 0,
+            tree_width: 30,
             quit: false,
         };
         app.report_startup_warnings();
@@ -437,26 +519,376 @@ impl App {
             keymap: self.keymap.clone(),
             theme: self.theme.clone(),
             theme_source: self.theme_source.clone(),
+            config_keys: self.document_key_count(),
         }
     }
 
     /// Records the current time, called once per loop iteration by the loop.
-    pub(crate) fn set_now(&mut self, now_unix_secs: u64) {
+    /// The clock as of this loop iteration, for components that show ages.
+    #[must_use]
+    pub fn now(&self) -> crate::domain::time::Timestamp {
+        chrono::DateTime::from_timestamp(i64::try_from(self.now_unix_secs).unwrap_or(0), 0)
+            .unwrap_or_default()
+    }
+
+    /// Replaces the pull request list (FR-2.1).
+    ///
+    /// The loop reaches this through [`Self::apply_completion`]; it is public so a
+    /// rendered frame can be tested against a known list, the same way
+    /// [`Self::open_review`] makes the review screen testable.
+    pub fn set_pull_requests(&mut self, page: crate::ports::forge::PullRequestPage) {
+        self.list.replace(page);
+    }
+
+    /// Opens the review screen for a detail and its diff (FR-3.3).
+    pub fn open_review(&mut self, detail: PullRequestDetail, view: DiffView) {
+        self.detail = Some(detail);
+        self.review = Some(view);
+        self.focus = Pane::Diff;
+        self.diff_loading = false;
+    }
+
+    /// Closes the review screen and returns to the list (FR-3.4).
+    pub fn close_review(&mut self) -> bool {
+        if self.review.is_none() {
+            return false;
+        }
+        self.review = None;
+        self.detail = None;
+        self.diff_offline = None;
+        self.diff_loading = false;
+        self.focus = Pane::PullRequests;
+        true
+    }
+
+    /// Whether a pull request is open, which decides which screen is drawn.
+    #[must_use]
+    pub fn review_screen(&self) -> Option<&DiffView> {
+        self.review.as_ref()
+    }
+
+    /// Replaces the review view, keeping the detail it belongs to.
+    pub fn set_review(&mut self, view: DiffView) {
+        self.review = Some(view);
+    }
+
+    /// The open review view for editing, if any.
+    pub fn review_mut(&mut self) -> Option<&mut DiffView> {
+        self.review.as_mut()
+    }
+
+    /// Remembers which job a request became, so a superseded answer can be dropped.
+    pub fn record_job(&mut self, effect: &Effect, id: u64) {
+        match effect {
+            Effect::LoadPullRequests | Effect::LoadMore => {
+                self.list_job = id;
+                self.list.loading = true;
+                self.list.error = None;
+            }
+            Effect::CountPullRequests => {
+                self.count_job = id;
+                self.list.counting = true;
+            }
+            Effect::OpenPullRequest(_) => {
+                self.detail_job = id;
+                self.diff_loading = true;
+            }
+            Effect::RunDoctor => self.doctor_job = id,
+            // Detection has no id to remember (there is only ever one, and its result
+            // is applied regardless), and the rest ask for no job at all.
+            _ => {}
+        }
+    }
+
+    /// Applies the result of a background job (ARCH-5).
+    ///
+    /// Returns what the loop should do next, if the result makes something else
+    /// necessary: opening a pull request needs its diff, a truncated list needs its
+    /// count, and so on. The reducer stays the only thing that decides, and it still
+    /// performs no IO.
+    pub fn apply_completion(&mut self, completion: jobs::Completion) -> Option<Effect> {
+        let Completion { job, outcome } = completion;
+
+        match outcome {
+            Outcome::Environment(environment) => {
+                // A stale detection result cannot happen: there is only ever one.
+                self.set_environment(*environment);
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "reading {} as {}",
+                        self.environment
+                            .as_ref()
+                            .map_or_else(String::new, |env| env.repo.slug()),
+                        self.environment
+                            .as_ref()
+                            .and_then(|env| env.gh.account.clone())
+                            .unwrap_or_else(|| "an unknown account".to_owned())
+                    ),
+                );
+                Some(Effect::LoadPullRequests)
+            }
+            Outcome::EnvironmentFailed(error) => {
+                self.set_environment_error(*error);
+                None
+            }
+            Outcome::Page(outcome) if job == self.list_job => {
+                // A full page means the total is unknown, so it is asked for
+                // separately rather than guessed at (FR-2.1).
+                let wanted_count =
+                    outcome.value().total.is_none() && outcome.value().may_have_more();
+                self.list.offline = outcome.offline_reason().map(str::to_owned);
+                match *outcome {
+                    FetchOutcome::Fresh(page) => self.list.replace(page),
+                    FetchOutcome::Offline { value, .. } => self.list.replace(value),
+                }
+                if wanted_count {
+                    Some(Effect::CountPullRequests)
+                } else {
+                    None
+                }
+            }
+            Outcome::Count(count) if job == self.count_job => {
+                self.list.set_total(count);
+                None
+            }
+            Outcome::Detail(outcome) if job == self.detail_job => {
+                self.diff_offline = outcome.offline_reason().map(str::to_owned);
+                let detail = outcome.into_value();
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "opened #{} · {} commit(s) · {} file(s)",
+                        detail.summary.number,
+                        detail.commits.len(),
+                        detail.summary.changed_files
+                    ),
+                );
+                self.detail = Some(detail);
+                Some(Effect::ReloadDiff)
+            }
+            Outcome::Patch(outcome) if job == self.patch_job => {
+                self.diff_offline = outcome.offline_reason().map(str::to_owned);
+                let patch = outcome.into_value();
+                let view = DiffView::with_options(
+                    patch,
+                    self.config.review.context_lines,
+                    self.config.review.ignore_whitespace,
+                );
+                let files = view.patch.stats();
+                match self.detail.take() {
+                    Some(detail) => self.open_review(detail, view),
+                    None => self.set_review(view),
+                }
+                self.notice(
+                    NoticeLevel::Info,
+                    format!("{} · {}", files.label(), self.list.status_label()),
+                );
+                None
+            }
+            Outcome::Checks(checks) => {
+                self.apply_checks(job, checks);
+                None
+            }
+            Outcome::Failed(message) => {
+                self.report_job_failure(job, &message);
+                None
+            }
+            // A result whose id has been superseded, or a job the user abandoned:
+            // dropped rather than painted over a fresher answer. The arms that carry
+            // an id are above, with their guards.
+            Outcome::Page(_)
+            | Outcome::Count(_)
+            | Outcome::Detail(_)
+            | Outcome::Patch(_)
+            | Outcome::Abandoned => None,
+        }
+    }
+
+    /// Records a job failure where the user will see it.
+    fn report_job_failure(&mut self, job: u64, message: &str) {
+        if job == self.list_job {
+            self.list.loading = false;
+            self.list.counting = false;
+            self.list.error = Some(message.to_owned());
+        } else if job == self.detail_job || job == self.patch_job {
+            self.diff_loading = false;
+            self.notice(NoticeLevel::Error, format!("could not open it: {message}"));
+        } else if job == self.count_job {
+            // A missing count is not worth a notification: the list already says
+            // "showing 50 of ≥50", which is true.
+            self.list.counting = false;
+        } else {
+            self.notice(NoticeLevel::Error, message.to_owned());
+        }
+        logging::log(Level::Warn, format!("job failed: {message}"));
+    }
+
+    /// Handles a mouse event (FR-7.5).
+    ///
+    /// The wheel scrolls whatever the pointer is over, and a click focuses the pane
+    /// and moves the selection to the row under the pointer.
+    pub fn on_mouse(&mut self, event: event::MouseEvent) -> Effect {
+        match event.kind {
+            event::MouseEventKind::ScrollDown => {
+                self.scroll_at(event.column, event.row, 1);
+                Effect::None
+            }
+            event::MouseEventKind::ScrollUp => {
+                self.scroll_at(event.column, event.row, -1);
+                Effect::None
+            }
+            event::MouseEventKind::Down(event::MouseButton::Left) => {
+                self.click_at(event.column, event.row);
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
+    /// Scrolls the pane under the pointer.
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) {
+        let pane = self.pane_at(column, row).unwrap_or(self.focus);
+        match pane {
+            Pane::PullRequests => {
+                self.list.move_cursor(delta * 3);
+                self.focus = Pane::PullRequests;
+            }
+            Pane::Diff => {
+                if let Some(view) = self.review.as_mut() {
+                    // The tree and the diff are both in the right-hand region; the
+                    // tree is the narrow left one.
+                    if column < self.tree_width {
+                        view.tree_focused = true;
+                        view.move_tree(delta * 3);
+                    } else {
+                        view.tree_focused = false;
+                        view.move_by(delta * 3);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Focuses the pane under the pointer and moves its cursor to the row clicked.
+    fn click_at(&mut self, column: u16, row: u16) {
+        let Some(pane) = self.pane_at(column, row) else {
+            return;
+        };
+        self.focus = pane;
+        match pane {
+            Pane::PullRequests => {
+                // The panes start below the header, the filter bar and the table
+                // header, which is three rows plus one for the border.
+                let offset = row.saturating_sub(self.list_top + 3);
+                if self.review.is_none() {
+                    self.list.move_cursor(i32::from(offset));
+                }
+            }
+            Pane::Diff => {
+                if let Some(view) = self.review.as_mut() {
+                    if column < self.tree_width {
+                        view.tree_focused = true;
+                        let offset = row.saturating_sub(self.review_top + 1);
+                        view.move_tree(i32::from(offset));
+                    } else {
+                        view.tree_focused = false;
+                        let offset = row.saturating_sub(self.review_top + 1);
+                        view.move_by(i32::from(offset));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Which pane a terminal coordinate is in, if any.
+    fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
+        if self.review.is_some() {
+            if row < self.review_top {
+                return None;
+            }
+            return Some(Pane::Diff);
+        }
+        if row < self.list_top + 1 {
+            return None;
+        }
+        if column < self.tree_width && self.review.is_some() {
+            return Some(Pane::Diff);
+        }
+        Some(Pane::PullRequests)
+    }
+
+    /// Records the pane geometry of the last frame, so a mouse event can be placed.
+    ///
+    /// Called from `render`, which is where the sizes are known. It is arithmetic
+    /// only: the render path still performs no IO.
+    fn record_geometry(&mut self, area: ratatui::layout::Rect) {
+        self.last_width = area.width;
+        self.list_top = area.y;
+        self.tree_width = crate::tui::components::review::TREE_WIDTH;
+        self.review_top = area.y + 1;
+    }
+
+    /// Recomputes the scroll offsets for the panes that are about to be drawn.
+    fn sync_scroll(&mut self, area: ratatui::layout::Rect) {
+        if let Some(view) = self.review.as_mut() {
+            let body = area.height.saturating_sub(1);
+            let inner = body.saturating_sub(2);
+            view.prepare(inner, inner);
+        }
+    }
+
+    /// Opens the command line with a prefix already typed (FR-7.4).
+    ///
+    /// Used by `<leader>f` and `<leader>s`, which are shortcuts for a command rather
+    /// than a second implementation of one.
+    pub fn open_command(&mut self, prefix: &str) {
+        self.cancel_overlay();
+        self.command.clear();
+        for character in prefix.chars() {
+            self.command.push(character);
+        }
+        self.mode = Mode::Command;
+    }
+
+    /// The terminal width of the last frame.
+    ///
+    /// Wrapping a toggle needs the width the *user* has, and only the renderer knows
+    /// it; it is recorded rather than guessed at.
+    #[must_use]
+    pub fn terminal_width(&self) -> u16 {
+        self.last_width
+    }
+
+    /// Records that the environment was resolved (FR-1.1).
+    pub fn set_environment(&mut self, environment: Environment) {
+        self.environment = Some(environment);
+        self.environment_error = None;
+        self.environment_running = false;
+    }
+
+    /// Records that the environment could not be resolved (FR-1.1).
+    pub fn set_environment_error(&mut self, error: EnvironmentError) {
+        self.environment_error = Some(error);
+        self.environment_running = false;
+    }
+
+    /// Sets the clock for this iteration of the event loop.
+    ///
+    /// The reducer never reads the clock itself, so this is how "now" reaches it —
+    /// and how a test can render the same frame twice.
+    pub fn set_now(&mut self, now_unix_secs: u64) {
         if self.started_at == 0 {
             self.started_at = now_unix_secs;
         }
         self.now_unix_secs = now_unix_secs;
     }
 
-    /// Seconds since the interface started.
-    pub(crate) fn uptime_secs(&self) -> u64 {
-        self.now_unix_secs.saturating_sub(self.started_at)
-    }
-
     /// How many keys the configuration document holds, including the ones this
     /// build does not understand (FR-8.6).
-    pub(crate) fn document_key_count(&self) -> usize {
-        self.document.value().values().map(count_keys).sum()
+    #[must_use]
+    pub fn document_key_count(&self) -> usize {
+        self.document.key_count()
     }
 
     /// Adds a notification to the status line (FR-7.6).
@@ -708,8 +1140,9 @@ impl App {
         let combo = keymap::normalize(KeyCombo::from(event));
         match self.mode {
             Mode::Command => self.on_command_key(combo),
+            Mode::Search => self.on_search_key(combo),
             Mode::Popup => self.on_popup_key(combo),
-            Mode::Normal | Mode::Insert | Mode::Search | Mode::Visual => self.on_normal_key(combo),
+            Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
     }
 
@@ -747,43 +1180,24 @@ impl App {
         }
     }
 
-    /// Marks the doctor job as started and opens the popup (FR-9.3).
-    ///
-    /// Returns the job id so the event loop can tag the report: a report from a
-    /// superseded job must not be applied.
-    pub(crate) fn start_doctor(&mut self) -> u64 {
-        self.doctor_job = self.doctor_job.wrapping_add(1);
+    /// Opens the doctor popup and marks the report as being collected (FR-9.3).
+    pub(crate) fn start_doctor(&mut self) {
         self.checks = Vec::new();
         self.doctor_running = true;
         self.open_overlay(Overlay::Doctor);
         self.notice(NoticeLevel::Info, "collecting the environment report…");
-        self.doctor_job
-    }
-
-    /// The id of the most recent doctor request.
-    pub(crate) const fn doctor_job(&self) -> u64 {
-        self.doctor_job
     }
 
     /// Delivers a doctor report collected off the event loop (FR-9.3).
+    ///
+    /// The job id is checked because a report for a superseded request must not
+    /// replace a newer one.
     pub(crate) fn apply_checks(&mut self, job: u64, checks: Vec<Check>) {
         if job != self.doctor_job {
-            return; // a superseded report
+            return;
         }
         self.checks = checks;
         self.doctor_running = false;
-    }
-
-    /// The doctor job died without reporting, so stop waiting for it.
-    pub(crate) fn abort_doctor_job(&mut self) {
-        if self.doctor_running {
-            self.doctor_running = false;
-            self.notice(
-                NoticeLevel::Error,
-                "the environment report could not be collected",
-            );
-        }
-        self.doctor_job = self.doctor_job.wrapping_add(1);
     }
 
     /// Surfaces the startup warnings without consuming them: the shell pane and
@@ -1011,6 +1425,48 @@ impl App {
         };
     }
 
+    /// Typing in the `/` box filters the loaded list as the user types (FR-2.2).
+    ///
+    /// Ordinary characters are text, exactly as on the command line: a search for
+    /// "n" must not jump to the next match, and a search for "x" must not clear the
+    /// filters. Only a modified key can be a binding here.
+    fn on_search_key(&mut self, combo: KeyCombo) -> Effect {
+        if let Some(action) = self.global_action(combo) {
+            return update::dispatch(self, &action);
+        }
+        if combo.code == KeyCode::Esc || combo.code == KeyCode::Enter {
+            self.mode = Mode::Normal;
+            return Effect::None;
+        }
+
+        match combo.code {
+            KeyCode::Backspace => {
+                let mut text = self.list.search.clone();
+                text.pop();
+                self.list.set_search(&text);
+                self.list.offline = None;
+                Effect::None
+            }
+            // Ctrl-U clears the box, which is the one shortcut worth having while
+            // typing in it.
+            KeyCode::Char('u') if combo.modifiers == KeyModifiers::CONTROL => {
+                self.list.set_search("");
+                self.list.offline = None;
+                Effect::None
+            }
+            KeyCode::Char(value)
+                if combo.modifiers.is_empty() || combo.modifiers == KeyModifiers::SHIFT =>
+            {
+                let mut text = self.list.search.clone();
+                text.push(value);
+                self.list.set_search(&text);
+                self.list.offline = None;
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
     fn on_command_key(&mut self, combo: KeyCombo) -> Effect {
         if let Some(action) = self.global_action(combo) {
             return update::dispatch(self, &action);
@@ -1069,6 +1525,9 @@ impl App {
         ])
         .split(area);
 
+        self.record_geometry(rows[1]);
+        self.sync_scroll(rows[1]);
+
         components::header::render(frame, rows[0], self);
         components::panes::render(frame, rows[1], self);
         components::palette::render(frame, rows[2], self);
@@ -1098,14 +1557,6 @@ fn clamp_cursor(current: usize, delta: i32, count: usize) -> usize {
         current.saturating_add(step)
     };
     next.min(last)
-}
-
-/// Counts the keys in a value, descending into tables.
-fn count_keys(value: &toml::Value) -> usize {
-    match value.as_table() {
-        Some(table) => table.values().map(count_keys).sum(),
-        None => 1,
-    }
 }
 
 #[cfg(test)]
@@ -1214,10 +1665,11 @@ mod tests {
     #[test]
     fn an_unbound_key_reports_itself_and_clears_the_sequence() {
         let (_dir, mut app) = app();
-        press(&mut app, "z");
+        // `z` is the prefix of `za` now, so this uses a key bound to nothing.
+        press(&mut app, "Q");
         assert!(app.pending.is_empty());
         let notice = app.latest_notice().expect("a notice should be shown");
-        assert!(notice.text.contains('z'), "{:?}", notice.text);
+        assert!(notice.text.contains('Q'), "{:?}", notice.text);
         assert_eq!(notice.level, NoticeLevel::Warn);
     }
 
@@ -1400,7 +1852,10 @@ mod tests {
         assert!(app.doctor_running);
         assert!(app.checks().is_empty());
 
-        let job = app.doctor_job();
+        // The job id is what the loop stamps on the request and what the report
+        // carries back.
+        let job = 7;
+        app.record_job(&Effect::RunDoctor, job);
         app.apply_checks(
             job,
             vec![Check {
@@ -1421,7 +1876,7 @@ mod tests {
             press(&mut app, &character.to_string());
         }
         press(&mut app, "<CR>");
-        let first = app.doctor_job();
+        app.record_job(&Effect::RunDoctor, 1);
 
         // A second request supersedes the first.
         press(&mut app, ":");
@@ -1429,34 +1884,22 @@ mod tests {
             press(&mut app, &character.to_string());
         }
         press(&mut app, "<CR>");
+        app.record_job(&Effect::RunDoctor, 2);
 
-        app.apply_checks(first, Vec::new());
+        app.apply_checks(1, Vec::new());
         assert!(
             app.doctor_running,
             "the stale report must not resolve the job"
         );
 
         app.apply_checks(
-            app.doctor_job(),
+            2,
             vec![Check {
                 name: "home",
                 status: crate::doctor::Status::Ok,
                 detail: "ok".to_owned(),
             }],
         );
-        assert!(!app.doctor_running);
-    }
-
-    #[test]
-    fn a_dead_doctor_job_stops_waiting() {
-        let (_dir, mut app) = app();
-        press(&mut app, ":");
-        for character in "doctor".chars() {
-            press(&mut app, &character.to_string());
-        }
-        press(&mut app, "<CR>");
-        assert!(app.doctor_running);
-        app.abort_doctor_job();
         assert!(!app.doctor_running);
     }
 

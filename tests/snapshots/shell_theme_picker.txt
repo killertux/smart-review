@@ -1,29 +1,29 @@
  smart-review v0.1.0 config: built-in defaults                                         acme/service
-┌ Planned ─────────────────────────────────────────────┐┌ This shell ──────────────────────────────┐
-│ > M1  browse, filter and search pull requests        ││ home     <HOME>                          │
-│   M1  read the diff with vim motions and the mouse   ││ config   <HOME>/config.toml              │
-│   M2  a managed worktree per pull request            ││ keys     0 parsed                        │
-│   M2  pick provider, model and thinking in the TUI   ││ theme    dark (built-in)                 │
-│   M2  streamed analysis and a review-ordered diff    ││ keybinds 18 bindings                     │
-│   M3  a persistent chat about the pull request       ││ focus    list                            │
-│   M4  inline comments and one batched review         ││ uptime   0s                              │
-│   M5  polish, docs and release builds                ││                                          │
-│                                                      ││ warnings none                            │
-│ This build is the M0 shell.                          ││                                          │
-│ Navigation, themes, ke┌ theme ───────────────────────────────────────────┐leader>  action menu   │
-│ command line are live.│ * dark                                           │C-c>     quit          │
-│ panes arrive in M1.   │   light                                          │                       │
+│ filters [is:open] <leader>f adds one                                                             │
+│ search / filters what has been fetched; :filter asks GitHub                                      │
+┌ no repository · open · showing 0 ────────────────────────────────────────────────────────────────┐
+│Looking for the repository and gh…                                                                │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                       ┌ theme ───────────────────────────────────────────┐                       │
+│                       │ * dark                                           │                       │
+│                       │   light                                          │                       │
 │                       │                                                  │                       │
 │                       │ j/k move · Enter applies · Esc cancels           │                       │
 │                       └──────────────────────────────────────────────────┘                       │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-│                                                      ││                                          │
-└──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
  POPUP list · acme/service · — · — · 0 drafts                ? help · <leader> actions · : commands

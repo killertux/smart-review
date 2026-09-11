@@ -25,6 +25,11 @@ pub struct PrListState {
     pub sort: PrSort,
     /// How many the current query asks for.
     pub limit: u32,
+    /// How many are fetched per page, which is how much `:load-more` adds.
+    pub page_size: u32,
+    /// The most `:load-more` will ever fetch, so the list cannot grow without
+    /// bound (FR-2.1).
+    pub cap: u32,
     /// How many exist in total, when GitHub has told us.
     pub total: Option<u32>,
     /// The cursor, as an index into [`Self::items`].
@@ -44,13 +49,30 @@ pub struct PrListState {
 }
 
 impl PrListState {
-    /// A list that asks for `limit` pull requests.
+    /// A list that asks for `page_size` pull requests and will grow to `cap`.
     #[must_use]
-    pub fn new(limit: u32) -> Self {
+    pub fn new(page_size: u32, cap: u32) -> Self {
         Self {
-            limit,
+            limit: page_size,
+            page_size,
+            cap: cap.max(page_size),
             ..Self::default()
         }
+    }
+
+    /// The limit `:load-more` should ask for, or `None` at the cap (FR-2.1).
+    #[must_use]
+    pub fn load_more_limit(&self) -> Option<u32> {
+        if self.limit >= self.cap {
+            return None;
+        }
+        Some(self.limit.saturating_add(self.page_size).min(self.cap))
+    }
+
+    /// Whether more pages can still be fetched.
+    #[must_use]
+    pub fn can_load_more(&self) -> bool {
+        self.load_more_limit().is_some()
     }
 
     /// The query the list currently describes.
@@ -100,6 +122,12 @@ impl PrListState {
     pub fn cursor_position(&self) -> Option<usize> {
         let visible = self.visible();
         visible.iter().position(|index| *index == self.cursor)
+    }
+
+    /// The index of the cursor within [`Self::items`].
+    #[must_use]
+    pub fn cursor_index(&self) -> usize {
+        self.cursor
     }
 
     /// The selected pull request.
@@ -266,6 +294,21 @@ impl PrListState {
     pub fn status_label(&self) -> String {
         let shown = self.visible_len();
         let fetched = self.items.len();
+        let total = self
+            .total
+            .map_or(String::new(), |total| format!(" · {total} total"));
+
+        // A search narrows what has been *fetched*, which is a different question
+        // from how many exist, so the sentence changes rather than mixing the two
+        // numbers into something that reads like a contradiction.
+        if !self.search.trim().is_empty() {
+            let offline = if self.offline.is_some() {
+                " · offline"
+            } else {
+                ""
+            };
+            return format!("matching {shown} of {fetched} loaded{total}{offline}");
+        }
 
         let counts = match self.total {
             Some(total) => format!("showing {shown} of {total}"),
@@ -277,18 +320,12 @@ impl PrListState {
             None => format!("showing {shown}"),
         };
 
-        let filtered = if self.search.trim().is_empty() || shown == fetched {
-            String::new()
-        } else {
-            format!(" ({} hidden by search)", fetched - shown)
-        };
-
         let offline = self
             .offline
             .as_ref()
             .map_or(String::new(), |_| " · offline".to_owned());
 
-        format!("{counts}{filtered}{offline}")
+        format!("{counts}{offline}")
     }
 
     /// Whether the empty pane should explain that the search matched nothing.
@@ -338,7 +375,7 @@ mod tests {
     }
 
     fn list_of(numbers: &[u64]) -> PrListState {
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         list.replace(PullRequestPage::complete(
             numbers
                 .iter()
@@ -370,7 +407,7 @@ mod tests {
 
     #[test]
     fn an_empty_list_has_no_selection_and_does_not_move() {
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         assert!(list.selected().is_none());
         list.move_cursor(1);
         list.move_cursor_to(true);
@@ -389,11 +426,20 @@ mod tests {
         assert_eq!(list.visible_len(), 1);
         assert_eq!(list.selected().unwrap().number, 141);
         assert_eq!(list.items.len(), 3, "the fetched set is untouched");
-        assert_eq!(list.status_label(), "showing 1 of 3 (2 hidden by search)");
+        assert_eq!(
+            list.status_label(),
+            "matching 1 of 3 loaded · 3 total",
+            "the loaded count and the total are different questions"
+        );
 
         list.set_search("");
         assert_eq!(list.visible_len(), 3);
         assert_eq!(list.status_label(), "showing 3 of 3");
+
+        // A search and a known total both matter, so both are named.
+        list.set_total(137);
+        list.set_search("billing");
+        assert_eq!(list.status_label(), "matching 1 of 3 loaded · 137 total");
     }
 
     #[test]
@@ -479,7 +525,7 @@ mod tests {
     fn a_short_page_ends_the_fetch_and_answers_the_total_outright() {
         // 50 then 12: the second page was short, so there is nothing after it and
         // the count query is unnecessary (FR-2.1: never silently truncate).
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         list.replace(PullRequestPage::possibly_truncated(
             (1..=50).map(|number| summary(number, "x")).collect(),
             50,
@@ -497,7 +543,7 @@ mod tests {
 
     #[test]
     fn the_status_line_is_honest_before_the_count_arrives() {
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         list.loading = true;
         list.replace(PullRequestPage::possibly_truncated(
             (1..=50).map(|number| summary(number, "x")).collect(),
@@ -513,7 +559,7 @@ mod tests {
 
     #[test]
     fn a_short_page_needs_no_count() {
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         list.replace(PullRequestPage::complete(vec![summary(1, "one")], 50));
         assert!(!list.counting);
         assert_eq!(
@@ -535,7 +581,7 @@ mod tests {
 
     #[test]
     fn filters_become_chips_with_the_state_first() {
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         assert_eq!(list.chips(), vec!["is:open"]);
 
         list.push_filter(Filter::Author("alice".to_owned()));
@@ -568,14 +614,14 @@ mod tests {
 
     #[test]
     fn a_non_default_sort_is_shown_as_a_chip() {
-        let mut list = PrListState::new(50);
+        let mut list = PrListState::new(50, 500);
         list.sort = PrSort::UpdatedDesc;
         assert_eq!(list.chips(), vec!["is:open", "sort:recently updated"]);
     }
 
     #[test]
     fn the_query_carries_the_filters_the_state_the_sort_and_the_limit() {
-        let mut list = PrListState::new(25);
+        let mut list = PrListState::new(25, 500);
         list.push_filter(Filter::Author("alice".to_owned()));
         list.state_filter = PrStateFilter::Merged;
         list.sort = PrSort::CreatedAsc;
@@ -604,6 +650,26 @@ mod tests {
         assert_eq!(list.cursor_position(), Some(5));
         list.move_page(-1, true);
         assert_eq!(list.cursor_position(), Some(0), "and it stops at the top");
+    }
+
+    #[test]
+    fn loading_more_grows_by_a_page_and_stops_at_the_cap() {
+        let mut list = PrListState::new(50, 120);
+        assert_eq!(list.limit, 50);
+        assert_eq!(list.load_more_limit(), Some(100));
+        list.limit = 100;
+        assert_eq!(list.load_more_limit(), Some(120), "clamped to the cap");
+        list.limit = 120;
+        assert_eq!(list.load_more_limit(), None);
+        assert!(!list.can_load_more());
+    }
+
+    #[test]
+    fn a_cap_below_the_page_size_is_raised_to_it() {
+        // Otherwise the first fetch would already be over the cap.
+        let list = PrListState::new(50, 10);
+        assert_eq!(list.cap, 50);
+        assert_eq!(list.load_more_limit(), None);
     }
 
     #[test]

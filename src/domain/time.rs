@@ -8,6 +8,15 @@ use chrono::{DateTime, Duration, Utc};
 /// in, so comparisons and lifetimes never depend on the machine's timezone.
 pub type Timestamp = DateTime<Utc>;
 
+/// A timestamp from seconds since the Unix epoch.
+///
+/// Exists so that callers — tests, fixtures and the cache, which stores epoch
+/// seconds — do not each have to know which date library is behind [`Timestamp`].
+#[must_use]
+pub fn from_unix_secs(seconds: i64) -> Timestamp {
+    DateTime::from_timestamp(seconds, 0).unwrap_or_default()
+}
+
 /// Formats the gap between two instants the way a PR list does: short, and never
 /// more precise than it needs to be.
 ///

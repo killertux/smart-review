@@ -65,6 +65,49 @@ pub mod element {
     pub const COMMAND_ERROR: &str = "command.error";
     /// The highlighted row in a picker.
     pub const PICKER_SELECTED: &str = "picker.selected";
+
+    /// An added line in a diff.
+    pub const DIFF_ADD: &str = "diff.add";
+    /// The changed part of an added line.
+    pub const DIFF_ADD_EMPHASIS: &str = "diff.add_emphasis";
+    /// A deleted line in a diff.
+    pub const DIFF_DEL: &str = "diff.del";
+    /// The changed part of a deleted line.
+    pub const DIFF_DEL_EMPHASIS: &str = "diff.del_emphasis";
+    /// An unchanged line shown for context.
+    pub const DIFF_CONTEXT: &str = "diff.context";
+    /// A `@@` hunk header.
+    pub const DIFF_HUNK_HEADER: &str = "diff.hunk_header";
+    /// The line-number gutter.
+    pub const DIFF_LINE_NUMBER: &str = "diff.line_number";
+    /// A file whose diff is out of date with the head commit.
+    pub const DIFF_STALE: &str = "diff.stale";
+    /// A folded hunk or directory summary row.
+    pub const DIFF_FOLDED: &str = "diff.folded";
+    /// A directory in the file tree.
+    pub const TREE_DIR: &str = "tree.dir";
+    /// An unchanged file in the tree.
+    pub const TREE_FILE: &str = "tree.file";
+    /// A modified file in the tree.
+    pub const TREE_MODIFIED: &str = "tree.modified";
+    /// An added file in the tree.
+    pub const TREE_ADDED: &str = "tree.added";
+    /// A deleted file in the tree.
+    pub const TREE_DELETED: &str = "tree.deleted";
+    /// The marker that says a comment exists on a line.
+    pub const COMMENT_MARKER: &str = "comment.marker";
+    /// The marker that says a draft comment is attached to a line.
+    pub const DRAFT_MARKER: &str = "draft.marker";
+    /// The draft/WIP marker in the PR list.
+    pub const LIST_DRAFT: &str = "list.draft";
+    /// A passing check summary.
+    pub const LIST_CHECK_OK: &str = "list.check_ok";
+    /// A failing check summary.
+    pub const LIST_CHECK_FAIL: &str = "list.check_fail";
+    /// A pending check summary.
+    pub const LIST_CHECK_PENDING: &str = "list.check_pending";
+    /// A draft pull request's title.
+    pub const LIST_STALE: &str = "list.stale";
 }
 
 /// Every element name, used to warn about typos in theme files.
@@ -92,6 +135,27 @@ pub const KNOWN_ELEMENTS: &[&str] = &[
     element::COMMAND_PROMPT,
     element::COMMAND_ERROR,
     element::PICKER_SELECTED,
+    element::DIFF_ADD,
+    element::DIFF_ADD_EMPHASIS,
+    element::DIFF_DEL,
+    element::DIFF_DEL_EMPHASIS,
+    element::DIFF_CONTEXT,
+    element::DIFF_HUNK_HEADER,
+    element::DIFF_LINE_NUMBER,
+    element::DIFF_STALE,
+    element::DIFF_FOLDED,
+    element::TREE_DIR,
+    element::TREE_FILE,
+    element::TREE_MODIFIED,
+    element::TREE_ADDED,
+    element::TREE_DELETED,
+    element::COMMENT_MARKER,
+    element::DRAFT_MARKER,
+    element::LIST_DRAFT,
+    element::LIST_CHECK_OK,
+    element::LIST_CHECK_FAIL,
+    element::LIST_CHECK_PENDING,
+    element::LIST_STALE,
 ];
 
 /// A resolved theme.
@@ -179,12 +243,96 @@ impl Theme {
     }
 }
 
+/// The semantic colours a built-in theme is built from.
+///
+/// One struct rather than local variables per table: the token-to-colour mapping is
+/// shared by both built-in themes, so it is written once and only the palette
+/// differs. That is also what keeps the two tables from drifting apart token by
+/// token.
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    /// Application background.
+    bg: Color,
+    /// Application foreground.
+    fg: Color,
+    /// Highlights, focus and titles.
+    accent: Color,
+    /// Placeholders, folding summaries and gutters.
+    muted: Color,
+    /// Unfocused borders.
+    border: Color,
+    /// The background of an added line.
+    added_background: Color,
+    /// The foreground of an added line.
+    added_foreground: Color,
+    /// The background of a deleted line.
+    deleted_background: Color,
+    /// The foreground of a deleted line.
+    deleted_foreground: Color,
+    /// Open pull requests, modified files, drafts.
+    warn: Color,
+    /// Passing checks, insert mode.
+    ok: Color,
+    /// Failures.
+    error: Color,
+}
+
 fn dark_styles() -> Vec<(&'static str, Style)> {
-    let bg = Color::Rgb(0x0d, 0x11, 0x17);
-    let fg = Color::Rgb(0xc9, 0xd1, 0xd9);
-    let accent = Color::Rgb(0x58, 0xa6, 0xff);
-    let muted = Color::Rgb(0x6e, 0x76, 0x81);
-    let border = Color::Rgb(0x30, 0x36, 0x3d);
+    let palette = Palette {
+        bg: Color::Rgb(0x0d, 0x11, 0x17),
+        fg: Color::Rgb(0xc9, 0xd1, 0xd9),
+        accent: Color::Rgb(0x58, 0xa6, 0xff),
+        muted: Color::Rgb(0x6e, 0x76, 0x81),
+        border: Color::Rgb(0x30, 0x36, 0x3d),
+        added_background: Color::Rgb(0x10, 0x2b, 0x1a),
+        added_foreground: Color::Rgb(0x7e, 0xe7, 0x87),
+        deleted_background: Color::Rgb(0x33, 0x14, 0x17),
+        deleted_foreground: Color::Rgb(0xff, 0x9b, 0x9b),
+        warn: Color::Rgb(0xd2, 0x99, 0x22),
+        ok: Color::Rgb(0x3f, 0xb9, 0x50),
+        error: Color::Rgb(0xf8, 0x51, 0x49),
+    };
+    styles_for(&palette)
+}
+
+fn light_styles() -> Vec<(&'static str, Style)> {
+    let palette = Palette {
+        bg: Color::Rgb(0xff, 0xff, 0xff),
+        fg: Color::Rgb(0x1f, 0x23, 0x28),
+        accent: Color::Rgb(0x09, 0x69, 0xda),
+        muted: Color::Rgb(0x6e, 0x77, 0x81),
+        border: Color::Rgb(0xd0, 0xd7, 0xde),
+        added_background: Color::Rgb(0xe6, 0xff, 0xec),
+        added_foreground: Color::Rgb(0x0b, 0x4f, 0x21),
+        deleted_background: Color::Rgb(0xff, 0xeb, 0xee),
+        deleted_foreground: Color::Rgb(0x8a, 0x13, 0x1c),
+        warn: Color::Rgb(0x9a, 0x6a, 0x00),
+        ok: Color::Rgb(0x1a, 0x7f, 0x37),
+        error: Color::Rgb(0xcf, 0x22, 0x2e),
+    };
+    styles_for(&palette)
+}
+
+/// Every token, in the order a theme file is easiest to read.
+fn styles_for(p: &Palette) -> Vec<(&'static str, Style)> {
+    let mut styles = shell_styles(p);
+    styles.extend(reading_styles(p));
+    styles
+}
+
+/// The shell: background, borders, status line, notifications, popups.
+fn shell_styles(p: &Palette) -> Vec<(&'static str, Style)> {
+    let Palette {
+        bg,
+        fg,
+        accent,
+        muted,
+        border,
+        warn,
+        ok,
+        error,
+        ..
+    } = *p;
 
     vec![
         (element::BG, Style::default().bg(bg).fg(fg)),
@@ -198,13 +346,17 @@ fn dark_styles() -> Vec<(&'static str, Style)> {
         ),
         (
             element::CURSOR_LINE,
-            Style::default().bg(Color::Rgb(0x16, 0x1b, 0x22)),
+            Style::default().bg(if is_dark(bg) {
+                Color::Rgb(0x16, 0x1b, 0x22)
+            } else {
+                Color::Rgb(0xee, 0xf2, 0xf7)
+            }),
         ),
         (
             element::SELECTION,
             Style::default()
-                .bg(Color::Rgb(0x1f, 0x6f, 0xeb))
-                .fg(Color::Rgb(0xff, 0xff, 0xff))
+                .bg(accent)
+                .fg(bg)
                 .add_modifier(Modifier::BOLD),
         ),
         (element::MUTED, Style::default().fg(muted)),
@@ -217,160 +369,135 @@ fn dark_styles() -> Vec<(&'static str, Style)> {
         ),
         (
             element::STATUS_INSERT,
-            Style::default()
-                .bg(Color::Rgb(0x3f, 0xb9, 0x50))
-                .fg(bg)
-                .add_modifier(Modifier::BOLD),
+            Style::default().bg(ok).fg(bg).add_modifier(Modifier::BOLD),
         ),
         (
             element::STATUS_COMMAND,
             Style::default()
-                .bg(Color::Rgb(0xd2, 0x99, 0x22))
+                .bg(warn)
                 .fg(bg)
                 .add_modifier(Modifier::BOLD),
         ),
         (
             element::STATUS_ERROR,
             Style::default()
-                .bg(Color::Rgb(0xf8, 0x51, 0x49))
+                .bg(error)
                 .fg(bg)
                 .add_modifier(Modifier::BOLD),
         ),
         (element::NOTICE_INFO, Style::default().fg(accent)),
-        (
-            element::NOTICE_WARN,
-            Style::default().fg(Color::Rgb(0xd2, 0x99, 0x22)),
-        ),
-        (
-            element::NOTICE_ERROR,
-            Style::default().fg(Color::Rgb(0xf8, 0x51, 0x49)),
-        ),
-        (
-            element::NOTICE_SUCCESS,
-            Style::default().fg(Color::Rgb(0x3f, 0xb9, 0x50)),
-        ),
+        (element::NOTICE_WARN, Style::default().fg(warn)),
+        (element::NOTICE_ERROR, Style::default().fg(error)),
+        (element::NOTICE_SUCCESS, Style::default().fg(ok)),
         (
             element::HELP_GROUP,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
         (
             element::HELP_KEY,
-            Style::default().fg(Color::Rgb(0xd2, 0xa8, 0xff)),
+            Style::default().fg(if is_dark(bg) {
+                Color::Rgb(0xd2, 0xa8, 0xff)
+            } else {
+                Color::Rgb(0x82, 0x50, 0xdf)
+            }),
         ),
         (element::HELP_DESCRIPTION, Style::default().fg(fg)),
         (
             element::COMMAND_PROMPT,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
-        (
-            element::COMMAND_ERROR,
-            Style::default().fg(Color::Rgb(0xf8, 0x51, 0x49)),
-        ),
+        (element::COMMAND_ERROR, Style::default().fg(error)),
         (
             element::PICKER_SELECTED,
             Style::default()
-                .bg(border)
-                .fg(fg)
+                .bg(accent)
+                .fg(bg)
                 .add_modifier(Modifier::BOLD),
         ),
     ]
 }
 
-fn light_styles() -> Vec<(&'static str, Style)> {
-    let bg = Color::Rgb(0xff, 0xff, 0xff);
-    let fg = Color::Rgb(0x1f, 0x23, 0x28);
-    let accent = Color::Rgb(0x09, 0x69, 0xda);
-    let muted = Color::Rgb(0x6e, 0x77, 0x81);
-    let border = Color::Rgb(0xd0, 0xd7, 0xde);
+/// Reading: diffs, the file tree, the list's markers (FR-7.7's M1 list).
+fn reading_styles(p: &Palette) -> Vec<(&'static str, Style)> {
+    let Palette {
+        fg,
+        accent,
+        muted,
+        added_background,
+        added_foreground,
+        deleted_background,
+        deleted_foreground,
+        warn,
+        ok,
+        error,
+        ..
+    } = *p;
 
     vec![
-        (element::BG, Style::default().bg(bg).fg(fg)),
-        (element::FG, Style::default().fg(fg)),
-        (element::ACCENT, Style::default().fg(accent)),
-        (element::BORDER, Style::default().fg(border)),
-        (element::BORDER_FOCUSED, Style::default().fg(accent)),
         (
-            element::TITLE,
+            element::DIFF_ADD,
+            Style::default().bg(added_background).fg(added_foreground),
+        ),
+        (
+            element::DIFF_ADD_EMPHASIS,
+            Style::default()
+                .fg(added_foreground)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+        (
+            element::DIFF_DEL,
+            Style::default()
+                .bg(deleted_background)
+                .fg(deleted_foreground),
+        ),
+        (
+            element::DIFF_DEL_EMPHASIS,
+            Style::default()
+                .fg(deleted_foreground)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+        (element::DIFF_CONTEXT, Style::default().fg(fg)),
+        (
+            element::DIFF_HUNK_HEADER,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
+        (element::DIFF_LINE_NUMBER, Style::default().fg(muted)),
+        (element::DIFF_STALE, Style::default().fg(warn)),
         (
-            element::CURSOR_LINE,
-            Style::default().bg(Color::Rgb(0xf6, 0xf8, 0xfa)),
+            element::DIFF_FOLDED,
+            Style::default().fg(muted).add_modifier(Modifier::ITALIC),
         ),
         (
-            element::SELECTION,
-            Style::default()
-                .bg(accent)
-                .fg(bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (element::MUTED, Style::default().fg(muted)),
-        (
-            element::STATUS_NORMAL,
-            Style::default()
-                .bg(accent)
-                .fg(bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (
-            element::STATUS_INSERT,
-            Style::default()
-                .bg(Color::Rgb(0x1a, 0x7f, 0x37))
-                .fg(bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (
-            element::STATUS_COMMAND,
-            Style::default()
-                .bg(Color::Rgb(0x9a, 0x67, 0x00))
-                .fg(bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (
-            element::STATUS_ERROR,
-            Style::default()
-                .bg(Color::Rgb(0xcf, 0x22, 0x2e))
-                .fg(bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        (element::NOTICE_INFO, Style::default().fg(accent)),
-        (
-            element::NOTICE_WARN,
-            Style::default().fg(Color::Rgb(0x9a, 0x67, 0x00)),
-        ),
-        (
-            element::NOTICE_ERROR,
-            Style::default().fg(Color::Rgb(0xcf, 0x22, 0x2e)),
-        ),
-        (
-            element::NOTICE_SUCCESS,
-            Style::default().fg(Color::Rgb(0x1a, 0x7f, 0x37)),
-        ),
-        (
-            element::HELP_GROUP,
+            element::TREE_DIR,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ),
+        (element::TREE_FILE, Style::default().fg(fg)),
+        (element::TREE_MODIFIED, Style::default().fg(warn)),
+        (element::TREE_ADDED, Style::default().fg(ok)),
+        (element::TREE_DELETED, Style::default().fg(error)),
+        (element::COMMENT_MARKER, Style::default().fg(accent)),
+        (element::DRAFT_MARKER, Style::default().fg(warn)),
         (
-            element::HELP_KEY,
-            Style::default().fg(Color::Rgb(0x82, 0x50, 0xdf)),
+            element::LIST_DRAFT,
+            Style::default().fg(muted).add_modifier(Modifier::ITALIC),
         ),
-        (element::HELP_DESCRIPTION, Style::default().fg(fg)),
-        (
-            element::COMMAND_PROMPT,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        (
-            element::COMMAND_ERROR,
-            Style::default().fg(Color::Rgb(0xcf, 0x22, 0x2e)),
-        ),
-        (
-            element::PICKER_SELECTED,
-            Style::default()
-                .bg(border)
-                .fg(fg)
-                .add_modifier(Modifier::BOLD),
-        ),
+        (element::LIST_CHECK_OK, Style::default().fg(ok)),
+        (element::LIST_CHECK_FAIL, Style::default().fg(error)),
+        (element::LIST_CHECK_PENDING, Style::default().fg(warn)),
+        (element::LIST_STALE, Style::default().fg(warn)),
     ]
+}
+
+/// Whether a background is dark, which decides the two shades that have no
+/// semantic name of their own (the cursor line and popup keys).
+fn is_dark(background: Color) -> bool {
+    match background {
+        Color::Rgb(red, green, blue) => {
+            // Rec. 601 luma: the same rule a terminal uses to decide contrast.
+            (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000 < 128
+        }
+        _ => true,
+    }
 }
 
 /// A user theme file (FR-8.4).

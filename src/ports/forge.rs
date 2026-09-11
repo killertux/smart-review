@@ -33,7 +33,7 @@ impl Default for ForgeCapabilities {
 /// `gh pr list`, so it is only known when the page was not full (in which case the
 /// count is the page size) or after a separate count query. An unknown total is
 /// reported as such rather than guessed at (FR-2.1).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PullRequestPage {
     /// The PRs, newest first.
     pub items: Vec<PullRequestSummary>,

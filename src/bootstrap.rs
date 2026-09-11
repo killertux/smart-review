@@ -74,6 +74,7 @@ impl Startup {
             keymap: self.keymap.clone(),
             theme: self.theme.clone(),
             theme_source: self.theme_source.clone(),
+            config_keys: self.document.key_count(),
         }
     }
 

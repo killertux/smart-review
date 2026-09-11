@@ -62,6 +62,9 @@ fn snapshot_home() -> (MutexGuard<'static, ()>, PathBuf) {
     (guard, home)
 }
 
+/// The instant the snapshot frames are rendered at, so ages are stable.
+const SNAPSHOT_NOW: u64 = 1_700_010_800;
+
 fn build(home: &Path) -> App {
     let cli = Cli {
         repo: Some("acme/service".to_owned()),
@@ -75,7 +78,10 @@ fn build(home: &Path) -> App {
         check: false,
     };
     let startup = Startup::load(&cli).expect("bootstrap");
-    App::new(startup).expect("build the app")
+    let mut app = App::new(startup).expect("build the app");
+    // Ages in the list are relative to now, which the loop normally supplies.
+    app.set_now(SNAPSHOT_NOW);
+    app
 }
 
 fn press(app: &mut App, keys: &str) {
@@ -226,6 +232,207 @@ fn shell_in_light_theme() {
     press(&mut app, "<Space>T");
     let frame = normalize(&render(&mut app, 100, 30), &home);
     assert_snapshot("shell_light", &frame);
+}
+
+/// A detection result, so the list pane shows pull requests rather than the
+/// "looking for the repository" state.
+fn environment() -> smart_review::domain::environment::Environment {
+    smart_review::domain::environment::Environment {
+        repo: smart_review::domain::RepoId::parse("acme/service").expect("repository"),
+        mode: smart_review::domain::environment::RunMode::InRepo,
+        remote: Some("origin".to_owned()),
+        root: Some(PathBuf::from("/src/service")),
+        default_branch: Some("main".to_owned()),
+        git_version: "2.43.0".to_owned(),
+        gh: smart_review::domain::environment::GhInstall {
+            path: PathBuf::from("/usr/bin/gh"),
+            version: "2.45.0".to_owned(),
+            account: Some("bruno".to_owned()),
+            scopes: vec!["repo".to_owned()],
+        },
+    }
+}
+
+/// Three pull requests with the markers the list promises to show.
+fn pull_requests() -> smart_review::ports::forge::PullRequestPage {
+    use smart_review::domain::pr::{
+        CheckState, CheckSummary, PrState, PullRequestSummary, ReviewDecision,
+    };
+
+    let make = |number: u64,
+                title: &str,
+                author: &str,
+                draft: bool,
+                checks: (CheckState, u32, u32),
+                decision: Option<ReviewDecision>| PullRequestSummary {
+        number,
+        title: title.to_owned(),
+        author: author.to_owned(),
+        state: PrState::Open,
+        is_draft: draft,
+        base_ref: "main".to_owned(),
+        head_ref: "topic".to_owned(),
+        head_sha: "5e44fd9d2e1d".to_owned(),
+        created_at: smart_review::domain::from_unix_secs(1_700_000_000),
+        updated_at: smart_review::domain::from_unix_secs(1_700_003_600),
+        additions: 218,
+        deletions: 43,
+        changed_files: 7,
+        labels: Vec::new(),
+        review_decision: decision,
+        checks: CheckSummary {
+            state: checks.0,
+            passed: checks.1,
+            total: checks.2,
+        },
+        url: "https://github.com/acme/service/pull/142".to_owned(),
+        is_cross_repository: false,
+    };
+
+    smart_review::ports::forge::PullRequestPage {
+        items: vec![
+            make(
+                142,
+                "Add retry to the webhook dispatcher",
+                "alice",
+                false,
+                (CheckState::Success, 3, 3),
+                Some(ReviewDecision::Approved),
+            ),
+            make(
+                141,
+                "WIP refactor of billing domain",
+                "bruno",
+                true,
+                (CheckState::Failure, 1, 3),
+                Some(ReviewDecision::ChangesRequested),
+            ),
+            make(
+                138,
+                "Bump tokio to 1.53",
+                "dependabot",
+                false,
+                (CheckState::Unknown, 0, 0),
+                None,
+            ),
+        ],
+        limit: 50,
+        total: Some(137),
+    }
+}
+
+/// A detail, so the review screen's tab bar has something to name.
+fn detail() -> smart_review::domain::pr::PullRequestDetail {
+    use smart_review::domain::pr::{PrState, PullRequestSummary};
+    use smart_review::domain::time::Timestamp;
+
+    let mut summary = PullRequestSummary {
+        number: 141,
+        title: "WIP refactor of billing domain".to_owned(),
+        author: "bruno".to_owned(),
+        state: PrState::Open,
+        is_draft: true,
+        base_ref: "main".to_owned(),
+        head_ref: "refactor/billing".to_owned(),
+        head_sha: "ba6c89f0a1b2".to_owned(),
+        created_at: Timestamp::default(),
+        updated_at: Timestamp::default(),
+        additions: 412,
+        deletions: 96,
+        changed_files: 12,
+        labels: Vec::new(),
+        review_decision: None,
+        checks: smart_review::domain::pr::CheckSummary::default(),
+        url: String::new(),
+        is_cross_repository: false,
+    };
+    summary.number = 141;
+
+    smart_review::domain::pr::PullRequestDetail {
+        summary,
+        body: "Splits Invoice into a domain object and a projection.".to_owned(),
+        merge_state_status: Some("BLOCKED".to_owned()),
+        reviewers: vec!["alice".to_owned()],
+        commits: Vec::new(),
+        checks: Vec::new(),
+        reviews: Vec::new(),
+        comments: Vec::new(),
+        base_sha: None,
+    }
+}
+
+/// A patch with the cases the diff pane has to render distinctly.
+fn diff_view() -> smart_review::tui::diff_view::DiffView {
+    const PATCH: &str = "\
+diff --git a/src/domain/invoice.rs b/src/domain/invoice.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/domain/invoice.rs
++++ b/src/domain/invoice.rs
+@@ -12,4 +14,5 @@ impl Invoice {
+     pub fn total(&self) -> Money {
+-        self.lines.sum()
++        let gross = self.lines.sum();
++        gross - self.discount
+     }
+ }
+diff --git a/docs/logo.png b/docs/logo.png
+new file mode 100644
+index 0000000..2222222
+Binary files /dev/null and b/docs/logo.png differ
+diff --git a/scripts/build.sh b/scripts/build.sh
+old mode 100644
+new mode 100755
+";
+    smart_review::tui::diff_view::DiffView::new(smart_review::domain::diff::parse_patch(PATCH))
+}
+
+#[test]
+fn shell_with_pull_requests() {
+    let (_serial, home) = snapshot_home();
+    let mut app = build(&home);
+    app.set_environment(environment());
+    app.set_pull_requests(pull_requests());
+    let frame = normalize(&render(&mut app, 110, 24), &home);
+    assert_snapshot("shell_list", &frame);
+}
+
+#[test]
+fn shell_with_a_search_that_matches_nothing() {
+    let (_serial, home) = snapshot_home();
+    let mut app = build(&home);
+    app.set_environment(environment());
+    app.set_pull_requests(pull_requests());
+    press(&mut app, "/");
+    for character in "postgres".chars() {
+        press(&mut app, &character.to_string());
+    }
+    let frame = normalize(&render(&mut app, 110, 24), &home);
+    assert_snapshot("shell_list_no_match", &frame);
+}
+
+#[test]
+fn shell_with_a_diff_open() {
+    let (_serial, home) = snapshot_home();
+    let mut app = build(&home);
+    app.set_environment(environment());
+    app.set_pull_requests(pull_requests());
+    app.open_review(detail(), diff_view());
+    let frame = normalize(&render(&mut app, 110, 24), &home);
+    assert_snapshot("shell_diff", &frame);
+}
+
+#[test]
+fn shell_with_the_diff_in_split_view() {
+    let (_serial, home) = snapshot_home();
+    let mut app = build(&home);
+    app.set_environment(environment());
+    app.set_pull_requests(pull_requests());
+    app.open_review(detail(), diff_view());
+    // Wide enough for the split view, which needs 140 columns (DEC-4).
+    press(&mut app, "<Space>ds");
+    press(&mut app, "j");
+    let frame = normalize(&render(&mut app, 150, 24), &home);
+    assert_snapshot("shell_diff_split", &frame);
 }
 
 #[test]

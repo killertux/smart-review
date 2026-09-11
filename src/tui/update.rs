@@ -27,6 +27,27 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "notice.clear",
         "Dismiss the current notification",
     ),
+    (
+        "clear-filters",
+        "filter.clear",
+        "Reset the filters and the search",
+    ),
+    (
+        "copy-path",
+        "review.copy_path",
+        "Copy the current file path",
+    ),
+    (
+        "filter",
+        "app.command",
+        "Add a filter: :filter author:alice",
+    ),
+    (
+        "load-more",
+        "app.load_more",
+        "Fetch the next page of pull requests",
+    ),
+    ("pr", "nav.open", "Open a pull request: :pr 141"),
     ("q", "app.quit", "Quit smart-review"),
     ("qa", "app.quit", "Quit smart-review"),
     ("quit", "app.quit", "Quit smart-review"),
@@ -35,6 +56,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "set",
         "app.command",
         "Change an option: :set ui.timeoutlen=250",
+    ),
+    (
+        "sort",
+        "app.command",
+        "Change the order: :sort updated desc",
     ),
     (
         "theme",
@@ -63,6 +89,23 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             app.start_doctor();
             Effect::RunDoctor
         }
+        "app.load_more" => {
+            if app.review.is_some() {
+                app.notice(
+                    NoticeLevel::Warn,
+                    "loading more applies to the list; press Esc to go back",
+                );
+                Effect::None
+            } else if !app.list.can_load_more() {
+                app.notice(
+                    NoticeLevel::Warn,
+                    "that is every pull request the current filters match",
+                );
+                Effect::None
+            } else {
+                Effect::LoadMore
+            }
+        }
         "app.theme_picker" => {
             app.open_overlay(Overlay::ThemePicker);
             Effect::None
@@ -84,12 +127,52 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "app.refresh" => {
+            // `R` means "ask again for whatever I am looking at".
+            if app.review.is_some() {
+                Effect::ReloadDiff
+            } else if app.environment.is_none() {
+                Effect::DetectEnvironment
+            } else {
+                app.list.offline = None;
+                Effect::LoadPullRequests
+            }
+        }
+        "pane.next" => set_focus(app, app.focus.next()),
+        "pane.prev" => set_focus(app, app.focus.prev()),
+        // The groups live in their own functions so that no single match has to hold
+        // the whole command surface.
+        other
+            if other.starts_with("app.")
+                || other.starts_with("notice.")
+                || other.starts_with("theme.") =>
+        {
+            dispatch_app(app, other)
+        }
+        other if other.starts_with("diff.") || other == "review.copy_path" => {
+            dispatch_diff(app, other)
+        }
+        other
+            if other.starts_with("nav.")
+                || other.starts_with("search.")
+                || other.starts_with("filter.")
+                || other == "sort.menu" =>
+        {
+            dispatch_list(app, other)
+        }
+        other => {
             app.notice(
-                NoticeLevel::Info,
-                "nothing to refresh yet: pull requests arrive in M1",
+                NoticeLevel::Warn,
+                format!("`{other}` is not implemented in this build"),
             );
             Effect::None
         }
+    }
+}
+
+/// Changes the focused pane and remembers it (FR-8.5).
+/// The application lifecycle and view actions.
+fn dispatch_app(app: &mut App, id: &str) -> Effect {
+    match id {
         "app.version" => {
             app.notice(
                 NoticeLevel::Info,
@@ -102,35 +185,255 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "theme.toggle" => app.toggle_theme(),
-        "nav.up" => {
-            app.move_cursor(-1);
-            Effect::None
-        }
-        "nav.down" => {
-            app.move_cursor(1);
-            Effect::None
-        }
-        "nav.top" => {
-            app.move_cursor_to(false);
-            Effect::None
-        }
-        "nav.bottom" => {
-            app.move_cursor_to(true);
-            Effect::None
-        }
-        "pane.next" => set_focus(app, app.focus.next()),
-        "pane.prev" => set_focus(app, app.focus.prev()),
-        other => {
-            app.notice(
-                NoticeLevel::Warn,
-                format!("`{other}` is not implemented in this build"),
-            );
-            Effect::None
-        }
+        _ => Effect::None,
     }
 }
 
-/// Changes the focused pane and remembers it (FR-8.5).
+/// The list, search and filter actions.
+fn dispatch_list(app: &mut App, id: &str) -> Effect {
+    match id {
+        "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
+            match id {
+                "nav.up" => app.move_cursor(-1),
+                "nav.down" => app.move_cursor(1),
+                "nav.top" => app.move_cursor_to(false),
+                _ => app.move_cursor_to(true),
+            }
+            Effect::None
+        }
+        "nav.open" => open_selected(app),
+        "nav.back" => go_back(app),
+        "nav.half_down" | "nav.page_down" | "nav.half_up" | "nav.page_up" => {
+            let forward = matches!(id, "nav.half_down" | "nav.page_down");
+            let half = matches!(id, "nav.half_down" | "nav.half_up");
+            move_current(app, if forward { 1 } else { -1 }, half);
+            Effect::None
+        }
+        "search.open" => {
+            app.cancel_overlay();
+            app.mode = Mode::Search;
+            Effect::None
+        }
+        "search.close" => {
+            // Leaving the search box keeps what was typed: it is a filter, not a
+            // half-finished command, and `Esc` again on the list clears it.
+            app.mode = Mode::Normal;
+            Effect::None
+        }
+        "search.next" => {
+            move_current(app, 1, false);
+            Effect::None
+        }
+        "search.prev" => {
+            move_current(app, -1, false);
+            Effect::None
+        }
+        "filter.menu" => {
+            app.open_command("filter ");
+            Effect::None
+        }
+        "sort.menu" => {
+            app.open_command("sort ");
+            Effect::None
+        }
+        "filter.clear" => {
+            app.list.clear_filters();
+            app.list.offline = None;
+            if app.environment.is_some() {
+                Effect::LoadPullRequests
+            } else {
+                Effect::None
+            }
+        }
+        _ => Effect::None,
+    }
+}
+
+/// The diff actions, which all need the review screen to be open.
+fn dispatch_diff(app: &mut App, id: &str) -> Effect {
+    match id {
+        "diff.next_hunk" => {
+            with_diff(app, |view| view.move_hunk(true));
+            Effect::None
+        }
+        "diff.prev_hunk" => {
+            with_diff(app, |view| view.move_hunk(false));
+            Effect::None
+        }
+        "diff.next_file" => {
+            with_diff(app, |view| {
+                view.tree_focused = false;
+                view.move_file(true);
+            });
+            Effect::None
+        }
+        "diff.prev_file" => {
+            with_diff(app, |view| {
+                view.tree_focused = false;
+                view.move_file(false);
+            });
+            Effect::None
+        }
+        "diff.toggle_hunk" => {
+            with_diff(app, crate::tui::diff_view::DiffView::toggle_hunk);
+            Effect::None
+        }
+        "diff.toggle_split" => toggle_split(app),
+        "diff.cycle_context" => cycle_context(app),
+        "diff.toggle_whitespace" => toggle_whitespace(app),
+        "review.copy_path" => copy_path(app),
+        _ => Effect::None,
+    }
+}
+
+/// Puts the path of the file under the cursor on the clipboard (FR-3.4).
+fn copy_path(app: &mut App) -> Effect {
+    let path = app
+        .review
+        .as_ref()
+        .and_then(crate::tui::diff_view::DiffView::current_path)
+        .map(ToString::to_string);
+    if let Some(path) = path {
+        Effect::CopyPath(path)
+    } else {
+        app.notice(NoticeLevel::Warn, "there is no file under the cursor");
+        Effect::None
+    }
+}
+
+/// Opens whatever the cursor is on: a pull request in the list, a file in the tree.
+fn open_selected(app: &mut App) -> Effect {
+    if let Some(view) = app.review.as_mut() {
+        if view.tree_focused {
+            view.activate_tree();
+        }
+        return Effect::None;
+    }
+    if let Some(number) = app.list.selected().map(|pr| pr.number) {
+        Effect::OpenPullRequest(number)
+    } else {
+        app.notice(NoticeLevel::Warn, "there is nothing to open");
+        Effect::None
+    }
+}
+
+/// `Esc`: closes the review, or clears what is narrowing the list (FR-3.4).
+fn go_back(app: &mut App) -> Effect {
+    if app.review.is_some() {
+        app.close_review();
+        return Effect::None;
+    }
+    if app.list.is_filtered() {
+        let was_loading = app.list.loading;
+        app.list.clear_filters();
+        app.list.offline = None;
+        // Only re-ask GitHub if something it was asked for changed.
+        return if was_loading || app.environment.is_none() {
+            Effect::None
+        } else {
+            Effect::LoadPullRequests
+        };
+    }
+    Effect::None
+}
+
+/// Moves whatever pane has the cursor.
+fn move_current(app: &mut App, direction: i32, half: bool) {
+    if let Some(view) = app.review.as_mut() {
+        if view.tree_focused {
+            view.move_tree(direction);
+        } else {
+            view.move_page(direction, half);
+        }
+        return;
+    }
+    app.list.move_page(direction, half);
+}
+
+/// Runs a closure against the open review view, if there is one.
+fn with_diff(app: &mut App, action: impl FnOnce(&mut crate::tui::diff_view::DiffView)) {
+    if let Some(view) = app.review.as_mut() {
+        action(view);
+    }
+}
+
+/// Turns the side-by-side view on or off, explaining when the terminal is too
+/// narrow to honour it (DEC-4).
+fn toggle_split(app: &mut App) -> Effect {
+    let width = app.terminal_width();
+    let Some(view) = app.review.as_mut() else {
+        app.notice(NoticeLevel::Warn, "open a pull request first");
+        return Effect::None;
+    };
+    view.split = !view.split;
+    let split = view.split;
+
+    if split && width > 0 && width < crate::tui::components::review::SPLIT_MIN_WIDTH {
+        app.notice(
+            NoticeLevel::Warn,
+            format!(
+                "side-by-side needs {} columns; this terminal has {width}, so the unified view is shown",
+                crate::tui::components::review::SPLIT_MIN_WIDTH
+            ),
+        );
+    } else if split {
+        app.notice(
+            NoticeLevel::Info,
+            "side-by-side view on (it needs 140 columns)",
+        );
+    } else {
+        app.notice(NoticeLevel::Info, "unified view on");
+    }
+    Effect::None
+}
+
+/// Cycles the diff context between the sizes the requirement names (FR-3.2).
+fn cycle_context(app: &mut App) -> Effect {
+    let Some(view) = app.review.as_mut() else {
+        app.notice(NoticeLevel::Warn, "open a pull request first");
+        return Effect::None;
+    };
+    view.context = match view.context {
+        0 => 3,
+        3 => 10,
+        _ => 0,
+    };
+    let context = view.context;
+    // Only a local workspace can re-diff without refetching; in remote mode the fix
+    // is a new `gh pr diff`, which is what `R` does.
+    app.notice(
+        NoticeLevel::Info,
+        format!(
+            "context {context} lines; press R to refetch ({})",
+            if context == 0 {
+                "0 needs the local workspace from M2"
+            } else {
+                "10 is a preference, 3 is what GitHub sends"
+            }
+        ),
+    );
+    Effect::None
+}
+
+/// Toggles whitespace-ignoring, which needs the local workspace (FR-3.2).
+fn toggle_whitespace(app: &mut App) -> Effect {
+    let Some(view) = app.review.as_mut() else {
+        app.notice(NoticeLevel::Warn, "open a pull request first");
+        return Effect::None;
+    };
+    view.ignore_whitespace = !view.ignore_whitespace;
+    let ignoring = view.ignore_whitespace;
+    if ignoring {
+        app.notice(
+            NoticeLevel::Warn,
+            "whitespace-ignoring diffs need the local workspace, which arrives in M2",
+        );
+    } else {
+        app.notice(NoticeLevel::Info, "showing whitespace changes");
+    }
+    Effect::None
+}
+
 fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
     app.focus = pane;
     app.state.focus = Some(pane.label().to_owned());

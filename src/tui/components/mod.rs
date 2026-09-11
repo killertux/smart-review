@@ -5,11 +5,14 @@
 
 pub mod command_line;
 pub mod doctor;
+pub mod filter_bar;
 pub mod header;
 pub mod help;
 pub mod leader;
 pub mod palette;
 pub mod panes;
+pub mod pr_list;
+pub mod review;
 pub mod status_line;
 pub mod theme_picker;
 
@@ -28,6 +31,32 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Overlay::Doctor => doctor::render(frame, area, app),
         Overlay::ThemePicker => theme_picker::render(frame, area, app),
     }
+}
+
+/// The border style for a pane, brightened when it has focus (FR-7.8).
+pub(crate) fn border_style(app: &App, pane: crate::tui::app::Pane) -> ratatui::style::Style {
+    if app.focus() == pane {
+        app.theme.style(crate::tui::theme::element::BORDER_FOCUSED)
+    } else {
+        app.theme.style(crate::tui::theme::element::BORDER)
+    }
+}
+
+/// The first visible row of a scrolling list, keeping `cursor` inside the window.
+///
+/// Shared by the list and the file tree so both scroll the same way: the previous
+/// offset is used as a hint but the cursor always wins, which is what keeps a
+/// refresh from scrolling the user somewhere unexpected (FR-2.3).
+pub(crate) fn scroll_for(cursor: usize, previous: usize, height: usize, len: usize) -> usize {
+    let height = height.max(1);
+    let mut scroll = previous.min(cursor);
+    if cursor >= scroll + height {
+        scroll = cursor + 1 - height;
+    }
+    if cursor < scroll {
+        scroll = cursor;
+    }
+    scroll.min(len.saturating_sub(height))
 }
 
 /// Converts a number of lines into a `u16` height, saturating rather than

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::domain::diff::{FileKind, FileStatus, LineKind, Patch, RelPath};
+use crate::domain::diff::{DiffLine, FileKind, FileStatus, LineKind, Patch, RelPath};
 
 /// What a row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,36 @@ impl DiffRow {
     #[must_use]
     pub fn is_hunk_start(&self) -> bool {
         self.kind == RowKind::HunkHeader
+    }
+}
+
+/// A row of the side-by-side view.
+///
+/// Pairs are computed when the view is rebuilt, not when it is drawn: pairing a run
+/// of deletions with the additions that replaced them is the only part of the split
+/// view with any logic in it, and it happens once per patch rather than once per
+/// frame (NFR-1.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitRow {
+    /// Set when the row spans the full width: file banners, hunk headers,
+    /// placeholders and folded summaries.
+    pub full: Option<DiffRow>,
+    /// The old side, when this row has one.
+    pub left: Option<DiffLine>,
+    /// The new side, when this row has one.
+    pub right: Option<DiffLine>,
+    /// The file the row belongs to.
+    pub file: usize,
+    /// The first unified row this split row covers, so the cursor and the split view
+    /// stay about the same thing.
+    pub unified: usize,
+}
+
+impl SplitRow {
+    /// The unified row to show as selected when `cursor` is on either half.
+    #[must_use]
+    pub fn covers(&self, cursor: usize, next_unified: usize) -> bool {
+        cursor >= self.unified && cursor < next_unified
     }
 }
 
@@ -162,6 +192,10 @@ pub struct DiffView {
     pub patch: Patch,
     /// The flattened rows, rebuilt only when the patch or the folds change.
     pub rows: Vec<DiffRow>,
+    /// The same content paired up for the side-by-side view.
+    pub split_rows: Vec<SplitRow>,
+    /// For each unified row, the split row that shows it.
+    split_index: Vec<usize>,
     /// The file tree, rebuilt with [`Self::rebuild`].
     pub tree: Vec<TreeRow>,
     /// The cursor, as an index into [`Self::rows`].
@@ -179,6 +213,8 @@ pub struct DiffView {
     pub tree_focused: bool,
     /// The cursor inside the tree.
     pub tree_cursor: usize,
+    /// The first visible row of the tree.
+    pub tree_scroll: usize,
     /// Whether the split (side-by-side) view is asked for. Whether it can be
     /// *shown* is a width question, answered at draw time (DEC-4).
     pub split: bool,
@@ -191,6 +227,15 @@ pub struct DiffView {
 }
 
 impl DiffView {
+    /// Builds a view over a patch with the configured diff options.
+    #[must_use]
+    pub fn with_options(patch: Patch, context: u32, ignore_whitespace: bool) -> Self {
+        let mut view = Self::new(patch);
+        view.context = context;
+        view.ignore_whitespace = ignore_whitespace;
+        view
+    }
+
     /// Builds a view over a patch.
     #[must_use]
     pub fn new(patch: Patch) -> Self {
@@ -198,6 +243,8 @@ impl DiffView {
             files: patch.files.len(),
             patch,
             rows: Vec::new(),
+            split_rows: Vec::new(),
+            split_index: Vec::new(),
             tree: Vec::new(),
             cursor: 0,
             scroll: 0,
@@ -206,6 +253,7 @@ impl DiffView {
             folded_dirs: BTreeSet::new(),
             tree_focused: false,
             tree_cursor: 0,
+            tree_scroll: 0,
             split: false,
             context: 3,
             ignore_whitespace: false,
@@ -220,11 +268,57 @@ impl DiffView {
     /// fold changes rather than per frame.
     pub fn rebuild(&mut self) {
         self.rows = flatten(&self.patch, &self.folded_hunks);
+        let (split, index) = build_split(&self.rows);
+        self.split_rows = split;
+        self.split_index = index;
         self.tree = build_tree(&self.patch, &self.folded_dirs);
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
         if self.tree_cursor >= self.tree.len() {
             self.tree_cursor = self.tree.len().saturating_sub(1);
         }
+    }
+
+    /// The split row that shows the cursor, and the rows after it.
+    ///
+    /// The renderer walks this instead of the unified rows when the side-by-side
+    /// view is on, so a paired deletion and addition occupy one drawn row.
+    #[must_use]
+    pub fn split_window(&self, height: u16) -> &[SplitRow] {
+        if self.split_rows.is_empty() {
+            return &[];
+        }
+        let first = self
+            .split_index
+            .get(self.cursor)
+            .copied()
+            .unwrap_or_default();
+        let height = usize::from(height.max(1));
+        let end = (first + height).min(self.split_rows.len());
+        &self.split_rows[first..end]
+    }
+
+    /// Which unified row the split view should show as selected.
+    #[must_use]
+    pub fn selected_unified(&self) -> usize {
+        self.cursor
+    }
+
+    /// Updates everything that depends on the size of the panes.
+    ///
+    /// Called by the renderer, which is the only thing that knows how tall the panes
+    /// are; it is arithmetic, not IO, so the render path stays free of side effects
+    /// on the world.
+    pub fn prepare(&mut self, diff_height: u16, tree_height: u16) {
+        self.ensure_visible(diff_height);
+        let tree_height = usize::from(tree_height.max(1));
+        let mut scroll = self.tree_scroll.min(self.tree_cursor);
+        if self.tree_cursor >= scroll + tree_height {
+            scroll = self.tree_cursor + 1 - tree_height;
+        }
+        if self.tree_cursor < scroll {
+            scroll = self.tree_cursor;
+        }
+        self.tree_scroll = scroll.min(self.tree.len().saturating_sub(tree_height));
     }
 
     /// The row under the cursor.
@@ -526,6 +620,92 @@ fn flatten(patch: &Patch, folded: &BTreeSet<(usize, usize)>) -> Vec<DiffRow> {
         }
     }
     rows
+}
+
+/// Pairs the flattened rows for the side-by-side view.
+///
+/// A run of deletions is matched against the run of additions that follows it, index
+/// by index, which is how a replacement reads as one row with an old side and a new
+/// side. Context lines appear on both sides. Unbalanced runs leave one side empty
+/// rather than shifting everything after them.
+///
+/// Returns the rows and, for each unified row, the index of the split row that shows
+/// it.
+fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
+    let mut split: Vec<SplitRow> = Vec::with_capacity(rows.len());
+    let mut index = Vec::with_capacity(rows.len());
+
+    let mut position = 0;
+    while position < rows.len() {
+        let row = &rows[position];
+
+        if row.kind != RowKind::Line {
+            index.push(split.len());
+            split.push(SplitRow {
+                full: Some(row.clone()),
+                left: None,
+                right: None,
+                file: row.file,
+                unified: position,
+            });
+            position += 1;
+            continue;
+        }
+
+        // Collect the deletions, then the additions that follow.
+        let mut deletions: Vec<DiffLine> = Vec::new();
+        let mut additions: Vec<DiffLine> = Vec::new();
+        let start = position;
+        while position < rows.len() && rows[position].line_kind == Some(LineKind::Delete) {
+            index.push(split.len());
+            deletions.push(as_line(&rows[position]));
+            position += 1;
+        }
+        while position < rows.len() && rows[position].line_kind == Some(LineKind::Add) {
+            index.push(split.len());
+            additions.push(as_line(&rows[position]));
+            position += 1;
+        }
+
+        if deletions.is_empty() && additions.is_empty() {
+            // A context line keeps both sides.
+            let line = as_line(row);
+            index.push(split.len());
+            split.push(SplitRow {
+                full: None,
+                left: Some(line.clone()),
+                right: Some(line),
+                file: row.file,
+                unified: position,
+            });
+            position += 1;
+            continue;
+        }
+
+        // The pairing for a run: deletion i against addition i.
+        for slot in 0..deletions.len().max(additions.len()) {
+            split.push(SplitRow {
+                full: None,
+                left: deletions.get(slot).cloned(),
+                right: additions.get(slot).cloned(),
+                file: row.file,
+                unified: start,
+            });
+        }
+    }
+
+    (split, index)
+}
+
+/// Turns a flattened row back into the line it came from.
+fn as_line(row: &DiffRow) -> DiffLine {
+    DiffLine {
+        kind: row.line_kind.unwrap_or(LineKind::Context),
+        old_line: row.old_line,
+        new_line: row.new_line,
+        content: row.text.clone(),
+        no_newline: row.no_newline,
+    }
 }
 
 /// Groups the patch's files into a tree, with the files in name order.

@@ -26,4 +26,4 @@ pub use pr::{
 };
 pub use query::{Filter, FilterError, PrQuery, PrSort, PrStateFilter, ReviewFilter};
 pub use repo::{RepoId, RepoIdError};
-pub use time::Timestamp;
+pub use time::{Timestamp, from_unix_secs};

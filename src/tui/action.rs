@@ -17,6 +17,10 @@ pub enum Group {
     Navigation,
     /// Moving between panes.
     Pane,
+    /// Finding things.
+    Search,
+    /// Reading a diff.
+    Diff,
     /// Changing the look.
     Theme,
 }
@@ -29,6 +33,8 @@ impl Group {
             Self::App => "App",
             Self::Navigation => "Navigation",
             Self::Pane => "Panes",
+            Self::Search => "Search",
+            Self::Diff => "Diff",
             Self::Theme => "Theme",
         }
     }
@@ -139,6 +145,144 @@ pub const ACTIONS: &[ActionDef] = &[
         id: "nav.bottom",
         description: "Jump to the last item",
         group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "nav.open",
+        description: "Open the selected pull request, or the selected file",
+        group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "nav.half_down",
+        description: "Move half a screen down",
+        group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "nav.half_up",
+        description: "Move half a screen up",
+        group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "nav.page_down",
+        description: "Move a screen down",
+        group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "nav.page_up",
+        description: "Move a screen up",
+        group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "nav.back",
+        description: "Close the review, or clear the search and filters",
+        group: Group::Navigation,
+        hint: false,
+    },
+    ActionDef {
+        id: "search.open",
+        description: "Filter the loaded pull requests as you type",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "search.close",
+        description: "Stop editing the search",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "search.next",
+        description: "Next match",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "search.prev",
+        description: "Previous match",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "filter.menu",
+        description: "Add a filter chip",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "filter.clear",
+        description: "Clear the filters and the search",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "sort.menu",
+        description: "Change the sort order",
+        group: Group::Search,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.next_hunk",
+        description: "Next hunk",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.prev_hunk",
+        description: "Previous hunk",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.next_file",
+        description: "Next file",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.prev_file",
+        description: "Previous file",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.toggle_hunk",
+        description: "Fold or unfold the hunk under the cursor",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.toggle_split",
+        description: "Side-by-side view, when the terminal is wide enough",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.cycle_context",
+        description: "Cycle the context lines: 3, 10, 0",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "diff.toggle_whitespace",
+        description: "Ignore whitespace-only changes",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.copy_path",
+        description: "Copy the current file path",
+        group: Group::Diff,
+        hint: false,
+    },
+    ActionDef {
+        id: "app.load_more",
+        description: "Fetch the next page of pull requests",
+        group: Group::App,
         hint: false,
     },
     ActionDef {

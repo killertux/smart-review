@@ -34,6 +34,9 @@ pub struct Context {
     pub config_path: PathBuf,
     /// Whether a config file was read.
     pub config_exists: bool,
+    /// How many keys the config file declares, which is what makes "parsed" a
+    /// checkable statement rather than an absence of errors (FR-9.3).
+    pub config_keys: usize,
     /// Warnings collected while loading configuration and keybindings.
     pub warnings: Vec<String>,
     /// The keybinding engine.
