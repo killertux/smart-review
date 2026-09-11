@@ -1,0 +1,29 @@
+ smart-review v0.1.0 config: built-in defaults                                         acme/service
+┌ Planned ─────────────────────────────────────────────┐┌ This shell ──────────────────────────────┐
+│ > M1  browse, filter and search pull requests        ││ home     …/target/snapshot-home          │
+│   M1┌ Help ────────────────────────────────────────────────────────────────────────────────┐     │
+│   M2│ APP                                                                                  │     │
+│   M2│   <C-c>, <Space>q     Quit smart-review                                              │     │
+│   M2│   <Space>?, ?         Show the help popup                                            │     │
+│   M3│   :                   Open the command line                                          │     │
+│   M4│   <Space>             Show the available leader bindings                             │     │
+│   M5│   <Esc>               Close the current popup, or cancel pending keys                │     │
+│     │   <Space>r            Refresh the current view                                       │     │
+│ This│   ·                   Show environment checks                                        │     │
+│ Navi│ NAVIGATION                                                                           │nu   │
+│ comm│   <Up>, k             Move up                                                        │     │
+│ pane│   <Down>, j           Move down                                                      │     │
+│     │   gg                  Jump to the first item                                         │     │
+│     │   G                   Jump to the last item                                          │     │
+│     │ PANES                                                                                │     │
+│     │   <Tab>               Focus the next pane                                            │     │
+│     │   <S-Tab>             Focus the previous pane                                        │     │
+│     │ THEME                                                                                │     │
+│     │   <Space>t            Choose a theme                                                 │     │
+│     │   <Space>d            Switch to the dark theme                                       │     │
+│     │   <Space>l            Switch to the light theme                                      │     │
+│     │                                                                                      │     │
+│     │ Esc closes · : commands · <leader> action menu · q quits from a popup                │     │
+│     └──────────────────────────────────────────────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────┘└──────────────────────────────────────────┘
+ POPUP list · dark · leader <Space> · 19 keys                ? help · <leader> actions · : commands
