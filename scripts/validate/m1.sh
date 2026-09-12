@@ -99,39 +99,24 @@ GH
   printf '%s' "$fail_list" >"$dir/fail_list"
 }
 
-# Runs the interface in a pty, sends some keys, and strips the escape sequences so
-# the screen can be read as text.
+# Runs the interface in a pty, sends key groups and waits for each group's effect
+# before sending the next, then prints the final screen.
+#
+# `keys` and `waits` are parallel `~`-separated lists: the driver sends keys[i],
+# polls the replayed screen until waits[i] appears, and moves on. An empty wait
+# just settles briefly. The full capture still lands in `log`, so the transient
+# popups that `:q` closes can be replayed from it (see `shown` in m2b.sh).
 run_tui() {
-  local home="$1" keys="$2" fake="$3" log="$4"
-  # `~` separates groups of keys by a pause, because opening a pull request is a
-  # background job: a `:q` sent in the same breath quits before the diff arrives.
-  set +e
-  (sleep 1
-   IFS='~' read -ra groups <<<"$keys"
-   for group in "${groups[@]}"; do
-     printf '%b' "$group"
-     sleep 1.5
-   done
-   sleep 1) \
-    | PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" timeout 30 \
-      script -qefc "stty rows 40 cols 160 2>/dev/null; '$ROOT/$BIN' --repo acme/service" /dev/null \
-    >"$log" 2>&1
-  TUI_STATUS=$?
-  set -e
-
-  # A crash on the way out — a panic while restoring the terminal, a worker that
-  # deadlocks — must be visible even though the screen looked right beforehand.
-  if [ "$TUI_STATUS" -ne 0 ] && [ "$TUI_STATUS" -ne 124 ]; then
-    printf '  note: the interface exited %s; see %s\n' "$TUI_STATUS" "$log"
-  fi
+  local home="$1" keys="$2" waits="$3" fake="$4" log="$5"
+  PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" \
+    python3 "$ROOT/scripts/validate/drive.py" \
+      --cols 160 --rows 40 --log "$log" \
+      --ready "Add retry to the webhook dispatcher" \
+      --keys "$keys" --waits "$waits" -- \
+      "$ROOT/$BIN" --repo acme/service
   if grep -q 'panicked' "$log" 2>/dev/null; then
     printf '  note: the interface panicked; see %s\n' "$log"
   fi
-
-  # The capture is every frame concatenated, and the app only writes the cells that
-  # changed, so the raw stream is not what was on screen. Replaying the escape
-  # sequences reconstructs the final screen instead.
-  python3 "$ROOT/scripts/validate/screen.py" --path "$log" --cols 160 --rows 40
 }
 
 # Matches text on the reconstructed screen, ignoring the padding between columns.
@@ -256,7 +241,7 @@ else
   make_fake_gh "$FAKE"
 
   HOME_LIST="$TMP/home-list"
-  SCREEN="$(run_tui "$HOME_LIST" ':q\r' "$FAKE" /tmp/m1-list.log)"
+  SCREEN="$(run_tui "$HOME_LIST" ':q\r' '' "$FAKE" /tmp/m1-list.log)"
 
   # The list is the headline feature: rows, markers and an honest count.
   if printf '%s' "$SCREEN" | grep -q "Add retry to the webhook dispatcher"; then
@@ -287,7 +272,7 @@ else
 
   # `:filter is:all` re-asks GitHub with a different query, and the chips change.
   HOME_FILTER="$TMP/home-filter"
-  SCREEN="$(run_tui "$HOME_FILTER" ':filter is:all\r~:q\r' "$FAKE" /tmp/m1-filter.log)"
+  SCREEN="$(run_tui "$HOME_FILTER" ':filter is:all\r~:q\r' '\[is:all\]~' "$FAKE" /tmp/m1-filter.log)"
   if printf '%s' "$SCREEN" | saw "\[is:all\]"; then
     ok "a filter becomes a visible chip"
   else
@@ -297,7 +282,7 @@ else
 
   # `/` filters what has been fetched, without asking GitHub again.
   HOME_SEARCH="$TMP/home-search"
-  SCREEN="$(run_tui "$HOME_SEARCH" '/dependabot\r~:q\r' "$FAKE" /tmp/m1-search.log)"
+  SCREEN="$(run_tui "$HOME_SEARCH" '/dependabot\r~:q\r' 'matching 1 of 3 loaded~' "$FAKE" /tmp/m1-search.log)"
   if printf '%s' "$SCREEN" | saw "matching 1 of 3 loaded"; then
     ok "the client-side search narrows the fetched list"
   else
@@ -307,7 +292,7 @@ else
 
   # Enter opens the selected pull request: its diff comes from `gh pr diff`.
   HOME_DIFF="$TMP/home-diff"
-  SCREEN="$(run_tui "$HOME_DIFF" '\r~' "$FAKE" /tmp/m1-diff.log)"
+  SCREEN="$(run_tui "$HOME_DIFF" '\r~' 'impl Invoice~' "$FAKE" /tmp/m1-diff.log)"
   if printf '%s' "$SCREEN" | grep -q "impl Invoice"; then
     ok "opening a pull request shows its diff"
   else
@@ -338,7 +323,7 @@ else
   # `}` moves to the next file banner and `j` moves a line, so the status line's
   # file label is what proves the cursor travelled.
   HOME_NAV="$TMP/home-nav"
-  SCREEN="$(run_tui "$HOME_NAV" '\r~}}~:q\r' "$FAKE" /tmp/m1-nav.log)"
+  SCREEN="$(run_tui "$HOME_NAV" '\r~}}~:q\r' 'impl Invoice~M scripts/build\.sh~' "$FAKE" /tmp/m1-nav.log)"
   if printf '%s' "$SCREEN" | saw "M scripts/build.sh"; then
     ok "file navigation moves the cursor and the status line names the file"
   else
@@ -347,7 +332,7 @@ else
   fi
 
   HOME_HUNK="$TMP/home-hunk"
-  SCREEN="$(run_tui "$HOME_HUNK" '\r~]c~:q\r' "$FAKE" /tmp/m1-hunk.log)"
+  SCREEN="$(run_tui "$HOME_HUNK" '\r~]c~:q\r' 'impl Invoice~impl Billing~' "$FAKE" /tmp/m1-hunk.log)"
   if printf '%s' "$SCREEN" | saw "impl Billing"; then
     ok "hunk navigation reaches the next hunk"
   else
@@ -359,7 +344,7 @@ else
   # rolling down must move what is displayed: a wheel that only walks a selection down
   # the screen looks broken, and it looked broken here twice.
   HOME_WHEEL="$TMP/home-wheel"
-  SCREEN="$(run_tui "$HOME_WHEEL" ':pr 138\r' "$FAKE" /tmp/m1-wheel-before.log)"
+  SCREEN="$(run_tui "$HOME_WHEEL" ':pr 138\r' 'line 001 of the invoice' "$FAKE" /tmp/m1-wheel-before.log)"
   if printf '%s' "$SCREEN" | saw "line 001 of the invoice"; then
     ok "a long diff starts at the top"
   else
@@ -368,7 +353,7 @@ else
   fi
 
   HOME_WHEEL2="$TMP/home-wheel2"
-  SCREEN="$(run_tui "$HOME_WHEEL2" ':pr 138\r~\033[<65;60;12M\033[<65;60;12M\033[<65;60;12M' "$FAKE" /tmp/m1-wheel.log)"
+  SCREEN="$(run_tui "$HOME_WHEEL2" ':pr 138\r~\033[<65;60;12M\033[<65;60;12M\033[<65;60;12M' 'line 001 of the invoice~' "$FAKE" /tmp/m1-wheel.log)"
   if printf '%s' "$SCREEN" | saw "line 001 of the invoice"; then
     bad "the wheel did not scroll the diff"
     printf '%s\n' "$SCREEN" | tail -8
@@ -378,7 +363,7 @@ else
 
   # And a click lands on the row it was aimed at: the second file in the tree.
   HOME_CLICK="$TMP/home-click"
-  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;5M' "$FAKE" /tmp/m1-click.log)"
+  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;5M' 'impl Invoice~A docs/logo\.png' "$FAKE" /tmp/m1-click.log)"
   if printf '%s' "$SCREEN" | saw "A docs/logo.png"; then
     ok "a click on a tree row opens that file"
   else
@@ -389,7 +374,7 @@ else
   # `:copy-path` writes the OSC 52 sequence, which *is* the feature: a path on the
   # clipboard with no clipboard dependency (FR-3.4).
   HOME_COPY="$TMP/home-copy"
-  run_tui "$HOME_COPY" '\r~y~:q\r' "$FAKE" /tmp/m1-copy.log >/dev/null
+  run_tui "$HOME_COPY" '\r~y~:q\r' 'impl Invoice~copied~' "$FAKE" /tmp/m1-copy.log >/dev/null
   if grep -q ']52;c;' /tmp/m1-copy.log; then
     ok ":copy-path puts the file path on the terminal clipboard"
   else
@@ -419,7 +404,7 @@ else
   # shown must come from the cache with an honest offline marker (FR-2.3, DEC-14).
   FAKE_FAILING="$TMP/fake-gh-offline"
   make_fake_gh "$FAKE_FAILING" 1
-  SCREEN="$(run_tui "$HOME_LIST" ':q\r' "$FAKE_FAILING" /tmp/m1-offline.log)"
+  SCREEN="$(run_tui "$HOME_LIST" ':q\r' '' "$FAKE_FAILING" /tmp/m1-offline.log)"
   if printf '%s' "$SCREEN" | grep -q "Add retry to the webhook dispatcher"; then
     ok "a cached list is shown when the network is gone"
   else

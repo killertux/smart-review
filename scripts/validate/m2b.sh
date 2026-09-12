@@ -282,20 +282,13 @@ shown() {
 }
 
 run_tui() {
-  local home="$1" keys="$2" log="$3" settle="${4:-2}"
-  set +e
-  (sleep 1.5
-   IFS='~' read -ra groups <<<"$keys"
-   for group in "${groups[@]}"; do
-     printf '%b' "$group"
-     sleep "$settle"
-   done
-   sleep 1) \
-    | PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" FAKE_API_KEY=sk-fake-validation \
-      timeout 90 script -qefc "stty rows 40 cols 160 2>/dev/null; '$ROOT/$BIN' --repo acme/service --path '$REPO/clone'" /dev/null \
-    >"$log" 2>&1
-  set -e
-  python3 "$ROOT/scripts/validate/screen.py" --path "$log" --cols 160 --rows 40
+  local home="$1" keys="$2" waits="$3" log="$4"
+  PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" FAKE_API_KEY=sk-fake-validation \
+    python3 "$ROOT/scripts/validate/drive.py" \
+      --cols 160 --rows 40 --log "$log" \
+      --ready "Add retry to the webhook dispatcher" \
+      --keys "$keys" --waits "$waits" -- \
+      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone"
 }
 
 step "1/6 build"
@@ -314,7 +307,7 @@ make_home "$HOME_MAIN"
 step "2/6 the first analysis"
 # `<leader>a` twice: the first press is the FR-4.6 opt-in notice, the second sends.
 FRAMES="$TMP/confirm.log"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' "$FRAMES" 6)"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Nothing has been sent yet~' "$FRAMES")"
 if [ ! -s "$TMP/requests.jsonl" ]; then
   ok "the first press sent nothing at all"
 else
@@ -335,7 +328,7 @@ fi
 # below are about this run's requests.
 FRAMES="$TMP/analysis.log"
 : >"$TMP/requests.jsonl"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~ a~:q\r' "$FRAMES" 6)"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~ a~:q\r' 'money\.rs~Nothing has been sent yet~Money now rounds half up~' "$FRAMES")"
 if shown "$FRAMES" "Money now rounds half up"; then
   ok "the analysis panel shows the summary"
 else
@@ -396,7 +389,7 @@ PASS=$((PASS + $(printf '%s\n' "$WIRE" | grep -c '^  PASS')))
 FAIL=$((FAIL + $(printf '%s\n' "$WIRE" | grep -c '^  FAIL')))
 
 step "4/6 the ordered review"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' "$TMP/order.log" 6)"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Money now rounds half up~' "$TMP/order.log")"
 if printf '%s' "$SCREEN" | grep -q "recommended order"; then
   ok "the tree is in the recommended order"
 else
@@ -419,7 +412,7 @@ else
   bad "the positions in both orders are missing"
 fi
 # `o` switches to the path order and says so.
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~o~:q\r' "$TMP/order-toggle.log" 6)"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~o~:q\r' 'money\.rs~Money now rounds half up~~path order~' "$TMP/order-toggle.log")"
 if printf '%s' "$SCREEN" | grep -q "path order"; then
   ok "o switches to the path order"
 else
@@ -433,7 +426,7 @@ kill "$LLM_PID" 2>/dev/null
 LLM_PID=""
 sleep 0.5
 : >"$TMP/requests.jsonl"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' "$TMP/cached.log" 6)"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Money now rounds half up~' "$TMP/cached.log")"
 if shown "$TMP/cached.log" "Money now rounds half up"; then
   ok "the cached analysis is used with the provider down"
 else
@@ -466,7 +459,7 @@ echo prose-then-good >"$TMP/mode"
 : >"$TMP/repair.jsonl"
 HOME_REPAIR="$TMP/home-repair"
 make_home "$HOME_REPAIR"
-SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' "$TMP/repair.log" 8)"
+SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' 'money\.rs~Nothing has been sent yet~Money now rounds half up~' "$TMP/repair.log")"
 if shown "$TMP/repair.log" "Money now rounds half up"; then
   ok "prose was repaired into a usable analysis"
 else
@@ -489,7 +482,7 @@ fi
 echo prose >"$TMP/mode"
 HOME_BAD="$TMP/home-bad"
 make_home "$HOME_BAD"
-SCREEN="$(run_tui "$HOME_BAD" ':pr 141\r~ a~ a~:q\r' "$TMP/bad.log" 8)"
+SCREEN="$(run_tui "$HOME_BAD" ':pr 141\r~ a~ a~:q\r' 'money\.rs~Nothing has been sent yet~could not be used~' "$TMP/bad.log")"
 if shown "$TMP/bad.log" "could not be used"; then
   ok "an unusable answer is reported with its reason"
 else
@@ -511,7 +504,7 @@ fi
 echo good >"$TMP/mode"
 HOME_SMALL="$TMP/home-small"
 MAX_CONTEXT=6000 make_home "$HOME_SMALL"
-SCREEN="$(run_tui "$HOME_SMALL" ':pr 141\r~ a~ a~:context\r~:q\r' "$TMP/small.log" 6)"
+SCREEN="$(run_tui "$HOME_SMALL" ':pr 141\r~ a~ a~:context\r~:q\r' 'money\.rs~Nothing has been sent yet~Money now rounds half up~AGENTS\.md~' "$TMP/small.log")"
 if shown "$TMP/small.log" "elided|truncated|reduced"; then
   ok "a budget that does not fit is reported rather than hidden"
 else
