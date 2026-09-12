@@ -81,6 +81,10 @@ pub enum Slot {
     Analysis,
     /// The analysis request itself (FR-4.1).
     Analyze,
+    /// Reading the chat sessions for a pull request (FR-5.1).
+    Chat,
+    /// One chat answer (FR-5.2).
+    ChatAsk,
 }
 
 /// What a job was asked to do.
@@ -170,6 +174,31 @@ pub enum Job {
         /// agreed to send is what is sent.
         bundle: Box<crate::domain::context::Bundle>,
     },
+    /// Read a pull request's chat sessions (FR-5.1).
+    LoadChat {
+        /// Which pull request.
+        pr: u64,
+        /// The conversation to open, when the caller has one in mind.
+        open: Option<String>,
+    },
+    /// Gather the bundle one question would send (FR-5.3, FR-4.6).
+    GatherChat {
+        /// What to ask with, and about.
+        spec: Box<crate::application::chat::ChatSpec>,
+        /// The conversation as it stood when the question was asked.
+        session: Box<crate::domain::chat::Session>,
+        /// The question, carried through so the caller does not have to remember it.
+        question: String,
+    },
+    /// Ask one question (FR-5.2, FR-5.3).
+    ///
+    /// The session is carried in the job rather than read inside it: the store is the
+    /// caller's, and the conversation the answer belongs to must be the one the user was
+    /// looking at when they pressed Enter.
+    AskChat {
+        /// What to ask.
+        request: Box<ChatAsk>,
+    },
     /// Collect the environment report (FR-9.3).
     Report {
         /// What to check. Boxed because the context is much larger than any other
@@ -200,6 +229,17 @@ impl Job {
             // analysis", and a second request should replace the first.
             Self::LoadAnalysis { .. } | Self::GatherContext { .. } => Slot::Analysis,
             Self::RunAnalysis { .. } => Slot::Analyze,
+            // Reading and writing are one slot: the list and the conversation are the
+            // same resource, and a second request should replace the first.
+            // Reading, gathering and asking are three slots: the first is about the
+            // list, and the last two are about one question — a gather belongs to the
+            // question that asked for it, so asking again replaces it, while the list
+            // is unaffected.
+            // Reading the list and gathering one question's bundle are the same slot
+            // for different reasons: neither is the answer, and both are replaced by a
+            // newer request for the same thing.
+            Self::LoadChat { .. } | Self::GatherChat { .. } => Slot::Chat,
+            Self::AskChat { .. } => Slot::ChatAsk,
         }
     }
 
@@ -208,6 +248,24 @@ impl Job {
     pub fn is_cancellable(&self) -> bool {
         !matches!(self, Self::Report { .. })
     }
+}
+
+/// One chat question, with the conversation it belongs to (FR-5.2, FR-5.3).
+///
+/// Separate from [`crate::application::chat::ChatSpec`] because a job is what crosses a
+/// channel: the session is the state the answer will be appended to, and the question is
+/// what the user typed. Both are owned here, so the worker thread never reaches back
+/// into the interface.
+#[derive(Debug, Clone)]
+pub struct ChatAsk {
+    /// What to ask with, and about.
+    pub spec: crate::application::chat::ChatSpec,
+    /// The conversation as it stood when the question was asked.
+    pub session: Box<crate::domain::chat::Session>,
+    /// The question.
+    pub question: String,
+    /// The gathered bundle, so what was estimated is what is sent (FR-4.6).
+    pub bundle: Box<crate::domain::context::Bundle>,
 }
 
 /// What a job produced.
@@ -262,6 +320,27 @@ pub enum Outcome {
     },
     /// The analysis finished, one way or another (FR-4.1).
     Analyzed(Box<AnalysisRun>),
+    /// A pull request's sessions, and the one the caller asked to open (FR-5.1).
+    ChatLoaded {
+        /// The sessions that exist, newest first.
+        sessions: Vec<crate::domain::chat::SessionMeta>,
+        /// The conversation to show, when there is one to show.
+        session: Option<Box<crate::domain::chat::Session>>,
+        /// Whether the caller wanted a specific one and it was not there.
+        missing: Option<String>,
+    },
+    /// A chat answer finished, one way or another (FR-5.2).
+    ChatAnswered(Box<ChatAnswered>),
+    /// The bundle a chat question would send, and the question it was gathered for
+    /// (FR-5.3).
+    ChatGathered {
+        /// What was gathered.
+        bundle: Box<crate::domain::context::Bundle>,
+        /// The conversation it belongs to.
+        session: Box<crate::domain::chat::Session>,
+        /// The question that asked for it.
+        question: String,
+    },
     /// Worktrees were removed (FR-3.1).
     WorkspacesCleaned {
         /// How many were removed.
@@ -287,7 +366,34 @@ pub struct Progress {
     /// Which job this is about.
     pub job: u64,
     /// What it wants to say.
-    pub update: AnalysisProgress,
+    pub update: ProgressUpdate,
+}
+
+/// What a job wants the interface to know while it runs.
+///
+/// One channel carries every job's updates, so the vocabulary has to be one type: an
+/// analysis streams a JSON document and a chat answer streams prose, and the two
+/// messages mean different things to the pane that receives them ("repairing" vs "the
+/// model is typing"). Wrapping rather than sharing the variants keeps that difference
+/// visible where it matters — in the pane — instead of in a comment about how the same
+/// string means two things.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressUpdate {
+    /// An analysis run (FR-4.4).
+    Analysis(AnalysisProgress),
+    /// A chat answer (FR-5.2).
+    Chat(crate::application::chat::Progress),
+}
+
+/// A chat answer as a job result, with the conversation it belongs to (FR-5.2).
+#[derive(Debug, Clone)]
+pub struct ChatAnswered {
+    /// What the answer was, or that it was stopped.
+    pub run: crate::application::chat::ChatRun,
+    /// Which conversation it belongs to, so a session switch discards it.
+    pub session: String,
+    /// The question it answered, which is what `r` repeats.
+    pub question: String,
 }
 
 /// A finished job, on its way back to the event loop.
@@ -315,6 +421,8 @@ pub struct ExecutorPorts {
     pub workspace: Arc<dyn WorkspacePort>,
     /// Where analyses live (FR-4.3).
     pub analysis: Arc<dyn AnalysisCachePort>,
+    /// Where chat sessions live (FR-5.1).
+    pub chat: Arc<dyn crate::ports::ChatStorePort>,
     /// The provider (FR-4.1).
     pub llm: Arc<dyn LlmPort>,
     /// Which repository these are scoped to.
@@ -340,6 +448,8 @@ pub struct Executor {
     workspace: Arc<dyn WorkspacePort>,
     /// Where analyses and their review-plan overrides are kept (FR-4.3).
     analysis: Arc<dyn AnalysisCachePort>,
+    /// Where chat sessions are read and written (FR-5.1).
+    chat: Arc<dyn crate::ports::ChatStorePort>,
     /// The provider, for the analysis request itself (FR-4.1).
     llm: Arc<dyn LlmPort>,
     repo: RepoId,
@@ -356,6 +466,7 @@ impl Executor {
             clock,
             workspace,
             analysis,
+            chat,
             llm,
             repo,
             policy,
@@ -366,6 +477,7 @@ impl Executor {
             clock,
             workspace,
             analysis,
+            chat,
             llm,
             repo,
             policy,
@@ -442,11 +554,16 @@ impl Executor {
             }
             Job::RunAnalysis { request, bundle } => {
                 let analyst = self.analyst();
-                let mut report = |update: AnalysisProgress| sink.send(update);
+                let mut report = |update: AnalysisProgress| {
+                    sink.send(ProgressUpdate::Analysis(update));
+                };
                 match analyst.run(request, bundle, cancel, &mut report) {
                     Ok(run) => Outcome::Analyzed(Box::new(run)),
                     Err(error) => Outcome::Failed(error.to_string()),
                 }
+            }
+            Job::LoadChat { .. } | Job::GatherChat { .. } | Job::AskChat { .. } => {
+                self.chat_job(job, cancel, sink)
             }
             // Detection, the report, the catalog, the worktree and the connection
             // check do not need a repository resolved through the forge, so
@@ -523,6 +640,99 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// Runs one of the three chat jobs (FR-5.1–FR-5.3).
+    ///
+    /// Extracted from [`Executor::run`] because it is the one group whose arms are about
+    /// a *conversation* rather than about a request, and because the match there is at
+    /// the line limit clippy enforces.
+    fn chat_job(&self, job: &Job, cancel: &Cancel, sink: &ProgressSink<'_>) -> Outcome {
+        match job {
+            Job::LoadChat { pr, open } => self.load_chat(*pr, open.as_deref()),
+            Job::GatherChat {
+                spec,
+                session,
+                question,
+            } => {
+                let bundle = self.chatter().gather(spec, cancel);
+                Outcome::ChatGathered {
+                    bundle: Box::new(bundle),
+                    session: session.clone(),
+                    question: question.clone(),
+                }
+            }
+            Job::AskChat { request } => {
+                let chatter = self.chatter();
+                // The chat has its own progress vocabulary, wrapped rather than
+                // flattened into the analysis one: one channel, one variant, one place
+                // to look when the pane shows the wrong thing.
+                let mut report = |update: crate::application::chat::Progress| {
+                    sink.send(ProgressUpdate::Chat(update));
+                };
+                match chatter.ask(
+                    &request.spec,
+                    &request.session,
+                    &request.bundle,
+                    &request.question,
+                    cancel,
+                    &mut report,
+                ) {
+                    Ok(run) => Outcome::ChatAnswered(Box::new(ChatAnswered {
+                        run,
+                        session: request.session.id.clone(),
+                        question: request.question.clone(),
+                    })),
+                    Err(error) => Outcome::Failed(error.to_string()),
+                }
+            }
+            _ => Outcome::Abandoned,
+        }
+    }
+
+    /// Reads a pull request's conversations (FR-5.1).
+    ///
+    /// Never fails: a chat store that cannot be read is a store with no conversations
+    /// in it as far as the interface is concerned, and the error the user needs to see
+    /// is the one about *sending*, not about listing.
+    fn load_chat(&self, pr: u64, open: Option<&str>) -> Outcome {
+        let sessions = self.chat.list(&self.repo, pr).unwrap_or_default();
+        let wanted = match open {
+            Some(id) => Some(id.to_owned()),
+            // The newest conversation is what the pane opens by default, which is what
+            // makes restarting the app land on the conversation you were having.
+            None => sessions.first().map(|meta| meta.id.clone()),
+        };
+        match wanted {
+            Some(id) => match self.chat.load(&self.repo, pr, &id) {
+                Ok(Some(session)) => Outcome::ChatLoaded {
+                    sessions,
+                    session: Some(Box::new(session)),
+                    missing: None,
+                },
+                Ok(None) => Outcome::ChatLoaded {
+                    sessions,
+                    session: None,
+                    missing: Some(id),
+                },
+                Err(error) => Outcome::Failed(error.to_string()),
+            },
+            None => Outcome::ChatLoaded {
+                sessions,
+                session: None,
+                missing: None,
+            },
+        }
+    }
+
+    /// The chat use case, bound to this repository's ports.
+    fn chatter(&self) -> crate::application::chat::Chatter<'_> {
+        crate::application::chat::Chatter::new(
+            self.workspace.as_ref(),
+            self.llm.as_ref(),
+            self.clock.as_ref(),
+            &self.repo,
+        )
     }
 
     /// The analysis use case, bound to this repository's ports.
@@ -809,7 +1019,7 @@ impl ProgressSink<'_> {
     /// Sends an update, dropping it when nobody is listening.
     ///
     /// A dropped preview costs nothing: the answer arrives whole in the completion.
-    fn send(&self, update: AnalysisProgress) {
+    fn send(&self, update: ProgressUpdate) {
         let _ = self.sender.send(Progress {
             job: self.job,
             update,
@@ -933,6 +1143,15 @@ pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<
         | Effect::RunAnalysis { .. }
         | Effect::CancelAnalysis
         | Effect::SavePlan(_)
+        | Effect::LoadChat
+        | Effect::NewChat
+        | Effect::OpenChat(_)
+        | Effect::AskChat
+        | Effect::CancelChat
+        | Effect::RetryChat
+        | Effect::ExportChat(_)
+        | Effect::PruneChat
+        | Effect::SaveContextFiles
         | Effect::CancelInFlight
         | Effect::SetMouse(_)
         | Effect::None
@@ -1123,6 +1342,7 @@ mod tests {
         );
         let forge = Arc::new(SlowForge::new(delay));
         runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
+            chat: Arc::new(crate::test_support::FakeChatStore::default()),
             forge: Arc::clone(&forge) as Arc<dyn ForgePort>,
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),
@@ -1391,6 +1611,7 @@ mod tests {
             DetectRequest::default(),
         );
         runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
+            chat: Arc::new(crate::test_support::FakeChatStore::default()),
             forge: Arc::new(PanicForge) as Arc<dyn ForgePort>,
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),

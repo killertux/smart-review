@@ -30,6 +30,14 @@ pub struct AppState {
     /// with the other small values that survive a restart.
     #[serde(default)]
     pub analysis_opt_in: Vec<String>,
+    /// Files the user added to the context, per pull request (FR-5.3).
+    ///
+    /// A preference about a pull request rather than about a session: "I want the design
+    /// document in the bundle" should hold for the next conversation too, and it is
+    /// small enough to belong here with the other values that survive a restart
+    /// (FR-8.5).
+    #[serde(default)]
+    pub context_files: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Everything that can go wrong while reading or writing state.
@@ -108,6 +116,10 @@ mod tests {
             last_pr: Some(141),
             focus: Some("diff".to_owned()),
             analysis_opt_in: vec!["github.com/acme/service".to_owned()],
+            context_files: std::collections::BTreeMap::from([(
+                "github.com/acme/service#141".to_owned(),
+                vec!["docs/design.md".to_owned()],
+            )]),
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path).unwrap(), state);

@@ -89,6 +89,80 @@ pub struct Startup {
     pub llm: Arc<dyn LlmPort>,
     /// Where analyses and their review-plan overrides are kept (FR-4.3).
     pub analysis: Arc<dyn crate::ports::AnalysisCachePort>,
+    /// Where chat sessions are kept (FR-5.1). Disposable, like everything else under
+    /// `cache/`, but written carefully: the conversation is the user's own words.
+    pub chat: Arc<dyn crate::ports::ChatStorePort>,
+}
+
+/// The adapters a startup builds.
+///
+/// One struct rather than a dozen locals, because the composition root is the only place
+/// that names an adapter (ARCH-1) and a list of them is easier to audit for that than a
+/// stretch of `let`s in the middle of a long function.
+struct Ports {
+    /// Git, for detection and for the worktrees (FR-3.1).
+    workspace: Arc<dyn WorkspacePort>,
+    /// The same git, as the interface's port for listing worktrees (FR-3.1).
+    workspace_port: Arc<dyn WorkspacePort>,
+    /// `gh`, for detection (FR-1.1).
+    probe: Arc<dyn ForgeProbe>,
+    /// `gh`, for one repository's requests (FR-2.1).
+    forge_factory: Arc<dyn ForgeFactory>,
+    /// The answer cache (FR-2.3).
+    cache: Arc<dyn CacheStore>,
+    /// Provider keys (FR-4.5).
+    secret_store: Arc<dyn SecretStore>,
+    /// The model catalog (FR-4.7).
+    catalog: Arc<dyn ModelCatalogPort>,
+    /// The provider (FR-4.4).
+    llm: Arc<dyn LlmPort>,
+    /// Where analyses live (FR-4.3).
+    analysis: Arc<dyn crate::ports::AnalysisCachePort>,
+    /// Where conversations live (FR-5.1).
+    chat: Arc<dyn crate::ports::ChatStorePort>,
+}
+
+impl Ports {
+    /// Builds every adapter, given the one directory the caller resolved.
+    ///
+    /// The worktree root is wired in here and only here: everything that creates a
+    /// worktree writes inside the app's own directory (FR-3.1, DEC-1).
+    fn build(
+        home: &Home,
+        config: &crate::config::Config,
+        path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let workspace_root = home.worktrees();
+        let workspace: Arc<dyn WorkspacePort> = Arc::new(match path {
+            Some(path) => GitCli::new().in_dir(path).with_worktrees(workspace_root),
+            None => GitCli::new().with_worktrees(workspace_root),
+        });
+        let workspace_port = Arc::clone(&workspace);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let cache: Arc<dyn CacheStore> = Arc::new(DiskCache::new(home.cache()));
+        Self {
+            probe: Arc::new(GhCliProbe::new(config.forge.gh_path.clone())),
+            forge_factory: Arc::new(GhForgeFactory::new(config.forge.gh_path.clone())),
+            secret_store: Arc::new(FileSecrets::new(home.credentials(), Arc::new(RealEnv))),
+            catalog: Arc::new(ModelsDevCatalog::new(
+                config.catalog.url.clone(),
+                home.catalog_cache(),
+                u64::from(config.catalog.ttl_hours) * 3600,
+                Arc::new(ReqwestFetcher::new()),
+                Arc::clone(&clock),
+            )),
+            llm: Arc::new(LlmCrate::new()),
+            analysis: Arc::new(crate::adapters::analysis_cache::DiskAnalysisCache::new(
+                home.analysis_cache(),
+            )),
+            chat: Arc::new(crate::adapters::chat_store::FileChatStore::new(
+                home.cache(),
+            )),
+            workspace,
+            workspace_port,
+            cache,
+        }
+    }
 }
 
 /// Resolves which repository to read: the flag wins, then the environment.
@@ -190,37 +264,7 @@ impl Startup {
 
         let keymap = keymap::load(&home, &loaded.config.ui, &mut warnings)?;
 
-        // The composition root: this is the only place that names an adapter, so the
-        // presentation layer can depend on the ports alone (ARCH-1).
-        // The worktree root is wired in here, and only here: everything that creates
-        // a worktree writes inside the app's own directory (FR-3.1, DEC-1).
-        let workspace_root = home.worktrees();
-        let workspace: Arc<dyn WorkspacePort> = Arc::new(match &cli.path {
-            Some(path) => GitCli::new()
-                .in_dir(path.clone())
-                .with_worktrees(workspace_root),
-            None => GitCli::new().with_worktrees(workspace_root),
-        });
-        let probe: Arc<dyn ForgeProbe> =
-            Arc::new(GhCliProbe::new(loaded.config.forge.gh_path.clone()));
-        let forge_factory: Arc<dyn ForgeFactory> =
-            Arc::new(GhForgeFactory::new(loaded.config.forge.gh_path.clone()));
-        let workspace_port = Arc::clone(&workspace);
-        let cache: Arc<dyn CacheStore> = Arc::new(DiskCache::new(home.cache()));
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let secret_store: Arc<dyn SecretStore> =
-            Arc::new(FileSecrets::new(home.credentials(), Arc::new(RealEnv)));
-        let catalog: Arc<dyn ModelCatalogPort> = Arc::new(ModelsDevCatalog::new(
-            loaded.config.catalog.url.clone(),
-            home.catalog_cache(),
-            u64::from(loaded.config.catalog.ttl_hours) * 3600,
-            Arc::new(ReqwestFetcher::new()),
-            clock,
-        ));
-        let llm: Arc<dyn LlmPort> = Arc::new(LlmCrate::new());
-        let analysis: Arc<dyn crate::ports::AnalysisCachePort> = Arc::new(
-            crate::adapters::analysis_cache::DiskAnalysisCache::new(home.analysis_cache()),
-        );
+        let ports = Ports::build(&home, &loaded.config, cli.path.clone());
 
         Ok(Self {
             home,
@@ -240,16 +284,17 @@ impl Startup {
             path: cli.path.clone(),
             remote: cli.remote.clone(),
             clock: SystemClock,
-            workspace,
-            probe,
-            forge_factory,
-            cache,
+            workspace: ports.workspace,
+            probe: ports.probe,
+            forge_factory: ports.forge_factory,
+            cache: ports.cache,
             state_store,
-            secret_store,
-            workspace_port,
-            catalog,
-            llm,
-            analysis,
+            secret_store: ports.secret_store,
+            workspace_port: ports.workspace_port,
+            catalog: ports.catalog,
+            llm: ports.llm,
+            analysis: ports.analysis,
+            chat: ports.chat,
         })
     }
 }

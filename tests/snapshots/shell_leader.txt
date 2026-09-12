@@ -10,6 +10,7 @@
 │                         │  ?           Show the help popup             │                         │
 │                         │  T           Switch to the next theme        │                         │
 │                         │  a           Analyse the pull request, or ope│                         │
+│                         │  c           Talk about this pull request    │                         │
 │                         │  dc          Cycle the context lines: 3, 10, │                         │
 │                         │  ds          Side-by-side view, when the term│                         │
 │                         │  dw          Ignore whitespace-only changes  │                         │
@@ -19,7 +20,6 @@
 │                         │  s           Change the sort order           │                         │
 │                         │  t           Choose a theme                  │                         │
 │                         └──────────────────────────────────────────────┘                         │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

@@ -325,6 +325,18 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Normal), "K", "plan.move_up"),
     (Scope::In(Mode::Normal), "<leader>t", "app.theme_picker"),
     (Scope::In(Mode::Normal), "<leader>T", "theme.toggle"),
+    // `<leader>c` opens the chat pane (§5.4). The pane's own keys are scoped to insert
+    // mode, because that is the mode the compose box puts the app in (FR-5.2).
+    (Scope::In(Mode::Normal), "<leader>c", "chat.open"),
+    (Scope::In(Mode::Normal), "r", "chat.retry"),
+    (Scope::In(Mode::Insert), "<Enter>", "chat.send"),
+    // Enter sends, so a newline needs a modifier. `S-Enter` is what the requirement
+    // names; not every terminal can send it, which is why `C-j` (the line feed every
+    // terminal *can* send) and `A-Enter` are bound too.
+    (Scope::In(Mode::Insert), "<S-Enter>", "chat.newline"),
+    (Scope::In(Mode::Insert), "<A-Enter>", "chat.newline"),
+    (Scope::In(Mode::Insert), "<C-j>", "chat.newline"),
+    (Scope::In(Mode::Insert), "<Esc>", "chat.cancel"),
     (Scope::In(Mode::Normal), "<leader>?", "app.help"),
     (Scope::In(Mode::Normal), "<leader>q", "app.quit"),
 ];

@@ -23,6 +23,8 @@ pub enum Group {
     Diff,
     /// Changing the look.
     Theme,
+    /// Talking about a pull request (M3).
+    Chat,
 }
 
 impl Group {
@@ -36,6 +38,7 @@ impl Group {
             Self::Search => "Search",
             Self::Diff => "Diff",
             Self::Theme => "Theme",
+            Self::Chat => "Chat",
         }
     }
 }
@@ -316,6 +319,48 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
+        id: "chat.open",
+        description: "Talk about this pull request",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
+        id: "chat.send",
+        description: "Send the question",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
+        id: "chat.newline",
+        description: "Add a line to the question",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
+        id: "chat.retry",
+        description: "Ask the last question again",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
+        id: "chat.cancel",
+        description: "Stop the answer that is arriving",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
+        id: "chat.list",
+        description: "List the conversations about this pull request",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
+        id: "chat.export",
+        description: "Write a transcript",
+        group: Group::Chat,
+        hint: false,
+    },
+    ActionDef {
         id: "pane.next",
         description: "Focus the next pane",
         group: Group::Pane,
@@ -375,6 +420,7 @@ pub fn groups() -> &'static [Group] {
         Group::Search,
         Group::Diff,
         Group::Theme,
+        Group::Chat,
     ]
 }
 

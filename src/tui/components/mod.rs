@@ -4,6 +4,7 @@
 //! keeps rendering testable with `TestBackend` and free of hidden state.
 
 pub mod analysis;
+pub mod chat;
 pub mod command_line;
 pub mod doctor;
 pub mod filter_bar;

@@ -34,10 +34,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
     render_tabs(frame, rows[0], app);
 
+    // The chat pane takes the bottom of the body when it is open, through the same
+    // split the mouse handler uses (FR-7.5).
+    let (body, chat) = super::chat::chat_split(rows[1], app.chat_state().is_some());
     let columns =
-        Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).split(rows[1]);
+        Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).split(body);
     render_tree(frame, columns[0], app, view);
     render_diff(frame, columns[1], app, view);
+    if let Some(chat) = chat {
+        super::chat::render(frame, chat, app);
+    }
 }
 
 /// The tab bar: which PR, and which view of it.
@@ -64,7 +70,18 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (label, available) in [
         (format!("2 Checks ({}) ", detail.checks.len()), false),
         (format!("3 Reviews ({}) ", detail.reviews.len()), false),
-        ("4 Chat ".to_owned(), false),
+        (
+            match app.chat_state() {
+                Some(chat) => format!(
+                    "4 Chat ({}) ",
+                    chat.session
+                        .as_ref()
+                        .map_or(0, crate::domain::chat::Session::turns)
+                ),
+                None => "4 Chat ".to_owned(),
+            },
+            app.chat_state().is_some(),
+        ),
         (
             format!("5 Analysis ({}, {}) ", approvals.0, approvals.1),
             false,

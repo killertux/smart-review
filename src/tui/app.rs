@@ -130,6 +130,24 @@ pub enum Effect {
     CancelAnalysis,
     /// Store the review-plan overrides for this pull request (FR-4.2).
     SavePlan(Box<crate::domain::plan::Plan>),
+    /// Read the chat sessions for the open pull request (FR-5.1).
+    LoadChat,
+    /// Start a new conversation, keeping the old ones (FR-5.1).
+    NewChat,
+    /// Open one of the stored conversations (FR-5.1).
+    OpenChat(String),
+    /// Ask a question (FR-5.2, FR-5.3).
+    AskChat,
+    /// Give up on the answer in flight, keeping the text that arrived (FR-5.2).
+    CancelChat,
+    /// Ask the last question again (FR-5.2).
+    RetryChat,
+    /// Write a transcript to a file (FR-5.1).
+    ExportChat(String),
+    /// Remove the conversations DEC-9's cap says are too old (FR-8.5).
+    PruneChat,
+    /// Store the files the user added to the context (FR-5.3).
+    SaveContextFiles,
 }
 
 impl std::fmt::Debug for Effect {
@@ -141,6 +159,8 @@ impl std::fmt::Debug for Effect {
                 .field("provider", provider)
                 .field("key", &"<redacted>")
                 .finish(),
+            Self::OpenChat(id) => f.debug_tuple("OpenChat").field(id).finish(),
+            Self::ExportChat(format) => f.debug_tuple("ExportChat").field(format).finish(),
             other => f.write_str(&effect_name(other)),
         }
     }
@@ -206,6 +226,15 @@ fn effect_name(effect: &Effect) -> String {
         Effect::RunAnalysis { force } => format!("run-analysis(force={force})"),
         Effect::CancelAnalysis => "cancel-analysis".to_owned(),
         Effect::SavePlan(_) => "save-plan".to_owned(),
+        Effect::LoadChat => "load-chat".to_owned(),
+        Effect::NewChat => "new-chat".to_owned(),
+        Effect::OpenChat(id) => format!("open-chat({id})"),
+        Effect::AskChat => "ask-chat".to_owned(),
+        Effect::CancelChat => "cancel-chat".to_owned(),
+        Effect::RetryChat => "retry-chat".to_owned(),
+        Effect::ExportChat(format) => format!("export-chat({format})"),
+        Effect::PruneChat => "prune-chat".to_owned(),
+        Effect::SaveContextFiles => "save-context-files".to_owned(),
     }
 }
 
@@ -217,25 +246,34 @@ pub enum Pane {
     PullRequests,
     /// The diff and review pane (M1).
     Diff,
+    /// The chat pane (M3, FR-5.1).
+    Chat,
 }
 
 impl Pane {
-    /// The other pane.
+    /// The next pane, in the order `Tab` walks them.
+    ///
+    /// The order is the one the review screen shows left-to-right and top-to-bottom:
+    /// the list, the diff, then the conversation about it. `Tab` from the chat pane
+    /// goes back to the list rather than to the diff, because the list is where a
+    /// session starts and a cycle that could not reach it would be a trap.
     #[must_use]
     pub const fn next(self) -> Self {
         match self {
             Self::PullRequests => Self::Diff,
-            Self::Diff => Self::PullRequests,
+            Self::Diff => Self::Chat,
+            Self::Chat => Self::PullRequests,
         }
     }
 
-    /// The other pane, going backwards.
-    ///
-    /// Identical to [`Pane::next`] with two panes, but explicit so adding a third
-    /// pane does not silently make `pane.prev` move forwards.
+    /// The previous pane, going backwards.
     #[must_use]
     pub const fn prev(self) -> Self {
-        self.next()
+        match self {
+            Self::PullRequests => Self::Chat,
+            Self::Diff => Self::PullRequests,
+            Self::Chat => Self::Diff,
+        }
     }
 
     /// Name used in the status line and in `state.toml`.
@@ -244,6 +282,7 @@ impl Pane {
         match self {
             Self::PullRequests => "list",
             Self::Diff => "diff",
+            Self::Chat => "chat",
         }
     }
 
@@ -251,9 +290,33 @@ impl Pane {
     fn parse(name: &str) -> Self {
         match name {
             "diff" => Self::Diff,
+            "chat" => Self::Chat,
             _ => Self::PullRequests,
         }
     }
+}
+
+/// Where the panes were on the last frame (FR-7.5).
+///
+/// One struct rather than seven fields, because they are written together from one
+/// layout and read together by one mouse handler: two of them disagreeing is exactly how
+/// a click comes to land on the row above the one it was aimed at.
+#[derive(Debug, Clone, Copy, Default)]
+struct Geometry {
+    /// The width of the last frame, which the fit checks read.
+    width: u16,
+    /// The filter bar (FR-7.5).
+    filter_bar: ratatui::layout::Rect,
+    /// The list pane.
+    list: ratatui::layout::Rect,
+    /// The whole body, for the bounds a click has to fall inside.
+    body: ratatui::layout::Rect,
+    /// The first row of the review panes, below the tab bar.
+    review_top: u16,
+    /// The width of the file tree, which separates the two review panes.
+    tree_width: u16,
+    /// The chat pane, when it is open (FR-5.1).
+    chat: Option<ratatui::layout::Rect>,
 }
 
 /// The popup that currently owns the screen, if any.
@@ -669,6 +732,14 @@ pub struct App {
     pub(crate) diff_offline: Option<String>,
     /// The analysis panel's state (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
     pub(crate) panel: PanelState,
+    /// The chat pane's state (FR-5.1).
+    pub(crate) chat: crate::tui::chat::ChatState,
+    /// The bundle a question would send, once it has been gathered (FR-4.6).
+    chat_bundle: Option<Box<crate::domain::context::Bundle>>,
+    /// Which pull request and commit the bundle was gathered for (FR-4.6).
+    chat_bundle_for: Option<(u64, String)>,
+    /// Where chat sessions are kept (FR-5.1).
+    pub(crate) chat_store: std::sync::Arc<dyn crate::ports::ChatStorePort>,
     /// The job id of the newest detection request.
     pub(crate) environment_job: u64,
     /// The job id of the newest list request, so a superseded answer is dropped.
@@ -692,18 +763,8 @@ pub struct App {
     now_unix_secs: u64,
     /// Unix time the interface started.
     started_at: u64,
-    /// The width of the last frame.
-    last_width: u16,
-    /// The filter bar's rectangle, learned from the last frame (FR-7.5).
-    filter_bar_rect: ratatui::layout::Rect,
-    /// The list pane's rectangle, learned from the last frame.
-    list_pane: ratatui::layout::Rect,
-    /// The whole body rectangle, for the bounds a click has to fall inside.
-    body_rect: ratatui::layout::Rect,
-    /// The first row of the review panes.
-    review_top: u16,
-    /// The width of the file tree, which separates the two review panes.
-    tree_width: u16,
+    /// Where the panes were on the last frame (FR-7.5).
+    geometry: Geometry,
     /// Set when the user asks to quit.
     pub(crate) quit: bool,
 }
@@ -738,6 +799,7 @@ impl App {
             secret_store,
             workspace_port,
             analysis,
+            chat: chat_store,
             ..
         } = startup;
 
@@ -780,6 +842,10 @@ impl App {
             workspace_job: 0,
             diff_offline: None,
             panel: PanelState::default(),
+            chat: crate::tui::chat::ChatState::default(),
+            chat_bundle: None,
+            chat_bundle_for: None,
+            chat_store,
             environment_job: 0,
             list_job: 0,
             count_job: 0,
@@ -809,14 +875,7 @@ impl App {
             doctor_job: 0,
             now_unix_secs: 0,
             started_at: 0,
-            // Zero until a frame has been drawn: a width that was never measured
-            // must not be used to decide anything.
-            last_width: 0,
-            filter_bar_rect: ratatui::layout::Rect::default(),
-            list_pane: ratatui::layout::Rect::default(),
-            body_rect: ratatui::layout::Rect::default(),
-            review_top: 0,
-            tree_width: 30,
+            geometry: Geometry::default(),
             quit: false,
         };
         app.report_startup_warnings();
@@ -1056,6 +1115,15 @@ impl App {
             {
                 self.apply_analysis_outcome(job, outcome)
             }
+            // The chat group is its own handler for the same reason: a loaded list, a
+            // gather and an answer all belong to the pane's state.
+            Outcome::ChatLoaded { .. }
+            | Outcome::ChatAnswered(_)
+            | Outcome::ChatGathered { .. }
+                if job == self.chat.load_job || job == self.chat.job =>
+            {
+                self.apply_chat_outcome(job, outcome)
+            }
             Outcome::Checks(checks) => {
                 self.apply_checks(job, checks);
                 None
@@ -1063,16 +1131,7 @@ impl App {
             // A failure is gated like any other result: a superseded request's error
             // must not be announced as if it were the newest one.
             Outcome::Failed(message) if self.is_current_job(job) => {
-                // The decision to fetch a missing catalog is made before the failure
-                // is reported: reporting clears the job id it would be checked
-                // against, and the fetch is the more useful thing to do than to
-                // announce that there was nothing to read.
-                if let Some(effect) = self.catalog_unavailable(job) {
-                    self.catalog_job = 0;
-                    return Some(effect);
-                }
-                self.report_job_failure(job, &message);
-                None
+                self.apply_failure(job, &message)
             }
             Outcome::Environment(_)
             | Outcome::EnvironmentFailed(_)
@@ -1087,8 +1146,482 @@ impl App {
             | Outcome::Stored { .. }
             | Outcome::Context { .. }
             | Outcome::Analyzed(_)
+            | Outcome::ChatLoaded { .. }
+            | Outcome::ChatAnswered(_)
+            | Outcome::ChatGathered { .. }
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
+        }
+    }
+
+    /// The files the user has added to the context for this pull request (FR-5.3).
+    ///
+    /// Kept in `state.toml` rather than beside the session: "I want the design document
+    /// in the bundle" is a preference about the pull request, not a property of one
+    /// conversation, and it should hold for the next one too.
+    pub(crate) fn context_files_key(&self) -> Option<String> {
+        let environment = self.environment.as_ref()?;
+        let pr = self.detail.as_ref().map(|detail| detail.summary.number)?;
+        Some(format!("{}#{pr}", environment.repo.key()))
+    }
+
+    /// Loads the added files for the open pull request.
+    pub(crate) fn load_context_files(&mut self) {
+        let Some(key) = self.context_files_key() else {
+            self.chat.added.clear();
+            return;
+        };
+        self.chat.added = self
+            .state
+            .context_files
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    /// Records the added files, so the next run starts with them (FR-8.5).
+    pub(crate) fn remember_context_files(&mut self) {
+        let Some(key) = self.context_files_key() else {
+            return;
+        };
+        if self.chat.added.is_empty() {
+            self.state.context_files.remove(&key);
+        } else {
+            self.state
+                .context_files
+                .insert(key, self.chat.added.clone());
+        }
+    }
+
+    /// Adds a path to the context, or says why it cannot be (FR-5.3).
+    pub(crate) fn add_context_file(&mut self, path: &str) -> std::result::Result<String, String> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err("which file? `:context add src/domain/money.rs`".to_owned());
+        }
+        if crate::domain::context::is_secret_path(trimmed) {
+            // Refused rather than added and then elided: the user asked for this file
+            // by name, and a bundle that silently leaves it out is the one thing
+            // FR-4.6 exists to prevent.
+            return Err(format!(
+                "{trimmed} looks like a secret (a `.env` file or a credential) and is \
+                 never sent"
+            ));
+        }
+        if !self.path_in_diff(trimmed) && !self.path_exists_at_head(trimmed) {
+            return Err(format!(
+                "{trimmed} is not in this pull request's changed files and not in the \
+                 checkout at this commit"
+            ));
+        }
+        if !self.chat.added.iter().any(|added| added == trimmed) {
+            self.chat.added.push(trimmed.to_owned());
+        }
+        Ok(format!(
+            "added {trimmed} to the context of this pull request ({} file(s) in total; \
+             every question will include it)",
+            self.chat.added.len()
+        ))
+    }
+
+    /// Removes a path from the context (FR-5.3).
+    pub(crate) fn remove_context_file(
+        &mut self,
+        path: &str,
+    ) -> std::result::Result<String, String> {
+        let before = self.chat.added.len();
+        self.chat.added.retain(|added| added != path.trim());
+        if self.chat.added.len() == before {
+            return Err(format!("{path} was not in the context"));
+        }
+        Ok(format!("removed {path} from the context"))
+    }
+
+    /// Whether the checkout at head has a path, which is what `:context add` checks
+    /// against (FR-5.3).
+    fn path_exists_at_head(&self, path: &str) -> bool {
+        let (Some(workspace), true) = (&self.workspace, self.workspace_ready()) else {
+            return false;
+        };
+        self.workspace_port
+            .read_file(
+                &workspace.path,
+                &workspace.head_sha,
+                path,
+                &crate::ports::Cancel::new(),
+            )
+            .is_ok()
+    }
+
+    /// The request a question would send (FR-5.2, FR-5.3).
+    ///
+    /// Mirrors [`App::analysis_request`] deliberately: the two ask the same model the
+    /// same way, and the only difference is what they ask about.
+    pub(crate) fn chat_request(
+        &self,
+    ) -> Option<(
+        crate::application::chat::ChatSpec,
+        crate::domain::chat::Session,
+    )> {
+        let detail = self.detail.as_ref()?;
+        let resolved = self.active_model.as_ref()?;
+        let secret = self
+            .secret_store
+            .get(&resolved.provider, resolved.env_var.as_deref())
+            .ok()
+            .flatten()?;
+        let model = self.catalog.as_ref().and_then(|state| {
+            state
+                .load
+                .catalog
+                .model(&resolved.provider, &resolved.model)
+        });
+        let output_limit = model.and_then(crate::domain::model::CatalogModel::output_limit);
+        let mut chat = crate::application::models::analysis_chat(resolved, secret, output_limit);
+        // A chat answer is read as it arrives and is usually shorter than an analysis of
+        // the same pull request, so the long analysis timeout would only hold a dead
+        // connection open.
+        chat.timeout_secs = CHAT_TIMEOUT_SECS;
+        let policy = crate::domain::context::BundlePolicy {
+            max_context_tokens: crate::application::models::context_budget(
+                model.and_then(crate::domain::model::CatalogModel::context_limit),
+                self.config.llm.max_context_tokens,
+                chat.max_tokens,
+            ),
+            max_file_bytes: self.config.llm.max_file_bytes,
+            ..crate::domain::context::BundlePolicy::default()
+        };
+        let spec = crate::application::chat::ChatSpec {
+            repo: self
+                .environment
+                .as_ref()
+                .map(|environment| environment.repo.clone())?,
+            pr: detail.summary.number,
+            head_sha: detail.summary.head_sha.clone(),
+            chat,
+            detail: Box::new(detail.clone()),
+            patch: self
+                .review
+                .as_ref()
+                .map(|view| Box::new(view.patch.clone())),
+            checkout: self.checkout(),
+            policy,
+            added: self.chat.added.clone(),
+            cost: model.and_then(|model| model.cost.clone()),
+        };
+        let session = self.chat.session.clone().unwrap_or_else(|| {
+            crate::application::chat::new_session(
+                crate::domain::chat::session_id(
+                    self.now_unix_secs,
+                    self.chat.sessions.len() as u64,
+                ),
+                &spec.repo,
+                spec.pr,
+                &spec.head_sha,
+                &format!("{}/{}", spec.chat.provider, spec.chat.model),
+                self.config
+                    .llm
+                    .active
+                    .as_ref()
+                    .and_then(|selection| selection.reasoning.clone()),
+                self.now_unix_secs,
+            )
+        });
+        Some((spec, session))
+    }
+
+    /// Shows the chat pane, loading the conversation if it is not there yet.
+    pub(crate) fn show_chat(&mut self) {
+        self.chat.open();
+        self.load_context_files();
+    }
+
+    /// Shows the conversation list, without asking the store again: the list is what
+    /// the last load returned, and `:chat list` is not a refresh (FR-5.1).
+    pub(crate) fn list_chats(&mut self) {
+        self.chat.open = true;
+        self.chat.listing = true;
+    }
+
+    /// Records the job id of a chat load (FR-5.1).
+    pub fn record_chat_load(&mut self, job: u64) {
+        self.chat.load_job = job;
+    }
+
+    /// Records the job id of the question in flight (FR-5.2).
+    pub fn record_chat_job(&mut self, job: u64) {
+        self.chat.job = job;
+    }
+
+    /// Opens a fresh conversation, keeping the old ones (FR-5.1).
+    pub(crate) fn begin_chat(&mut self) {
+        self.chat.open();
+        self.chat.reset();
+        self.load_context_files();
+        // The bundle is gathered per question, and a new conversation is a new subject
+        // to estimate: keeping the old estimate would show the price of a different
+        // question.
+        self.chat_bundle = None;
+        self.chat_bundle_for = None;
+    }
+
+    /// Notes that the user is being asked before the first send (FR-4.6).
+    pub(crate) fn await_chat_confirmation(&mut self) {
+        self.chat.open = true;
+        let question = self.chat.input.text().trim().to_owned();
+        self.chat.awaiting_confirmation = Some(question);
+    }
+
+    /// Starts the answer to a question: the panel says so and the question is kept for
+    /// `r` (FR-5.2).
+    pub(crate) fn begin_chat_answer(&mut self, question: &str) {
+        self.chat.status = crate::tui::chat::ChatStatus::Sending {
+            stage: format!("asking {}", self.model_label()),
+        };
+        self.chat.pending = Some(question.to_owned());
+        self.chat.awaiting_confirmation = None;
+        self.chat.stream.clear();
+        self.chat.scroll = 0;
+        self.chat_bundle = None;
+        self.chat_bundle_for = None;
+    }
+
+    /// Gives up on the answer in flight, keeping what arrived (FR-5.2).
+    pub(crate) fn stop_chat(&mut self) {
+        self.chat.job = 0;
+        self.chat.stop();
+    }
+
+    /// Takes the gathered bundle when it is for the commit on screen (FR-4.6).
+    pub(crate) fn take_chat_bundle(&mut self) -> Option<crate::domain::context::Bundle> {
+        let head = self.detail.as_ref()?.summary.head_sha.clone();
+        let pr = self.detail.as_ref()?.summary.number;
+        if self.chat_bundle_for.as_ref() != Some(&(pr, head)) {
+            return None;
+        }
+        self.chat_bundle.take().map(|bundle| *bundle)
+    }
+
+    /// Writes a transcript (FR-5.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem's message when the file cannot be written.
+    pub(crate) fn export_chat(&self, format: &str) -> std::result::Result<String, String> {
+        let session = self
+            .chat
+            .session
+            .as_ref()
+            .ok_or_else(|| "there is no conversation to export yet".to_owned())?;
+        let (extension, body) = match format.trim() {
+            "" | "md" | "markdown" => ("md", crate::domain::chat::to_markdown(session)),
+            "json" => ("json", crate::domain::chat::to_json(session)?),
+            other => {
+                return Err(format!("{other} is not a format; use md or json"));
+            }
+        };
+        let name = format!(
+            "chat-{}-{}.{extension}",
+            session.pr,
+            crate::domain::chat::short_sha(&session.id)
+        );
+        let path = self.home.exports().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        crate::adapters::fs::write_atomic(&path, &body).map_err(|error| error.to_string())?;
+        Ok(path.display().to_string())
+    }
+
+    /// Re-reads the conversation list, after a write or a prune (FR-5.1).
+    pub(crate) fn reload_chat_list(&mut self) {
+        let (Some(repo), Some(pr)) = (
+            self.environment
+                .as_ref()
+                .map(|environment| environment.repo.clone()),
+            self.detail.as_ref().map(|detail| detail.summary.number),
+        ) else {
+            return;
+        };
+        self.chat.sessions = self.chat_store.list(&repo, pr).unwrap_or_default();
+    }
+
+    /// Keeps a gathered bundle, and asks for the answer when the user has already
+    /// agreed to send it (FR-4.6, FR-5.3).
+    ///
+    /// Returns the effect that turns a gathered bundle into a question, which is how a
+    /// bundle becomes a request without the reducer holding either one.
+    fn apply_chat_gathered(&mut self, outcome: jobs::Outcome) -> Option<Effect> {
+        let jobs::Outcome::ChatGathered {
+            bundle,
+            session,
+            question,
+        } = outcome
+        else {
+            return None;
+        };
+        let (pr, head) = self
+            .detail
+            .as_ref()
+            .map(|detail| (detail.summary.number, detail.summary.head_sha.clone()))?;
+        self.chat_bundle_for = Some((pr, head));
+        self.chat_bundle = Some(bundle);
+
+        // The confirmation is where the estimate is shown, because it is the only place
+        // the size of the request is known before something is paid for (FR-4.6).
+        if self.chat.is_confirming() {
+            self.show_chat_estimate(&session);
+            return None;
+        }
+        // Already agreed: the question goes now, with the bundle that was just gathered.
+        self.chat.pending = Some(question);
+        Some(Effect::AskChat)
+    }
+
+    /// Shows what a question would send, and asks for the key press that agrees to it
+    /// (FR-4.6).
+    fn show_chat_estimate(&mut self, session: &crate::domain::chat::Session) {
+        let Some((spec, _)) = self.chat_request() else {
+            return;
+        };
+        let Some(bundle) = self.chat_bundle.as_deref() else {
+            return;
+        };
+        let estimate = crate::application::chat::estimate_of(&spec, session, bundle);
+        let summary = bundle.summary();
+        self.chat.set_estimate(estimate);
+        self.chat.open = true;
+        self.notice(
+            NoticeLevel::Info,
+            format!(
+                "this sends {summary} of this pull request to {}; press Enter again to send",
+                self.model_label()
+            ),
+        );
+    }
+
+    /// A job that failed, with the one follow-up a failure can have (FR-9.1).
+    ///
+    /// The decision to fetch a missing catalog is made *before* the failure is reported:
+    /// reporting clears the job id it would be checked against, and fetching is the more
+    /// useful thing to do than announcing that there was nothing to read.
+    fn apply_failure(&mut self, job: u64, message: &str) -> Option<Effect> {
+        if let Some(effect) = self.catalog_unavailable(job) {
+            self.catalog_job = 0;
+            return Some(effect);
+        }
+        self.report_job_failure(job, message);
+        None
+    }
+
+    /// The outcomes that belong to the chat pane (FR-5.1–FR-5.3).
+    fn apply_chat_outcome(&mut self, job: u64, outcome: jobs::Outcome) -> Option<Effect> {
+        match outcome {
+            Outcome::ChatLoaded { .. } if job == self.chat.load_job => {
+                self.apply_chat_loaded(outcome);
+                None
+            }
+            Outcome::ChatAnswered(_) if job == self.chat.job => {
+                self.apply_chat_answer(outcome);
+                None
+            }
+            Outcome::ChatGathered { .. } if job == self.chat.load_job => {
+                self.apply_chat_gathered(outcome)
+            }
+            _ => None,
+        }
+    }
+
+    /// Applies the sessions a load produced, opening the conversation it named
+    /// (FR-5.1).
+    fn apply_chat_loaded(&mut self, outcome: jobs::Outcome) {
+        let jobs::Outcome::ChatLoaded {
+            sessions,
+            session,
+            missing,
+        } = outcome
+        else {
+            return;
+        };
+        self.chat.sessions = sessions;
+        if let Some(session) = session {
+            self.chat.session = Some(*session);
+            // The estimate belongs to the conversation that was open when it was made.
+            self.chat.estimate = None;
+        }
+        if let Some(id) = missing {
+            self.notice(
+                NoticeLevel::Warn,
+                format!("there is no chat session {id} for this pull request"),
+            );
+        }
+    }
+
+    /// Appends an answer to the conversation it belongs to (FR-5.1, FR-5.2).
+    fn apply_chat_answer(&mut self, outcome: jobs::Outcome) {
+        let jobs::Outcome::ChatAnswered(answered) = outcome else {
+            return;
+        };
+        let crate::tui::jobs::ChatAnswered { run, session, .. } = *answered;
+        self.chat.job = 0;
+        self.chat.pending = None;
+
+        // A superseded answer is dropped, which is what makes `Esc` and a second
+        // question safe to press in either order.
+        let Some(current) = self.chat.session.as_mut() else {
+            return;
+        };
+        if current.id != session {
+            return;
+        }
+        match run {
+            crate::application::chat::ChatRun::Answered(answer) => {
+                current.messages.push(answer.message);
+                current.updated_at = self.now_unix_secs;
+                self.chat.status = crate::tui::chat::ChatStatus::Idle;
+                self.record_analysis_opt_in();
+                // The store may refuse (DEC-9's size cap) or fail. Either way the
+                // conversation on screen is complete: the user's words are in memory and
+                // the message says what could not be written.
+                self.persist_chat();
+            }
+            crate::application::chat::ChatRun::Cancelled(message) => {
+                // FR-5.2: what arrived stays visible, marked as stopped. It is stored,
+                // so restarting the app does not hide the fact that the user stopped it.
+                current.messages.push(*message);
+                current.updated_at = self.now_unix_secs;
+                self.chat.status = crate::tui::chat::ChatStatus::Stopped;
+                self.persist_chat();
+            }
+        }
+        // The question that was asked is spent: the input is free for the next one.
+        self.chat.input.clear();
+        self.chat.stream.clear();
+        self.chat.scroll = 0;
+    }
+
+    /// Writes the open conversation to the store (FR-5.1).
+    ///
+    /// A failure here is reported rather than swallowed, and it does not lose the
+    /// conversation: it is in memory, and the notice says what could not be written.
+    pub(crate) fn persist_chat(&mut self) {
+        let Some(session) = self.chat.session.clone() else {
+            return;
+        };
+        if let Err(error) = self.chat_store.put(&session) {
+            self.notice(
+                NoticeLevel::Warn,
+                format!("the conversation could not be saved: {error}"),
+            );
+        }
+        // The repository comes from the session itself, so a conversation cannot be
+        // listed under a pull request it does not belong to.
+        if let Some(repo) = self
+            .environment
+            .as_ref()
+            .map(|environment| environment.repo.clone())
+        {
+            self.chat.sessions = self.chat_store.list(&repo, session.pr).unwrap_or_default();
         }
     }
 
@@ -1448,14 +1981,26 @@ impl App {
         self.panel.confirmed = false;
     }
 
-    /// Streams a piece of the answer into the preview (FR-4.4).
+    /// Streams a piece of the answer into the preview (FR-4.4, FR-5.2).
+    ///
+    /// Both panes receive from the one progress channel and each takes the updates
+    /// addressed to its own job, so text that arrives after `Esc`, or after the user
+    /// started a different question, is discarded by job id rather than by hoping the
+    /// timing works out.
     pub fn apply_progress(&mut self, progress: jobs::Progress) {
-        if progress.job != self.panel.job {
-            // A superseded run's text is dropped by job id, which is what makes `Esc`
-            // and a fresh `<leader>a` safe to press twice (FR-4.4).
+        if progress.job == self.chat.job {
+            if let jobs::ProgressUpdate::Chat(update) = progress.update {
+                self.apply_chat_progress(update);
+            }
             return;
         }
-        match progress.update {
+        if progress.job != self.panel.job {
+            return;
+        }
+        let jobs::ProgressUpdate::Analysis(update) = progress.update else {
+            return;
+        };
+        match update {
             crate::application::analysis::Progress::Stage(stage) => {
                 self.panel.state = if self.panel.stream.text().is_empty() {
                     AnalysisState::Running { stage }
@@ -1472,6 +2017,34 @@ impl App {
                 };
                 self.panel.stream.push(&delta);
                 self.panel.state = AnalysisState::Streaming { stage };
+            }
+        }
+    }
+
+    /// Streams a chat answer into the pane (FR-5.2).
+    fn apply_chat_progress(&mut self, update: crate::application::chat::Progress) {
+        use crate::application::chat::Progress;
+        use crate::tui::chat::ChatStatus;
+        match update {
+            Progress::Stage(stage) => {
+                self.chat.status = if self.chat.stream.text().is_empty() {
+                    ChatStatus::Sending { stage }
+                } else {
+                    ChatStatus::Streaming { stage }
+                };
+            }
+            Progress::Delta(delta) => {
+                let stage = match &self.chat.status {
+                    ChatStatus::Sending { stage } | ChatStatus::Streaming { stage } => {
+                        stage.clone()
+                    }
+                    other => other.label(),
+                };
+                self.chat.stream.push(&delta);
+                self.chat.status = ChatStatus::Streaming { stage };
+                // The newest text is what the user is waiting for, so the pane follows
+                // it down unless they have scrolled up to read something else.
+                self.chat.scroll = 0;
             }
         }
     }
@@ -1990,6 +2563,21 @@ impl App {
 
     /// Records a job failure where the user will see it.
     fn report_job_failure(&mut self, job: u64, message: &str) {
+        if job == self.chat.job {
+            self.chat.status = crate::tui::chat::ChatStatus::Failed {
+                reason: message.to_owned(),
+            };
+            self.chat.pending = None;
+            self.notice(
+                NoticeLevel::Error,
+                format!("the question failed: {message}"),
+            );
+            return;
+        }
+        if job == self.chat.load_job {
+            self.chat.load_job = 0;
+            return;
+        }
         if job == self.list_job {
             self.list.loading = false;
             self.list.counting = false;
@@ -2070,12 +2658,22 @@ impl App {
                 if let Some(view) = self.review.as_mut() {
                     // The tree and the diff share the region; the tree is the narrow
                     // one on the left.
-                    if column < self.tree_width {
+                    if column < self.geometry.tree_width {
                         view.scroll_tree_by(delta * 3);
                     } else {
                         view.tree_focused = false;
                         view.scroll_by(delta * 3);
                     }
+                }
+            }
+            Pane::Chat => {
+                // The conversation scrolls *up* from its end (FR-5.2), which is why a
+                // downward wheel reduces the offset rather than growing it.
+                let step = usize::try_from(delta.abs() * 3).unwrap_or(3);
+                if delta < 0 {
+                    self.chat.scroll = self.chat.scroll.saturating_add(step);
+                } else {
+                    self.chat.scroll = self.chat.scroll.saturating_sub(step);
                 }
             }
         }
@@ -2087,13 +2685,16 @@ impl App {
             return;
         };
         self.focus = pane;
+        self.sync_mode_to_focus();
         match pane {
             Pane::PullRequests => {
                 // The visible row under the pointer, turned into an absolute index by
                 // the same offset the frame drew with.
-                if let Some(index) =
-                    crate::tui::components::pr_list::row_at(self.list_pane, self.list.scroll, row)
-                    && index < self.list.visible_len()
+                if let Some(index) = crate::tui::components::pr_list::row_at(
+                    self.geometry.list,
+                    self.list.scroll,
+                    row,
+                ) && index < self.list.visible_len()
                 {
                     self.list.select_visible(index);
                 }
@@ -2107,7 +2708,7 @@ impl App {
                     return;
                 };
                 if let Some(view) = self.review.as_mut() {
-                    if column < self.tree_width {
+                    if column < self.geometry.tree_width {
                         let index = view.tree_scroll + offset;
                         // Only a row that exists: clicking the empty space below the
                         // last file must not open it.
@@ -2126,14 +2727,19 @@ impl App {
                     }
                 }
             }
+            // A click in the chat pane focuses it and puts the cursor in the compose
+            // box, which is the only thing there that can be edited.
+            Pane::Chat => {
+                self.chat.scroll = 0;
+            }
         }
     }
 
     /// The row of a review pane a terminal row is over, as an offset into the visible
     /// rows, or `None` when it is over a border, the tab bar, or nothing.
     fn review_row(&self, row: u16) -> Option<usize> {
-        let first = self.review_top.saturating_add(1);
-        let last = self.body_rect.bottom().saturating_sub(2);
+        let first = self.geometry.review_top.saturating_add(1);
+        let last = self.geometry.body.bottom().saturating_sub(2);
         if row < first || row > last {
             return None;
         }
@@ -2146,10 +2752,17 @@ impl App {
     /// must not move a cursor somewhere the user did not point at.
     fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
         if self.review.is_some() {
-            // The tree and the diff share the area below the tab bar.
-            return (row >= self.review_top).then_some(Pane::Diff);
+            // The chat pane, when it is open, is below the review panes; the tree and
+            // the diff share the rest.
+            if let Some(chat) = self.geometry.chat
+                && chat.contains(ratatui::layout::Position::from((column, row)))
+            {
+                return Some(Pane::Chat);
+            }
+            return (row >= self.geometry.review_top).then_some(Pane::Diff);
         }
-        self.list_pane
+        self.geometry
+            .list
             .contains(ratatui::layout::Position::from((column, row)))
             .then_some(Pane::PullRequests)
     }
@@ -2159,15 +2772,21 @@ impl App {
     /// Called from `render`, which is where the sizes are known. It is arithmetic
     /// only: the render path still performs no IO.
     fn record_geometry(&mut self, body: ratatui::layout::Rect) {
-        self.last_width = body.width;
-        self.body_rect = body;
-        self.tree_width = crate::tui::components::review::TREE_WIDTH;
-        self.review_top = body.y + 1;
+        self.geometry.width = body.width;
+        self.geometry.body = body;
+        self.geometry.tree_width = crate::tui::components::review::TREE_WIDTH;
+        self.geometry.review_top = body.y + 1;
+        // The chat split comes from the same function the renderer uses, for the same
+        // reason the list's does (FR-7.5).
+        let (review_area, chat) =
+            crate::tui::components::chat::chat_split(body, self.review.is_some() && self.chat.open);
+        self.geometry.chat = chat;
+        self.geometry.review_top = review_area.y + 1;
         // The filter bar sits above the list; the pane below it is the one the mouse
         // is tested against, and the same rectangle the renderer draws into.
         let (filter_bar, list) = components::panes::body_split(body);
-        self.filter_bar_rect = filter_bar;
-        self.list_pane = list;
+        self.geometry.filter_bar = filter_bar;
+        self.geometry.list = list;
     }
 
     /// Recomputes the scroll offsets for the panes that are about to be drawn.
@@ -2180,7 +2799,7 @@ impl App {
         if let Some(view) = self.review.as_mut() {
             view.prepare(inner, inner);
         }
-        let height = crate::tui::components::pr_list::layout(self.list_pane).height;
+        let height = crate::tui::components::pr_list::layout(self.geometry.list).height;
         let position = self.list.cursor_position().unwrap_or(0);
         self.list.scroll = crate::tui::components::ensure_visible(
             position,
@@ -2199,7 +2818,8 @@ impl App {
     /// How tall the review panes' row area is.
     fn review_body_height(&self) -> u16 {
         // The body, less the tab row, less the two borders.
-        self.list_pane
+        self.geometry
+            .list
             .height
             .saturating_add(crate::tui::components::filter_bar::HEIGHT)
             .saturating_sub(3)
@@ -2229,7 +2849,7 @@ impl App {
     /// it; it is recorded rather than guessed at.
     #[must_use]
     pub fn terminal_width(&self) -> u16 {
-        self.last_width
+        self.geometry.width
     }
 
     /// Records that the environment was resolved (FR-1.1).
@@ -2518,8 +3138,123 @@ impl App {
             Mode::Command => self.on_command_key(combo),
             Mode::Search => self.on_search_key(combo),
             Mode::Popup => self.on_popup_key(combo),
+            // The compose box takes every key that the keymap has not claimed for
+            // insert mode: a bare `j` is a letter in a question, and Enter sends
+            // (FR-5.2). The keymap is consulted first so `<S-Enter>`, `<C-j>` and
+            // `<Esc>` keep their meanings — they are the keys that are *not* text.
+            Mode::Insert if self.chat_is_composing() => self.on_chat_input_key(combo),
             Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
+    }
+
+    /// Keeps the input mode in step with which pane has the keyboard (FR-7.1).
+    ///
+    /// Only insert and normal mode move: a command line or a search box that is open
+    /// while the pointer lands somewhere is not a mode change the user asked for.
+    pub(crate) fn sync_mode_to_focus(&mut self) {
+        // The leader menu is not a modal: it is a hint that disappears on the next key,
+        // and it is *open* at the moment a `<leader>x` binding fires. Treating it as an
+        // overlay here is what made `<leader>c` open the chat pane with the keyboard
+        // still in normal mode.
+        if !matches!(self.overlay, Overlay::None | Overlay::Leader) {
+            return;
+        }
+        if self.focus == Pane::Chat {
+            self.mode = Mode::Insert;
+        } else if self.mode == Mode::Insert {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// Whether the chat compose box is the thing the keyboard belongs to.
+    ///
+    /// A half-typed key sequence suspends that: `chat.open` moves the focus (and so the
+    /// mode) as soon as its leader key is pressed, and if the *completing* key were then
+    /// treated as text, `<leader>c` would open the pane and type a `c` into it.
+    #[must_use]
+    pub fn chat_is_composing(&self) -> bool {
+        self.review.is_some()
+            && self.chat.open
+            && self.focus == Pane::Chat
+            && self.overlay == Overlay::None
+            && self.pending.is_empty()
+    }
+
+    /// A key pressed while the compose box has the keyboard (FR-5.2).
+    ///
+    /// The rule is the one the command line and the search box already use, extended to
+    /// a multi-line box: **a printable character is text**, and everything else is a
+    /// key. Without that rule the leader — a bare space by default — would start a key
+    /// sequence in the middle of a question, and `<C-j>` would be a letter.
+    fn on_chat_input_key(&mut self, combo: KeyCombo) -> Effect {
+        if combo.code == KeyCode::Esc {
+            return self.on_normal_key(combo);
+        }
+        let printable = matches!(combo.code, KeyCode::Char(_))
+            && !combo
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !printable && let Some(effect) = self.resolve_insert_binding(combo) {
+            return effect;
+        }
+        match combo.code {
+            KeyCode::Char(character) => {
+                self.chat.input.insert(character);
+                Effect::None
+            }
+            KeyCode::Backspace => {
+                self.chat.input.backspace();
+                Effect::None
+            }
+            KeyCode::Delete => {
+                self.chat.input.delete();
+                Effect::None
+            }
+            KeyCode::Left => {
+                self.chat.input.left();
+                Effect::None
+            }
+            KeyCode::Right => {
+                self.chat.input.right();
+                Effect::None
+            }
+            KeyCode::Up => {
+                self.chat.input.up();
+                Effect::None
+            }
+            KeyCode::Down => {
+                self.chat.input.down();
+                Effect::None
+            }
+            KeyCode::Home => {
+                self.chat.input.home();
+                Effect::None
+            }
+            KeyCode::End => {
+                self.chat.input.end();
+                Effect::None
+            }
+            // A key that is neither text nor bound goes to the normal path: `Tab` to
+            // leave the pane, and a modified key the user tried — inserting "x" for an
+            // unbound `Alt-x` would hide that it did nothing (FR-7.2).
+            _ => self.on_normal_key(combo),
+        }
+    }
+
+    /// The effect for a key bound in insert mode, if it is bound.
+    fn resolve_insert_binding(&mut self, combo: KeyCombo) -> Option<Effect> {
+        // `<C-c>` and the like are global; a bare letter is not bound in insert mode, so
+        // this returns `None` for it and it becomes text.
+        let action = match self.keymap.resolve(Mode::Insert, &[combo]) {
+            // A match is the binding; ambiguous means this key is both a binding and the
+            // start of a longer one, and in insert mode there is no longer one to wait
+            // for — a bare letter is text, so anything bound at all fires now.
+            keymap::Resolution::Match(binding) | keymap::Resolution::Ambiguous(binding) => {
+                binding.action.clone()
+            }
+            keymap::Resolution::Prefix | keymap::Resolution::None => return None,
+        };
+        Some(update::dispatch(self, &action))
     }
 
     /// Opens the model picker and asks for the catalog (FR-4.5, FR-4.7).
@@ -2574,6 +3309,52 @@ impl App {
     #[must_use]
     pub fn picker(&self) -> Option<&PickerState> {
         self.picker.as_ref()
+    }
+
+    /// The chat pane's state, when a pull request is open (FR-5.1).
+    ///
+    /// `None` outside the review screen: a conversation is *about* a pull request, and
+    /// there is nothing for one to be about in the list.
+    #[must_use]
+    pub fn chat_state(&self) -> Option<&crate::tui::chat::ChatState> {
+        (self.review.is_some() && self.chat.open).then_some(&self.chat)
+    }
+
+    /// The open pull request's detail.
+    #[must_use]
+    pub fn detail(&self) -> Option<&crate::domain::pr::PullRequestDetail> {
+        self.detail.as_ref()
+    }
+
+    /// The current time, for the components that show an age.
+    #[must_use]
+    pub fn now_unix(&self) -> u64 {
+        self.now_unix_secs
+    }
+
+    /// Whether the diff on screen contains a path, which is what makes a reference in
+    /// an answer jumpable (FR-5.1).
+    #[must_use]
+    pub fn path_in_diff(&self, path: &str) -> bool {
+        self.review.as_ref().is_some_and(|view| {
+            view.patch.files.iter().any(|file| {
+                file.path()
+                    .is_some_and(|candidate| candidate.as_str() == path)
+            })
+        })
+    }
+
+    /// What the catalog says the active model costs, for the per-answer estimate
+    /// (FR-5.4).
+    #[must_use]
+    pub fn model_cost(&self) -> Option<crate::domain::model::Cost> {
+        let resolved = self.active_model.as_ref()?;
+        self.catalog
+            .as_ref()?
+            .load
+            .catalog
+            .model(&resolved.provider, &resolved.model)
+            .and_then(|model| model.cost.clone())
     }
 
     /// The managed worktrees on disk (FR-3.1).
@@ -3252,6 +4033,13 @@ impl App {
         components::render_overlay(frame, area, self);
     }
 }
+
+/// How long a chat answer may take before it is given up on.
+///
+/// Shorter than an analysis (600 s): a question about a pull request is answered in
+/// seconds, so a request still open after two minutes is a dead connection rather than
+/// a long answer, and the user is watching it.
+pub const CHAT_TIMEOUT_SECS: u64 = 120;
 
 /// How long a notice of this level should live (FR-7.6).
 fn expiry_for(level: NoticeLevel) -> Option<Instant> {
@@ -4068,7 +4856,7 @@ mod tests {
         assert_eq!(app.list.selected().unwrap().number, 5);
 
         // The filter bar is not a row: a click there must not move the cursor.
-        app.on_mouse(click(10, app.filter_bar_rect.y));
+        app.on_mouse(click(10, app.geometry.filter_bar.y));
         assert_eq!(app.list.selected().unwrap().number, 5);
     }
 
@@ -4136,11 +4924,11 @@ mod tests {
         frame(&mut app, 120, 30);
         assert_eq!(app.review.as_ref().unwrap().scroll, 0);
 
-        app.on_mouse(wheel(60, app.review_top + 4, true));
+        app.on_mouse(wheel(60, app.geometry.review_top + 4, true));
         let after = app.review.as_ref().unwrap().scroll;
         assert!(after > 0, "the wheel moves the diff text");
 
-        app.on_mouse(wheel(60, app.review_top + 4, false));
+        app.on_mouse(wheel(60, app.geometry.review_top + 4, false));
         assert!(
             app.review.as_ref().unwrap().scroll < after,
             "and moves it back"
@@ -4154,7 +4942,7 @@ mod tests {
         let before = app.review.as_ref().unwrap().current_path().cloned();
 
         // Far below the two-line tree, inside the pane's rectangle.
-        app.on_mouse(click(5, app.review_top + 12));
+        app.on_mouse(click(5, app.geometry.review_top + 12));
         assert_eq!(
             app.review.as_ref().unwrap().current_path().cloned(),
             before,
@@ -4201,7 +4989,7 @@ mod tests {
         let (_dir, mut app) = review_app();
         frame(&mut app, 120, 30);
 
-        app.on_mouse(click(5, app.review_top + 1));
+        app.on_mouse(click(5, app.geometry.review_top + 1));
         let view = app.review.as_ref().unwrap();
         assert!(view.tree_focused, "the tree has the cursor");
         assert!(view.folded_dirs.contains("src"), "the folder folded");
@@ -4211,12 +4999,314 @@ mod tests {
         );
     }
 
+    /// An app with a review open, a model chosen, a fake provider and a fake store.
+    ///
+    /// The chat pane needs three things the other screens do not: something to talk
+    /// about, somebody to talk to, and somewhere to put the conversation.
+    fn chat_app() -> (
+        TempHome,
+        App,
+        std::sync::Arc<crate::test_support::FakeChatStore>,
+    ) {
+        use crate::test_support::{FakeChatStore, sample_detail};
+        let (dir, mut app) = review_app();
+        app.open_review(sample_detail(), crate::tui::diff_view::DiffView::new(
+            crate::domain::diff::parse_patch(
+                "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            ),
+        ));
+        app.active_model = Some(crate::application::models::ResolvedSelection {
+            provider: "deepseek".to_owned(),
+            model: "deepseek-v4-pro".to_owned(),
+            route: crate::domain::model::Route::Native(
+                crate::domain::model::NativeBackend::DeepSeek,
+            ),
+            base_url: None,
+            env_var: Some("DEEPSEEK_API_KEY".to_owned()),
+            env_source: None,
+            from_file: true,
+            thinking: None,
+            warnings: Vec::new(),
+        });
+        let store = std::sync::Arc::new(FakeChatStore::default());
+        app.chat_store = store.clone();
+        app.set_environment(crate::test_support::environment());
+        (dir, app, store)
+    }
+
+    #[test]
+    fn the_chat_pane_opens_and_the_compose_box_takes_the_keyboard() {
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        assert!(app.chat.open, "the pane is on screen");
+        assert_eq!(app.focus(), Pane::Chat);
+        assert_eq!(
+            app.mode(),
+            Mode::Insert,
+            "the keyboard belongs to the question"
+        );
+        // A letter is a letter in the compose box, not a navigation key: the failure
+        // this guards is `j` moving a list under a box the user is typing in.
+        press(&mut app, "why does it round?");
+        assert_eq!(app.chat.input.text(), "why does it round?");
+    }
+
+    #[test]
+    fn enter_sends_and_a_modified_enter_adds_a_line() {
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        press(&mut app, "does ");
+        press(&mut app, "<S-Enter>");
+        press(&mut app, "it round?");
+        assert_eq!(app.chat.input.text(), "does \nit round?");
+        // Enter is `chat.send`, which is an effect rather than an edit: the buffer is
+        // untouched until the answer comes back.
+        let effect = press(&mut app, "<Enter>");
+        assert_eq!(effect, Effect::AskChat);
+        assert_eq!(app.chat.input.text(), "does \nit round?");
+    }
+
+    #[test]
+    fn a_gathered_context_is_what_the_question_sends() {
+        // FR-4.6: the second press sends the bundle the first press estimated, so what
+        // the user agreed to is what leaves the machine.
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        press(&mut app, "why?");
+        assert_eq!(press(&mut app, "<Enter>"), Effect::AskChat);
+        // Without an opt-in for this repository the first question waits for agreement.
+        app.await_chat_confirmation();
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR 141",
+                commits: "one commit",
+                conventions: Vec::new(),
+                diff: None,
+                files: Vec::new(),
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        app.chat_bundle = Some(Box::new(bundle));
+        app.chat_bundle_for = app
+            .detail
+            .as_ref()
+            .map(|detail| (detail.summary.number, detail.summary.head_sha.clone()));
+        assert!(app.chat.is_confirming());
+        assert_eq!(press(&mut app, "<Enter>"), Effect::AskChat);
+        // The second press takes the bundle instead of gathering another one.
+        assert!(app.take_chat_bundle().is_some());
+    }
+
+    #[test]
+    fn escape_stops_an_answer_before_it_leaves_the_pane() {
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        app.chat.status = crate::tui::chat::ChatStatus::Streaming {
+            stage: "asking".to_owned(),
+        };
+        assert_eq!(press(&mut app, "<Esc>"), Effect::CancelChat);
+        assert!(app.chat.open, "the pane stays: the answer was stopped");
+        // Once nothing is running, `Esc` leaves the pane instead.
+        app.chat.status = crate::tui::chat::ChatStatus::Idle;
+        assert_eq!(press(&mut app, "<Esc>"), Effect::None);
+        assert!(!app.chat.open);
+    }
+
+    #[test]
+    fn a_stopped_answer_is_stored_and_shown_as_stopped() {
+        let (_dir, mut app, store) = chat_app();
+        press(&mut app, "<Space>c");
+        let session = crate::application::chat::new_session(
+            "1-0".to_owned(),
+            &crate::domain::repo::RepoId::parse("github.com/acme/service").expect("valid"),
+            141,
+            "abc123",
+            "deepseek/deepseek-v4-pro",
+            None,
+            1_000,
+        );
+        app.chat.session = Some(session);
+        app.chat.job = 7;
+        let mut partial =
+            crate::domain::chat::Message::assistant("half an ans", 1_000, None, Vec::new());
+        partial.partial = true;
+        app.apply_completion(crate::tui::jobs::Completion {
+            job: 7,
+            outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
+                crate::tui::jobs::ChatAnswered {
+                    run: crate::application::chat::ChatRun::Cancelled(Box::new(partial)),
+                    session: "1-0".to_owned(),
+                    question: "why?".to_owned(),
+                },
+            )),
+        });
+        let session = app.chat.session.as_ref().expect("the session");
+        assert_eq!(session.messages.len(), 1);
+        assert!(session.messages[0].partial);
+        assert_eq!(
+            store.all().len(),
+            1,
+            "a stopped answer is stored: restarting must not pretend it completed"
+        );
+        assert_eq!(app.chat.status, crate::tui::chat::ChatStatus::Stopped);
+    }
+
+    #[test]
+    fn a_successful_answer_clears_the_question_and_offers_the_pane_again() {
+        let (_dir, mut app, store) = chat_app();
+        press(&mut app, "<Space>c");
+        app.chat.input.set_text("does it round?");
+        app.chat.session = Some(crate::application::chat::new_session(
+            "1-0".to_owned(),
+            &crate::domain::repo::RepoId::parse("github.com/acme/service").expect("valid"),
+            141,
+            "abc123",
+            "deepseek/deepseek-v4-pro",
+            None,
+            1_000,
+        ));
+        app.chat.job = 9;
+        app.apply_completion(crate::tui::jobs::Completion {
+            job: 9,
+            outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
+                crate::tui::jobs::ChatAnswered {
+                    run: crate::application::chat::ChatRun::Answered(Box::new(
+                        crate::application::chat::Answered {
+                            message: crate::domain::chat::Message::assistant(
+                                "It rounds half up.",
+                                1_000,
+                                None,
+                                Vec::new(),
+                            ),
+                            usage: None,
+                            context_bytes: 100,
+                        },
+                    )),
+                    session: "1-0".to_owned(),
+                    question: "does it round?".to_owned(),
+                },
+            )),
+        });
+        assert_eq!(app.chat.status, crate::tui::chat::ChatStatus::Idle);
+        assert!(app.chat.input.is_empty(), "the question was sent");
+        let session = app.chat.session.as_ref().expect("session");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0].role,
+            crate::domain::chat::Role::Assistant
+        );
+        assert_eq!(store.all().len(), 1, "and it was written");
+    }
+
+    #[test]
+    fn an_answer_for_a_conversation_that_is_no_longer_open_is_dropped() {
+        // `:chat new` while an answer is arriving must not append it to the new
+        // conversation: the id is what the answer is checked against.
+        let (_dir, mut app, store) = chat_app();
+        press(&mut app, "<Space>c");
+        app.chat.session = Some(crate::application::chat::new_session(
+            "2-0".to_owned(),
+            &crate::domain::repo::RepoId::parse("github.com/acme/service").expect("valid"),
+            141,
+            "abc123",
+            "m",
+            None,
+            1_000,
+        ));
+        app.chat.job = 3;
+        app.apply_completion(crate::tui::jobs::Completion {
+            job: 3,
+            outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
+                crate::tui::jobs::ChatAnswered {
+                    run: crate::application::chat::ChatRun::Cancelled(Box::new(
+                        crate::domain::chat::Message::assistant("late", 1, None, Vec::new()),
+                    )),
+                    session: "1-0".to_owned(),
+                    question: "why?".to_owned(),
+                },
+            )),
+        });
+        assert!(
+            app.chat
+                .session
+                .as_ref()
+                .expect("session")
+                .messages
+                .is_empty(),
+            "the late answer went nowhere"
+        );
+        assert!(store.all().is_empty());
+    }
+
+    #[test]
+    fn adding_a_file_the_pull_request_does_not_have_is_refused_with_the_reason() {
+        let (_dir, mut app, _store) = chat_app();
+        let error = app.add_context_file("src/nowhere.rs").expect_err("refused");
+        assert!(error.contains("src/nowhere.rs"), "{error}");
+        assert!(app.chat.added.is_empty());
+        // A changed file is accepted, and adding it twice is not two files.
+        app.add_context_file("src/one.rs").expect("accepted");
+        app.add_context_file("src/one.rs").expect("idempotent");
+        assert_eq!(app.chat.added, vec!["src/one.rs".to_owned()]);
+        assert!(app.remove_context_file("src/one.rs").is_ok());
+        assert!(app.chat.added.is_empty());
+    }
+
+    #[test]
+    fn a_secret_path_is_never_added_to_the_context() {
+        // FR-4.6: the refusal happens when the user asks by name, because a bundle that
+        // silently leaves out what they asked for is the one thing the requirement
+        // exists to prevent.
+        let (_dir, mut app, _store) = chat_app();
+        let error = app.add_context_file(".env.local").expect_err("refused");
+        assert!(error.contains("secret"), "{error}");
+        assert!(app.chat.added.is_empty());
+    }
+
+    #[test]
+    fn the_context_of_a_pull_request_survives_a_restart() {
+        let (dir, mut app, _store) = chat_app();
+        app.add_context_file("src/one.rs").expect("accepted");
+        app.remember_context_files();
+        // The loop writes the state file when an effect asks it to; here the write is
+        // explicit, because "survives a restart" is a claim about the file.
+        crate::state::save(&dir.path().join("state.toml"), &app.state).expect("saves");
+        let key = app.context_files_key().expect("a key");
+        assert_eq!(
+            app.state.context_files.get(&key).map(Vec::as_slice),
+            Some(["src/one.rs".to_owned()].as_slice())
+        );
+        // A new app on the same home reads it back, which is what makes the preference
+        // a preference rather than a session detail.
+        let cli = Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(dir.path().to_path_buf()),
+            log_level: None,
+            check: false,
+        };
+        let mut fresh = App::new(Startup::load(&cli).unwrap()).unwrap();
+        fresh.open_review(
+            crate::test_support::sample_detail(),
+            crate::tui::diff_view::DiffView::new(crate::domain::diff::parse_patch(
+                "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            )),
+        );
+        fresh.set_environment(crate::test_support::environment());
+        fresh.load_context_files();
+        assert_eq!(fresh.chat.added, vec!["src/one.rs".to_owned()]);
+    }
+
     #[test]
     fn a_click_in_the_diff_moves_the_diff_cursor() {
         let (_dir, mut app) = review_app();
         frame(&mut app, 120, 30);
 
-        app.on_mouse(click(80, app.review_top + 3));
+        app.on_mouse(click(80, app.geometry.review_top + 3));
         let view = app.review.as_ref().unwrap();
         assert!(!view.tree_focused);
         assert_eq!(view.cursor, 2, "the row under the pointer");

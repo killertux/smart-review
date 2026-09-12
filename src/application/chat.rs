@@ -333,6 +333,31 @@ impl Estimate {
     }
 }
 
+/// How big a request would be, from a bundle that has already been gathered (FR-4.6).
+///
+/// Pure, and free-standing because the interface needs it *after* a gather job has
+/// returned a bundle and before anything is sent: the estimate is what the user is
+/// shown to agree to, so it goes through the same prompt assembly the request will.
+#[must_use]
+pub fn estimate_of(spec: &ChatSpec, session: &Session, bundle: &Bundle) -> Estimate {
+    let budget_bytes = history_budget(&spec.policy);
+    let (messages, dropped) = replayable_history(session, budget_bytes, MIN_HISTORY_MESSAGES);
+    let history_bytes: usize = messages.iter().map(|message| message.text.len()).sum();
+    let system = system_prompt(&bundle.text);
+    let total = system.len() + bundle.text.len() + history_bytes;
+    Estimate {
+        context_bytes: bundle.bytes(),
+        history_bytes,
+        system_bytes: system.len(),
+        estimated_tokens: estimate_tokens(total),
+        history: HistoryPlan {
+            messages,
+            dropped,
+            budget_bytes,
+        },
+    }
+}
+
 /// The byte budget for the conversation, from the bundle's token budget (FR-4.6).
 #[must_use]
 pub fn history_budget(policy: &BundlePolicy) -> usize {

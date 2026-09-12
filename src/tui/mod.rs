@@ -12,6 +12,7 @@
 
 pub mod action;
 pub mod app;
+pub mod chat;
 pub mod clipboard;
 pub mod components;
 pub mod diff_view;
@@ -252,6 +253,20 @@ pub(crate) fn apply(
             let _ = apply_analysis_effect(&effect, app, runner, &mut pending_effects);
         }
 
+        // The chat effects are their own group for the same reason: they share the
+        // pane's state, and asking a question queues the gather that must precede it.
+        Effect::LoadChat
+        | Effect::NewChat
+        | Effect::OpenChat(_)
+        | Effect::AskChat
+        | Effect::CancelChat
+        | Effect::RetryChat
+        | Effect::ExportChat(_)
+        | Effect::PruneChat
+        | Effect::SaveContextFiles => {
+            let _ = apply_chat_effect(&effect, app, runner);
+        }
+
         // The model, key and workspace effects are their own group: they share the
         // picker's state and they queue work for each other (a saved key commits the
         // selection, which then asks to be checked).
@@ -309,6 +324,9 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
     // pull request opens and when its context changes, and both are moments when the
     // head may have moved (FR-4.3).
     pending_effects.push(Effect::LoadAnalysis);
+    // The conversation from the last run is read on the same occasion, so `<leader>c`
+    // shows what was said rather than an empty box (FR-5.1).
+    pending_effects.push(Effect::LoadChat);
 
     // Ask for the worktree in the background while the diff is being read, but only
     // once per pull request: this handler runs again for every context or whitespace
@@ -411,6 +429,172 @@ fn apply_analysis_effect(
         _ => return false,
     }
     true
+}
+
+/// Handles the effects that read, ask and store chat conversations (FR-5.1–FR-5.3).
+///
+/// Returns whether the effect belonged to this group, so `apply` stays exhaustive.
+fn apply_chat_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> bool {
+    match effect {
+        Effect::LoadChat => {
+            let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
+                return true;
+            };
+            let id = runner.submit(jobs::Job::LoadChat { pr, open: None });
+            app.record_chat_load(id);
+        }
+
+        Effect::NewChat => {
+            // A new conversation is *not* written until it has something in it: an
+            // empty session file per key press would fill DEC-9's cap with nothing.
+            app.begin_chat();
+        }
+
+        Effect::OpenChat(id) => {
+            let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
+                return true;
+            };
+            let job = runner.submit(jobs::Job::LoadChat {
+                pr,
+                open: Some(id.clone()),
+            });
+            app.record_chat_load(job);
+        }
+
+        Effect::AskChat | Effect::RetryChat => {
+            ask_chat(app, runner, matches!(effect, Effect::RetryChat));
+        }
+
+        Effect::CancelChat => {
+            runner.cancel(jobs::Slot::ChatAsk);
+            runner.cancel(jobs::Slot::Chat);
+            app.stop_chat();
+        }
+
+        Effect::ExportChat(format) => {
+            // A small, local write on an explicit action: the same exception the config
+            // write-back gets, and it cannot fail in a way that needs a worker thread
+            // (FR-5.1).
+            match app.export_chat(format) {
+                Ok(path) => app.notice(
+                    app::NoticeLevel::Info,
+                    format!("wrote the transcript to {path}"),
+                ),
+                Err(error) => app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not write the transcript: {error}"),
+                ),
+            }
+        }
+
+        Effect::PruneChat => {
+            // DEC-9's cap, enforced when a conversation is added rather than on every
+            // write: pruning is announced, and announcing it twice is noise.
+            let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
+                return true;
+            };
+            let Some(repo) = app
+                .environment
+                .as_ref()
+                .map(|environment| environment.repo.clone())
+            else {
+                return true;
+            };
+            match app.chat_store.prune(&repo, pr) {
+                Ok(pruned) if !pruned.is_empty() => {
+                    app.notice(app::NoticeLevel::Info, pruned.notice());
+                    app.reload_chat_list();
+                }
+                Ok(_) => {}
+                Err(error) => app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not prune old conversations: {error}"),
+                ),
+            }
+        }
+
+        Effect::SaveContextFiles => {
+            // Files the user added with `:context add` are a preference, so they live in
+            // `state.toml` with the other small values that survive a restart (FR-8.5).
+            app.remember_context_files();
+        }
+
+        _ => return false,
+    }
+    true
+}
+
+/// Starts a question: what to ask, and whether anything is sent yet (FR-5.2, FR-4.6).
+///
+/// Extracted from [`apply_chat_effect`] because it is the one part of the chat with a
+/// sequence in it — the question, the model, the bundle, the first-send confirmation —
+/// and reading those four decisions inside a twenty-arm match hides them.
+fn ask_chat(app: &mut App, runner: &mut JobRunner, retry: bool) {
+    let question = if retry {
+        app.chat.retry_question()
+    } else {
+        let typed = app.chat.input.text().trim().to_owned();
+        (!typed.is_empty()).then_some(typed)
+    };
+    let Some(question) = question.filter(|text| !text.trim().is_empty()) else {
+        app.notice(
+            app::NoticeLevel::Info,
+            "there is no question to repeat yet".to_owned(),
+        );
+        return;
+    };
+    if question.len() > crate::domain::chat::MAX_QUESTION_BYTES {
+        app.notice(
+            app::NoticeLevel::Warn,
+            format!(
+                "that question is {} — long for a question; `:context add <path>` may be what \
+                 you want",
+                crate::domain::context::human_bytes(question.len() as u64)
+            ),
+        );
+    }
+
+    let Some((mut spec, session)) = app.chat_request() else {
+        app.notice(
+            app::NoticeLevel::Warn,
+            if app.has_model() {
+                "open a pull request first".to_owned()
+            } else {
+                "choose a provider and model first: <leader>m".to_owned()
+            },
+        );
+        return;
+    };
+    spec.chat.prompt.clone_from(&question);
+
+    // What the user agrees to is the bundle, so one already gathered for this commit is
+    // what gets sent (FR-4.6): gathering again would be slower and a chance for the two
+    // to differ.
+    if let Some(bundle) = app.take_chat_bundle() {
+        app.begin_chat_answer(&question);
+        let id = runner.submit(jobs::Job::AskChat {
+            request: Box::new(jobs::ChatAsk {
+                spec,
+                session: Box::new(session),
+                question,
+                bundle: Box::new(bundle),
+            }),
+        });
+        app.record_chat_job(id);
+        return;
+    }
+
+    // The first question in a repository is confirmed once (FR-4.6): the same notice an
+    // analysis shows, because it is the same bundle leaving the machine.
+    if !app.analysis_opt_in_recorded() {
+        app.await_chat_confirmation();
+    }
+    let id = runner.submit(jobs::Job::GatherChat {
+        spec: Box::new(spec),
+        session: Box::new(session),
+        question,
+    });
+    app.record_chat_load(id);
 }
 
 /// Handles the effects that configure a model, a key or the worktrees.
@@ -638,6 +822,7 @@ pub(crate) fn executor_for(
     analysis: Arc<dyn crate::ports::AnalysisCachePort>,
     llm: std::sync::Arc<dyn crate::ports::LlmPort>,
 ) -> Option<Arc<Executor>> {
+    let chat = app.chat_store.clone();
     let repo: RepoId = app.environment.as_ref()?.repo.clone();
     Some(Arc::new(Executor::new(jobs::ExecutorPorts {
         forge: factory.forge(&repo),
@@ -645,6 +830,7 @@ pub(crate) fn executor_for(
         clock,
         workspace,
         analysis,
+        chat,
         llm,
         repo,
         policy: CachePolicy {

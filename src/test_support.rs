@@ -744,6 +744,111 @@ impl crate::ports::AnalysisCachePort for InMemoryAnalysis {
     }
 }
 
+/// An in-memory [`ChatStorePort`](crate::ports::ChatStorePort).
+///
+/// A `BTreeMap` per pull request, with the same pruning rule the real store has — the
+/// rule is DEC-9's, not the filesystem's, so a fake that skipped it would let a test
+/// pass while the app filled a disk.
+#[derive(Debug, Default)]
+pub(crate) struct FakeChatStore {
+    sessions:
+        Mutex<std::collections::BTreeMap<(String, u64, String), crate::domain::chat::Session>>,
+}
+
+impl FakeChatStore {
+    /// Every session, for an assertion about what was written.
+    #[cfg(test)]
+    pub(crate) fn all(&self) -> Vec<crate::domain::chat::Session> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+impl crate::ports::ChatStorePort for FakeChatStore {
+    fn list(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Vec<crate::domain::chat::SessionMeta>, crate::ports::ChatStoreError> {
+        let mut metas: Vec<crate::domain::chat::SessionMeta> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|session| session.repo == repo.key() && session.pr == pr)
+            .map(crate::domain::chat::SessionMeta::of)
+            .collect();
+        metas.sort_by_key(|meta| std::cmp::Reverse((meta.updated_at, meta.id.clone())));
+        Ok(metas)
+    }
+
+    fn load(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+        id: &str,
+    ) -> Result<Option<crate::domain::chat::Session>, crate::ports::ChatStoreError> {
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(repo.key(), pr, id.to_owned()))
+            .cloned())
+    }
+
+    fn latest(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Option<crate::domain::chat::Session>, crate::ports::ChatStoreError> {
+        let Some(meta) = self.list(repo, pr)?.into_iter().next() else {
+            return Ok(None);
+        };
+        self.load(repo, pr, &meta.id)
+    }
+
+    fn put(
+        &self,
+        session: &crate::domain::chat::Session,
+    ) -> Result<(), crate::ports::ChatStoreError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (session.repo.clone(), session.pr, session.id.clone()),
+                session.clone(),
+            );
+        Ok(())
+    }
+
+    fn remove(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+        id: &str,
+    ) -> Result<(), crate::ports::ChatStoreError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(repo.key(), pr, id.to_owned()));
+        Ok(())
+    }
+
+    fn prune(
+        &self,
+        _repo: &crate::domain::repo::RepoId,
+        _pr: u64,
+    ) -> Result<crate::domain::chat::Pruned, crate::ports::ChatStoreError> {
+        // The fake stores nothing it should not, so there is nothing to prune; the
+        // pruning rule itself is tested against the real store and in `domain::chat`.
+        Ok(crate::domain::chat::Pruned::default())
+    }
+}
+
 /// A sample pull request, for tests that need a detail but are not about parsing one.
 pub(crate) fn sample_detail() -> crate::domain::pr::PullRequestDetail {
     let summary = crate::domain::pr::PullRequestSummary {
