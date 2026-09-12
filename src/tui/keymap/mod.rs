@@ -328,6 +328,13 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     // `<leader>c` opens the chat pane (§5.4). The pane's own keys are scoped to insert
     // mode, because that is the mode the compose box puts the app in (FR-5.2).
     (Scope::In(Mode::Normal), "<leader>c", "chat.open"),
+    // `Tab` moves between panes in *both* modes. Without the insert-mode binding the
+    // compose box would be a room with no door: `Tab` is not text, so it reaches the
+    // keymap, and a keymap with no insert-mode binding for it reports "not bound" and
+    // leaves the user typing in a pane they cannot leave. `Tab` is therefore a pane
+    // move rather than a tab character, which is worth saying out loud.
+    (Scope::In(Mode::Insert), "<Tab>", "pane.next"),
+    (Scope::In(Mode::Insert), "<S-Tab>", "pane.prev"),
     (Scope::In(Mode::Normal), "r", "chat.retry"),
     (Scope::In(Mode::Insert), "<Enter>", "chat.send"),
     // Enter sends, so a newline needs a modifier. `S-Enter` is what the requirement

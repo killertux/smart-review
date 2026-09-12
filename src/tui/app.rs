@@ -767,6 +767,12 @@ pub struct App {
     geometry: Geometry,
     /// Set when the user asks to quit.
     pub(crate) quit: bool,
+    /// Set when `state.toml` no longer describes the app.
+    ///
+    /// The reducer cannot write it (no IO in the reducer), so it says *that* the file is
+    /// stale and the loop writes it. Without this the one-time opt-in of FR-4.6 lived
+    /// only as long as the process, and every restart asked the same question again.
+    state_dirty: bool,
 }
 
 impl App {
@@ -877,6 +883,7 @@ impl App {
             started_at: 0,
             geometry: Geometry::default(),
             quit: false,
+            state_dirty: false,
         };
         app.report_startup_warnings();
         Ok(app)
@@ -967,10 +974,20 @@ impl App {
     }
 
     /// Opens the review screen for a detail and its diff (FR-3.3).
+    ///
+    /// The focus is only taken when this *opens* the screen. Every patch arrival goes
+    /// through here — the forge's diff, then the worktree's, then again after a context
+    /// change — and a late arrival that re-focused the diff pane would pull the keyboard
+    /// out of whatever the user had moved on to. With two panes that was invisible;
+    /// with a compose box it silently turned a typed question into key bindings.
     pub fn open_review(&mut self, detail: PullRequestDetail, view: DiffView) {
+        let opening = self.review.is_none();
         self.detail = Some(detail);
         self.review = Some(view);
-        self.focus = Pane::Diff;
+        if opening {
+            self.focus = Pane::Diff;
+            self.sync_mode_to_focus();
+        }
         self.diff_loading = false;
         self.stop_opening();
     }
@@ -1372,9 +1389,19 @@ impl App {
         self.chat.awaiting_confirmation = Some(question);
     }
 
-    /// Starts the answer to a question: the panel says so and the question is kept for
-    /// `r` (FR-5.2).
-    pub(crate) fn begin_chat_answer(&mut self, question: &str) {
+    /// Starts the answer to a question (FR-5.1, FR-5.2).
+    ///
+    /// The question joins the conversation *now*, before the provider answers, and the
+    /// session is stored here rather than when the answer arrives. Both matter for the
+    /// same reason: the answer has to land somewhere, and a conversation whose first
+    /// turn only exists once its answer does loses the question if the answer never
+    /// comes. It also means the user sees what they asked while the model is thinking,
+    /// which is what every chat interface does and what makes a slow answer tolerable.
+    pub(crate) fn begin_chat_answer(
+        &mut self,
+        question: &str,
+        session: crate::domain::chat::Session,
+    ) {
         self.chat.status = crate::tui::chat::ChatStatus::Sending {
             stage: format!("asking {}", self.model_label()),
         };
@@ -1384,11 +1411,25 @@ impl App {
         self.chat.scroll = 0;
         self.chat_bundle = None;
         self.chat_bundle_for = None;
+        self.chat.input.clear();
+
+        let mut session = session;
+        session.messages.push(crate::domain::chat::Message::user(
+            question,
+            self.now_unix_secs,
+        ));
+        session.updated_at = self.now_unix_secs;
+        self.chat.session = Some(session);
+        self.persist_chat();
     }
 
     /// Gives up on the answer in flight, keeping what arrived (FR-5.2).
+    ///
+    /// The job id is deliberately *not* cleared: the worker still finishes — with the
+    /// text that arrived, marked as stopped — and that completion has to be matched to
+    /// be stored. Clearing the id here is what made the partial answer visible while it
+    /// was streaming and gone the moment the app restarted.
     pub(crate) fn stop_chat(&mut self) {
-        self.chat.job = 0;
         self.chat.stop();
     }
 
@@ -1474,7 +1515,7 @@ impl App {
             return None;
         }
         // Already agreed: the question goes now, with the bundle that was just gathered.
-        self.chat.pending = Some(question);
+        self.chat.staged = Some(question);
         Some(Effect::AskChat)
     }
 
@@ -1594,8 +1635,9 @@ impl App {
                 self.persist_chat();
             }
         }
-        // The question that was asked is spent: the input is free for the next one.
-        self.chat.input.clear();
+        // The input was cleared when the question was taken, not here: a user who types
+        // the next question while the answer is arriving must not lose it to the answer
+        // landing.
         self.chat.stream.clear();
         self.chat.scroll = 0;
     }
@@ -1979,6 +2021,14 @@ impl App {
             self.state.analysis_opt_in.push(key);
         }
         self.panel.confirmed = false;
+        // Agreeing once is the whole point of a one-time notice (FR-4.6): the record has
+        // to reach the disk, or the next run asks again.
+        self.state_dirty = true;
+    }
+
+    /// Whether the state file needs writing, clearing the flag.
+    pub(crate) fn take_state_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.state_dirty)
     }
 
     /// Streams a piece of the answer into the preview (FR-4.4, FR-5.2).
@@ -5009,12 +5059,16 @@ mod tests {
         std::sync::Arc<crate::test_support::FakeChatStore>,
     ) {
         use crate::test_support::{FakeChatStore, sample_detail};
-        let (dir, mut app) = review_app();
-        app.open_review(sample_detail(), crate::tui::diff_view::DiffView::new(
-            crate::domain::diff::parse_patch(
+        // Built through `open_review` rather than `set_review`, because that is the call
+        // that puts the focus in the review screen — and the focus is half of what these
+        // tests are about.
+        let (dir, mut app) = list_app();
+        app.open_review(
+            sample_detail(),
+            crate::tui::diff_view::DiffView::new(crate::domain::diff::parse_patch(
                 "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n",
-            ),
-        ));
+            )),
+        );
         app.active_model = Some(crate::application::models::ResolvedSelection {
             provider: "deepseek".to_owned(),
             model: "deepseek-v4-pro".to_owned(),
@@ -5031,6 +5085,9 @@ mod tests {
         let store = std::sync::Arc::new(FakeChatStore::default());
         app.chat_store = store.clone();
         app.set_environment(crate::test_support::environment());
+        // A key, so `chat_request` resolves: a chat that cannot reach a provider cannot
+        // be asked anything, and the tests below are about what happens when it can.
+        app.secret_store = std::sync::Arc::new(crate::test_support::FixedSecrets::new("sk-test"));
         (dir, app, store)
     }
 
@@ -5098,6 +5155,164 @@ mod tests {
     }
 
     #[test]
+    fn recording_the_opt_in_asks_for_the_state_file_to_be_written() {
+        // FR-4.6's notice is once per repository, which is only true if the record
+        // reaches the disk: this flag is what the loop writes it from.
+        let (_dir, mut app, _store) = chat_app();
+        assert!(!app.take_state_dirty(), "nothing to write at startup");
+        app.record_analysis_opt_in();
+        assert!(app.analysis_opt_in_recorded());
+        assert!(app.take_state_dirty(), "the opt-in is worth writing");
+        assert!(!app.take_state_dirty(), "and only once");
+    }
+
+    #[test]
+    fn a_late_diff_does_not_pull_the_keyboard_out_of_the_compose_box() {
+        // The order the validator produced: open a pull request, Tab to the chat pane,
+        // and *then* let the worktree's local diff arrive. `apply_patch` calls
+        // `open_review`, which used to re-focus the diff pane — so the next characters
+        // typed became key bindings instead of words.
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Tab>");
+        assert_eq!(app.focus(), Pane::Chat);
+        app.diff_loading = true;
+
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n",
+        );
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            job: app.patch_job,
+            outcome: crate::tui::jobs::Outcome::Patch {
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
+                source: crate::domain::diff::DiffSource::Worktree,
+            },
+        });
+        assert!(effect.is_none());
+        assert_eq!(app.focus(), Pane::Chat, "the compose box kept the keyboard");
+        assert_eq!(app.mode(), Mode::Insert);
+        press(&mut app, "why?");
+        assert_eq!(app.chat.input.text(), "why?");
+    }
+
+    #[test]
+    fn opening_a_review_takes_the_focus_from_the_list() {
+        // And the other half of it: arriving at a review screen *does* move the focus.
+        let (_dir, mut app) = list_app();
+        assert_eq!(app.focus(), Pane::PullRequests);
+        app.open_review(
+            crate::test_support::sample_detail(),
+            crate::tui::diff_view::DiffView::new(crate::domain::diff::parse_patch(
+                "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n",
+            )),
+        );
+        assert_eq!(app.focus(), Pane::Diff);
+        assert_eq!(app.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn the_first_question_shows_an_estimate_and_waits() {
+        // The sequence the validator drives: type, press Enter, and the pane asks —
+        // with the *size* of what would be sent, which is the whole point of asking.
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        press(&mut app, "why does it round?");
+        assert_eq!(
+            press(&mut app, "<Enter>"),
+            Effect::AskChat,
+            "the effect asks"
+        );
+        app.await_chat_confirmation();
+        app.record_chat_load(42);
+
+        // The gather job comes back with a bundle.
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR 141",
+                commits: "one commit",
+                conventions: Vec::new(),
+                diff: None,
+                files: Vec::new(),
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        let session = app.chat_request().expect("a request").1;
+        app.apply_completion(crate::tui::jobs::Completion {
+            job: 42,
+            outcome: crate::tui::jobs::Outcome::ChatGathered {
+                bundle: Box::new(bundle),
+                session: Box::new(session),
+                question: "why does it round?".to_owned(),
+            },
+        });
+        assert!(app.chat.is_confirming(), "still waiting for agreement");
+        let estimate = app.chat.estimate.as_ref().expect("an estimate");
+        assert!(estimate.context_bytes > 0);
+        assert!(estimate.label().contains("context"), "{}", estimate.label());
+        assert!(
+            estimate.label().starts_with('~'),
+            "the label is an estimate and says so: {}",
+            estimate.label()
+        );
+        // And the bundle is kept, so agreeing sends what was estimated.
+        assert!(app.take_chat_bundle().is_some());
+    }
+
+    #[test]
+    fn a_cancelled_answer_is_still_stored_when_its_job_finishes() {
+        // The worker reports a stopped answer *after* `Esc`, so the completion has to
+        // still be matched: the partial text is worth keeping (FR-5.2) and the store is
+        // where a restart finds it.
+        let (_dir, mut app, store) = chat_app();
+        press(&mut app, "<Space>c");
+        let session = crate::application::chat::new_session(
+            "1-0".to_owned(),
+            &crate::domain::repo::RepoId::parse("github.com/acme/service").expect("valid"),
+            141,
+            "abc123",
+            "m",
+            None,
+            1_000,
+        );
+        app.begin_chat_answer("why?", session);
+        app.chat.job = 12;
+        app.chat.status = crate::tui::chat::ChatStatus::Streaming {
+            stage: "asking".to_owned(),
+        };
+        app.stop_chat();
+        assert_eq!(
+            app.chat.status,
+            crate::tui::chat::ChatStatus::Stopped,
+            "the pane says so immediately"
+        );
+
+        let mut partial =
+            crate::domain::chat::Message::assistant("half an ans", 1_000, None, Vec::new());
+        partial.partial = true;
+        app.apply_completion(crate::tui::jobs::Completion {
+            job: 12,
+            outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
+                crate::tui::jobs::ChatAnswered {
+                    run: crate::application::chat::ChatRun::Cancelled(Box::new(partial)),
+                    session: "1-0".to_owned(),
+                    question: "why?".to_owned(),
+                },
+            )),
+        });
+        let session = app.chat.session.as_ref().expect("session");
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "the question and the partial answer"
+        );
+        assert!(session.messages[1].partial);
+        assert_eq!(store.all().len(), 1);
+        assert!(
+            store.all()[0].messages[1].partial,
+            "the stored conversation says the answer was stopped"
+        );
+    }
+
+    #[test]
     fn escape_stops_an_answer_before_it_leaves_the_pane() {
         let (_dir, mut app, _store) = chat_app();
         press(&mut app, "<Space>c");
@@ -5152,11 +5367,10 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_answer_clears_the_question_and_offers_the_pane_again() {
+    fn a_successful_answer_lands_in_the_conversation_the_question_opened() {
         let (_dir, mut app, store) = chat_app();
         press(&mut app, "<Space>c");
-        app.chat.input.set_text("does it round?");
-        app.chat.session = Some(crate::application::chat::new_session(
+        let session = crate::application::chat::new_session(
             "1-0".to_owned(),
             &crate::domain::repo::RepoId::parse("github.com/acme/service").expect("valid"),
             141,
@@ -5164,8 +5378,18 @@ mod tests {
             "deepseek/deepseek-v4-pro",
             None,
             1_000,
-        ));
+        );
+        // The question is asked: this is where the conversation is created and stored.
+        app.chat.input.set_text("does it round?");
+        app.begin_chat_answer("does it round?", session);
+        assert_eq!(app.chat.session.as_ref().expect("session").turns(), 1);
+        assert_eq!(
+            store.all().len(),
+            1,
+            "the question is stored before its answer exists"
+        );
         app.chat.job = 9;
+        app.chat.input.set_text("a question typed while waiting");
         app.apply_completion(crate::tui::jobs::Completion {
             job: 9,
             outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
@@ -5188,14 +5412,20 @@ mod tests {
             )),
         });
         assert_eq!(app.chat.status, crate::tui::chat::ChatStatus::Idle);
-        assert!(app.chat.input.is_empty(), "the question was sent");
-        let session = app.chat.session.as_ref().expect("session");
-        assert_eq!(session.messages.len(), 1);
         assert_eq!(
-            session.messages[0].role,
+            app.chat.input.text(),
+            "a question typed while waiting",
+            "the answer landing does not touch what the user has typed since"
+        );
+        let session = app.chat.session.as_ref().expect("session");
+        assert_eq!(session.messages.len(), 2, "the question and its answer");
+        assert_eq!(session.messages[0].role, crate::domain::chat::Role::User);
+        assert_eq!(
+            session.messages[1].role,
             crate::domain::chat::Role::Assistant
         );
-        assert_eq!(store.all().len(), 1, "and it was written");
+        assert_eq!(store.all().len(), 1, "one conversation");
+        assert_eq!(store.all()[0].messages.len(), 2, "written with both turns");
     }
 
     #[test]
@@ -5310,6 +5540,47 @@ mod tests {
         let view = app.review.as_ref().unwrap();
         assert!(!view.tree_focused);
         assert_eq!(view.cursor, 2, "the row under the pointer");
+    }
+
+    #[test]
+    fn tab_walks_the_three_stops_of_a_review_screen() {
+        // The diff text, the conversation, then the tree: the first version of this cycle
+        // could not reach the chat pane at all, which is the kind of bug a test that only
+        // checks "the focus changed" passes straight through.
+        let (_dir, mut app, _store) = chat_app();
+        assert_eq!(app.focus(), Pane::Diff);
+        assert!(
+            !app.review.as_ref().expect("review").tree_focused,
+            "a review opens on the diff text"
+        );
+
+        let effect = press(&mut app, "<Tab>");
+        assert_eq!(app.focus(), Pane::Chat, "second stop: the conversation");
+        assert!(app.chat.open);
+        assert_eq!(app.mode(), Mode::Insert);
+        assert_eq!(
+            effect,
+            Effect::LoadChat,
+            "a conversation is loaded on arrival"
+        );
+
+        press(&mut app, "<Tab>");
+        assert_eq!(app.focus(), Pane::Diff);
+        assert!(app.review.as_ref().expect("review").tree_focused);
+
+        press(&mut app, "<Tab>");
+        assert_eq!(app.focus(), Pane::Diff);
+        assert!(
+            !app.review.as_ref().expect("review").tree_focused,
+            "and around"
+        );
+
+        // Backwards is the same cycle in reverse, and the pane is already open so
+        // arriving at it asks for nothing.
+        press(&mut app, "<S-Tab>");
+        assert!(app.review.as_ref().expect("review").tree_focused);
+        assert_eq!(press(&mut app, "<S-Tab>"), Effect::SaveState);
+        assert_eq!(app.focus(), Pane::Chat);
     }
 
     #[test]

@@ -26,5 +26,5 @@
 │     │   <C-b>               Move a screen up                                               │     │
 │     │   <Esc>, h            Close the review, or clear the search and filters              │     │
 └─────│ PANES                                                                                │─────┘
- POPUP│   <Tab>               Focus the next pane                                            │mands
+ POPUP│   <Tab>, <Tab> (inser…Focus the next pane                                            │mands
       └──────────────────────────────────────────────────────────────────────────────────────┘

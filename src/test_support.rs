@@ -849,6 +849,77 @@ impl crate::ports::ChatStorePort for FakeChatStore {
     }
 }
 
+/// A [`SecretStore`](crate::ports::SecretStore) holding one key for every provider.
+///
+/// Simpler than the file-backed one, and it exists because a test that has to write a
+/// `credentials.toml` to test anything that talks to a provider is a test that spends
+/// its lines on the filesystem rather than on the behaviour.
+#[derive(Debug)]
+pub(crate) struct FixedSecrets {
+    key: String,
+    store: Mutex<std::collections::BTreeMap<String, String>>,
+}
+
+impl FixedSecrets {
+    /// A store where every provider has this key.
+    pub(crate) fn new(key: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            store: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl crate::ports::SecretStore for FixedSecrets {
+    fn get(
+        &self,
+        provider: &str,
+        env_var: Option<&str>,
+    ) -> Result<Option<crate::ports::ApiKey>, crate::ports::SecretError> {
+        let _ = env_var;
+        let stored = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| self.key.clone());
+        Ok(Some(crate::ports::ApiKey::new(
+            stored,
+            crate::ports::KeySource::File,
+        )))
+    }
+
+    fn set(&self, provider: &str, key: &str) -> Result<(), crate::ports::SecretError> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(provider.to_owned(), key.to_owned());
+        Ok(())
+    }
+
+    fn remove(&self, provider: &str) -> Result<(), crate::ports::SecretError> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(provider);
+        Ok(())
+    }
+
+    fn status(&self) -> Result<Vec<crate::ports::KeyStatus>, crate::ports::SecretError> {
+        Ok(self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .map(|provider| crate::ports::KeyStatus {
+                provider: provider.clone(),
+                source: Some(crate::ports::KeySource::File),
+            })
+            .collect())
+    }
+}
+
 /// A sample pull request, for tests that need a detail but are not about parsing one.
 pub(crate) fn sample_detail() -> crate::domain::pr::PullRequestDetail {
     let summary = crate::domain::pr::PullRequestSummary {

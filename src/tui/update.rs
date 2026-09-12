@@ -791,39 +791,98 @@ fn toggle_whitespace(app: &mut App) -> Effect {
 
 /// Moves the focus on. Inside a review that means the tree and the diff in turn
 /// (FR-3.3: the two panes keep independent cursors and `Tab` moves between them).
+/// The three places `Tab` can stop inside a review screen.
+///
+/// A cycle of three rather than two `Pane`s, because the file tree and the diff text are
+/// two stops inside *one* pane: modelling them as a pair of booleans alongside a separate
+/// chat pane is what made the first version of this skip the chat pane entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The file tree.
+    Tree,
+    /// The diff text.
+    Diff,
+    /// The conversation.
+    Chat,
+}
+
+impl Stop {
+    /// The next stop, which is the order the screen reads in.
+    const fn next(self) -> Self {
+        match self {
+            Self::Tree => Self::Diff,
+            Self::Diff => Self::Chat,
+            Self::Chat => Self::Tree,
+        }
+    }
+
+    /// The previous stop.
+    const fn prev(self) -> Self {
+        match self {
+            Self::Tree => Self::Chat,
+            Self::Diff => Self::Tree,
+            Self::Chat => Self::Diff,
+        }
+    }
+}
+
 fn switch_pane(app: &mut App, forward: bool) -> Effect {
     if let Some(view) = app.review.as_mut() {
-        // Tab inside a review screen first moves between the tree and the diff, which is
-        // what it did before there was a third pane; from the diff it then moves to the
-        // conversation, and back to the tree from there.
-        if app.focus == crate::tui::app::Pane::Diff && view.tree_focused {
-            view.tree_focused = false;
-            return Effect::None;
-        }
-        if app.focus == crate::tui::app::Pane::Diff && !view.tree_focused {
-            // The tree is where a review starts, so `Tab` from the diff goes back to it
-            // unless the pane is on the other side of the cycle.
-            if !forward && view.tree_focused {
-                return Effect::None;
-            }
-            view.tree_focused = true;
-            app.notice(NoticeLevel::Info, "file tree: Enter opens, j/k moves");
-            return Effect::None;
-        }
+        let current = match (app.focus, view.tree_focused) {
+            (crate::tui::app::Pane::Chat, _) => Stop::Chat,
+            (_, true) => Stop::Tree,
+            _ => Stop::Diff,
+        };
+        let stop = if forward {
+            current.next()
+        } else {
+            current.prev()
+        };
+        return focus_stop(app, stop);
     }
     let pane = if forward {
         app.focus.next()
     } else {
         app.focus.prev()
     };
-    // Reaching the chat pane opens it: a focus that lands on a pane which is not drawn
-    // would leave the keyboard in a place with nothing to type into (FR-5.2).
-    if pane == crate::tui::app::Pane::Chat && !app.chat.open {
-        app.show_chat();
-        set_focus(app, pane);
-        return Effect::LoadChat;
+    if pane == crate::tui::app::Pane::Chat {
+        // Outside a review screen there is nothing to talk about, so the cycle stays
+        // between the list and the (empty) diff pane.
+        return set_focus(app, crate::tui::app::Pane::PullRequests);
     }
     set_focus(app, pane)
+}
+
+/// Focuses one of the three review stops, opening the chat pane if that is where the
+/// cycle landed (FR-5.2).
+fn focus_stop(app: &mut App, stop: Stop) -> Effect {
+    match stop {
+        Stop::Tree => {
+            if let Some(view) = app.review.as_mut() {
+                view.tree_focused = true;
+            }
+            app.notice(NoticeLevel::Info, "file tree: Enter opens, j/k moves");
+            set_focus(app, crate::tui::app::Pane::Diff)
+        }
+        Stop::Diff => {
+            if let Some(view) = app.review.as_mut() {
+                view.tree_focused = false;
+            }
+            set_focus(app, crate::tui::app::Pane::Diff)
+        }
+        Stop::Chat => {
+            // A focus that lands on a pane which is not drawn would leave the keyboard
+            // in a place with nothing to type into.
+            let was_open = app.chat.open;
+            app.show_chat();
+            let effect = set_focus(app, crate::tui::app::Pane::Chat);
+            if was_open || app.chat.session.is_some() {
+                effect
+            } else {
+                Effect::LoadChat
+            }
+        }
+    }
 }
 
 fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {

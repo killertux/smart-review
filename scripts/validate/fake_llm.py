@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A scripted, OpenAI-compatible provider, for validating M2b end to end.
+"""A scripted, OpenAI-compatible provider, for validating M2b and M3 end to end.
 
 The point of the analysis milestone is the path from a diff to an ordered review, and
 the only way to validate that path without paying a provider is to be the provider. This
@@ -17,6 +17,10 @@ says between one run and the next. Modes:
                      prompt arrives — detected by its own wording, so the fake needs no
                      state to know which attempt it is
     empty            a JSON object that says nothing
+    chat             a chat answer: prose, one path reference, one general-knowledge
+                     line (M3)
+    chat-slow        the same, dribbled out over a second, so the checker can stop it
+                     halfway (M3)
 
 Every request body is appended to the log file, one JSON object per line, which is how
 the checker asserts what was actually sent: the diff, the file contents, the repository
@@ -26,6 +30,7 @@ conventions, and above all what was *not* sent.
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # The analysis the "good" mode returns. Three properties matter to the checker:
@@ -73,6 +78,21 @@ GOOD = {
     "suggested_questions": ["Is the rounding rule documented for finance?"],
 }
 
+# A chat answer, with the two things the M3 checker looks for: a reference to a file
+# that is in the diff (so the pane can say it is jumpable) and a sentence the model
+# marked as general knowledge rather than as coming from the context (FR-5.3).
+CHAT = "\n\n".join(
+    [
+        "The rounding changed in `src/domain/money.rs`: it now adds five cents before "
+        "dividing, which rounds half up for positive amounts.",
+        "The negative case is the one to check: `src/domain/money.rs` has no sign handling.",
+        "[general] Rust's integer division truncates toward zero, so the sign follows the "
+        "numerator.",
+        "If you want the invoice total checked, add `src/domain/invoice.rs` to the context: "
+        "it is not in this change.",
+    ]
+)
+
 PROSE = (
     "I looked at the diff. Money now rounds half up, and the invoice total follows "
     "it. The main risk is the sign of the rounding. Let me know if you want more."
@@ -81,6 +101,8 @@ PROSE = (
 
 def scripted(mode: str, prompt: str) -> str:
     """What the provider says for this request."""
+    if mode in ("chat", "chat-slow"):
+        return chat_answer(prompt)
     if mode == "prose":
         return PROSE
     if mode == "prose-then-good":
@@ -92,6 +114,21 @@ def scripted(mode: str, prompt: str) -> str:
     if mode == "empty":
         return "{}"
     return json.dumps(GOOD)
+
+
+def chat_answer(prompt: str) -> str:
+    """A chat answer that quotes the question it is answering.
+
+    The quote is not decoration: the checker has to tell one answer from another, and a
+    scripted provider that says the same thing every time makes "the answer to *this*
+    question arrived" unobservable — the previous answer's text is still on screen.
+    """
+    asked = ""
+    for line in reversed(prompt.splitlines()):
+        if line.startswith("user:"):
+            asked = line.removeprefix("user:").strip()[:40]
+            break
+    return f'You asked: "{asked}". ' + CHAT
 
 
 def message_text(content) -> str:
@@ -116,9 +153,15 @@ def message_text(content) -> str:
 
 
 def answer_for(body: dict, mode: str) -> str:
-    """The text of the answer, for the messages in this request."""
-    prompt = " ".join(
-        message_text(message.get("content")) for message in body.get("messages", [])
+    """The text of the answer, for the messages in this request.
+
+    The transcript is labelled with roles rather than joined blindly: a chat answer that
+    quotes the question has to be able to find it, and "the last thing the user said" is
+    not recoverable from a bag of words.
+    """
+    prompt = "\n".join(
+        f"{message.get('role', '?')}: {message_text(message.get('content'))}"
+        for message in body.get("messages", [])
     )
     return scripted(mode, prompt)
 
@@ -134,6 +177,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args) -> None:  # noqa: ANN002
         """Silence the default access log: it is noise on the checker's output."""
 
+    @classmethod
+    def mode(cls) -> str:
+        """What the checker has asked for right now.
+
+        Deliberately lock-free: every caller already holds `cls.lock`, and taking it
+        twice here would deadlock the server on the first request — with the app waiting
+        for an answer that can never come, which looks exactly like a product bug.
+        """
+        return open(cls.mode_file, encoding="utf-8").read().strip() or "good"
+
     def do_POST(self) -> None:  # noqa: N802 - the base class names it
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length).decode("utf-8", "replace")
@@ -144,19 +197,32 @@ class Handler(BaseHTTPRequestHandler):
 
         with self.lock:
             with open(self.log_file, "a", encoding="utf-8") as handle:
+                # The mode is recorded with the request: "what did the provider say"
+                # and "what did it say it because of" are one question when a check
+                # fails, and reconstructing it from the order of the steps is guesswork.
                 handle.write(
-                    json.dumps({"path": self.path, "body": body}, sort_keys=True) + "\n"
+                    json.dumps(
+                        {"path": self.path, "mode": self.mode(), "body": body},
+                        sort_keys=True,
+                    )
+                    + "\n"
                 )
-            mode = open(self.mode_file, encoding="utf-8").read().strip() or "good"
+            mode = self.mode()
 
         answer = answer_for(body, mode)
         if body.get("stream"):
-            self.stream(answer)
+            self.stream(answer, slow=mode == "chat-slow")
         else:
             self.json(answer)
 
-    def stream(self, answer: str) -> None:
-        """Server-sent events, in several chunks, as a real provider does."""
+    def stream(self, answer: str, slow: bool = False) -> None:
+        """Server-sent events, in several chunks, as a real provider does.
+
+        `slow` dribbles the answer out over about a second, which is what gives the
+        M3 checker a window in which to press `Esc`: a stream that finishes in one
+        millisecond cannot be cancelled, and a cancellation nobody can test is a
+        cancellation nobody knows works.
+        """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -175,6 +241,8 @@ class Handler(BaseHTTPRequestHandler):
             }
             self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
             self.wfile.flush()
+            if slow:
+                time.sleep(0.25)
         usage = {
             "id": "chatcmpl-fake",
             "object": "chat.completion.chunk",

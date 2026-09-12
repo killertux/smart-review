@@ -115,7 +115,7 @@ pub fn run(startup: Startup) -> Result<()> {
         app.tick();
 
         // Results from background jobs, then whatever they asked for next.
-        let mut queued = drain_completions(
+        let (queued, background_changed) = drain_completions(
             &mut app,
             &mut runner,
             forge_factory.as_ref(),
@@ -123,6 +123,15 @@ pub fn run(startup: Startup) -> Result<()> {
             &clock_source,
             &workspace_for_executor,
         );
+        // A result from a job changes the screen, and the frame above was drawn before
+        // it arrived. Without a second draw that change waits for the next event to be
+        // seen — which is not a cosmetic delay: pressing a key in between means acting
+        // on a screen that no longer describes the state. It is how a question that had
+        // been gathered and priced reached the provider without its confirmation ever
+        // being on screen.
+        if background_changed {
+            terminal.draw(|frame| app.render(frame))?;
+        }
 
         let effect = if event::poll(app.poll_timeout())? {
             match event::read()? {
@@ -138,6 +147,7 @@ pub fn run(startup: Startup) -> Result<()> {
             app.on_timeout()
         };
 
+        let mut queued = queued;
         queued.extend(apply(
             effect,
             &mut app,
@@ -152,6 +162,21 @@ pub fn run(startup: Startup) -> Result<()> {
             &mut runner,
             &mut terminal,
         );
+        // A change that the reducer could not write itself — the one-time opt-in of
+        // FR-4.6 is the one that matters — is written here, where the store is.
+        if app.take_state_dirty()
+            && let Err(error) = state_store.save(&app.state)
+        {
+            app.notice(
+                app::NoticeLevel::Warn,
+                format!("could not save state: {error}"),
+            );
+        }
+        // The effects above may have changed the screen too, and they are applied after
+        // the event that asked for them. Drawing here rather than at the top of the next
+        // iteration means what the key press did is on screen before the loop can block
+        // again — the same reason the background draw exists.
+        terminal.draw(|frame| app.render(frame))?;
     }
 
     runner.cancel_all();
@@ -532,6 +557,10 @@ fn apply_chat_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> 
 fn ask_chat(app: &mut App, runner: &mut JobRunner, retry: bool) {
     let question = if retry {
         app.chat.retry_question()
+    } else if let Some(staged) = app.chat.take_staged() {
+        // This effect came from a gather rather than from the keyboard: the question is
+        // the one that gather was made for, and the compose box has been cleared since.
+        Some(staged)
     } else {
         let typed = app.chat.input.text().trim().to_owned();
         (!typed.is_empty()).then_some(typed)
@@ -571,7 +600,7 @@ fn ask_chat(app: &mut App, runner: &mut JobRunner, retry: bool) {
     // what gets sent (FR-4.6): gathering again would be slower and a chance for the two
     // to differ.
     if let Some(bundle) = app.take_chat_bundle() {
-        app.begin_chat_answer(&question);
+        app.begin_chat_answer(&question, session.clone());
         let id = runner.submit(jobs::Job::AskChat {
             request: Box::new(jobs::ChatAsk {
                 spec,
@@ -743,14 +772,17 @@ fn drain_completions(
     cache: &Arc<dyn crate::ports::CacheStore>,
     clock: &Arc<dyn Clock>,
     workspace: &Arc<dyn crate::ports::WorkspacePort>,
-) -> Vec<Effect> {
+) -> (Vec<Effect>, bool) {
     // Streaming text arrives on its own channel, so it is drained with the
     // completions: both are "what the background has to say right now" (FR-4.4).
+    let mut changed = false;
     for progress in runner.poll_progress() {
         app.apply_progress(progress);
+        changed = true;
     }
     let mut follow_ups: Vec<Effect> = Vec::new();
     for completion in runner.poll() {
+        changed = true;
         let detected = matches!(completion.outcome, Outcome::Environment(_));
         let effect = app.apply_completion(completion);
         if detected
@@ -777,7 +809,7 @@ fn drain_completions(
             follow_ups.push(effect);
         }
     }
-    follow_ups
+    (follow_ups, changed)
 }
 
 /// Applies queued effects, including the ones they queue in turn.

@@ -82,6 +82,13 @@ pub struct ChatState {
     /// The question waiting to be confirmed before the first send for this repository
     /// (FR-4.6).
     pub awaiting_confirmation: Option<String>,
+    /// The question whose context has been gathered and is waiting to be sent.
+    ///
+    /// A gather is not the send: the effect that gathers returns, and the effect that
+    /// sends comes back later, by which time the compose box has been cleared. Without
+    /// this, the send would re-read an empty box and report that there is nothing to ask
+    /// — which is exactly what the second question did.
+    pub staged: Option<String>,
     /// What the next request would be made of, when it is known (FR-4.6, FR-5.4).
     pub estimate: Option<Estimate>,
     /// What the last request left out of the conversation (FR-4.6).
@@ -133,6 +140,11 @@ impl ChatState {
         self.awaiting_confirmation.is_some()
     }
 
+    /// Takes the question a gather was made for, if there is one (FR-4.6).
+    pub fn take_staged(&mut self) -> Option<String> {
+        self.staged.take()
+    }
+
     /// The question a retry would repeat: the one in flight, or the last one asked
     /// (FR-5.2).
     #[must_use]
@@ -178,6 +190,7 @@ impl ChatState {
     pub fn stop(&mut self) {
         self.status = ChatStatus::Stopped;
         self.pending = None;
+        self.staged = None;
     }
 
     /// Clears the pane back to "nothing asked yet" for a new conversation (FR-5.1).
@@ -187,6 +200,7 @@ impl ChatState {
         self.stream.clear();
         self.pending = None;
         self.awaiting_confirmation = None;
+        self.staged = None;
         self.estimate = None;
         self.dropped = 0;
         self.scroll = 0;
