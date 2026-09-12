@@ -54,13 +54,13 @@ jobs:
       - name: Tests
         run: cargo test --all-features
 
-      - name: Release build
-        run: cargo build --release
+      - name: Build
+        run: cargo build
 
       - name: Smoke test the binary
         run: |
-          ./target/release/smart-review --version
-          ./target/release/smart-review --help
+          ./target/debug/smart-review --version
+          ./target/debug/smart-review --help
 
       # `--check` runs the same detection the interface does, so on a runner with no
       # `gh auth login` it reports an unusable environment and exits 2 — which is the
@@ -69,7 +69,7 @@ jobs:
       - name: Environment report
         run: |
           set +e
-          SMART_REVIEW_HOME="$(mktemp -d)" ./target/release/smart-review --check >/tmp/check.txt 2>&1
+          SMART_REVIEW_HOME="$(mktemp -d)" ./target/debug/smart-review --check >/tmp/check.txt 2>&1
           code=$?
           set -e
           cat /tmp/check.txt

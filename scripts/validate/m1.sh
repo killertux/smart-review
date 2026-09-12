@@ -21,7 +21,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP="$(mktemp -d)"
-BIN="target/release/smart-review"
+BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
@@ -168,11 +168,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "3/6 release build"
-if cargo build --release >/tmp/m1-build.log 2>&1; then
-  ok "cargo build --release"
+step "3/6 build"
+if cargo build >/tmp/m1-build.log 2>&1; then
+  ok "cargo build"
 else
-  bad "cargo build --release"
+  bad "cargo build"
   tail -20 /tmp/m1-build.log
 fi
 
@@ -390,7 +390,7 @@ else
     >/tmp/m1-signal.log 2>&1 &
   SIGNAL_JOB=$!
   sleep 4
-  pkill -TERM -f 'target/release/smart-review' 2>/dev/null
+  pkill -TERM -f 'target/debug/smart-review' 2>/dev/null
   wait "$SIGNAL_JOB" 2>/dev/null
   set -e
 

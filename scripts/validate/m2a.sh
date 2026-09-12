@@ -22,7 +22,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP="$(mktemp -d)"
-BIN="target/release/smart-review"
+BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 MODELS="$ROOT/tests/fixtures/models/providers.json"
 
@@ -136,10 +136,10 @@ run_tui() {
 saw() { grep -q "$1"; }
 
 step "1/7 build"
-if cargo build --release --quiet 2>"$TMP/build.log"; then
-  ok "the release binary builds"
+if cargo build --quiet 2>"$TMP/build.log"; then
+  ok "the debug binary builds"
 else
-  bad "the release binary does not build"
+  bad "the debug binary does not build"
   sed -n '1,20p' "$TMP/build.log"
   printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
   exit 1

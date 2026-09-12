@@ -18,7 +18,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP_HOME="$(mktemp -d)"
-BIN="target/release/smart-review"
+BIN="target/debug/smart-review"
 cleanup() { rm -rf "$TMP_HOME"; }
 trap cleanup EXIT
 
@@ -45,11 +45,11 @@ else
   grep -E '^test .* FAILED|panicked' /tmp/m0-test.log | head -10
 fi
 
-step "4/7 release build"
-if cargo build --release >/tmp/m0-build.log 2>&1; then
-  ok "cargo build --release"
+step "4/7 build"
+if cargo build >/tmp/m0-build.log 2>&1; then
+  ok "cargo build"
 else
-  bad "cargo build --release"
+  bad "cargo build"
   tail -20 /tmp/m0-build.log
 fi
 
