@@ -114,6 +114,13 @@ differently from the ones it grounded in your code. `Esc` stops an answer and ke
 arrived; the conversation is stored per pull request, so restarting finds it, and
 `:chat export md` writes a transcript to `~/.smart-review/exports/`.
 
+Not every provider streams, and the app does not pretend otherwise: it asks for a
+streamed answer where the provider supports one, then for the same answer with text-only
+deltas, then through the provider's OpenAI-compatible endpoint, and finally as a single
+request. The answer arrives either way — `logs/smart-review.log` records which of the
+four produced it — and a provider that refuses or cannot be reached says so in the pane
+rather than leaving it looking as if it were still thinking.
+
 Two mechanisms filter the list, and the interface keeps them visibly apart: the
 **chips** change what GitHub is asked (`gh pr list --search`), while the `/` box
 filters what has already arrived, so 300 cached pull requests narrow without a

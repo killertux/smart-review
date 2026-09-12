@@ -250,7 +250,7 @@ names the active model.
 - [x] Token/cost accounting per session, optional per-message cost estimate from catalog `cost` (FR-5.4).
 - [x] Retention cap per DEC-9 (default: 50 sessions × 2 MB per PR) with announced pruning (FR-8.5).
 - [x] Tests: history persistence round-trip, trimming, cancellation, prompt assembly snapshots with a fake `LlmPort`.
-- [x] `scripts/validate/m3.sh`: 51 checks, driving the chat against a scripted provider and reading the wire.
+- [x] `scripts/validate/m3.sh`: 59 checks, driving the chat against a scripted provider and reading the wire, including a provider the pinned crate cannot stream for and one that never answers.
 
 **Notes on what M3 decided, where it is not obvious from the requirements**
 - **The context goes in the system prompt, not in a message.** That is what makes FR-4.6's third truncation step safe: the oldest turns can be dropped without ever being able to drop the subject of the conversation, and no message has to be flagged as the important one. The cost is that the bundle is re-sent with every turn, which is what "the model sees exactly what `:context` reports" costs.
@@ -259,6 +259,8 @@ names the active model.
 - **`Tab` is a pane move in insert mode too** — the compose box would otherwise be a room with no door. `Esc` clears a pending confirmation first, then leaves the pane.
 - **`:context add <path>` refuses** a path the pull request does not have, and refuses anything that looks like a secret outright: a bundle that silently leaves out what the user asked for by name is the one thing FR-4.6 exists to prevent. The added files live in `state.toml` per pull request — a preference about the pull request, not about one conversation.
 - **Transcripts are written to `exports/`**, not to `cache/`: a transcript the user asked for is not disposable (FR-8.5).
+- **A provider the crate cannot stream for still answers.** Only three of the crate's backends implement structured streaming and only three more implement the text-only one; DeepSeek, Groq, Mistral and OpenRouter implement neither, and asking them for it produced an error the interface then dropped. The adapter walks down four ways of asking (structured stream → string stream → structured stream through the passthrough → one un-streamed request) and stops the moment text has arrived, because a partial answer has already been paid for. Appendix B has the measurements.
+- **A failed job is never invisible.** Every job slot a pane can hold belongs in `is_current_job`; leaving one out does not make its failure harmless, it makes it look like a pane that is still thinking. `scripts/validate/m3.sh` now checks the failure *on screen*, for the chat and for the analysis, because that is the shape the bug took: a real provider, a real error, and a pane that said "asking" forever.
 - **The crate does not ask for streaming usage on the passthrough route** (FR-5.4's tokens and per-session cost would be permanently empty): only its native `OpenAI` backend sets `stream_options.include_usage`. The passthrough provider's config now sets `SUPPORT_STREAM_OPTIONS`, and the validator asserts the field is on the wire.
 
 **FR coverage:** FR-5.1–5.4.
