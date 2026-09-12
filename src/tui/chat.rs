@@ -172,6 +172,9 @@ impl ChatState {
         if self.status.is_running() || self.status == ChatStatus::Stopped {
             lines.push(ChatLine::Streaming);
         }
+        if matches!(self.status, ChatStatus::Failed { .. }) {
+            lines.push(ChatLine::Failed);
+        }
         lines
     }
 
@@ -218,12 +221,36 @@ pub enum ChatLine {
     Stored(usize),
     /// The answer arriving now (FR-5.2).
     Streaming,
+    /// The request that failed, with the reason (FR-9.1).
+    ///
+    /// A line of its own rather than a status-line notice: the reason is what the user
+    /// has to read to fix it, and a notice is gone after six seconds. This is what the
+    /// pane was missing when a provider the crate cannot stream for answered every
+    /// question with its refusal — the answer never arrived and the pane said nothing.
+    Failed,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::chat::Message;
+
+    #[test]
+    fn a_failed_request_is_a_line_of_the_conversation() {
+        // Not just a notice and not just the status line: the reason is what the user
+        // has to read to fix it, and a notice expires after six seconds. The pane showed
+        // nothing at all for a failed request before this, which is how a provider the
+        // crate cannot stream for looked like an app that had simply stopped.
+        let mut chat = ChatState {
+            status: ChatStatus::Failed {
+                reason: "the key is invalid".to_owned(),
+            },
+            ..ChatState::default()
+        };
+        assert!(chat.messages().contains(&ChatLine::Failed));
+        chat.status = ChatStatus::Idle;
+        assert!(!chat.messages().contains(&ChatLine::Failed));
+    }
 
     fn session() -> Session {
         let mut session = Session::new(
@@ -333,9 +360,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_is_not_a_conversation_turn() {
-        // The status is not a message: a provider error must not become something the
-        // model is told it said.
+    fn a_failure_is_a_line_on_screen_but_not_a_conversation_turn() {
+        // Both halves matter, and they are different things. A provider error must not
+        // become a message the model is told it said — but it must be *visible*: the
+        // pane showed nothing at all for a failed request, which is how a provider the
+        // crate cannot stream for looked like an app that had stopped.
         let chat = ChatState {
             session: Some(session()),
             status: ChatStatus::Failed {
@@ -343,7 +372,16 @@ mod tests {
             },
             ..ChatState::default()
         };
-        assert_eq!(chat.messages().len(), 2);
-        assert_eq!(chat.session.as_ref().expect("session").messages.len(), 2);
+        assert_eq!(
+            chat.session.as_ref().expect("session").messages.len(),
+            2,
+            "the session is untouched by a failure"
+        );
+        assert_eq!(
+            chat.messages().len(),
+            3,
+            "the failure is drawn, after the conversation"
+        );
+        assert_eq!(chat.messages().last(), Some(&ChatLine::Failed));
     }
 }

@@ -766,21 +766,27 @@ FRAMES="$TMP/dead.log"
 # The wait names the failure itself: if the pane never says it, the step times out
 # rather than reporting a passing run that proves nothing.
 SCREEN="$(run_tui "$HOME_DEAD" "$OPEN~why does it round?\r" "$OPEN_WAIT~failed: " "$FRAMES")"
-if printf '%s' "$SCREEN" | grep -q "failed: "; then
-  ok "a provider that cannot be reached is reported as failed"
+# Asserted on the *pane*, not on the notice: a notice says "the question failed" and
+# expires after six seconds, so grepping for "failed: " would be satisfied by a flash the
+# user may never read — and it was, when the pane itself drew nothing.
+if shown "$FRAMES" "model \\(failed\\)"; then
+  ok "the chat pane marks the failed request"
 else
-  bad "the pane did not report the failure"
+  bad "the pane did not mark the failure"
   printf '%s\n' "$SCREEN" | tail -10
 fi
+# "Still asking" is about the *last* frame, not about any frame: `shown` answers "was
+# this ever on screen", and it certainly was, a second before the failure.
 if printf '%s' "$SCREEN" | grep -qi "asking dead-1"; then
   bad "the pane is still saying it is asking"
 else
   ok "the pane stopped saying it was asking"
 fi
-if printf '%s' "$SCREEN" | grep -qi "refused\|connect\|failed: [a-z]"; then
-  ok "the reason is shown, not just the word failed"
+# The reason in the transport's own words, which is what a person acts on.
+if shown "$FRAMES" "error sending request"; then
+  ok "the reason is shown in the pane, not just the word failed"
 else
-  bad "the failure has no reason"
+  bad "the pane shows no reason"
   printf '%s\n' "$SCREEN" | tail -10
 fi
 keep_requests step8-dead

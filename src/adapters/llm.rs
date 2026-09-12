@@ -227,34 +227,28 @@ impl LlmCrate {
     ) -> Attempt {
         let mut emitted = false;
         let outcome = block_on(async {
-            let mut stream = provider
-                .chat_stream_struct(messages)
-                .await
-                .map_err(|error| translate(&request.provider, &error))?;
+            let mut stream = provider.chat_stream_struct(messages).await?;
             let mut text = String::new();
             let mut usage = None;
             while let Some(item) = stream.next().await {
                 // Checked between chunks: cancellation is a flag, and the cost of
-                // finishing an answer nobody wants is the user's money (ARCH-5).
+                // finishing an answer nobody wants is the user's money (ARCH-5). The
+                // flag travels as an error like any other, and the caller recognizes it.
                 if cancel.is_cancelled() {
-                    return Err(LlmError::Cancelled);
+                    return Err(cancelled());
                 }
-                match item {
-                    Ok(response) => {
-                        for choice in response.choices {
-                            if let Some(content) = choice.delta.content
-                                && !content.is_empty()
-                            {
-                                emitted = true;
-                                text.push_str(&content);
-                                on_delta(&content);
-                            }
-                        }
-                        if response.usage.is_some() {
-                            usage = response.usage;
-                        }
+                let response = item?;
+                for choice in response.choices {
+                    if let Some(content) = choice.delta.content
+                        && !content.is_empty()
+                    {
+                        emitted = true;
+                        text.push_str(&content);
+                        on_delta(&content);
                     }
-                    Err(error) => return Err(translate(&request.provider, &error)),
+                }
+                if response.usage.is_some() {
+                    usage = response.usage;
                 }
             }
             Ok(ChatOutcome {
@@ -283,24 +277,17 @@ impl LlmCrate {
     ) -> Attempt {
         let mut emitted = false;
         let outcome = block_on(async {
-            let mut stream = provider
-                .chat_stream(messages)
-                .await
-                .map_err(|error| translate(&request.provider, &error))?;
+            let mut stream = provider.chat_stream(messages).await?;
             let mut text = String::new();
             while let Some(item) = stream.next().await {
                 if cancel.is_cancelled() {
-                    return Err(LlmError::Cancelled);
+                    return Err(cancelled());
                 }
-                match item {
-                    Ok(delta) => {
-                        if !delta.is_empty() {
-                            emitted = true;
-                            text.push_str(&delta);
-                            on_delta(&delta);
-                        }
-                    }
-                    Err(error) => return Err(translate(&request.provider, &error)),
+                let delta = item?;
+                if !delta.is_empty() {
+                    emitted = true;
+                    text.push_str(&delta);
+                    on_delta(&delta);
                 }
             }
             Ok(ChatOutcome {
@@ -319,9 +306,9 @@ impl LlmCrate {
         request: &ChatRequest,
         messages: &[ChatMessage],
         cancel: &Cancel,
-    ) -> Result<ChatOutcome, LlmError> {
+    ) -> Result<ChatOutcome, Failure> {
         if cancel.is_cancelled() {
-            return Err(LlmError::Cancelled);
+            return Err(Failure::plain(LlmError::Cancelled));
         }
         logging::log(
             Level::Debug,
@@ -332,20 +319,46 @@ impl LlmCrate {
                 request.prompt.len()
             ),
         );
-        let answer = block_on(async { provider.chat(messages).await })
-            .map_err(|error| LlmError::Transport {
-                provider: request.provider.clone(),
-                reason: error.to_string(),
-            })?
-            .map_err(|error| translate(&request.provider, &error))?;
-        if cancel.is_cancelled() {
-            return Err(LlmError::Cancelled);
+        match Attempt::from(
+            block_on(async { provider.chat(messages).await }).map(|answer| {
+                answer.map(|answer| ChatOutcome {
+                    text: answer.text().unwrap_or_default(),
+                    usage: usage_of(answer.usage()),
+                    thinking: answer.thinking(),
+                })
+            }),
+            &request.provider,
+            false,
+        ) {
+            Attempt::Done(outcome) => Ok(*outcome),
+            Attempt::Failed(failure) => Err(failure),
         }
-        Ok(ChatOutcome {
-            text: answer.text().unwrap_or_default(),
-            usage: usage_of(answer.usage()),
-            thinking: answer.thinking(),
-        })
+    }
+}
+
+/// The crate's error for "the caller stopped this", which is not a provider problem.
+fn cancelled() -> llm::error::LLMError {
+    llm::error::LLMError::Generic("the caller cancelled the request".to_owned())
+}
+
+/// Keeps the more informative of two failures: anything beats the crate's catch-all, and
+/// otherwise the first stands, because it is about the route the user chose.
+fn choose(reported: Option<Failure>, next: Failure) -> Failure {
+    match reported {
+        Some(current) if current.vague && !next.vague => next,
+        Some(current) => current,
+        None => next,
+    }
+}
+
+impl Failure {
+    /// A failure that emitted nothing and is not the crate's catch-all.
+    fn plain(error: LlmError) -> Self {
+        Self {
+            error,
+            emitted: false,
+            vague: false,
+        }
     }
 }
 
@@ -362,12 +375,25 @@ enum Attempt {
     /// The answer arrived.
     Done(Box<ChatOutcome>),
     /// The request was made and failed, with or without text first.
-    Failed {
-        /// What to tell the user if nothing else works.
-        error: LlmError,
-        /// Whether any text arrived before the failure.
-        emitted: bool,
-    },
+    Failed(Failure),
+}
+
+/// A failed attempt.
+///
+/// `vague` carries the one thing the translated error cannot: whether the crate's
+/// *catch-all* produced it. `LLMError::Generic` is what a trait's default method returns
+/// when a backend does not implement something — "Structured streaming not supported for
+/// this provider" is the one that matters here — and that sentence is never what the user
+/// needs to read when a real reason exists further down the cascade. It is a property of
+/// the error *type*, not of its wording, so a crate that rewords its messages changes
+/// nothing.
+struct Failure {
+    /// What to tell the user if nothing else works.
+    error: LlmError,
+    /// Whether any text arrived before the failure.
+    emitted: bool,
+    /// Whether this is the crate's catch-all rather than something the provider said.
+    vague: bool,
 }
 
 impl Attempt {
@@ -376,20 +402,28 @@ impl Attempt {
     /// A runtime that will not start is a transport failure, because that is what it is
     /// from the caller's side: nothing was sent.
     fn from(
-        outcome: Result<Result<ChatOutcome, LlmError>, crate::adapters::http::RuntimeError>,
+        outcome: Result<
+            Result<ChatOutcome, llm::error::LLMError>,
+            crate::adapters::http::RuntimeError,
+        >,
         provider: &str,
         emitted: bool,
     ) -> Self {
         match outcome {
             Ok(Ok(outcome)) => Self::Done(Box::new(outcome)),
-            Ok(Err(error)) => Self::Failed { error, emitted },
-            Err(error) => Self::Failed {
+            Ok(Err(error)) => Self::Failed(Failure {
+                vague: matches!(error, llm::error::LLMError::Generic(_)),
+                error: translate(provider, &error),
+                emitted,
+            }),
+            Err(error) => Self::Failed(Failure {
                 error: LlmError::Transport {
                     provider: provider.to_owned(),
                     reason: error.to_string(),
                 },
                 emitted,
-            },
+                vague: false,
+            }),
         }
     }
 }
@@ -444,8 +478,35 @@ fn translate(provider: &str, error: &llm::error::LLMError) -> LlmError {
         },
         _ => LlmError::Request {
             provider: provider.to_owned(),
-            reason: first_line(&text),
+            reason: provider_message(error),
         },
+    }
+}
+
+/// What to show for a provider's refusal.
+///
+/// The crate wraps a provider error response as `ResponseFormatError { message, raw }`,
+/// where `message` is the status line and `raw` is the provider's JSON body. The raw body
+/// is mostly noise on screen — but its `error.message` is usually the only sentence that
+/// tells a person what to fix ("Authentication Fails, Your api key … is invalid"), so it
+/// is lifted out and the JSON is dropped (FR-9.1).
+fn provider_message(error: &llm::error::LLMError) -> String {
+    let llm::error::LLMError::ResponseFormatError {
+        message,
+        raw_response,
+    } = error
+    else {
+        return first_line(&error.to_string());
+    };
+    let detail = serde_json::from_str::<serde_json::Value>(raw_response)
+        .ok()
+        .as_ref()
+        .and_then(|body| body.pointer("/error/message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    match detail {
+        Some(detail) => format!("{}: {detail}", first_line(message)),
+        None => first_line(message),
     }
 }
 
@@ -478,7 +539,7 @@ impl LlmPort for LlmCrate {
         }
         let provider = Self::provider(request)?;
         let messages = Self::messages(request);
-        Self::ask_once(&*provider, request, &messages, cancel)
+        Self::ask_once(&*provider, request, &messages, cancel).map_err(|failure| failure.error)
     }
 
     /// Answers a request by the best way the provider actually supports (FR-4.4,
@@ -500,9 +561,11 @@ impl LlmPort for LlmCrate {
     /// 4. **one request, no streaming** — the answer arrives whole, with usage.
     ///
     /// A path that fails *after* emitting text ends the request: that answer has been
-    /// paid for, and asking again would bill it twice. A path that fails before the
-    /// first token has cost nothing, so the next one is tried; the first error is the
-    /// one reported, because it is the one about the route the user chose.
+    /// paid for, and asking again would bill it twice. A path that fails before the first
+    /// token has cost nothing, so the next one is tried. What is reported when nothing
+    /// works is the most informative failure rather than the first one, so that a bad key
+    /// reads as a bad key instead of as the crate's "not supported" about a method this
+    /// build deliberately never reaches.
     fn stream(
         &self,
         request: &ChatRequest,
@@ -528,7 +591,7 @@ impl LlmCrate {
         on_delta: &mut DeltaHandler<'_>,
     ) -> Result<ChatOutcome, LlmError> {
         let messages = Self::messages(request);
-        let mut first_error: Option<LlmError> = None;
+        let mut reported: Option<Failure> = None;
 
         for provider in candidates {
             let attempts = [
@@ -552,15 +615,15 @@ impl LlmCrate {
                         );
                         return Ok(*outcome);
                     }
-                    Attempt::Failed {
-                        error,
-                        emitted: true,
-                    } => return Err(error),
-                    Attempt::Failed {
-                        error,
-                        emitted: false,
-                    } => {
-                        first_error.get_or_insert(error);
+                    // Text has already arrived: that answer has been paid for, so the
+                    // question is not asked again.
+                    Attempt::Failed(failure) if failure.emitted => return Err(failure.error),
+                    Attempt::Failed(failure) => {
+                        // Cancellation ends everything: the user asked for it to stop.
+                        if failure.error == LlmError::Cancelled {
+                            return Err(failure.error);
+                        }
+                        reported = Some(choose(reported, failure));
                     }
                 }
             }
@@ -578,8 +641,11 @@ impl LlmCrate {
                     );
                     return Ok(outcome);
                 }
-                Err(error) => {
-                    first_error.get_or_insert(error);
+                Err(failure) => {
+                    if failure.error == LlmError::Cancelled {
+                        return Err(failure.error);
+                    }
+                    reported = Some(choose(reported, failure));
                 }
             }
         }
@@ -588,10 +654,13 @@ impl LlmCrate {
         // either answers or errors — but an error is the right shape for it: the lints
         // here refuse `unreachable!()` and a panic in a job thread is worse than a
         // sentence the user can read.
-        Err(first_error.unwrap_or_else(|| LlmError::Request {
-            provider: request.provider.clone(),
-            reason: "no way to ask this provider produced an answer".to_owned(),
-        }))
+        Err(reported.map_or_else(
+            || LlmError::Request {
+                provider: request.provider.clone(),
+                reason: "no way to ask this provider produced an answer".to_owned(),
+            },
+            |failure| failure.error,
+        ))
     }
 }
 
@@ -1194,6 +1263,55 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(chunks)))
         }
+    }
+
+    #[test]
+    fn what_is_reported_is_the_most_informative_failure() {
+        // The real DeepSeek run: the native backend has no streaming (the crate's
+        // catch-all), the passthrough and the plain request both reached the provider and
+        // were told the key was invalid. Reporting the *first* failure told the user
+        // "Structured streaming not supported for this provider" — a sentence about a
+        // method the app does not even call — instead of "your key is invalid".
+        let refusal = llm::error::LLMError::Generic(
+            "Structured streaming not supported for this provider".to_owned(),
+        );
+        let auth = llm::error::LLMError::AuthError(
+            "Authentication Fails, Your api key: ****pose is invalid".to_owned(),
+        );
+        let first = Attempt::from(Ok(Err(refusal)), "deepseek", false);
+        let Attempt::Failed(first) = first else {
+            panic!("a failure")
+        };
+        let second = Attempt::from(Ok(Err(auth)), "deepseek", false);
+        let Attempt::Failed(second) = second else {
+            panic!("a failure")
+        };
+        assert!(first.vague, "the catch-all is marked as such");
+        assert!(!second.vague, "the provider's own words are not");
+        let chosen = choose(Some(first), second);
+        let message = chosen.error.to_string();
+        assert!(message.contains("Authentication Fails"), "{message}");
+        assert!(!message.contains("not supported"), "{message}");
+    }
+
+    #[test]
+    fn a_catch_all_does_not_displace_the_first_real_failure() {
+        // The other direction: once a substantive failure is in hand, a later catch-all
+        // (from the next way of asking) does not replace it.
+        let real = Failure::plain(LlmError::Transport {
+            provider: "deepseek".to_owned(),
+            reason: "connection refused".to_owned(),
+        });
+        let vague = Failure {
+            error: LlmError::Request {
+                provider: "deepseek".to_owned(),
+                reason: "Generic error: not supported".to_owned(),
+            },
+            emitted: false,
+            vague: true,
+        };
+        let chosen = choose(Some(real), vague);
+        assert!(chosen.error.to_string().contains("connection refused"));
     }
 
     #[test]

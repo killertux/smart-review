@@ -168,6 +168,10 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &App, chat: &ChatStat
                 lines.extend(streaming_lines(chat, width, theme));
                 lines.push(Line::default());
             }
+            ChatLine::Failed => {
+                lines.extend(failed_lines(chat, theme));
+                lines.push(Line::default());
+            }
         }
     }
 
@@ -346,6 +350,27 @@ fn footer_for(message: &Message, theme: &Theme, app: &App) -> Vec<Line<'static>>
         footer.push(Line::from(Span::styled(text, theme.style(element::MUTED))));
     }
     footer
+}
+
+/// A request that produced no answer, with the reason (FR-9.1).
+fn failed_lines(chat: &ChatState, theme: &Theme) -> Vec<Line<'static>> {
+    let ChatStatus::Failed { reason } = &chat.status else {
+        return Vec::new();
+    };
+    vec![
+        Line::from(Span::styled(
+            " model (failed)".to_owned(),
+            theme.style(element::NOTICE_ERROR),
+        )),
+        Line::from(Span::styled(
+            format!("   {reason}"),
+            theme.style(element::FG),
+        )),
+        Line::from(Span::styled(
+            "   r repeats the question · `:model` shows what is configured".to_owned(),
+            theme.style(element::MUTED),
+        )),
+    ]
 }
 
 /// The answer arriving now, plus what the last request left out (FR-5.2, FR-4.6).
