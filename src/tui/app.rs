@@ -1187,7 +1187,7 @@ impl App {
                 format!(
                     "an analysis from {age} ago covers an older commit ({}); <leader>a analyses \
                      the current one",
-                    &stale.key.head_sha.get(..8).unwrap_or(&stale.key.head_sha)
+                    stale.key.head_sha.get(..8).unwrap_or(&stale.key.head_sha)
                 ),
             );
         }

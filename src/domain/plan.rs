@@ -718,13 +718,13 @@ mod tests {
                 .contains(&"src/domain/money.rs".to_owned())
         );
         assert_eq!(plan.group_of("src/domain/money.rs"), Some("application"));
-        // And it is not still in `domain`.
-        assert!(
+        // And it is not still in `domain`: exactly one position for the file.
+        assert_eq!(
             plan.files(OrderMode::Recommended, &path_order())
                 .iter()
                 .filter(|file| *file == "src/domain/money.rs")
-                .count()
-                == 1
+                .count(),
+            1
         );
         assert!(plan.overridden);
     }
@@ -793,6 +793,6 @@ mod tests {
     fn the_plan_says_where_it_came_from() {
         assert_eq!(PlanSource::Analysis.label(), "from the analysis");
         assert!(PlanSource::Heuristic.label().contains("path rules"));
-        assert!(plan().source == PlanSource::Analysis);
+        assert_eq!(plan().source, PlanSource::Analysis);
     }
 }
