@@ -108,6 +108,21 @@ pub mod element {
     pub const LIST_CHECK_PENDING: &str = "list.check_pending";
     /// A draft pull request's title.
     pub const LIST_STALE: &str = "list.stale";
+    /// Inline code and fenced blocks in an answer, and in a chat question.
+    pub const CODE: &str = "chat.code";
+    /// A chat question, as opposed to an answer.
+    pub const CHAT_QUESTION: &str = "chat.question";
+    /// A chat answer.
+    pub const CHAT_ANSWER: &str = "chat.answer";
+    /// A line the model flagged as general knowledge rather than from the context
+    /// (FR-5.3).
+    pub const CHAT_GENERAL: &str = "chat.general";
+    /// A chat turn that failed, or that was stopped before it finished (FR-5.2).
+    pub const CHAT_STOPPED: &str = "chat.stopped";
+    /// The path references an answer made (FR-5.1).
+    pub const CHAT_REFERENCE: &str = "chat.reference";
+    /// The chat compose box.
+    pub const CHAT_INPUT: &str = "chat.input";
 }
 
 /// Every element name, used to warn about typos in theme files.
@@ -156,6 +171,13 @@ pub const KNOWN_ELEMENTS: &[&str] = &[
     element::LIST_CHECK_FAIL,
     element::LIST_CHECK_PENDING,
     element::LIST_STALE,
+    element::CODE,
+    element::CHAT_QUESTION,
+    element::CHAT_ANSWER,
+    element::CHAT_GENERAL,
+    element::CHAT_STOPPED,
+    element::CHAT_REFERENCE,
+    element::CHAT_INPUT,
 ];
 
 /// A resolved theme.
@@ -485,6 +507,23 @@ fn reading_styles(p: &Palette) -> Vec<(&'static str, Style)> {
         (element::LIST_CHECK_FAIL, Style::default().fg(error)),
         (element::LIST_CHECK_PENDING, Style::default().fg(warn)),
         (element::LIST_STALE, Style::default().fg(warn)),
+        // A chat answer is prose, so it is the foreground colour and its *structure* is
+        // what is styled: code, the user's own question, and the two things a reader
+        // must be able to tell apart at a glance — what the model grounded in their code
+        // and what it did not (FR-5.3).
+        (element::CODE, Style::default().fg(accent)),
+        (
+            element::CHAT_QUESTION,
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        ),
+        (element::CHAT_ANSWER, Style::default().fg(fg)),
+        (
+            element::CHAT_GENERAL,
+            Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+        ),
+        (element::CHAT_STOPPED, Style::default().fg(warn)),
+        (element::CHAT_REFERENCE, Style::default().fg(ok)),
+        (element::CHAT_INPUT, Style::default().fg(fg)),
     ]
 }
 
