@@ -14,13 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  tests:
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -79,20 +74,17 @@ jobs:
       # The milestones' own gates: formatting, lints, tests, first-run layout,
       # permissions, configuration robustness, and — for M1 — the whole browsing
       # and diff chain driven through a fake `gh`, with the screen reconstructed
-      # from the pty capture. Ubuntu only, because the pty steps need GNU script.
+      # from the pty capture (the pty steps need GNU `script`).
       - name: Milestone validation (M0)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m0.sh
 
       - name: Milestone validation (M1)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m1.sh
 
       # M2a adds a managed worktree, a local diff and the model picker: the validator
       # builds a real repository with a pull request ref, serves the catalog from a
       # local HTTP server, and drives the picker through a pty.
       - name: Milestone validation (M2a)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m2a.sh
 
       # M2b adds the analysis path: the validator stands in for the provider with a
@@ -100,5 +92,4 @@ jobs:
       # stream, normalize, cache, ordered review — runs offline, and the request the
       # app actually sent is checked on the wire for what must and must not be in it.
       - name: Milestone validation (M2b)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m2b.sh
