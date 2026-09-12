@@ -83,6 +83,7 @@ fn panel_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         // scrolls away.
         AnalysisState::Confirming => confirming_lines(app, theme),
         AnalysisState::Unusable { reason } => unusable_lines(theme, reason),
+        AnalysisState::Failed { reason } => failed_lines(theme, reason),
         AnalysisState::Cancelled => cancelled_lines(theme),
         AnalysisState::Ready | AnalysisState::Idle => answer_lines(app, theme),
     }
@@ -202,6 +203,29 @@ fn unusable_lines(theme: &Theme, reason: &str) -> Vec<Line<'static>> {
         Line::default(),
         Line::from(Span::styled(
             " `:analyze raw` shows what the model actually wrote.".to_owned(),
+            theme.style(element::MUTED),
+        )),
+    ]
+}
+
+/// A request that never produced an answer (FR-9.1).
+///
+/// The reason is the provider's or the transport's own words, because that is the only
+/// thing that distinguishes "the key is wrong" from "the model name is wrong" from
+/// "this provider cannot do it".
+fn failed_lines(theme: &Theme, reason: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            " the provider did not answer".to_owned(),
+            theme.style(element::NOTICE_ERROR),
+        )),
+        Line::default(),
+        Line::from(Span::styled(format!(" {reason}"), theme.style(element::FG))),
+        Line::default(),
+        Line::from(Span::styled(
+            " <leader>a tries again · `:model` shows what is configured · `:doctor` checks\
+             \nthe key and the network"
+                .to_owned(),
             theme.style(element::MUTED),
         )),
     ]
