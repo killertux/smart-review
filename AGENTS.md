@@ -122,3 +122,11 @@ Rules of engagement with the lints:
 - Never rewrite shared history, force-push, or amend someone else's commit.
 - One milestone per commit or PR, titled with the milestone (`M0: ...`), unless
   the owner asks otherwise.
+- **Every milestone PR description ends with a manual test recipe.** A reviewer who
+  does not want to read the diff must be able to convince themselves the milestone
+  works by running the app. Write it as a script: the exact commands to set up
+  (`SMART_REVIEW_HOME`, a fixture repository, a fake or real provider), then numbered
+  keystrokes with what to look for after each, then what to check on disk. Say what a
+  *failure* looks like, not only what success looks like, and name the one or two
+  things the automated gate cannot check (a stream arriving, a click landing, a
+  prompt asking before it spends money) — that is what the recipe is for.

@@ -95,9 +95,26 @@ impl LlmCrate {
             .map_err(|error| translate(&request.provider, &error))
     }
 
-    /// One turn as the crate's message type.
+    /// The conversation as the crate's message types.
+    ///
+    /// The system prompt is *not* here: `ChatRole` has no system variant, so the crate
+    /// takes it through the builder, which is why the chat path puts the context bundle
+    /// there rather than in the first message (FR-5.3).
     fn messages(request: &ChatRequest) -> Vec<ChatMessage> {
-        vec![ChatMessage::user().content(request.prompt.clone()).build()]
+        let mut messages: Vec<ChatMessage> = request
+            .history
+            .iter()
+            .map(|(role, text)| match role {
+                crate::domain::chat::Role::User => {
+                    ChatMessage::user().content(text.clone()).build()
+                }
+                crate::domain::chat::Role::Assistant => {
+                    ChatMessage::assistant().content(text.clone()).build()
+                }
+            })
+            .collect();
+        messages.push(ChatMessage::user().content(request.prompt.clone()).build());
+        messages
     }
 }
 
@@ -161,6 +178,16 @@ impl OpenAIProviderConfig for Compatible {
     /// accepts an effort string, and the domain refuses an option it cannot send
     /// (FR-4.8) rather than this adapter guessing.
     const SUPPORTS_REASONING_EFFORT: bool = true;
+    /// Asking for token usage in the stream (FR-4.8, FR-5.4).
+    ///
+    /// The crate sets `stream_options: {include_usage: true}` only for its *native*
+    /// `OpenAI` backend — every other compatible provider leaves it off — and without it
+    /// a provider reports no usage at all on a streamed answer. That would leave the
+    /// per-answer tokens and the per-session cost of FR-5.4 empty for the whole
+    /// passthrough route, which is most of the catalog. Providers that do not know the
+    /// field ignore it; the ones that reject it say so, which is a better failure than
+    /// silently reporting nothing.
+    const SUPPORTS_STREAM_OPTIONS: bool = true;
 }
 
 /// The crate's backend and the base URL to use, if any (DEC-17).

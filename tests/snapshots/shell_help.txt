@@ -1,4 +1,4 @@
- smart┌ Help  [27/53] ───────────────────────────────────────────────────────────────────────┐rvice
+ smart┌ Help  [27/61] ───────────────────────────────────────────────────────────────────────┐rvice
 │ filt│ APP                                                                                  │     │
 │ sear│   <C-c>, <Space>q, q  Quit smart-review                                              │     │
 ┌ no r│   <Space>?, ?         Show the help popup                                            │─────┐
@@ -26,5 +26,5 @@
 │     │   <C-b>               Move a screen up                                               │     │
 │     │   <Esc>, h            Close the review, or clear the search and filters              │     │
 └─────│ PANES                                                                                │─────┘
- POPUP│   <Tab>               Focus the next pane                                            │mands
+ POPUP│   <Tab>, <Tab> (inser…Focus the next pane                                            │mands
       └──────────────────────────────────────────────────────────────────────────────────────┘

@@ -82,8 +82,14 @@ fn build_lines(app: &App) -> Vec<Line<'static>> {
         for definition in definitions {
             lines.push(Line::from(vec![
                 Span::raw("   "),
+                // Truncated *and* padded: a key list longer than the column used to push
+                // the description right up against it, and a description that starts in a
+                // different column on one row reads as a different field.
                 Span::styled(
-                    format!("{:<20}", keys_for(app, definition.id)),
+                    crate::tui::text::pad(
+                        &crate::tui::text::truncate(&keys_for(app, definition.id), KEY_COLUMN),
+                        KEY_COLUMN,
+                    ),
                     theme.style(element::HELP_KEY),
                 ),
                 Span::styled(
@@ -115,6 +121,9 @@ fn matches_filter(app: &App, action_id: &str) -> bool {
 }
 
 /// Every key sequence bound to an action, with the mode when it is not `normal`.
+/// How wide the key column is before the description starts.
+const KEY_COLUMN: usize = 20;
+
 fn keys_for(app: &App, action_id: &str) -> String {
     let mut labels: Vec<String> = app
         .keymap

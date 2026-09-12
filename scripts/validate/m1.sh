@@ -404,7 +404,11 @@ else
   # shown must come from the cache with an honest offline marker (FR-2.3, DEC-14).
   FAKE_FAILING="$TMP/fake-gh-offline"
   make_fake_gh "$FAKE_FAILING" 1
-  SCREEN="$(run_tui "$HOME_LIST" ':q\r' '' "$FAKE_FAILING" /tmp/m1-offline.log)"
+  # The first key group is empty: it waits for the offline state to be reached, and only
+  # then quits. Quitting immediately is a race — the cached page is painted before the
+  # fetch is even attempted, so the indicator the check wants appears *after* the first
+  # frame, and an app that has already exited never reaches it.
+  SCREEN="$(run_tui "$HOME_LIST" '~:q\r' 'offline~' "$FAKE_FAILING" /tmp/m1-offline.log)"
   if printf '%s' "$SCREEN" | grep -q "Add retry to the webhook dispatcher"; then
     ok "a cached list is shown when the network is gone"
   else

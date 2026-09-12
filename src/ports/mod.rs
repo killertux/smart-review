@@ -21,6 +21,7 @@ pub mod analysis;
 pub mod cache;
 pub mod cancel;
 pub mod catalog;
+pub mod chat;
 pub mod forge;
 pub mod llm;
 pub mod secret;
@@ -30,6 +31,7 @@ pub use analysis::{AnalysisCacheError, AnalysisCachePort, AnalysisKey, StoredAna
 pub use cache::{CacheKey, CacheKeyError, CacheStore, Stored};
 pub use cancel::Cancel;
 pub use catalog::{CatalogFetchError, CatalogLoad, CatalogPolicy, CatalogSource, ModelCatalogPort};
+pub use chat::{ChatStoreError, ChatStorePort};
 pub use forge::{
     ForgeCapabilities, ForgeFactory, ForgePort, ForgeProbe, ForgeStatus, PullRequestPage,
 };

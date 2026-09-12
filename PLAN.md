@@ -14,6 +14,7 @@
 - **Crates are gated.** No dependency is added without explicit owner approval (DEP-1). The ledger in §5 lists everything each milestone would need, with justification, so approvals can be granted in one batch per milestone.
 - **`REQUIREMENTS.md` wins.** If implementation reveals a requirement is wrong, stop and change the requirement first (DEV-5), then the code.
 - **Nothing is committed or pushed unless asked** (DEV-6).
+- **Every milestone PR ends with a manual test recipe** (owner's request, M3 onwards): environment, numbered steps with what to look for, what to check on disk, and the one or two behaviours no automated check covers. The PR is where the reviewer decides whether to believe the milestone; a diff is not evidence that a stream arrives or a click lands.
 
 ### 0.1 Definition of done (applies to every milestone)
 - [ ] `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean, including `clippy::pedantic` and the workspace restriction lints (DEV-8). No blanket `#[allow]`: every suppression is item-scoped and carries a comment.
@@ -239,19 +240,30 @@ names the active model.
 
 **Goal:** ask questions about the PR and get grounded, streamed, persistent answers.
 
-**Runnable artifact:** `Tab` to the Chat pane, ask "does this break the webhook retry contract?", watch the answer stream with file references, press `Esc` mid-answer to cancel, restart the app and find the conversation.
+**Runnable artifact:** `Tab` to the Chat pane (or `<leader>c`), ask "does this break the webhook retry contract?", watch the answer stream with its file references, press `Esc` mid-answer to stop it, restart the app and find the conversation.
 
 **Work items**
-- [ ] Sessions per `(repo, PR)` with `:chat new|list|open|export`, append-only history, persistence under `cache/` (FR-5.1).
-- [ ] Streaming UI with cancellation, retry/regenerate, and `Shift-Enter` newline fallbacks (FR-5.2).
-- [ ] Grounding: shared context bundle + history trimming, `:context add <path>` so the user can widen context instead of the model guessing, and no tool loop (FR-5.3, DEC-2).
-- [ ] Answer rendering: markdown-ish, path references jump to the diff/file, citation distinction between provided context and general knowledge (FR-5.1, FR-5.3).
-- [ ] Token/cost accounting per session, optional per-message cost estimate from catalog `cost` (FR-5.4).
-- [ ] Retention cap per DEC-9 (default: 50 sessions × 2 MB per PR) with announced pruning (FR-8.5).
-- [ ] Tests: history persistence round-trip, trimming, cancellation, prompt assembly snapshots with a fake `LlmPort`.
+- [x] Sessions per `(repo, PR)` with `:chat new|list|open|export`, append-only history, persistence under `cache/` (FR-5.1).
+- [x] Streaming UI with cancellation, retry/regenerate, and `Shift-Enter` newline fallbacks (FR-5.2).
+- [x] Grounding: shared context bundle + history trimming, `:context add <path>` so the user can widen context instead of the model guessing, and no tool loop (FR-5.3, DEC-2).
+- [x] Answer rendering: markdown-ish, path references jump to the diff/file, citation distinction between provided context and general knowledge (FR-5.1, FR-5.3).
+- [x] Token/cost accounting per session, optional per-message cost estimate from catalog `cost` (FR-5.4).
+- [x] Retention cap per DEC-9 (default: 50 sessions × 2 MB per PR) with announced pruning (FR-8.5).
+- [x] Tests: history persistence round-trip, trimming, cancellation, prompt assembly snapshots with a fake `LlmPort`.
+- [x] `scripts/validate/m3.sh`: 51 checks, driving the chat against a scripted provider and reading the wire.
+
+**Notes on what M3 decided, where it is not obvious from the requirements**
+- **The context goes in the system prompt, not in a message.** That is what makes FR-4.6's third truncation step safe: the oldest turns can be dropped without ever being able to drop the subject of the conversation, and no message has to be flagged as the important one. The cost is that the bundle is re-sent with every turn, which is what "the model sees exactly what `:context` reports" costs.
+- **The conversation starts when the question does**, not when the answer arrives: the question is visible while the model is thinking and is on disk before its answer exists, so a crash between the two loses nothing the user typed.
+- **A question whose answer was stopped keeps its question** when the history is replayed, and the half-answer is not replayed. The natural follow-up ("finish the thought") is otherwise a question about nothing.
+- **`Tab` is a pane move in insert mode too** — the compose box would otherwise be a room with no door. `Esc` clears a pending confirmation first, then leaves the pane.
+- **`:context add <path>` refuses** a path the pull request does not have, and refuses anything that looks like a secret outright: a bundle that silently leaves out what the user asked for by name is the one thing FR-4.6 exists to prevent. The added files live in `state.toml` per pull request — a preference about the pull request, not about one conversation.
+- **Transcripts are written to `exports/`**, not to `cache/`: a transcript the user asked for is not disposable (FR-8.5).
+- **The crate does not ask for streaming usage on the passthrough route** (FR-5.4's tokens and per-session cost would be permanently empty): only its native `OpenAI` backend sets `stream_options.include_usage`. The passthrough provider's config now sets `SUPPORT_STREAM_OPTIONS`, and the validator asserts the field is on the wire.
 
 **FR coverage:** FR-5.1–5.4.
-**Crates to approve:** none expected.
+**Crates to approve:** none new.
+**Risks:** a long conversation is re-sent every turn, so cost grows with turns rather than with the question (the history is capped at a quarter of the context budget, and the per-answer cost is on screen). Cancellation depends on the provider stopping when the connection closes; a provider that keeps generating is billed for what it generated before the app dropped the stream.
 
 ---
 

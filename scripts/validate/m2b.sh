@@ -459,8 +459,14 @@ echo prose-then-good >"$TMP/mode"
 : >"$TMP/repair.jsonl"
 HOME_REPAIR="$TMP/home-repair"
 make_home "$HOME_REPAIR"
-SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' 'money\.rs~Nothing has been sent yet~Money now rounds half up~' "$TMP/repair.log")"
-if shown "$TMP/repair.log" "Money now rounds half up"; then
+# The waits name phrases only the *repaired analysis* contains. The obvious pattern — the
+# summary — is in the prose too, so waiting for it returns while the panel still says
+# "repairing", and the quit that follows cuts the run off before the retry lands. The
+# prose is "I looked at the diff…"; the analysis it is replaced by has an intent line.
+SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' \
+  'money\.rs~Nothing has been sent yet~Finance reported a rounding drift~needed a second attempt' \
+  "$TMP/repair.log")"
+if shown "$TMP/repair.log" "Finance reported a rounding drift"; then
   ok "prose was repaired into a usable analysis"
 else
   bad "the repair path did not produce an analysis"

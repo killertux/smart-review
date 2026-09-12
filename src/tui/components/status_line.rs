@@ -61,6 +61,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // The order and the analysis are what a reviewer is looking at in M2, so
         // they get the columns the diff source and the model do not need (FR-3.5).
         Span::styled(analysis_label(app), background),
+        // FR-5.4: what the conversation has cost so far, in the same place the analysis
+        // reports its own state. Only once there is something to report: a `0 turns`
+        // segment on every screen would be noise.
+        Span::styled(chat_label(app), background),
         Span::styled("· 0 drafts ", background),
     ];
 
@@ -79,6 +83,18 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(padded_line(left, right, area.width)).style(background),
         area,
     );
+}
+
+/// The conversation's cost, when there is one (FR-5.4).
+fn chat_label(app: &App) -> String {
+    let Some(chat) = app.chat_state() else {
+        return String::new();
+    };
+    let totals = chat.totals();
+    if totals.turns == 0 {
+        return String::new();
+    }
+    format!("· chat {} ", totals.label())
 }
 
 fn repository_label(app: &App) -> String {

@@ -15,11 +15,13 @@
 //! Everything IO-shaped lives in the caller's worker thread; this type holds ports and
 //! never touches the terminal. The reducer sees only values.
 
+pub use crate::application::context::Checkout;
+use crate::application::context::ContextSource;
 use crate::domain::analysis::{
     Analysis, AnalysisUsage, Normalized, ParseFailure, PathIndex, Severity, normalize,
     repair_prompt, system_prompt, user_prompt,
 };
-use crate::domain::context::{Bundle, BundleInputs, BundlePolicy, build, human_bytes};
+use crate::domain::context::{Bundle, BundlePolicy, human_bytes};
 use crate::domain::diff::Patch;
 use crate::domain::pr::PullRequestDetail;
 use crate::domain::repo::RepoId;
@@ -27,13 +29,6 @@ use crate::ports::analysis::{AnalysisCachePort, AnalysisKey, StoredAnalysis};
 use crate::ports::llm::{ChatRequest, DeltaHandler, LlmError, LlmPort, TokenUsage};
 use crate::ports::workspace::WorkspacePort;
 use crate::ports::{Cancel, Clock};
-
-/// The convention files, in the priority the requirements give them (FR-4.6).
-///
-/// The first one that exists is *the* conventions file: a repository that has an
-/// `AGENTS.md` has said what it wants reviewers told, and appending its README to that
-/// would dilute the instruction it wrote.
-pub const CONVENTION_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "README.md"];
 
 /// What the caller wants a gathered bundle for (FR-4.6).
 ///
@@ -61,15 +56,6 @@ pub enum Progress {
 
 /// Receives progress as it happens.
 pub type ProgressHandler<'a> = dyn FnMut(Progress) + Send + 'a;
-
-/// Where the pull request's files can be read from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Checkout {
-    /// A directory in which the head commit exists, usually the managed worktree.
-    pub path: std::path::PathBuf,
-    /// The commit to read from.
-    pub head_sha: String,
-}
 
 /// Everything an analysis needs that the caller already knows.
 ///
@@ -105,6 +91,29 @@ impl AnalysisRequest {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// An analysis and a chat gather the same bundle (FR-5.3).
+impl ContextSource for AnalysisRequest {
+    fn changed_paths(&self) -> Vec<String> {
+        AnalysisRequest::changed_paths(self)
+    }
+
+    fn detail(&self) -> &PullRequestDetail {
+        &self.detail
+    }
+
+    fn patch(&self) -> Option<&Patch> {
+        self.patch.as_deref()
+    }
+
+    fn checkout(&self) -> Option<&Checkout> {
+        self.checkout.as_ref()
+    }
+
+    fn policy(&self) -> &BundlePolicy {
+        &self.policy
     }
 }
 
@@ -189,109 +198,16 @@ impl<'a> Analyst<'a> {
     /// first send for a repository (FR-4.6), and the bundle that was estimated is the
     /// one that is sent — gathering twice would be both slower and a chance for the
     /// two to differ.
+    ///
+    /// Delegates to [`crate::application::context::gather`], which chat shares (FR-5.3).
     #[must_use]
     pub fn gather(
         &self,
         request: &AnalysisRequest,
         cancel: &Cancel,
     ) -> (Bundle, Vec<(String, Vec<u8>)>) {
-        let paths = request.changed_paths();
-        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
-
-        if let Some(checkout) = &request.checkout {
-            for path in &paths {
-                match self
-                    .workspace
-                    .read_file(&checkout.path, &checkout.head_sha, path, cancel)
-                {
-                    Ok(bytes) => files.push((path.clone(), bytes)),
-                    // A file that cannot be read is not a reason to fail the whole
-                    // analysis: it is one elided file, and the bundle says so.
-                    Err(error) => skipped.push(format!("{path}: {error}")),
-                }
-            }
-        }
-
-        let (conventions, convention_label) = if let Some(checkout) = &request.checkout {
-            self.conventions(checkout, cancel)
-        } else {
-            (Vec::new(), None)
-        };
-
-        let mut segments_note = Vec::new();
-        if request.checkout.is_none() {
-            segments_note.push(
-                "no local workspace: the changed files' contents are not in the bundle. \
-                 `:workspace` or the review screen's local diff creates one"
-                    .to_owned(),
-            );
-        }
-        for missing in &skipped {
-            segments_note.push(format!("could not read {missing}"));
-        }
-        if let Some(label) = &convention_label {
-            let others: Vec<&&str> = CONVENTION_FILES
-                .iter()
-                .filter(|name| **name != label.as_str())
-                .collect();
-            segments_note.push(format!(
-                "{label} was used as the repository's conventions; {} did not override it",
-                others
-                    .iter()
-                    .map(|name| **name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-
-        let metadata = render_metadata(&request.detail);
-        let commits = render_commits(&request.detail);
-        let inputs = BundleInputs {
-            metadata: &metadata,
-            commits: &commits,
-            conventions: conventions
-                .iter()
-                .map(|(label, bytes)| (label.as_str(), bytes.as_slice()))
-                .collect(),
-            diff: request.patch.as_deref(),
-            files: files
-                .iter()
-                .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
-                .collect(),
-        };
-        let mut bundle = build(&inputs, &request.policy);
-        for note in segments_note {
-            bundle.segments.push(crate::domain::context::Segment {
-                kind: crate::domain::context::SegmentKind::Metadata,
-                label: "note".to_owned(),
-                bytes: 0,
-                included: false,
-                truncated: false,
-                detail: Some(note),
-            });
-        }
-        (bundle, files)
-    }
-
-    /// Reads the first convention file that exists (FR-4.6).
-    fn conventions(
-        &self,
-        checkout: &Checkout,
-        cancel: &Cancel,
-    ) -> (Vec<(String, Vec<u8>)>, Option<String>) {
-        for name in CONVENTION_FILES {
-            let Ok(bytes) =
-                self.workspace
-                    .read_file(&checkout.path, &checkout.head_sha, name, cancel)
-            else {
-                continue;
-            };
-            if !bytes.is_empty() {
-                return (vec![((*name).to_owned(), bytes)], Some((*name).to_owned()));
-            }
-        }
-        (Vec::new(), None)
+        let gathered = crate::application::context::gather(self.workspace, request, cancel);
+        (gathered.bundle, gathered.files)
     }
 
     /// Gathers and asks (FR-4.1, FR-4.4).
@@ -387,23 +303,24 @@ impl<'a> Analyst<'a> {
 
         // The corrections and the repair flag are part of the answer, so they are
         // stored with it: a reader who opens the analysis tomorrow is told what was
-        // fixed just as much as the reader who watched it arrive (FR-4.1).
+        // fixed just as much as the reader who watched it arrive (FR-4.1). They go in
+        // *before* the write, because the stored copy is the one that is read back.
         let mut warnings = normalized.warnings;
-        let mut stored = StoredAnalysis {
+        let stored = StoredAnalysis {
             key: request.key.clone(),
             analysis: normalized.analysis.clone(),
             raw: cap_raw(&raw),
-            warnings: Vec::new(),
+            warnings: warnings.clone(),
             repaired,
             stored_at: self.clock.now_unix_secs(),
         };
         // A cache that cannot be written must not lose the analysis the user just paid
-        // for: it is reported and the run continues, and the warning is part of what
-        // is stored so it follows the document.
+        // for: it is reported and the run continues. This warning is about the storage
+        // rather than about the answer, so it is deliberately not part of the entry —
+        // there is no entry.
         if let Err(error) = self.cache.put(&stored) {
             warnings.push(format!("the analysis could not be cached: {error}"));
         }
-        stored.warnings.clone_from(&warnings);
 
         Ok(AnalysisRun::Ready(Box::new(Analyzed {
             analysis: Box::new(normalized.analysis),
@@ -651,73 +568,9 @@ mod tests {
     use super::*;
     use crate::domain::analysis::AnalysisUsage;
     use crate::ports::analysis::{AnalysisCacheError, StoredAnalysis};
-    use crate::ports::llm::ChatOutcome;
-    use crate::test_support::FakeClock;
+    use crate::test_support::{FakeClock, FakeLlm, sample_detail};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-
-    struct FakeLlm {
-        /// The answers, in the order they will be given: the first request gets the
-        /// first one.
-        answers: Mutex<std::collections::VecDeque<String>>,
-        prompts: Mutex<Vec<(Option<String>, String)>>,
-    }
-
-    impl std::fmt::Debug for FakeLlm {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("FakeLlm").finish_non_exhaustive()
-        }
-    }
-
-    impl FakeLlm {
-        fn answering(answers: &[&str]) -> Self {
-            Self {
-                answers: Mutex::new(answers.iter().map(|a| (*a).to_owned()).collect()),
-                prompts: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl LlmPort for FakeLlm {
-        fn complete(
-            &self,
-            _request: &ChatRequest,
-            _cancel: &Cancel,
-        ) -> Result<ChatOutcome, LlmError> {
-            Err(LlmError::Request {
-                provider: "test".to_owned(),
-                reason: "the analysis streams, so this fake implements `stream` only".to_owned(),
-            })
-        }
-        fn stream(
-            &self,
-            request: &ChatRequest,
-            _cancel: &Cancel,
-            on_delta: &mut DeltaHandler<'_>,
-        ) -> Result<ChatOutcome, LlmError> {
-            self.prompts
-                .lock()
-                .expect("lock")
-                .push((request.system.clone(), request.prompt.clone()));
-            let answer = self
-                .answers
-                .lock()
-                .expect("lock")
-                .pop_front()
-                .unwrap_or_else(|| "{}".to_owned());
-            on_delta(&answer);
-            Ok(ChatOutcome {
-                text: answer,
-                usage: Some(TokenUsage {
-                    prompt: 10,
-                    completion: 20,
-                    total: 30,
-                    reasoning: Some(5),
-                }),
-                thinking: None,
-            })
-        }
-    }
 
     #[derive(Debug, Default)]
     struct FakeCache {
@@ -797,45 +650,6 @@ mod tests {
         )
     }
 
-    fn detail() -> PullRequestDetail {
-        let summary = crate::domain::pr::PullRequestSummary {
-            number: 141,
-            title: "Round half up".to_owned(),
-            author: "someone".to_owned(),
-            created_at: crate::domain::time::from_unix_secs(0),
-            updated_at: crate::domain::time::from_unix_secs(0),
-            is_draft: false,
-            base_ref: "main".to_owned(),
-            head_ref: "rounding".to_owned(),
-            head_sha: "abc123".to_owned(),
-            additions: 10,
-            deletions: 2,
-            changed_files: 1,
-            labels: vec!["bug".to_owned()],
-            review_decision: None,
-            checks: crate::domain::pr::CheckSummary::default(),
-            state: crate::domain::pr::PrState::Open,
-            url: "https://example.invalid/141".to_owned(),
-            is_cross_repository: false,
-        };
-        PullRequestDetail {
-            summary,
-            body: "Fixes a rounding bug.".to_owned(),
-            merge_state_status: None,
-            reviewers: Vec::new(),
-            commits: vec![crate::domain::pr::Commit {
-                sha: "abcdef1234567890".to_owned(),
-                summary: "round half up".to_owned(),
-                author: "someone".to_owned(),
-                committed_at: crate::domain::time::from_unix_secs(0),
-            }],
-            checks: Vec::new(),
-            reviews: Vec::new(),
-            comments: Vec::new(),
-            base_sha: None,
-        }
-    }
-
     const GOOD: &str = r#"{"summary": "Billing rounds half up now.", "intent": "fix a bug",
         "review_plan": [{"order": 1, "group": "domain", "rationale": "rules",
                          "files": ["src/money.rs"]}]}"#;
@@ -850,7 +664,7 @@ mod tests {
                 crate::ports::secret::ApiKey::new("sk-test", crate::ports::secret::KeySource::File),
                 "placeholder",
             ),
-            detail: Box::new(detail()),
+            detail: Box::new(sample_detail()),
             patch: Some(Box::new(patch())),
             checkout: Some(Checkout {
                 path: std::path::PathBuf::from("/tmp/ws"),
@@ -1115,6 +929,38 @@ mod tests {
     }
 
     #[test]
+    fn the_corrections_are_stored_with_the_document_they_describe() {
+        // FR-4.1: the warnings are a property of the answer, not of the run. An
+        // analysis read back tomorrow dropped the same invented path, so a cache hit
+        // has to report it too — which means the entry that is written must carry
+        // them, not just the value the run returns.
+        let request = request();
+        let (outcome, cache, _) = run(
+            &[
+                r#"{"summary": "ok", "review_plan": [{"order": 1, "group": "domain",
+                 "rationale": "rules", "files": ["src/money.rs", "src/invented.rs"]}]}"#,
+            ],
+            &[("src/money.rs", "fn money() {}")],
+            &request,
+        );
+        let AnalysisRun::Ready(ready) = outcome else {
+            panic!("expected a usable answer, got {outcome:?}");
+        };
+        assert!(
+            ready.warnings.iter().any(|w| w.contains("src/invented.rs")),
+            "the run reports it: {:?}",
+            ready.warnings
+        );
+
+        let entries = cache.entries.lock().expect("lock");
+        let stored = entries.values().next().expect("the analysis was stored");
+        assert_eq!(
+            stored.warnings, ready.warnings,
+            "the stored copy must carry the same corrections the run reported"
+        );
+    }
+
+    #[test]
     fn a_cache_that_cannot_be_written_does_not_lose_the_analysis() {
         #[derive(Debug)]
         struct Unwritable;
@@ -1208,7 +1054,7 @@ mod tests {
 
     #[test]
     fn the_metadata_block_states_the_facts_the_model_needs() {
-        let rendered = render_metadata(&detail());
+        let rendered = render_metadata(&sample_detail());
         for needle in [
             "Pull request 141",
             "title: Round half up",
@@ -1224,21 +1070,21 @@ mod tests {
             );
         }
         // A description-less pull request says so rather than showing an empty block.
-        let mut bare = detail();
+        let mut bare = sample_detail();
         bare.body = "   ".to_owned();
         assert!(render_metadata(&bare).contains("(the author wrote none)"));
     }
 
     #[test]
     fn the_commit_block_lists_every_commit_oldest_first() {
-        let rendered = render_commits(&detail());
+        let rendered = render_commits(&sample_detail());
         assert!(rendered.contains("# Commits (1)"), "{rendered}");
         assert!(
             rendered.contains("abcdef12 round half up — someone"),
             "{rendered}"
         );
         // No commits means no block at all rather than an empty heading.
-        let mut bare = detail();
+        let mut bare = sample_detail();
         bare.commits.clear();
         assert!(render_commits(&bare).is_empty());
     }

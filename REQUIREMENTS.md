@@ -1,6 +1,6 @@
 # Smart Review — Requirements Specification
 
-**Status:** Draft v0.8 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M1 and M2a are implemented; §5's keymap reflects them. M2b (analysis and review order) is next.
+**Status:** Draft v0.9 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M0–M3 are implemented: the shell, browsing and diffs, the workspace and model configuration, the analysis with its review order, and chat. §5's keymap reflects them. M4 (review publishing) is next.
 **Scope:** v1 (MVP) + post-v1 backlog
 **Source of truth:** this file. If code and this file disagree, the file wins or the file is updated in the same change.
 
@@ -281,6 +281,8 @@ Acceptance criteria:
 
 **FR-5.4 Cost & limits** — SHOULD — M3
 Per-session token usage is displayed; `max_tokens`/`temperature` are configurable per profile; an optional per-session cost estimate is shown when the provider reports pricing.
+
+*Implementation note (M3):* a provider reports token usage on a streamed answer only if the request asks for it (`stream_options.include_usage` on the OpenAI-compatible route). The pinned `llm` crate sets that field for its native OpenAI backend alone, so the passthrough configuration sets it explicitly — Appendix B records the detail. Without it, this requirement would be met by an empty field on most of the catalog.
 
 ### FR-6 Review actions
 
@@ -953,7 +955,9 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 - Streaming MUST be used for analysis and chat (FR-4.4).
 - Pin the resolved crate version in `Cargo.toml` and record it plus the re-verified API surface here at M2. The `agent` feature is **not** needed in v1 (DEC-2: no tool loop).
 - **The passthrough route must not use `LLMBackend::OpenAI` (verified at M2b, `llm` 1.3.8).** That backend sends both chat and streaming to the **Responses API** (`{base_url}/responses`), which OpenAI implements and most "OpenAI-compatible" providers do not — pointing it at another provider's `api` URL 404s on every request. The passthrough therefore builds `providers::openai_compatible::OpenAICompatibleProvider<T>` directly with a `T` whose `CHAT_ENDPOINT` is `chat/completions`; the crate's own OpenAI-compatible backends (openrouter, mistral, groq, cohere, xai, huggingface) are the same generic provider, which is why only the OpenAI entry needed the workaround. `adapters/llm.rs` holds the adapter as `Box<dyn ChatProvider>` (the crate's `LLMProvider` is a `ChatProvider`; the box upcast is stable since Rust 1.86) so both kinds travel the same path.
+- **Streamed answers carry no usage unless the request asks (verified at M3, `llm` 1.3.8).** The crate sets `stream_options: {include_usage: true}` only for its *native* OpenAI backend (`OpenAI::SUPPORTS_STREAM_OPTIONS = true`); `OpenAICompatibleProvider<T>` defaults it to `false`. Without that field a provider reports no token counts on a streamed answer, so FR-4.8's accounting and FR-5.4's per-session cost would be permanently empty on the whole passthrough route (most of the catalog, DEC-17). The passthrough configuration in `adapters/llm.rs` therefore sets `SUPPORTS_STREAM_OPTIONS = true`, and the M3 validator asserts the field is on the wire.
 - Extend Appendix C at M2 with: pick a provider/model with no key → masked prompt → key stored `0600` → analysis runs; then flip thinking on/off and confirm the analysis cache misses.
+- **Chat keeps the context in the system prompt (M3).** Not a requirement, a consequence of one: FR-4.6's truncation order ends with "oldest chat turns dropped", and a conversation whose first message *is* the context cannot drop turns without dropping its subject. The role separation in the crate (`ChatRole` has no `System`) is why the context goes through the builder rather than into the first user message, which is also where the analysis prompt puts it.
 
 ### B.3 Budgeting
 - Token estimation: `ceil(bytes / 4)` is acceptable until a real tokenizer is approved as a dependency.
@@ -967,5 +971,6 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 - [ ] `Ctrl-C`, `SIGTERM`, and a forced panic all restore the terminal.
 - [ ] Kill the network mid-analysis and mid-chat → cancellable, explained, no lost draft.
 - [ ] `<leader>a` on a real pull request: the estimate and the file list first, then the analysis streaming in, then the tree in the recommended order; `o` returns to path order, `J`/`K` moves a group, and restarting the app shows the analysis from cache without calling the provider (verify in `logs/`).
+- [ ] `<leader>c` on a real pull request: ask something the diff answers and something it does not, watch the second answer say what is missing, `:context add <that file>` and ask again; `Esc` mid-answer stops it and keeps what arrived; restarting shows the conversation; `:chat export md` opens in an editor as something a colleague could read.
 - [ ] `--dry-run` prints the exact commands for fetch, worktree, and publish and performs no mutation.
 - [ ] Second launch reuses cache and workspace and makes no unnecessary network calls (`:` shows the job log).

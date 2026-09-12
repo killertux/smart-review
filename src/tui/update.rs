@@ -91,7 +91,12 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "context",
         "app.command",
-        "Inspect what an analysis would send, or set the diff context: :context 10",
+        "Show, extend or narrow what is sent: :context [add|remove <path>|0-1000]",
+    ),
+    (
+        "chat",
+        "chat.open",
+        "Talk about this pull request: :chat [new|list|open <id>|export [md|json]|retry]",
     ),
     (
         "analyze",
@@ -187,6 +192,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "pane.prev" => switch_pane(app, false),
         // The groups live in their own functions so that no single match has to hold
         // the whole command surface.
+        other if other.starts_with("chat.") => dispatch_chat(app, other),
         other
             if other.starts_with("app.")
                 || other.starts_with("notice.")
@@ -253,6 +259,57 @@ fn toggle_order(app: &mut App) -> Effect {
         format!("{} ({source}){positions}", order.label()),
     );
     Effect::None
+}
+
+/// The chat actions (FR-5.1–5.3).
+fn dispatch_chat(app: &mut App, id: &str) -> Effect {
+    match id {
+        "chat.open" => {
+            // `<leader>c` opens what is there and loads what is not: a user with a
+            // conversation wants to read it, and a user with none wants somewhere to
+            // type. The load is what finds the conversation from the last run (FR-5.1).
+            if app.chat_state().is_some() {
+                app.chat.close();
+                app.mode = crate::tui::keymap::Mode::Normal;
+                return Effect::None;
+            }
+            app.show_chat();
+            let effect = set_focus(app, crate::tui::app::Pane::Chat);
+            if app.chat.session.is_some() {
+                effect
+            } else {
+                Effect::LoadChat
+            }
+        }
+        "chat.send" => Effect::AskChat,
+        "chat.newline" => {
+            // Only meaningful while the compose box owns the keys, which is the mode
+            // this action is scoped to.
+            app.chat.input.newline();
+            Effect::None
+        }
+        "chat.retry" => Effect::RetryChat,
+        "chat.cancel" => {
+            if app.chat.status.is_running() {
+                return Effect::CancelChat;
+            }
+            if app.chat.is_confirming() {
+                app.chat.awaiting_confirmation = None;
+                app.notice(NoticeLevel::Info, "nothing was sent".to_owned());
+                return Effect::None;
+            }
+            // Otherwise `Esc` leaves the pane, which is what it means everywhere else.
+            app.chat.close();
+            set_focus(app, crate::tui::app::Pane::Diff);
+            Effect::None
+        }
+        "chat.list" => {
+            app.list_chats();
+            Effect::None
+        }
+        "chat.export" => Effect::ExportChat("md".to_owned()),
+        other => unimplemented_action(app, other),
+    }
 }
 
 fn dispatch_app(app: &mut App, id: &str) -> Effect {
@@ -734,27 +791,107 @@ fn toggle_whitespace(app: &mut App) -> Effect {
 
 /// Moves the focus on. Inside a review that means the tree and the diff in turn
 /// (FR-3.3: the two panes keep independent cursors and `Tab` moves between them).
+/// The three places `Tab` can stop inside a review screen.
+///
+/// A cycle of three rather than two `Pane`s, because the file tree and the diff text are
+/// two stops inside *one* pane: modelling them as a pair of booleans alongside a separate
+/// chat pane is what made the first version of this skip the chat pane entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The file tree.
+    Tree,
+    /// The diff text.
+    Diff,
+    /// The conversation.
+    Chat,
+}
+
+impl Stop {
+    /// The next stop, which is the order the screen reads in.
+    const fn next(self) -> Self {
+        match self {
+            Self::Tree => Self::Diff,
+            Self::Diff => Self::Chat,
+            Self::Chat => Self::Tree,
+        }
+    }
+
+    /// The previous stop.
+    const fn prev(self) -> Self {
+        match self {
+            Self::Tree => Self::Chat,
+            Self::Diff => Self::Tree,
+            Self::Chat => Self::Diff,
+        }
+    }
+}
+
 fn switch_pane(app: &mut App, forward: bool) -> Effect {
     if let Some(view) = app.review.as_mut() {
-        view.tree_focused = !view.tree_focused;
-        if view.tree_focused {
-            app.notice(NoticeLevel::Info, "file tree: Enter opens, j/k moves");
-        }
-        return Effect::None;
-    }
-    set_focus(
-        app,
-        if forward {
-            app.focus.next()
+        let current = match (app.focus, view.tree_focused) {
+            (crate::tui::app::Pane::Chat, _) => Stop::Chat,
+            (_, true) => Stop::Tree,
+            _ => Stop::Diff,
+        };
+        let stop = if forward {
+            current.next()
         } else {
-            app.focus.prev()
-        },
-    )
+            current.prev()
+        };
+        return focus_stop(app, stop);
+    }
+    let pane = if forward {
+        app.focus.next()
+    } else {
+        app.focus.prev()
+    };
+    if pane == crate::tui::app::Pane::Chat {
+        // Outside a review screen there is nothing to talk about, so the cycle stays
+        // between the list and the (empty) diff pane.
+        return set_focus(app, crate::tui::app::Pane::PullRequests);
+    }
+    set_focus(app, pane)
+}
+
+/// Focuses one of the three review stops, opening the chat pane if that is where the
+/// cycle landed (FR-5.2).
+fn focus_stop(app: &mut App, stop: Stop) -> Effect {
+    match stop {
+        Stop::Tree => {
+            if let Some(view) = app.review.as_mut() {
+                view.tree_focused = true;
+            }
+            app.notice(NoticeLevel::Info, "file tree: Enter opens, j/k moves");
+            set_focus(app, crate::tui::app::Pane::Diff)
+        }
+        Stop::Diff => {
+            if let Some(view) = app.review.as_mut() {
+                view.tree_focused = false;
+            }
+            set_focus(app, crate::tui::app::Pane::Diff)
+        }
+        Stop::Chat => {
+            // A focus that lands on a pane which is not drawn would leave the keyboard
+            // in a place with nothing to type into.
+            let was_open = app.chat.open;
+            app.show_chat();
+            let effect = set_focus(app, crate::tui::app::Pane::Chat);
+            if was_open || app.chat.session.is_some() {
+                effect
+            } else {
+                Effect::LoadChat
+            }
+        }
+    }
 }
 
 fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
     app.focus = pane;
     app.state.focus = Some(pane.label().to_owned());
+    // The chat compose box is a text-entry surface, so focusing it switches the app to
+    // insert mode and leaving it switches back: the status line then says which of the
+    // two the keyboard is doing (FR-7.1).
+    app.sync_mode_to_focus();
     Effect::SaveState
 }
 
@@ -800,6 +937,7 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "catalog" => catalog_command(app, argument),
         "workspace" => workspace_command(app, argument),
         "context" => context_command(app, argument),
+        "chat" => chat_command(app, argument),
         "analyze" => start_analysis(app, argument),
         "plan" => plan_command(app, argument),
         "theme" => match argument {
@@ -1140,7 +1278,88 @@ fn workspace_command(app: &mut App, argument: &str) -> Effect {
 }
 
 /// `:context <n>` (FR-3.2).
+/// `:chat` — the conversation commands (FR-5.1, FR-5.2).
+///
+/// Every branch prints something rather than staying quiet, because a command that
+/// appears to do nothing is worse than one that refuses: the palette test requires each
+/// listed command to work with no argument, and "what can I do with `:chat`" is the
+/// question a bare `:chat` should answer.
+fn chat_command(app: &mut App, argument: &str) -> Effect {
+    let mut words = argument.split_whitespace();
+    let subcommand = words.next().unwrap_or_default();
+    let rest = words.collect::<Vec<_>>().join(" ");
+    match subcommand {
+        "" | "show" => {
+            app.show_chat();
+            Effect::None
+        }
+        "new" => {
+            app.notice(
+                NoticeLevel::Info,
+                "starting a new conversation; the old ones stay in `:chat list`".to_owned(),
+            );
+            Effect::NewChat
+        }
+        "list" => {
+            app.list_chats();
+            Effect::None
+        }
+        "open" => {
+            if rest.is_empty() {
+                app.list_chats();
+                return Effect::None;
+            }
+            Effect::OpenChat(rest)
+        }
+        "export" => Effect::ExportChat(if rest.is_empty() {
+            "md".to_owned()
+        } else {
+            rest
+        }),
+        "retry" => Effect::RetryChat,
+        other => {
+            app.command_error(format!(
+                "{other} is not a chat command; use new, list, open <id>, export [md|json] or retry"
+            ));
+            Effect::None
+        }
+    }
+}
+
+/// `:context` — the inspector, the added files, or the diff's context lines (FR-4.6).
 fn context_command(app: &mut App, argument: &str) -> Effect {
+    let mut words = argument.split_whitespace();
+    match (words.next(), words.next()) {
+        (Some("add"), Some(path)) => {
+            match app.add_context_file(path) {
+                Ok(message) => {
+                    app.notice(NoticeLevel::Info, message);
+                    return Effect::SaveContextFiles;
+                }
+                Err(message) => app.command_error(message),
+            }
+            return Effect::None;
+        }
+        (Some("add"), None) => {
+            app.command_error("which file? `:context add src/domain/money.rs`");
+            return Effect::None;
+        }
+        (Some("remove"), Some(path)) => {
+            match app.remove_context_file(path) {
+                Ok(message) => {
+                    app.notice(NoticeLevel::Info, message);
+                    return Effect::SaveContextFiles;
+                }
+                Err(message) => app.command_error(message),
+            }
+            return Effect::None;
+        }
+        (Some("remove"), None) => {
+            app.command_error("which file? `:context remove src/domain/money.rs`");
+            return Effect::None;
+        }
+        _ => {}
+    }
     if argument.is_empty() {
         // FR-4.6's inspector: what an analysis would send. A number still means the
         // diff's own context, which is the M1 meaning of the same word (FR-3.2) — and
@@ -1704,7 +1923,9 @@ mod tests {
         app.record_analysis_job(7);
         app.apply_progress(crate::tui::jobs::Progress {
             job: 6,
-            update: crate::application::analysis::Progress::Delta("old".to_owned()),
+            update: crate::tui::jobs::ProgressUpdate::Analysis(
+                crate::application::analysis::Progress::Delta("old".to_owned()),
+            ),
         });
         assert!(
             app.analysis_stream().is_empty(),
@@ -1712,7 +1933,9 @@ mod tests {
         );
         app.apply_progress(crate::tui::jobs::Progress {
             job: 7,
-            update: crate::application::analysis::Progress::Delta("new".to_owned()),
+            update: crate::tui::jobs::ProgressUpdate::Analysis(
+                crate::application::analysis::Progress::Delta("new".to_owned()),
+            ),
         });
         assert_eq!(app.analysis_stream(), "new");
         assert!(matches!(

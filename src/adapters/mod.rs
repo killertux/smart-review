@@ -8,6 +8,7 @@
 pub mod analysis_cache;
 pub mod cache;
 pub mod catalog;
+pub mod chat_store;
 pub mod clock;
 pub mod credentials;
 pub mod fs;

@@ -125,6 +125,15 @@ impl Home {
         self.cache().join("analysis")
     }
 
+    /// Directory holding chat transcripts written by `:chat export` (FR-5.1).
+    ///
+    /// Next to the logs rather than under `cache/`: a transcript the user asked for is
+    /// not disposable, which is the whole distinction that directory draws (FR-8.5).
+    #[must_use]
+    pub fn exports(&self) -> PathBuf {
+        self.root.join("exports")
+    }
+
     /// Directory holding managed PR worktrees (FR-3.1).
     #[must_use]
     pub fn worktrees(&self) -> PathBuf {
@@ -158,6 +167,7 @@ impl Home {
             self.root.clone(),
             self.themes(),
             self.cache(),
+            self.exports(),
             self.worktrees(),
             self.logs(),
         ] {
@@ -192,6 +202,7 @@ impl Home {
              - `state.toml` — window, theme and recently opened state.\n\
              - `themes/` — your own themes; each file inherits from `base`.\n\
              - `cache/` — disposable: PR lists, details, analyses and chats.\n\
+             - `exports/` — chat transcripts you asked to keep (`:chat export`).\n\
              - `worktrees/` — per-pull-request checkouts owned by the app.\n\
              - `logs/` — rotated logs; never contains secrets.\n\n\
              Root: {}\n",

@@ -744,6 +744,316 @@ impl crate::ports::AnalysisCachePort for InMemoryAnalysis {
     }
 }
 
+/// An in-memory [`ChatStorePort`](crate::ports::ChatStorePort).
+///
+/// A `BTreeMap` per pull request, with the same pruning rule the real store has — the
+/// rule is DEC-9's, not the filesystem's, so a fake that skipped it would let a test
+/// pass while the app filled a disk.
+#[derive(Debug, Default)]
+pub(crate) struct FakeChatStore {
+    sessions:
+        Mutex<std::collections::BTreeMap<(String, u64, String), crate::domain::chat::Session>>,
+}
+
+impl FakeChatStore {
+    /// Every session, for an assertion about what was written.
+    #[cfg(test)]
+    pub(crate) fn all(&self) -> Vec<crate::domain::chat::Session> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+impl crate::ports::ChatStorePort for FakeChatStore {
+    fn list(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Vec<crate::domain::chat::SessionMeta>, crate::ports::ChatStoreError> {
+        let mut metas: Vec<crate::domain::chat::SessionMeta> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|session| session.repo == repo.key() && session.pr == pr)
+            .map(crate::domain::chat::SessionMeta::of)
+            .collect();
+        metas.sort_by_key(|meta| std::cmp::Reverse((meta.updated_at, meta.id.clone())));
+        Ok(metas)
+    }
+
+    fn load(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+        id: &str,
+    ) -> Result<Option<crate::domain::chat::Session>, crate::ports::ChatStoreError> {
+        Ok(self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(repo.key(), pr, id.to_owned()))
+            .cloned())
+    }
+
+    fn latest(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Option<crate::domain::chat::Session>, crate::ports::ChatStoreError> {
+        let Some(meta) = self.list(repo, pr)?.into_iter().next() else {
+            return Ok(None);
+        };
+        self.load(repo, pr, &meta.id)
+    }
+
+    fn put(
+        &self,
+        session: &crate::domain::chat::Session,
+    ) -> Result<(), crate::ports::ChatStoreError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (session.repo.clone(), session.pr, session.id.clone()),
+                session.clone(),
+            );
+        Ok(())
+    }
+
+    fn remove(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+        id: &str,
+    ) -> Result<(), crate::ports::ChatStoreError> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(repo.key(), pr, id.to_owned()));
+        Ok(())
+    }
+
+    fn prune(
+        &self,
+        _repo: &crate::domain::repo::RepoId,
+        _pr: u64,
+    ) -> Result<crate::domain::chat::Pruned, crate::ports::ChatStoreError> {
+        // The fake stores nothing it should not, so there is nothing to prune; the
+        // pruning rule itself is tested against the real store and in `domain::chat`.
+        Ok(crate::domain::chat::Pruned::default())
+    }
+}
+
+/// A [`SecretStore`](crate::ports::SecretStore) holding one key for every provider.
+///
+/// Simpler than the file-backed one, and it exists because a test that has to write a
+/// `credentials.toml` to test anything that talks to a provider is a test that spends
+/// its lines on the filesystem rather than on the behaviour.
+#[derive(Debug)]
+pub(crate) struct FixedSecrets {
+    key: String,
+    store: Mutex<std::collections::BTreeMap<String, String>>,
+}
+
+impl FixedSecrets {
+    /// A store where every provider has this key.
+    pub(crate) fn new(key: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            store: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl crate::ports::SecretStore for FixedSecrets {
+    fn get(
+        &self,
+        provider: &str,
+        env_var: Option<&str>,
+    ) -> Result<Option<crate::ports::ApiKey>, crate::ports::SecretError> {
+        let _ = env_var;
+        let stored = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| self.key.clone());
+        Ok(Some(crate::ports::ApiKey::new(
+            stored,
+            crate::ports::KeySource::File,
+        )))
+    }
+
+    fn set(&self, provider: &str, key: &str) -> Result<(), crate::ports::SecretError> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(provider.to_owned(), key.to_owned());
+        Ok(())
+    }
+
+    fn remove(&self, provider: &str) -> Result<(), crate::ports::SecretError> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(provider);
+        Ok(())
+    }
+
+    fn status(&self) -> Result<Vec<crate::ports::KeyStatus>, crate::ports::SecretError> {
+        Ok(self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .map(|provider| crate::ports::KeyStatus {
+                provider: provider.clone(),
+                source: Some(crate::ports::KeySource::File),
+            })
+            .collect())
+    }
+}
+
+/// A sample pull request, for tests that need a detail but are not about parsing one.
+pub(crate) fn sample_detail() -> crate::domain::pr::PullRequestDetail {
+    let summary = crate::domain::pr::PullRequestSummary {
+        number: 141,
+        title: "Round half up".to_owned(),
+        author: "someone".to_owned(),
+        created_at: crate::domain::time::from_unix_secs(0),
+        updated_at: crate::domain::time::from_unix_secs(0),
+        is_draft: false,
+        base_ref: "main".to_owned(),
+        head_ref: "rounding".to_owned(),
+        head_sha: "abc123".to_owned(),
+        additions: 10,
+        deletions: 2,
+        changed_files: 1,
+        labels: vec!["bug".to_owned()],
+        review_decision: None,
+        checks: crate::domain::pr::CheckSummary::default(),
+        state: crate::domain::pr::PrState::Open,
+        url: "https://example.invalid/141".to_owned(),
+        is_cross_repository: false,
+    };
+    crate::domain::pr::PullRequestDetail {
+        summary,
+        body: "Fixes a rounding bug.".to_owned(),
+        merge_state_status: None,
+        reviewers: Vec::new(),
+        commits: vec![crate::domain::pr::Commit {
+            sha: "abcdef1234567890".to_owned(),
+            summary: "round half up".to_owned(),
+            author: "someone".to_owned(),
+            committed_at: crate::domain::time::from_unix_secs(0),
+        }],
+        checks: Vec::new(),
+        reviews: Vec::new(),
+        comments: Vec::new(),
+        base_sha: None,
+    }
+}
+
+/// An [`LlmPort`](crate::ports::LlmPort) that answers from a list and records what it
+/// was asked.
+///
+/// It records the *history* as well as the prompt, because "what the provider saw" is
+/// the thing a chat test is about (FR-5.3): a fake that only kept the prompt would pass
+/// while sending the whole conversation nowhere.
+#[derive(Debug, Default)]
+pub(crate) struct FakeLlm {
+    /// The answers, in the order they will be given.
+    answers: Mutex<std::collections::VecDeque<String>>,
+    /// `(system, prompt)` per request.
+    pub(crate) prompts: Mutex<Vec<(Option<String>, String)>>,
+    /// The conversation that came with each request.
+    pub(crate) histories: Mutex<Vec<Vec<(crate::domain::chat::Role, String)>>>,
+    /// A failure to return instead of an answer.
+    failure: Option<crate::ports::LlmError>,
+}
+
+impl FakeLlm {
+    /// A fake that answers with these texts, in order.
+    pub(crate) fn answering(answers: &[&str]) -> Self {
+        Self {
+            answers: Mutex::new(answers.iter().map(|a| (*a).to_owned()).collect()),
+            ..Self::default()
+        }
+    }
+
+    /// A fake that always fails this way.
+    pub(crate) fn failing(error: crate::ports::LlmError) -> Self {
+        Self {
+            failure: Some(error),
+            ..Self::default()
+        }
+    }
+}
+
+impl crate::ports::LlmPort for FakeLlm {
+    fn complete(
+        &self,
+        _request: &crate::ports::ChatRequest,
+        _cancel: &crate::ports::Cancel,
+    ) -> Result<crate::ports::ChatOutcome, crate::ports::LlmError> {
+        Err(crate::ports::LlmError::Request {
+            provider: "test".to_owned(),
+            reason: "this fake implements `stream` only".to_owned(),
+        })
+    }
+
+    fn stream(
+        &self,
+        request: &crate::ports::ChatRequest,
+        cancel: &crate::ports::Cancel,
+        on_delta: &mut crate::ports::DeltaHandler<'_>,
+    ) -> Result<crate::ports::ChatOutcome, crate::ports::LlmError> {
+        self.prompts
+            .lock()
+            .expect("lock")
+            .push((request.system.clone(), request.prompt.clone()));
+        self.histories
+            .lock()
+            .expect("lock")
+            .push(request.history.clone());
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let answer = self
+            .answers
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or_else(|| "{}".to_owned());
+        on_delta(&answer);
+        if cancel.is_cancelled() {
+            // A cancelled call reports what arrived, which is what the chat path reads
+            // to keep partial text (FR-5.2).
+            return Ok(crate::ports::ChatOutcome {
+                text: answer,
+                usage: None,
+                thinking: None,
+            });
+        }
+        Ok(crate::ports::ChatOutcome {
+            text: answer,
+            usage: Some(crate::ports::TokenUsage {
+                prompt: 10,
+                completion: 20,
+                total: 30,
+                reasoning: Some(5),
+            }),
+            thinking: None,
+        })
+    }
+}
+
 /// A job runner wired for tests: the real ports detection needs, and the two the
 /// picker uses replaced by ones that refuse.
 pub(crate) fn test_job_runner(

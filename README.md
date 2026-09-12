@@ -46,6 +46,10 @@ Inside the app:
 | `y` | copy the current file path (OSC 52) |
 | `<leader>m` | choose the provider, model and thinking settings |
 | `<leader>a` | analyse the pull request, or open the analysis |
+| `<leader>c` | talk about the pull request (`Tab` reaches the pane too) |
+| `Enter` | send the question (`Alt-Enter` or `Ctrl-J` adds a line) |
+| `r` | repeat the last question |
+| `Esc` | stop the answer that is arriving, then leave the pane |
 | `o` | switch between the recommended and path orders |
 | `J` / `K` | move the selected review-plan group |
 | `<leader>dc` | cycle the diff context: 3, 10, 0 lines |
@@ -62,7 +66,8 @@ Inside the app:
 
 `:help`, `:doctor`, `:pr 141`, `:filter author:alice`, `:clear-filters`,
 `:sort updated desc`, `:load-more`, `:copy-path`, `:theme <name>|next|reload`,
-`:analyze [--force|raw]`, `:plan [reset|path|move <file> <group>]`, `:context`,
+`:analyze [--force|raw]`, `:plan [reset|path|move <file> <group>]`,
+`:context [add|remove <path>]`, `:chat [new|list|open <id>|export [md|json]|retry]`,
 `:model [show]`, `:key [clear <provider>]`, `:catalog [refresh]`,
 `:workspace [clean [--all]]`, `:set ui.timeoutlen=250`, `:keymap`, `:version`.
 `Esc` closes a popup, cancels a half-typed key sequence, or stops an analysis that is
@@ -97,6 +102,17 @@ analysis is cached per commit, model and thinking setting, so re-opening it cost
 nothing. If the model answers with prose instead of JSON it is asked once more with
 the reason, and if it still does not, the text is shown rather than swallowed
 (`:analyze raw`).
+
+`<leader>c` (or `Tab`) opens a conversation about the pull request. The model sees the
+same bundle an analysis gets — the diff, the changed files, the commit messages and the
+repository's `AGENTS.md`, exactly what `:context` lists — and nothing else: it cannot
+read the repository, and when it needs something that is not there it says so instead of
+guessing. When you want it to have that file, `:context add src/domain/invoice.rs` puts
+it in the bundle for every later question. Answers stream in, with the paths they name
+listed as being in the change, and sentences the model marks as general knowledge shown
+differently from the ones it grounded in your code. `Esc` stops an answer and keeps what
+arrived; the conversation is stored per pull request, so restarting finds it, and
+`:chat export md` writes a transcript to `~/.smart-review/exports/`.
 
 Two mechanisms filter the list, and the interface keeps them visibly apart: the
 **chips** change what GitHub is asked (`gh pr list --search`), while the `/` box
