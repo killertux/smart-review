@@ -10,6 +10,7 @@
 //! a repository, or a terminal (NFR-5.2).
 
 pub mod analysis;
+pub mod chat;
 pub mod context;
 pub mod diff;
 pub mod environment;
@@ -23,6 +24,9 @@ pub mod time;
 pub use analysis::{
     ANALYSIS_VERSION, Analysis, AnalysisUsage, FileNote, PROMPT_VERSION, ParseFailure, PathIndex,
     PlanGroup, RiskArea, Severity, UNCLASSIFIED,
+};
+pub use chat::{
+    CHAT_PROMPT_VERSION, Message, Pruned, Reference, Role, Session, SessionMeta, Totals,
 };
 pub use context::{
     Bundle, BundleInputs, BundlePolicy, Disposition, Segment, SegmentKind, estimate_tokens,

@@ -95,16 +95,38 @@ impl ChatRequest {
 }
 
 /// The provider's own token accounting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serializable because a chat session stores what each answer cost next to the
+/// answer (FR-5.4): a cost that could only be recomputed while the process was alive
+/// would make the figure on screen a claim rather than a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     /// Prompt tokens.
+    #[serde(default)]
     pub prompt: u32,
     /// Completion tokens.
+    #[serde(default)]
     pub completion: u32,
     /// Total, as the provider reports it.
+    #[serde(default)]
     pub total: u32,
     /// Reasoning tokens, when the provider breaks them out (FR-4.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u32>,
+}
+
+impl TokenUsage {
+    /// Adds another answer's usage to this one, for a session total (FR-5.4).
+    pub fn add(&mut self, other: Self) {
+        self.prompt = self.prompt.saturating_add(other.prompt);
+        self.completion = self.completion.saturating_add(other.completion);
+        self.total = self.total.saturating_add(other.total);
+        self.reasoning = match (self.reasoning, other.reasoning) {
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
+            (Some(left), None) | (None, Some(left)) => Some(left),
+            (None, None) => None,
+        };
+    }
 }
 
 /// What a request produced.

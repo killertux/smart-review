@@ -387,23 +387,24 @@ impl<'a> Analyst<'a> {
 
         // The corrections and the repair flag are part of the answer, so they are
         // stored with it: a reader who opens the analysis tomorrow is told what was
-        // fixed just as much as the reader who watched it arrive (FR-4.1).
+        // fixed just as much as the reader who watched it arrive (FR-4.1). They go in
+        // *before* the write, because the stored copy is the one that is read back.
         let mut warnings = normalized.warnings;
-        let mut stored = StoredAnalysis {
+        let stored = StoredAnalysis {
             key: request.key.clone(),
             analysis: normalized.analysis.clone(),
             raw: cap_raw(&raw),
-            warnings: Vec::new(),
+            warnings: warnings.clone(),
             repaired,
             stored_at: self.clock.now_unix_secs(),
         };
         // A cache that cannot be written must not lose the analysis the user just paid
-        // for: it is reported and the run continues, and the warning is part of what
-        // is stored so it follows the document.
+        // for: it is reported and the run continues. This warning is about the storage
+        // rather than about the answer, so it is deliberately not part of the entry —
+        // there is no entry.
         if let Err(error) = self.cache.put(&stored) {
             warnings.push(format!("the analysis could not be cached: {error}"));
         }
-        stored.warnings.clone_from(&warnings);
 
         Ok(AnalysisRun::Ready(Box::new(Analyzed {
             analysis: Box::new(normalized.analysis),
@@ -1112,6 +1113,38 @@ mod tests {
             .expect("runs");
         assert!(matches!(outcome, AnalysisRun::Cancelled));
         assert!(cache.entries.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn the_corrections_are_stored_with_the_document_they_describe() {
+        // FR-4.1: the warnings are a property of the answer, not of the run. An
+        // analysis read back tomorrow dropped the same invented path, so a cache hit
+        // has to report it too — which means the entry that is written must carry
+        // them, not just the value the run returns.
+        let request = request();
+        let (outcome, cache, _) = run(
+            &[
+                r#"{"summary": "ok", "review_plan": [{"order": 1, "group": "domain",
+                 "rationale": "rules", "files": ["src/money.rs", "src/invented.rs"]}]}"#,
+            ],
+            &[("src/money.rs", "fn money() {}")],
+            &request,
+        );
+        let AnalysisRun::Ready(ready) = outcome else {
+            panic!("expected a usable answer, got {outcome:?}");
+        };
+        assert!(
+            ready.warnings.iter().any(|w| w.contains("src/invented.rs")),
+            "the run reports it: {:?}",
+            ready.warnings
+        );
+
+        let entries = cache.entries.lock().expect("lock");
+        let stored = entries.values().next().expect("the analysis was stored");
+        assert_eq!(
+            stored.warnings, ready.warnings,
+            "the stored copy must carry the same corrections the run reported"
+        );
     }
 
     #[test]
