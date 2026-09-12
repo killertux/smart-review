@@ -13,10 +13,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 
 use crate::Startup;
+use crate::application::analysis::AnalysisIntent;
 use crate::application::models::CatalogState;
 use crate::application::prs::FetchOutcome;
 use crate::config::{Config, ConfigDocument, ModelSelection};
 use crate::doctor::{Check, Context};
+use crate::domain::context::BundlePolicy;
 use crate::domain::diff::DiffSource;
 use crate::domain::environment::{Environment, EnvironmentError};
 use crate::domain::pr::PullRequestDetail;
@@ -115,6 +117,19 @@ pub enum Effect {
     ClearKey(String),
     /// Remove the worktrees that are no longer needed (FR-3.1).
     CleanWorkspaces(bool),
+    /// Read whatever analysis is stored for the open pull request (FR-4.3).
+    LoadAnalysis,
+    /// Gather the context bundle, which is what an analysis would send (FR-4.6).
+    GatherContext(AnalysisIntent),
+    /// Ask the provider for an analysis (FR-4.1).
+    RunAnalysis {
+        /// Recompute even when the cache has a matching entry (`:analyze --force`).
+        force: bool,
+    },
+    /// Give up on the run in flight, keeping the text that arrived (FR-4.4).
+    CancelAnalysis,
+    /// Store the review-plan overrides for this pull request (FR-4.2).
+    SavePlan(Box<crate::domain::plan::Plan>),
 }
 
 impl std::fmt::Debug for Effect {
@@ -186,6 +201,11 @@ fn effect_name(effect: &Effect) -> String {
         Effect::SaveSelection(_) => "save-selection".to_owned(),
         Effect::ClearKey(provider) => format!("clear-key({provider})"),
         Effect::CleanWorkspaces(all) => format!("clean-workspaces({all})"),
+        Effect::LoadAnalysis => "load-analysis".to_owned(),
+        Effect::GatherContext(intent) => format!("gather-context({intent:?})"),
+        Effect::RunAnalysis { force } => format!("run-analysis(force={force})"),
+        Effect::CancelAnalysis => "cancel-analysis".to_owned(),
+        Effect::SavePlan(_) => "save-plan".to_owned(),
     }
 }
 
@@ -250,6 +270,168 @@ pub enum Overlay {
     Doctor,
     /// Theme selection (FR-7.7).
     ThemePicker,
+    /// The analysis panel: the summary, the intent, the risks and the plan (FR-4.1).
+    Analysis,
+    /// The context inspector: what would be sent and what was left out (FR-4.6).
+    Context,
+    /// The model's own text, when it could not be used as an analysis (FR-4.1).
+    RawAnswer,
+}
+
+/// Everything the analysis panel owns (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
+///
+/// Grouped because it changes together: a run replaces the analysis, its plan, its
+/// warnings and its stream in one step, and a struct is what makes that one step
+/// visible instead of thirteen assignments that must be kept in order.
+#[derive(Debug, Default)]
+pub struct PanelState {
+    /// The analysis for the open pull request.
+    pub analysis: Option<Box<crate::ports::StoredAnalysis>>,
+    /// An analysis for the same pull request at an older commit (DEC-15).
+    pub stale: Option<Box<crate::ports::StoredAnalysis>>,
+    /// What the analysis is doing right now.
+    pub state: AnalysisState,
+    /// The gathered context bundle (FR-4.6).
+    pub bundle: Option<Box<crate::domain::context::Bundle>>,
+    /// Which pull request and commit the bundle was gathered for.
+    pub bundle_for: Option<(u64, String)>,
+    /// The review plan in force (FR-4.2).
+    pub plan: Option<crate::domain::plan::Plan>,
+    /// The job id of the run (FR-4.4).
+    pub job: u64,
+    /// The job id of the context gather (FR-4.6).
+    pub context_job: u64,
+    /// The job id of the stored-analysis read (FR-4.3).
+    pub stored_job: u64,
+    /// The text that has streamed in (FR-4.4).
+    pub stream: StreamBuffer,
+    /// What normalization corrected (FR-4.1).
+    pub warnings: Vec<String>,
+    /// The model's unusable text, with the reason (FR-4.1).
+    pub raw: Option<(String, String)>,
+    /// Whether the user has confirmed the first send for this repository (FR-4.6).
+    pub confirmed: bool,
+}
+
+/// Everything the analysis panel owns (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
+///
+/// What the analysis is doing (FR-4.4).
+///
+/// The states are the interface's, not the use case's: what a user needs to know is
+/// whether an answer is expected, whether one is arriving, and whether the last one
+/// was usable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AnalysisState {
+    /// Nothing requested.
+    #[default]
+    Idle,
+    /// Gathering the context, which is the local half.
+    Gathering,
+    /// Gathered, and waiting for the user to agree to send it (FR-4.6).
+    Confirming,
+    /// Waiting for the provider, with the stage it is on.
+    Running {
+        /// What the job is doing: asking, or repairing.
+        stage: String,
+    },
+    /// Answering, with text arriving.
+    Streaming {
+        /// What the job is doing: asking, or repairing.
+        stage: String,
+    },
+    /// An analysis is available.
+    Ready,
+    /// The answer could not be used (FR-4.1).
+    Unusable {
+        /// Why, in the model's words where possible.
+        reason: String,
+    },
+    /// The user stopped it (FR-4.4).
+    Cancelled,
+}
+
+impl AnalysisState {
+    /// Whether work is in flight, which is what `Esc` cancels.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self,
+            Self::Gathering | Self::Running { .. } | Self::Streaming { .. }
+        )
+    }
+
+    /// Whether the user is being asked to confirm a send (FR-4.6).
+    #[must_use]
+    pub fn is_confirming(&self) -> bool {
+        matches!(self, Self::Confirming)
+    }
+
+    /// The one-line description for the status area.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Idle => "no analysis".to_owned(),
+            Self::Gathering => "gathering the context".to_owned(),
+            Self::Confirming => "ready to send; confirm with <leader>a".to_owned(),
+            Self::Running { stage } | Self::Streaming { stage } => stage.clone(),
+            Self::Ready => "analysed".to_owned(),
+            Self::Unusable { reason } => format!("unusable answer: {reason}"),
+            Self::Cancelled => "cancelled".to_owned(),
+        }
+    }
+}
+
+/// Somewhere to keep text that arrives in pieces.
+///
+/// Bounded: what the interface shows while an answer streams is a preview, and a
+/// provider that streams a megabyte should not be able to make the interface hold it
+/// twice (the completion carries the whole thing anyway).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamBuffer {
+    text: String,
+    truncated: bool,
+}
+
+/// The most streamed text the preview keeps.
+pub const MAX_STREAM_BYTES: usize = 64 * 1024;
+
+impl StreamBuffer {
+    /// Adds a piece, keeping the total bounded.
+    pub fn push(&mut self, delta: &str) {
+        if self.text.len() >= MAX_STREAM_BYTES {
+            self.truncated = true;
+            return;
+        }
+        let room = MAX_STREAM_BYTES.saturating_sub(self.text.len());
+        if delta.len() <= room {
+            self.text.push_str(delta);
+            return;
+        }
+        let mut end = room;
+        while end > 0 && !delta.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&delta[..end]);
+        self.truncated = true;
+    }
+
+    /// The text so far.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether the preview was cut short.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Forgets everything, for a new run.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.truncated = false;
+    }
 }
 
 /// A pull request being opened, and how far along that is.
@@ -467,6 +649,8 @@ pub struct App {
     pub(crate) check_job: u64,
     /// The job id of the catalog fetch (FR-4.7).
     pub(crate) catalog_job: u64,
+    /// Whether the automatic fetch for a configured model has already been tried.
+    pub(crate) catalog_auto_fetched: bool,
     /// The diff flags the review screen is using (FR-3.2).
     pub(crate) diff_options: DiffOptions,
     /// Where the diff on screen was read from (FR-3.2).
@@ -475,12 +659,16 @@ pub struct App {
     pub(crate) secret_store: std::sync::Arc<dyn SecretStore>,
     /// The workspace port, for listing managed worktrees (FR-3.1).
     pub(crate) workspace_port: std::sync::Arc<dyn crate::ports::WorkspacePort>,
+    /// Where analyses and their review-plan overrides are kept (FR-4.3).
+    pub(crate) analysis_cache: std::sync::Arc<dyn crate::ports::AnalysisCachePort>,
     /// The open pull request's worktree, once it exists (FR-3.1).
     pub(crate) workspace: Option<Workspace>,
     /// The job id of the worktree being built (FR-3.1).
     pub(crate) workspace_job: u64,
     /// Why the shown diff came from the cache, when it did (DEC-14).
     pub(crate) diff_offline: Option<String>,
+    /// The analysis panel's state (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
+    pub(crate) panel: PanelState,
     /// The job id of the newest detection request.
     pub(crate) environment_job: u64,
     /// The job id of the newest list request, so a superseded answer is dropped.
@@ -549,6 +737,7 @@ impl App {
             remote,
             secret_store,
             workspace_port,
+            analysis,
             ..
         } = startup;
 
@@ -557,6 +746,7 @@ impl App {
         let mut app = Self {
             secret_store,
             workspace_port,
+            analysis_cache: analysis,
             home,
             config,
             document,
@@ -583,11 +773,13 @@ impl App {
             model_problem: None,
             check_job: 0,
             catalog_job: 0,
+            catalog_auto_fetched: false,
             diff_options: DiffOptions::default(),
             diff_source: DiffSource::Forge,
             workspace: None,
             workspace_job: 0,
             diff_offline: None,
+            panel: PanelState::default(),
             environment_job: 0,
             list_job: 0,
             count_job: 0,
@@ -854,6 +1046,16 @@ impl App {
                 self.report_worktrees_cleaned(removed, kept, &failed);
                 None
             }
+            // The analysis group has its own handler: three outcomes that share the
+            // panel's state, and a match with twenty arms is one where the interesting
+            // ones hide.
+            Outcome::Stored { .. } | Outcome::Context { .. } | Outcome::Analyzed(_)
+                if job == self.panel.stored_job
+                    || job == self.panel.context_job
+                    || job == self.panel.job =>
+            {
+                self.apply_analysis_outcome(job, outcome)
+            }
             Outcome::Checks(checks) => {
                 self.apply_checks(job, checks);
                 None
@@ -861,6 +1063,14 @@ impl App {
             // A failure is gated like any other result: a superseded request's error
             // must not be announced as if it were the newest one.
             Outcome::Failed(message) if self.is_current_job(job) => {
+                // The decision to fetch a missing catalog is made before the failure
+                // is reported: reporting clears the job id it would be checked
+                // against, and the fetch is the more useful thing to do than to
+                // announce that there was nothing to read.
+                if let Some(effect) = self.catalog_unavailable(job) {
+                    self.catalog_job = 0;
+                    return Some(effect);
+                }
                 self.report_job_failure(job, &message);
                 None
             }
@@ -874,9 +1084,721 @@ impl App {
             | Outcome::Workspace(_)
             | Outcome::ModelChecked(_)
             | Outcome::WorkspacesCleaned { .. }
+            | Outcome::Stored { .. }
+            | Outcome::Context { .. }
+            | Outcome::Analyzed(_)
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
+    }
+
+    /// The outcomes that belong to the analysis panel (FR-4.1, FR-4.3, FR-4.6).
+    ///
+    /// Returns what to do next, which is how a gathered bundle becomes the request it
+    /// was gathered for.
+    fn apply_analysis_outcome(&mut self, job: u64, outcome: jobs::Outcome) -> Option<Effect> {
+        match outcome {
+            Outcome::Stored {
+                current,
+                stale,
+                plan,
+            } if job == self.panel.stored_job => {
+                self.panel.stored_job = 0;
+                self.apply_stored(
+                    current.map(|stored| *stored),
+                    stale.map(|stored| *stored),
+                    plan.map(|plan| *plan),
+                );
+                None
+            }
+            Outcome::Context { bundle, intent } if job == self.panel.context_job => {
+                self.panel.context_job = 0;
+                self.apply_context(*bundle, intent)
+            }
+            Outcome::Analyzed(run) if job == self.panel.job => {
+                self.panel.job = 0;
+                self.apply_analysis(*run);
+                None
+            }
+            // Unreachable: `apply_completion` routes only these three here, gated on
+            // their own job ids.
+            _ => None,
+        }
+    }
+
+    /// Fetches the catalog when a configured model needs it and the cache was empty.
+    ///
+    /// The startup load is cache-only so that a fresh run makes no network call
+    /// (FR-4.7). That is the right default, but it left a user who had already chosen a
+    /// model being told there was no model until they opened the picker — a fetch they
+    /// had not asked for is worth less than a working model they did ask for.
+    ///
+    /// Once only: an unreachable catalog must not become a fetch loop, and the second
+    /// failure is a real failure worth reporting.
+    #[must_use]
+    pub fn catalog_unavailable(&mut self, job: u64) -> Option<Effect> {
+        if job != self.catalog_job
+            || self.catalog.is_some()
+            || self.catalog_auto_fetched
+            || self.config.llm.active.is_none()
+        {
+            // No model configured means the picker is where a model is chosen, and it
+            // fetches the catalog when it opens.
+            return None;
+        }
+        self.catalog_auto_fetched = true;
+        logging::log(
+            Level::Debug,
+            "no cached catalog and a model is configured: fetching it now",
+        );
+        Some(Effect::LoadCatalog(
+            crate::ports::catalog::CatalogPolicy::Refresh,
+        ))
+    }
+
+    /// Applies what the analysis cache held (FR-4.3, DEC-15).
+    ///
+    /// A stored analysis for the *current* head is used without asking; one for an
+    /// older head is not presented as current but is offered, because the alternative
+    /// — throwing it away — spends money to recompute something the user may still
+    /// want to read (DEC-15).
+    pub fn apply_stored(
+        &mut self,
+        current: Option<crate::ports::StoredAnalysis>,
+        stale: Option<crate::ports::StoredAnalysis>,
+        plan: Option<crate::domain::plan::Plan>,
+    ) {
+        self.panel.stale = stale.map(Box::new);
+        if let Some(stored) = current {
+            self.adopt_analysis(stored);
+        } else if let Some(stale) = &self.panel.stale {
+            let age = crate::domain::time::relative(
+                crate::domain::time::from_unix_secs(
+                    i64::try_from(self.now_unix_secs).unwrap_or(i64::MAX),
+                ),
+                crate::domain::time::from_unix_secs(
+                    i64::try_from(stale.stored_at).unwrap_or(i64::MAX),
+                ),
+            );
+            self.panel.analysis = None;
+            self.panel.state = AnalysisState::Idle;
+            self.notice(
+                NoticeLevel::Info,
+                format!(
+                    "an analysis from {age} ago covers an older commit ({}); <leader>a analyses \
+                     the current one",
+                    stale.key.head_sha.get(..8).unwrap_or(&stale.key.head_sha)
+                ),
+            );
+        }
+        // The stored overrides win only when they describe the same commit the
+        // analysis does; otherwise the analysis's own order is used (FR-4.2).
+        if let Some(plan) = plan {
+            let head = self.analysis_head();
+            let usable = head.as_deref().is_some_and(|head| plan.matches_head(head));
+            if usable {
+                self.panel.plan = Some(plan);
+                self.apply_plan_to_review();
+            } else if plan.overridden {
+                self.notice(
+                    NoticeLevel::Info,
+                    "the saved review order was made against an older commit and was not used"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    /// Applies a gathered context bundle (FR-4.6).
+    pub fn apply_context(
+        &mut self,
+        bundle: crate::domain::context::Bundle,
+        intent: AnalysisIntent,
+    ) -> Option<Effect> {
+        self.panel.bundle_for = self
+            .detail
+            .as_ref()
+            .map(|detail| (detail.summary.number, detail.summary.head_sha.clone()));
+        // The gather is over. Whatever happens next (a run, the inspector, or the user
+        // thinking about it) starts from "nothing is in flight", which is what the
+        // second key press and the status line both read.
+        self.panel.state = AnalysisState::Idle;
+        let bundle = Box::new(bundle);
+        match intent {
+            AnalysisIntent::Inspect => {
+                self.panel.bundle = Some(bundle);
+                self.open_overlay(Overlay::Context);
+                None
+            }
+            AnalysisIntent::Run => {
+                self.panel.bundle = Some(bundle);
+                Some(Effect::RunAnalysis { force: false })
+            }
+            AnalysisIntent::Estimate => {
+                let summary = bundle.summary();
+                self.panel.bundle = Some(bundle);
+                // The opt-in notice is per repository and shown once (FR-4.6): after
+                // it, analysis is one key press.
+                if self.analysis_opt_in_recorded() {
+                    return Some(Effect::RunAnalysis { force: false });
+                }
+                self.panel.confirmed = true;
+                // The panel as well as the notice: a notice expires after a few
+                // seconds, and a question that disappears before it is answered is not
+                // a question. This is also where the size estimate stays readable.
+                self.panel.state = AnalysisState::Confirming;
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "this sends {summary} of this pull request to {}; press <leader>a again \
+                         to confirm",
+                        self.model_label()
+                    ),
+                );
+                self.open_overlay(Overlay::Analysis);
+                None
+            }
+        }
+    }
+
+    /// Applies a finished run, whichever way it went (FR-4.1, FR-4.4).
+    pub fn apply_analysis(&mut self, run: crate::application::analysis::AnalysisRun) {
+        use crate::application::analysis::AnalysisRun;
+        match run {
+            AnalysisRun::Ready(ready) => {
+                let stored = crate::ports::StoredAnalysis {
+                    key: self
+                        .analysis_key()
+                        .unwrap_or_else(|| crate::ports::AnalysisKey {
+                            repo: String::new(),
+                            pr: self.detail.as_ref().map_or(0, |d| d.summary.number),
+                            head_sha: String::new(),
+                            provider: String::new(),
+                            model: String::new(),
+                            thinking: None,
+                            prompt_version: crate::domain::analysis::PROMPT_VERSION,
+                        }),
+                    analysis: (*ready.analysis).clone(),
+                    raw: self.panel.stream.text().to_owned(),
+                    // The document is already in the cache (the use case stored it);
+                    // this value is what the panel shows, carrying the same
+                    // corrections and the same repair flag the cache holds.
+                    warnings: ready.warnings.clone(),
+                    repaired: ready.repaired,
+                    stored_at: self.now_unix_secs,
+                };
+                self.adopt_analysis(stored);
+                let usage = ready
+                    .usage
+                    .map(|usage| {
+                        let reasoning = usage
+                            .reasoning
+                            .map(|tokens| format!(", {tokens} reasoning"))
+                            .unwrap_or_default();
+                        format!(" · {} in/{}{reasoning} out", usage.prompt, usage.completion)
+                    })
+                    .unwrap_or_default();
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "analysed #{} with {}{usage}{}",
+                        self.detail
+                            .as_ref()
+                            .map_or(0, |detail| detail.summary.number),
+                        self.model_label(),
+                        if ready.repaired {
+                            " (after a retry)"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
+            AnalysisRun::Unparsed(unparsed) => {
+                // Kept rather than discarded: the text is the only explanation of what
+                // the model did instead of answering (FR-4.1).
+                self.panel.raw = Some((unparsed.reason.clone(), unparsed.raw.clone()));
+                self.panel.state = AnalysisState::Unusable {
+                    reason: unparsed.reason.clone(),
+                };
+                self.notice(
+                    NoticeLevel::Warn,
+                    format!(
+                        "the answer could not be used: {} · `:analysis raw` shows it",
+                        unparsed.reason
+                    ),
+                );
+                self.open_overlay(Overlay::RawAnswer);
+            }
+            AnalysisRun::Cancelled => {
+                self.panel.state = AnalysisState::Cancelled;
+                self.notice(
+                    NoticeLevel::Info,
+                    "the analysis was cancelled; any text it had produced is kept".to_owned(),
+                );
+            }
+        }
+    }
+
+    /// Takes a document as the current analysis and re-orders the review (FR-4.2).
+    fn adopt_analysis(&mut self, stored: crate::ports::StoredAnalysis) {
+        // The plan is derived here rather than in the view, so the panel and the tree
+        // can never disagree about what the analysis said (FR-4.2).
+        let derived = crate::domain::plan::Plan::from_analysis(&stored.analysis);
+        // A user who ordered the files by hand keeps that order when the same analysis
+        // is read again; a plan for a different commit is replaced rather than applied
+        // to files it no longer describes (FR-4.2).
+        let keep = self.panel.plan.as_ref().is_some_and(|existing| {
+            existing.overridden && existing.matches_head(&stored.analysis.head_sha)
+        });
+        let repaired = stored.repaired;
+        self.panel.warnings.clone_from(&stored.warnings);
+        self.panel.stale = None;
+        self.panel.raw = None;
+        self.panel.stream.clear();
+        self.panel.state = AnalysisState::Ready;
+        self.panel.analysis = Some(Box::new(stored));
+        if !keep {
+            self.panel.plan = Some(derived);
+        }
+        self.apply_plan_to_review();
+        if repaired {
+            self.notice(
+                NoticeLevel::Info,
+                "the first answer was not usable JSON; it was asked again".to_owned(),
+            );
+        }
+    }
+
+    /// Pushes the plan, or its absence, into the review view (FR-3.5).
+    pub(crate) fn apply_plan_to_review(&mut self) {
+        let plan = self.panel.plan.clone();
+        if let Some(view) = self.review.as_mut() {
+            view.set_plan(plan);
+        }
+    }
+
+    /// The question the cache is asked for the open pull request (FR-4.3).
+    ///
+    /// Built from the resolved selection rather than from the config file, because the
+    /// key must describe what would actually be sent — including the thinking setting,
+    /// which is the one part that only exists after the catalog has been consulted
+    /// (FR-4.8).
+    #[must_use]
+    pub fn analysis_key(&self) -> Option<crate::ports::AnalysisKey> {
+        let detail = self.detail.as_ref()?;
+        let environment = self.environment.as_ref()?;
+        let resolved = self.active_model.as_ref()?;
+        Some(crate::ports::AnalysisKey {
+            repo: environment.repo.key(),
+            pr: detail.summary.number,
+            head_sha: detail.summary.head_sha.clone(),
+            provider: resolved.provider.clone(),
+            model: resolved.model.clone(),
+            thinking: self
+                .config
+                .llm
+                .active
+                .as_ref()
+                .and_then(|selection| selection.reasoning.clone()),
+            prompt_version: crate::domain::analysis::PROMPT_VERSION,
+        })
+    }
+
+    /// The commit the current analysis describes, if there is one.
+    #[must_use]
+    pub fn analysis_head(&self) -> Option<String> {
+        self.panel
+            .analysis
+            .as_ref()
+            .map(|stored| stored.analysis.head_sha.clone())
+            .or_else(|| {
+                self.detail
+                    .as_ref()
+                    .map(|detail| detail.summary.head_sha.clone())
+            })
+    }
+
+    /// The model, as the interface names it.
+    pub(crate) fn model_label(&self) -> String {
+        self.active_model.as_ref().map_or_else(
+            || "the configured model".to_owned(),
+            |resolved| format!("{}/{}", resolved.provider, resolved.model),
+        )
+    }
+
+    /// Whether this repository has already been told what an analysis sends (FR-4.6).
+    #[must_use]
+    pub fn analysis_opt_in_recorded(&self) -> bool {
+        let Some(environment) = self.environment.as_ref() else {
+            return false;
+        };
+        self.state.analysis_opt_in.contains(&environment.repo.key())
+    }
+
+    /// Records the opt-in for this repository (FR-4.6).
+    pub fn record_analysis_opt_in(&mut self) {
+        let Some(environment) = self.environment.as_ref() else {
+            return;
+        };
+        let key = environment.repo.key();
+        if !self.state.analysis_opt_in.contains(&key) {
+            self.state.analysis_opt_in.push(key);
+        }
+        self.panel.confirmed = false;
+    }
+
+    /// Streams a piece of the answer into the preview (FR-4.4).
+    pub fn apply_progress(&mut self, progress: jobs::Progress) {
+        if progress.job != self.panel.job {
+            // A superseded run's text is dropped by job id, which is what makes `Esc`
+            // and a fresh `<leader>a` safe to press twice (FR-4.4).
+            return;
+        }
+        match progress.update {
+            crate::application::analysis::Progress::Stage(stage) => {
+                self.panel.state = if self.panel.stream.text().is_empty() {
+                    AnalysisState::Running { stage }
+                } else {
+                    AnalysisState::Streaming { stage }
+                };
+            }
+            crate::application::analysis::Progress::Delta(delta) => {
+                let stage = match &self.panel.state {
+                    AnalysisState::Running { stage } | AnalysisState::Streaming { stage } => {
+                        stage.clone()
+                    }
+                    other => other.label(),
+                };
+                self.panel.stream.push(&delta);
+                self.panel.state = AnalysisState::Streaming { stage };
+            }
+        }
+    }
+
+    /// Builds the request an analysis would send (FR-4.1, FR-4.6).
+    ///
+    /// Returns `None` when there is nothing to analyse or nobody to ask: both are
+    /// normal states, and the caller says which one it is.
+    #[must_use]
+    pub fn analysis_request(&self) -> Option<crate::application::analysis::AnalysisRequest> {
+        let detail = self.detail.as_ref()?;
+        let key = self.analysis_key()?;
+        let resolved = self.active_model.as_ref()?;
+        let secret = self
+            .secret_store
+            .get(&resolved.provider, resolved.env_var.as_deref())
+            .ok()
+            .flatten()?;
+        // The output cap comes from the catalog when it declares one (FR-4.7).
+        let output_limit = self
+            .catalog
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .load
+                    .catalog
+                    .model(&resolved.provider, &resolved.model)
+            })
+            .and_then(crate::domain::model::CatalogModel::output_limit);
+        let chat = crate::application::models::analysis_chat(resolved, secret, output_limit);
+        let policy = BundlePolicy {
+            max_context_tokens: crate::application::models::context_budget(
+                self.catalog
+                    .as_ref()
+                    .and_then(|state| {
+                        state
+                            .load
+                            .catalog
+                            .model(&resolved.provider, &resolved.model)
+                    })
+                    .and_then(crate::domain::model::CatalogModel::context_limit),
+                self.config.llm.max_context_tokens,
+                chat.max_tokens,
+            ),
+            max_file_bytes: self.config.llm.max_file_bytes,
+            ..BundlePolicy::default()
+        };
+        Some(crate::application::analysis::AnalysisRequest {
+            key,
+            chat,
+            detail: Box::new(detail.clone()),
+            patch: self
+                .review
+                .as_ref()
+                .map(|view| Box::new(view.patch.clone())),
+            checkout: self.checkout(),
+            policy,
+        })
+    }
+
+    /// Where the files can be read, when a worktree exists (FR-3.1).
+    #[must_use]
+    fn checkout(&self) -> Option<crate::application::analysis::Checkout> {
+        let workspace = self.workspace.as_ref()?;
+        if !self.workspace_ready() {
+            return None;
+        }
+        Some(crate::application::analysis::Checkout {
+            path: workspace.path.clone(),
+            head_sha: workspace.head_sha.clone(),
+        })
+    }
+
+    /// Takes the gathered bundle when it belongs to the pull request on screen.
+    ///
+    /// A bundle gathered for another commit or another pull request is discarded
+    /// rather than sent: it would describe a change the user is not looking at, which
+    /// is the one thing a cached context must never do (FR-4.6).
+    pub(crate) fn take_context_bundle_for_current_head(
+        &mut self,
+    ) -> Option<crate::domain::context::Bundle> {
+        let current = self
+            .detail
+            .as_ref()
+            .map(|detail| (detail.summary.number, detail.summary.head_sha.clone()));
+        match (&self.panel.bundle_for, current) {
+            (Some(built), Some(now)) if *built == now => {
+                self.panel.bundle.take().map(|bundle| *bundle)
+            }
+            _ => {
+                self.panel.bundle = None;
+                self.panel.bundle_for = None;
+                None
+            }
+        }
+    }
+
+    /// Starts a run: the stream is cleared and the state says so (FR-4.4).
+    ///
+    /// The panel opens with it, because a stream nobody is looking at is a spinner
+    /// with extra steps.
+    pub(crate) fn begin_analysis(&mut self) {
+        self.panel.stream.clear();
+        self.panel.raw = None;
+        self.panel.state = AnalysisState::Running {
+            stage: "asking the provider".to_owned(),
+        };
+        self.open_overlay(Overlay::Analysis);
+    }
+
+    /// Gives up on a run, keeping whatever text arrived (FR-4.4).
+    pub(crate) fn cancelled_analysis(&mut self) {
+        if self.panel.state.is_running() {
+            self.panel.state = AnalysisState::Cancelled;
+        }
+    }
+
+    /// Drops the current analysis so the next run recomputes it (FR-4.3).
+    pub(crate) fn forget_analysis(&mut self) {
+        self.panel.analysis = None;
+        self.panel.stale = None;
+        self.panel.warnings.clear();
+        self.panel.raw = None;
+        self.panel.stream.clear();
+    }
+
+    /// Remembers the job id of a stored-analysis read (FR-4.3).
+    pub fn record_stored_job(&mut self, id: u64) {
+        self.panel.stored_job = id;
+    }
+
+    /// Remembers the job id of a context gather (FR-4.6).
+    pub fn record_context_job(&mut self, id: u64) {
+        self.panel.context_job = id;
+    }
+
+    /// Remembers the job id of an analysis run (FR-4.4).
+    pub fn record_analysis_job(&mut self, id: u64) {
+        self.panel.job = id;
+    }
+
+    /// The environment, once detection has resolved one (FR-1.1).
+    #[must_use]
+    pub fn environment(&self) -> Option<&Environment> {
+        self.environment.as_ref()
+    }
+
+    /// What the analysis is doing (FR-4.4).
+    #[must_use]
+    pub fn analysis_state(&self) -> &AnalysisState {
+        &self.panel.state
+    }
+
+    /// The text that has streamed in so far (FR-4.4).
+    #[must_use]
+    pub fn analysis_stream(&self) -> &str {
+        self.panel.stream.text()
+    }
+
+    /// Whether the streamed preview was cut short.
+    #[must_use]
+    pub fn analysis_stream_truncated(&self) -> bool {
+        self.panel.stream.is_truncated()
+    }
+
+    /// Whether the stored analysis needed a repair pass (FR-4.1).
+    #[must_use]
+    pub fn analysis_repaired(&self) -> bool {
+        self.panel
+            .analysis
+            .as_ref()
+            .is_some_and(|stored| stored.repaired)
+    }
+
+    /// What was corrected while normalizing the analysis (FR-4.1).
+    #[must_use]
+    pub fn analysis_warnings(&self) -> &[String] {
+        &self.panel.warnings
+    }
+
+    /// The gathered context bundle, if there is one (FR-4.6).
+    #[must_use]
+    pub fn context_bundle(&self) -> Option<&crate::domain::context::Bundle> {
+        self.panel.bundle.as_deref()
+    }
+
+    /// The review plan in force (FR-4.2).
+    #[must_use]
+    pub fn plan(&self) -> Option<&crate::domain::plan::Plan> {
+        self.panel.plan.as_ref()
+    }
+
+    /// What the analysis said about the file under the cursor (FR-4.1).
+    ///
+    /// Built from the note's parts so an empty field does not produce a stray dash;
+    /// `notes` is the sentence worth reading, `change` the summary of what changed.
+    #[must_use]
+    pub fn current_file_note(&self) -> Option<String> {
+        let stored = self.panel.analysis.as_ref()?;
+        let path = self.review.as_ref()?.current_path()?.to_string();
+        let note = stored.analysis.note(&path)?;
+        let text = if note.notes.trim().is_empty() {
+            note.change.trim()
+        } else {
+            note.notes.trim()
+        };
+        if text.is_empty() {
+            // A note with a review_focus list and nothing else still says something.
+            let focus = note.review_focus.join("; ");
+            return (!focus.is_empty()).then(|| format!("check: {focus}"));
+        }
+        Some(text.to_owned())
+    }
+
+    /// The review plan, for editing (FR-4.2).
+    pub fn plan_mut(&mut self) -> Option<&mut crate::domain::plan::Plan> {
+        self.panel.plan.as_mut()
+    }
+
+    /// Replaces the review plan and re-orders the view to match (FR-4.2).
+    pub fn set_plan(&mut self, plan: crate::domain::plan::Plan) {
+        self.panel.plan = Some(plan);
+        self.apply_plan_to_review();
+    }
+
+    /// Rebuilds the view after an override, keeping the file the cursor is in.
+    pub(crate) fn after_plan_change(&mut self) {
+        self.apply_plan_to_review();
+    }
+
+    /// The group the tree cursor is on, when it is on a group heading (FR-4.2).
+    #[must_use]
+    pub fn selected_plan_group(&self) -> Option<String> {
+        let view = self.review.as_ref()?;
+        if !view.tree_focused {
+            return None;
+        }
+        match view.tree.get(view.tree_cursor).map(|row| &row.kind) {
+            Some(crate::tui::diff_view::TreeKind::Group { name, .. }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// One line describing the review order, for `:plan` (FR-4.2).
+    #[must_use]
+    pub fn plan_summary(&self) -> String {
+        let Some(plan) = self.panel.plan.as_ref() else {
+            return "no review plan yet: <leader>a analyses the pull request".to_owned();
+        };
+        format!(
+            "{} order, {} ({}){}",
+            if self
+                .review
+                .as_ref()
+                .is_some_and(|view| view.order == crate::domain::plan::OrderMode::Recommended)
+            {
+                "recommended"
+            } else {
+                "path"
+            },
+            plan.groups
+                .iter()
+                .map(|group| format!("{}.{} ({})", group.order, group.group, group.files.len()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            plan.source.label(),
+            if plan.overridden {
+                "; your manual order is in force"
+            } else {
+                ""
+            }
+        )
+    }
+
+    /// The model's unusable answer, with the reason (FR-4.1).
+    #[must_use]
+    pub fn raw_answer(&self) -> Option<&(String, String)> {
+        self.panel.raw.as_ref()
+    }
+
+    /// Whether a model has been chosen and can be used (FR-4.5).
+    #[must_use]
+    pub fn has_model(&self) -> bool {
+        self.active_model.is_some()
+    }
+
+    /// The analysis panel's contents (FR-4.1).
+    #[must_use]
+    pub fn analysis_panel(&self) -> Option<crate::application::analysis::PanelModel> {
+        let stored = self.panel.analysis.as_ref()?;
+        Some(crate::application::analysis::PanelModel::of(
+            &stored.analysis,
+        ))
+    }
+
+    /// The provenance line: which model, which prompt version, how old (FR-4.3).
+    #[must_use]
+    pub fn analysis_provenance(&self) -> Option<String> {
+        let stored = self.panel.analysis.as_ref()?;
+        let mut label = stored
+            .analysis
+            .provenance(crate::domain::time::from_unix_secs(
+                i64::try_from(self.now_unix_secs).unwrap_or(i64::MAX),
+            ));
+        if !stored.analysis.matches_prompt() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut label,
+                format_args!(
+                    " · made with prompt v{} (now v{})",
+                    stored.analysis.prompt_version,
+                    crate::domain::analysis::PROMPT_VERSION
+                ),
+            );
+        }
+        Some(label)
+    }
+
+    /// Whether the analysis on screen describes an older commit than the pull request
+    /// is at (DEC-15).
+    #[must_use]
+    pub fn analysis_is_stale(&self) -> bool {
+        let Some(stored) = self.panel.analysis.as_ref() else {
+            return false;
+        };
+        self.detail
+            .as_ref()
+            .is_some_and(|detail| detail.summary.head_sha != stored.analysis.head_sha)
     }
 
     /// Stores a detail and says what was opened (FR-2.4).
@@ -2923,6 +3845,85 @@ mod tests {
         assert!(app.latest_notice().is_some());
         app.tick_at(Instant::now() + NOTICE_LIFETIME + Duration::from_secs(1));
         assert!(app.latest_notice().is_none());
+    }
+
+    #[test]
+    fn a_configured_model_gets_the_catalog_fetched_without_the_picker() {
+        let (_dir, mut app) = app();
+        // No cache, so the startup load failed; a model is configured, so the fetch
+        // follows on its own rather than waiting for the picker to be opened.
+        app.config.llm.active = Some(ModelSelection {
+            provider: "fake".to_owned(),
+            model: "fake-analysis-1".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+        });
+        app.record_catalog_job(9);
+        assert!(matches!(
+            app.catalog_unavailable(9),
+            Some(Effect::LoadCatalog(CatalogPolicy::Refresh))
+        ));
+        // Without a configured model the picker is where a model is chosen, so no
+        // fetch is started behind the user's back.
+        let (_dir2, mut bare) = super::tests::app();
+        bare.record_catalog_job(9);
+        assert!(bare.catalog_unavailable(9).is_none());
+        // And a catalog that arrived is never fetched again by this path.
+        let (_dir3, mut loaded) = super::tests::app();
+        loaded.config.llm.active = Some(ModelSelection {
+            provider: "fake".to_owned(),
+            model: "fake-analysis-1".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+        });
+        loaded.record_catalog_job(9);
+        loaded.catalog = Some(crate::application::models::CatalogState {
+            load: crate::ports::catalog::CatalogLoad {
+                catalog: crate::domain::model::Catalog::from_json("{}").expect("empty"),
+                source: crate::ports::catalog::CatalogSource::Fetched,
+            },
+            providers: Vec::new(),
+        });
+        assert!(loaded.catalog_unavailable(9).is_none());
+    }
+
+    #[test]
+    fn the_automatic_catalog_fetch_happens_once() {
+        let (_dir, mut app) = app();
+        app.config.llm.active = Some(ModelSelection {
+            provider: "fake".to_owned(),
+            model: "fake-analysis-1".to_owned(),
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+        });
+        app.record_catalog_job(9);
+        assert!(app.catalog_unavailable(9).is_some());
+        // A second failure is a real failure: fetching again would be a loop.
+        app.record_catalog_job(10);
+        assert!(app.catalog_unavailable(10).is_none());
+    }
+
+    #[test]
+    fn a_gathered_bundle_is_not_a_run_in_flight() {
+        let (_dir, mut app) = app();
+        app.panel.state = crate::tui::app::AnalysisState::Gathering;
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "PR #141",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        app.apply_context(
+            bundle,
+            crate::application::analysis::AnalysisIntent::Estimate,
+        );
+        assert_eq!(app.panel.state, crate::tui::app::AnalysisState::Confirming);
+        assert!(!app.analysis_state().is_running());
+        assert!(app.analysis_state().is_confirming());
     }
 
     #[test]

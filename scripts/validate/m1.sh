@@ -328,7 +328,7 @@ else
     bad "the mode-only placeholder is missing"
   fi
 
-  if printf '%s' "$SCREEN" | grep -q "Files (4)"; then
+  if printf '%s' "$SCREEN" | grep -q "order (4)"; then
     ok "the file tree lists every changed file, rename included"
   else
     bad "the file tree did not list the files"

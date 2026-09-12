@@ -460,7 +460,12 @@ impl PickerState {
         }
         let empty = self.rows.is_empty() && self.step != Step::Key;
         footer.push(Line::from(Span::styled(
-            if empty {
+            if empty && self.query.is_empty() {
+                // An empty list with no filter is not a failed search: it is a
+                // catalog that did not load, and saying "nothing matches" sent the
+                // reader looking for a filter to clear.
+                "no models to choose from — Esc, then <leader>m again to retry".to_owned()
+            } else if empty {
                 "nothing matches; <C-u> clears the filter".to_owned()
             } else {
                 match self.step {
@@ -901,6 +906,26 @@ mod tests {
             "",
         )]);
         assert_eq!(picker.cursor(), 0);
+    }
+
+    #[test]
+    fn an_empty_list_does_not_blame_the_filter_when_there_is_none() {
+        // The failure this fixes: a catalog that could not be fetched showed "nothing
+        // matches; <C-u> clears the filter", which is advice about a filter that was
+        // never set.
+        let mut picker = PickerState::new();
+        assert!(picker.query().is_empty());
+        assert!(picker.rows().is_empty());
+        let footer = picker.footer_lines(&Theme::default(), None);
+        let text = format!("{footer:?}");
+        assert!(text.contains("no models to choose from"), "{text}");
+        assert!(!text.contains("nothing matches"), "{text}");
+
+        // With a filter typed, the old advice is right.
+        picker.push_char('z');
+        let footer = picker.footer_lines(&Theme::default(), None);
+        let text = format!("{footer:?}");
+        assert!(text.contains("nothing matches"), "{text}");
     }
 
     #[test]

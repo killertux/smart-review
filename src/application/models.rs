@@ -399,6 +399,69 @@ pub fn connection_check(resolved: &ResolvedSelection, key: ApiKey) -> ChatReques
     request
 }
 
+/// The request that runs an analysis (FR-4.1, FR-4.6).
+///
+/// Separate from [`connection_check`] because the two ask for opposite things: the
+/// check wants the cheapest possible answer and turns thinking off, while the analysis
+/// wants as much room as the catalog allows and sends the thinking settings the user
+/// chose (FR-4.8).
+#[must_use]
+pub fn analysis_chat(
+    resolved: &ResolvedSelection,
+    key: ApiKey,
+    output_limit: Option<u32>,
+) -> ChatRequest {
+    let mut request = ChatRequest::new(
+        resolved.provider.clone(),
+        resolved.model.clone(),
+        resolved.route.clone(),
+        key,
+        String::new(),
+    );
+    request.base_url.clone_from(&resolved.base_url);
+    request.thinking.clone_from(&resolved.thinking);
+    // The output cap comes from the catalog when it declares one: asking for more
+    // than a model can produce is a truncation, not a bigger answer (FR-4.7).
+    request.max_tokens = output_limit.map(|limit| limit.min(DEFAULT_MAX_TOKENS));
+    request.timeout_secs = ANALYSIS_TIMEOUT_SECS;
+    request
+}
+
+/// The context budget for one analysis (FR-4.6, FR-4.7, Appendix B.3).
+///
+/// Three inputs, in the order the requirements give them: the model's own
+/// `limit.context` when the catalog declares one, the user's `max_context_tokens`
+/// otherwise, and room for the answer. The reservation matters — a prompt that fills
+/// the whole window leaves the model nothing to answer with, which reads to the user as
+/// truncation rather than as a full context.
+#[must_use]
+pub fn context_budget(
+    catalog_limit: Option<u32>,
+    configured: u32,
+    output_reserved: Option<u32>,
+) -> u32 {
+    /// The least context worth sending: below this the bundle is not an analysis of
+    /// anything in particular, and a smaller request would be a worse answer rather
+    /// than a cheaper one.
+    const FLOOR: u32 = 4_096;
+    /// What is held back for the answer when the caller does not say.
+    const DEFAULT_RESERVE: u32 = 8_192;
+
+    let base = catalog_limit.unwrap_or(configured).max(FLOOR);
+    let reserve = output_reserved.unwrap_or(DEFAULT_RESERVE).min(base / 2);
+    base.saturating_sub(reserve).max(FLOOR)
+}
+
+/// How long an analysis may take before it is given up on.
+///
+/// Long, because a whole pull request is a whole pull request: a large diff with
+/// reasoning on can legitimately take minutes, and a timeout that fires early would
+/// waste exactly the tokens it was trying to save.
+pub const ANALYSIS_TIMEOUT_SECS: u64 = 600;
+
+/// The most tokens an analysis is allowed to ask for.
+const DEFAULT_MAX_TOKENS: u32 = 32_768;
+
 /// What is known about the key for one provider (FR-4.5, NFR-3.1).
 ///
 /// # Errors

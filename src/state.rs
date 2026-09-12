@@ -22,6 +22,14 @@ pub struct AppState {
     pub last_pr: Option<u64>,
     /// Last focused pane, by name.
     pub focus: Option<String>,
+    /// Repositories whose owner has been shown what an analysis sends, and agreed
+    /// (FR-4.6).
+    ///
+    /// A one-time notice per repository, so it is a property of the user's
+    /// relationship with a repository rather than of a session, and it belongs here
+    /// with the other small values that survive a restart.
+    #[serde(default)]
+    pub analysis_opt_in: Vec<String>,
 }
 
 /// Everything that can go wrong while reading or writing state.
@@ -99,6 +107,7 @@ mod tests {
             last_repo: Some("github.com/acme/service".to_owned()),
             last_pr: Some(141),
             focus: Some("diff".to_owned()),
+            analysis_opt_in: vec!["github.com/acme/service".to_owned()],
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path).unwrap(), state);

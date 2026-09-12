@@ -129,7 +129,7 @@ mod tests {
         assert!(rendered.contains("filters"), "{rendered}");
         assert!(rendered.contains("[is:open]"), "{rendered}");
         // No file tree, which belongs to the review screen.
-        assert!(!rendered.contains("Files ("), "{rendered}");
+        assert!(!rendered.contains("order ("), "{rendered}");
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
             .unwrap();
         let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
 
-        assert!(rendered.contains("Files (0)"), "{rendered}");
+        assert!(rendered.contains("path order (0)"), "{rendered}");
         assert!(
             !rendered.contains("[is:open]"),
             "the list is not drawn behind the review screen: {rendered}"

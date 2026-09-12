@@ -32,6 +32,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::Startup;
+use crate::application::analysis::AnalysisIntent;
 use crate::application::environment::DetectRequest;
 use crate::application::prs::CachePolicy;
 use crate::domain::repo::RepoId;
@@ -92,7 +93,9 @@ pub fn run(startup: Startup) -> Result<()> {
     // A model configured in an earlier run is resolved from the cache, if there is
     // one: the status line can then name it, and `:model show` can say what is wrong
     // with it, without the 4 MB catalog fetch that the picker asks for when it opens
-    // (FR-4.7 keeps the network for an explicit request).
+    // (FR-4.7 keeps the network for an explicit request). When there is no cache the
+    // fetch follows by itself, because a user who has already chosen a model should
+    // not have to open a picker to make the app notice — see `catalog_unavailable`.
     if app.config.llm.active.is_some() {
         let _ = apply(
             Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::CacheOnly),
@@ -213,45 +216,7 @@ pub(crate) fn apply(
             }
         }
 
-        Effect::ReloadDiff => {
-            // The head SHA keys the cached diff, so a reload needs the open PR's.
-            let Some(detail) = app.detail.as_ref() else {
-                return pending_effects;
-            };
-            let number = detail.summary.number;
-            let head_sha = detail.summary.head_sha.clone();
-            let options = app.diff_options;
-
-            // Which source answers depends on whether the code is on disk yet
-            // (FR-3.2). The forge is always the fallback: a worktree that cannot be
-            // built must not mean a diff that cannot be read.
-            let job = match (&app.workspace, app.workspace_ready()) {
-                (Some(workspace), true) => Job::LocalPatch {
-                    request: Box::new(crate::ports::workspace::DiffRequest {
-                        path: workspace.path.clone(),
-                        base_sha: workspace.base_sha.clone(),
-                        head_sha: workspace.head_sha.clone(),
-                        options,
-                    }),
-                    number,
-                    head_sha: head_sha.clone(),
-                    options,
-                },
-                _ => Job::Patch { number, head_sha },
-            };
-            let id = runner.submit(job);
-            app.patch_job = id;
-            app.diff_loading = true;
-            // The second step of the same wait: fetching a large diff is the slow half.
-            app.advance_opening();
-
-            // Ask for the worktree in the background while the diff is being read, but
-            // only once per pull request: this handler runs again for every context or
-            // whitespace change (FR-3.1).
-            if app.workspace.is_none() && app.workspace_job == 0 && app.wants_workspace() {
-                pending_effects.push(Effect::EnsureWorkspace(number));
-            }
-        }
+        Effect::ReloadDiff => reload_diff(app, runner, &mut pending_effects),
 
         Effect::CopyPath(path) => {
             // OSC 52 asks the terminal to set the clipboard. A terminal that does not
@@ -274,6 +239,17 @@ pub(crate) fn apply(
             }
         }
 
+        // The analysis effects are their own group for the same reason the model
+        // ones are: they share state, and they queue each other (a gather is followed
+        // by the request it was gathered for).
+        Effect::LoadAnalysis
+        | Effect::GatherContext(_)
+        | Effect::RunAnalysis { .. }
+        | Effect::CancelAnalysis
+        | Effect::SavePlan(_) => {
+            let _ = apply_analysis_effect(&effect, app, runner, &mut pending_effects);
+        }
+
         // The model, key and workspace effects are their own group: they share the
         // picker's state and they queue work for each other (a saved key commits the
         // selection, which then asks to be checked).
@@ -289,6 +265,150 @@ pub(crate) fn apply(
     }
 
     pending_effects
+}
+
+/// Reloads the diff of the open pull request, from the best source available (FR-3.2).
+///
+/// Extracted from [`apply`] because it is the one effect with a decision in it — the
+/// worktree if the code is on disk, the forge otherwise — plus two follow-ups.
+fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<Effect>) {
+    // The head SHA keys the cached diff, so a reload needs the open PR's.
+    let Some(detail) = app.detail.as_ref() else {
+        return;
+    };
+    let number = detail.summary.number;
+    let head_sha = detail.summary.head_sha.clone();
+    let options = app.diff_options;
+
+    // Which source answers depends on whether the code is on disk yet (FR-3.2). The
+    // forge is always the fallback: a worktree that cannot be built must not mean a
+    // diff that cannot be read.
+    let job = match (&app.workspace, app.workspace_ready()) {
+        (Some(workspace), true) => Job::LocalPatch {
+            request: Box::new(crate::ports::workspace::DiffRequest {
+                path: workspace.path.clone(),
+                base_sha: workspace.base_sha.clone(),
+                head_sha: workspace.head_sha.clone(),
+                options,
+            }),
+            number,
+            head_sha: head_sha.clone(),
+            options,
+        },
+        _ => Job::Patch { number, head_sha },
+    };
+    let id = runner.submit(job);
+    app.patch_job = id;
+    app.diff_loading = true;
+    // The second step of the same wait: fetching a large diff is the slow half.
+    app.advance_opening();
+
+    // The analysis cache is checked on the same occasion: a diff is reloaded when a
+    // pull request opens and when its context changes, and both are moments when the
+    // head may have moved (FR-4.3).
+    pending_effects.push(Effect::LoadAnalysis);
+
+    // Ask for the worktree in the background while the diff is being read, but only
+    // once per pull request: this handler runs again for every context or whitespace
+    // change (FR-3.1).
+    if app.workspace.is_none() && app.workspace_job == 0 && app.wants_workspace() {
+        pending_effects.push(Effect::EnsureWorkspace(number));
+    }
+}
+
+/// Handles the effects that read, gather or run an analysis (FR-4.1, FR-4.3, FR-4.6).
+///
+/// Returns whether the effect belonged to this group, so `apply` stays exhaustive.
+fn apply_analysis_effect(
+    effect: &Effect,
+    app: &mut App,
+    runner: &mut JobRunner,
+    pending_effects: &mut Vec<Effect>,
+) -> bool {
+    match effect {
+        Effect::LoadAnalysis => {
+            let Some(key) = app.analysis_key() else {
+                // Nothing is open, or no model is chosen: there is no question to ask
+                // the cache, and asking it with half a key would be a bug.
+                return true;
+            };
+            let id = runner.submit(jobs::Job::LoadAnalysis { key: Box::new(key) });
+            app.record_stored_job(id);
+        }
+
+        Effect::GatherContext(intent) => {
+            let Some(request) = app.analysis_request() else {
+                app.notice(
+                    app::NoticeLevel::Warn,
+                    if app.has_model() {
+                        "open a pull request first".to_owned()
+                    } else {
+                        "choose a provider and model first: <leader>m".to_owned()
+                    },
+                );
+                return true;
+            };
+            app.panel.state = app::AnalysisState::Gathering;
+            let id = runner.submit(jobs::Job::GatherContext {
+                request: Box::new(request),
+                intent: *intent,
+            });
+            app.record_context_job(id);
+        }
+
+        Effect::RunAnalysis { force } => {
+            // Without a bundle there is nothing the user agreed to send, so the run
+            // starts by gathering one (FR-4.6).
+            let Some(bundle) = app.take_context_bundle_for_current_head() else {
+                pending_effects.push(Effect::GatherContext(AnalysisIntent::Estimate));
+                return true;
+            };
+            if *force {
+                // `--force` recomputes; the cache is not consulted and the result
+                // replaces the entry (FR-4.3).
+                app.forget_analysis();
+            }
+            let Some(request) = app.analysis_request() else {
+                return true;
+            };
+            app.begin_analysis();
+            let id = runner.submit(jobs::Job::RunAnalysis {
+                request: Box::new(request),
+                bundle: Box::new(bundle),
+            });
+            app.record_analysis_job(id);
+        }
+
+        Effect::CancelAnalysis => {
+            runner.cancel(jobs::Slot::Analyze);
+            runner.cancel(jobs::Slot::Analysis);
+            app.cancelled_analysis();
+        }
+
+        Effect::SavePlan(plan) => {
+            // A small, local write next to the analysis it belongs to: the same
+            // exception the config write-back gets, and it happens here because this
+            // is where the cache lives.
+            let Some(repo) = app
+                .environment()
+                .map(|environment| environment.repo.clone())
+            else {
+                return true;
+            };
+            let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
+                return true;
+            };
+            if let Err(error) = app.analysis_cache.put_plan(&repo, pr, plan) {
+                app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not save the review order: {error}"),
+                );
+            }
+        }
+
+        _ => return false,
+    }
+    true
 }
 
 /// Handles the effects that configure a model, a key or the worktrees.
@@ -438,6 +558,11 @@ fn drain_completions(
     clock: &Arc<dyn Clock>,
     workspace: &Arc<dyn crate::ports::WorkspacePort>,
 ) -> Vec<Effect> {
+    // Streaming text arrives on its own channel, so it is drained with the
+    // completions: both are "what the background has to say right now" (FR-4.4).
+    for progress in runner.poll_progress() {
+        app.apply_progress(progress);
+    }
     let mut follow_ups: Vec<Effect> = Vec::new();
     for completion in runner.poll() {
         let detected = matches!(completion.outcome, Outcome::Environment(_));
@@ -449,6 +574,8 @@ fn drain_completions(
                 cache.clone(),
                 clock.clone(),
                 workspace.clone(),
+                app.analysis_cache.clone(),
+                runner.llm(),
             )
         {
             runner.set_executor(executor);
@@ -506,18 +633,22 @@ pub(crate) fn executor_for(
     cache: Arc<dyn crate::ports::CacheStore>,
     clock: Arc<dyn Clock>,
     workspace: Arc<dyn crate::ports::WorkspacePort>,
+    analysis: Arc<dyn crate::ports::AnalysisCachePort>,
+    llm: std::sync::Arc<dyn crate::ports::LlmPort>,
 ) -> Option<Arc<Executor>> {
     let repo: RepoId = app.environment.as_ref()?.repo.clone();
-    Some(Arc::new(Executor::new(
-        factory.forge(&repo),
+    Some(Arc::new(Executor::new(jobs::ExecutorPorts {
+        forge: factory.forge(&repo),
         cache,
         clock,
         workspace,
+        analysis,
+        llm,
         repo,
-        CachePolicy {
+        policy: CachePolicy {
             list_ttl_secs: app.config.cache.ttl_list_secs,
             detail_ttl_secs: app.config.cache.ttl_detail_secs,
             ..CachePolicy::default()
         },
-    )))
+    })))
 }

@@ -539,6 +539,211 @@ impl crate::ports::LlmPort for NoLlm {
     }
 }
 
+/// A resolved environment, for tests that need a repository and a forge (FR-1.1).
+pub(crate) fn environment() -> crate::domain::environment::Environment {
+    crate::domain::environment::Environment {
+        repo: crate::domain::repo::RepoId::new("github.com", "acme", "service"),
+        mode: crate::domain::environment::RunMode::InRepo,
+        remote: Some("origin".to_owned()),
+        root: Some(std::path::PathBuf::from("/src/service")),
+        default_branch: Some("main".to_owned()),
+        git_version: "2.43.0".to_owned(),
+        gh: crate::domain::environment::GhInstall {
+            path: std::path::PathBuf::from("/usr/bin/gh"),
+            version: "2.45.0".to_owned(),
+            account: Some("tester".to_owned()),
+            scopes: vec!["repo".to_owned()],
+        },
+    }
+}
+
+/// A selection that is ready to use, for tests that need a model (FR-4.5).
+pub(crate) fn resolved_model() -> crate::application::models::ResolvedSelection {
+    crate::application::models::ResolvedSelection {
+        provider: "deepseek".to_owned(),
+        model: "deepseek-v4-pro".to_owned(),
+        route: crate::domain::model::Route::Native(crate::domain::model::NativeBackend::DeepSeek),
+        base_url: None,
+        env_var: Some("DEEPSEEK_API_KEY".to_owned()),
+        env_source: None,
+        from_file: true,
+        thinking: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// A pull request detail for the analysis tests (FR-4.1).
+pub(crate) fn analysis_detail() -> crate::domain::pr::PullRequestDetail {
+    let summary = crate::domain::pr::PullRequestSummary {
+        number: 141,
+        title: "Round half up".to_owned(),
+        author: "someone".to_owned(),
+        state: crate::domain::pr::PrState::Open,
+        is_draft: false,
+        base_ref: "main".to_owned(),
+        head_ref: "rounding".to_owned(),
+        head_sha: "abc123".to_owned(),
+        created_at: crate::domain::time::from_unix_secs(0),
+        updated_at: crate::domain::time::from_unix_secs(0),
+        additions: 4,
+        deletions: 2,
+        changed_files: 2,
+        labels: Vec::new(),
+        review_decision: None,
+        checks: crate::domain::pr::CheckSummary::default(),
+        url: "https://example.invalid/141".to_owned(),
+        is_cross_repository: false,
+    };
+    crate::domain::pr::PullRequestDetail {
+        summary,
+        body: "Fixes a rounding bug.".to_owned(),
+        merge_state_status: None,
+        reviewers: Vec::new(),
+        commits: vec![crate::domain::pr::Commit {
+            sha: "abcdef1234567890".to_owned(),
+            summary: "round half up".to_owned(),
+            author: "someone".to_owned(),
+            committed_at: crate::domain::time::from_unix_secs(0),
+        }],
+        checks: Vec::new(),
+        reviews: Vec::new(),
+        comments: Vec::new(),
+        base_sha: None,
+    }
+}
+
+/// A patch with two files, so a plan has something to order (FR-4.2).
+pub(crate) fn analysis_patch() -> crate::domain::diff::Patch {
+    crate::domain::diff::parse_patch(
+        "diff --git a/src/domain/money.rs b/src/domain/money.rs\n\
+         --- a/src/domain/money.rs\n\
+         +++ b/src/domain/money.rs\n\
+         @@ -1 +1 @@\n\
+         -old\n\
+         +new\n\
+         diff --git a/tests/money.rs b/tests/money.rs\n\
+         new file mode 100644\n\
+         --- /dev/null\n\
+         +++ b/tests/money.rs\n\
+         @@ -0,0 +1 @@\n\
+         +fn it_rounds() {}\n",
+    )
+}
+
+/// An analysis document for the panel tests (FR-4.1).
+pub(crate) fn stored_analysis(head_sha: &str) -> crate::ports::StoredAnalysis {
+    let index = crate::domain::analysis::PathIndex::from_paths(
+        ["src/domain/money.rs", "tests/money.rs"].map(str::to_owned),
+    );
+    let normalized = crate::domain::analysis::normalize(
+        r#"{"summary": "Billing rounds half up.", "intent": "fix a bug",
+            "risk_areas": [{"title": "Rounding", "severity": "high",
+                            "files": ["src/domain/money.rs"], "why": "money"}],
+            "review_plan": [{"order": 1, "group": "domain", "rationale": "rules first",
+                             "files": ["src/domain/money.rs"]},
+                            {"order": 2, "group": "tests", "rationale": "then the tests",
+                             "files": ["tests/money.rs"]}],
+            "per_file_notes": [{"path": "src/domain/money.rs", "change": "rounding",
+                                "notes": "check the sign", "review_focus": ["negatives"]}],
+            "suggested_questions": ["Documented?"]}"#,
+        &index,
+        "deepseek/deepseek-v4-pro",
+        head_sha,
+        "2026-01-01T00:00:00Z",
+        crate::domain::analysis::AnalysisUsage::default(),
+    )
+    .expect("the fixture normalizes");
+    crate::ports::StoredAnalysis {
+        key: crate::ports::AnalysisKey {
+            repo: "github.com/acme/service".to_owned(),
+            pr: 141,
+            head_sha: head_sha.to_owned(),
+            provider: "deepseek".to_owned(),
+            model: "deepseek-v4-pro".to_owned(),
+            thinking: None,
+            prompt_version: crate::domain::analysis::PROMPT_VERSION,
+        },
+        analysis: normalized.analysis,
+        raw: "{}".to_owned(),
+        warnings: normalized.warnings,
+        repaired: false,
+        stored_at: 1_767_225_600,
+    }
+}
+
+/// An analysis cache in memory, for tests that run the analysis path (FR-4.3).
+#[derive(Debug, Default)]
+pub(crate) struct InMemoryAnalysis {
+    entries: Mutex<BTreeMap<String, crate::ports::StoredAnalysis>>,
+    plans: Mutex<BTreeMap<String, crate::domain::plan::Plan>>,
+}
+
+impl crate::ports::AnalysisCachePort for InMemoryAnalysis {
+    fn get(
+        &self,
+        key: &crate::ports::AnalysisKey,
+    ) -> Result<Option<crate::ports::StoredAnalysis>, crate::ports::AnalysisCacheError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key.digest())
+            .cloned())
+    }
+
+    fn list(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Vec<crate::ports::StoredAnalysis>, crate::ports::AnalysisCacheError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|stored| stored.key.repo == repo.key() && stored.key.pr == pr)
+            .cloned()
+            .collect())
+    }
+
+    fn put(
+        &self,
+        stored: &crate::ports::StoredAnalysis,
+    ) -> Result<(), crate::ports::AnalysisCacheError> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stored.key.digest(), stored.clone());
+        Ok(())
+    }
+
+    fn plan(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Option<crate::domain::plan::Plan>, crate::ports::AnalysisCacheError> {
+        Ok(self
+            .plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&format!("{}/pr-{pr}", repo.key()))
+            .cloned())
+    }
+
+    fn put_plan(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+        plan: &crate::domain::plan::Plan,
+    ) -> Result<(), crate::ports::AnalysisCacheError> {
+        self.plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(format!("{}/pr-{pr}", repo.key()), plan.clone());
+        Ok(())
+    }
+}
+
 /// A job runner wired for tests: the real ports detection needs, and the two the
 /// picker uses replaced by ones that refuse.
 pub(crate) fn test_job_runner(

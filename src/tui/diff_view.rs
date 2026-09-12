@@ -108,6 +108,22 @@ pub struct TreeRow {
 /// What a tree row stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeKind {
+    /// A review-plan group (FR-4.2): a heading the ordered view is read through.
+    Group {
+        /// The group's name.
+        name: String,
+        /// Where it sits in the recommended order, from one.
+        order: u32,
+        /// How many files are in it.
+        files: usize,
+        /// Whether its files are folded.
+        folded: bool,
+    },
+    /// The sentence explaining why a group is read where it is (FR-4.2).
+    Rationale {
+        /// The explanation.
+        text: String,
+    },
     /// A directory, with the files underneath it.
     Directory {
         /// Its path, used as the fold key.
@@ -227,6 +243,11 @@ pub struct DiffView {
     /// Whether the diff was produced with whitespace ignored. Read-only in M1, for
     /// the same reason as [`Self::context`].
     pub ignore_whitespace: bool,
+    /// Which order the tree is in (FR-3.5).
+    pub order: crate::domain::plan::OrderMode,
+    /// The review plan, when there is one. The heuristic plan is present as soon as a
+    /// patch is, so the recommended order always works (FR-3.5, DEC-10).
+    pub plan: Option<crate::domain::plan::Plan>,
 }
 
 impl DiffView {
@@ -260,6 +281,8 @@ impl DiffView {
             split: false,
             context: 3,
             ignore_whitespace: false,
+            order: crate::domain::plan::OrderMode::Path,
+            plan: None,
         };
         view.rebuild();
         view
@@ -274,11 +297,104 @@ impl DiffView {
         let (split, index) = build_split(&self.rows);
         self.split_rows = split;
         self.split_index = index;
-        self.tree = build_tree(&self.patch, &self.folded_dirs);
+        self.tree = self.build_tree();
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
         if self.tree_cursor >= self.tree.len() {
             self.tree_cursor = self.tree.len().saturating_sub(1);
         }
+    }
+
+    /// The paths the patch changed, in the patch's own order.
+    #[must_use]
+    pub fn paths(&self) -> Vec<String> {
+        self.patch
+            .files
+            .iter()
+            .filter_map(|file| file.path().map(ToString::to_string))
+            .collect()
+    }
+
+    /// Sets the review plan, keeping the order mode.
+    pub fn set_plan(&mut self, plan: Option<crate::domain::plan::Plan>) {
+        self.plan = plan;
+        // With a plan available the recommended order is the useful default, which is
+        // the whole point of analysing a pull request (FR-3.5). Without one the tree
+        // stays in path order rather than in a heuristic order the user did not ask
+        // for.
+        if self.plan.is_some() && self.order == crate::domain::plan::OrderMode::Path {
+            self.order = crate::domain::plan::OrderMode::Recommended;
+        }
+        self.rebuild_tree();
+    }
+
+    /// Switches between the recommended and path orders, keeping the current file.
+    ///
+    /// "Preserves the current file when possible" is a requirement (FR-3.5), and it is
+    /// also the only way the toggle does not feel like it moved the ground.
+    pub fn set_order(&mut self, order: crate::domain::plan::OrderMode) {
+        if self.order == order {
+            return;
+        }
+        let file = self.current_file();
+        self.order = order;
+        self.rebuild_tree();
+        if let Some(file) = file {
+            self.focus_file(file);
+        }
+    }
+
+    /// Toggles between the two orders (FR-3.5, `o`).
+    pub fn toggle_order(&mut self) {
+        self.set_order(self.order.toggled());
+    }
+
+    /// Rebuilds the tree alone, which is all an order change needs.
+    pub fn rebuild_tree(&mut self) {
+        self.tree = self.build_tree();
+        if self.tree_cursor >= self.tree.len() {
+            self.tree_cursor = self.tree.len().saturating_sub(1);
+        }
+    }
+
+    /// Moves the tree cursor to a file, wherever it is in the current tree.
+    pub fn focus_file(&mut self, file: usize) {
+        if let Some(index) = self
+            .tree
+            .iter()
+            .position(|row| matches!(row.kind, TreeKind::File { index } if index == file))
+        {
+            self.tree_cursor = index;
+        }
+    }
+
+    /// The tree for the current order.
+    fn build_tree(&self) -> Vec<TreeRow> {
+        if self.order == crate::domain::plan::OrderMode::Recommended
+            && let Some(plan) = &self.plan
+        {
+            return build_plan_tree(plan, &self.patch, &self.folded_dirs);
+        }
+        build_tree(&self.patch, &self.folded_dirs)
+    }
+
+    /// How the current file sits in both orders, for the tree's header (FR-3.5).
+    ///
+    /// The two numbers are what make the toggle honest: the user can see that the file
+    /// they are reading is seventh by path and second by plan before pressing anything.
+    #[must_use]
+    pub fn order_positions(&self) -> Option<String> {
+        let plan = self.plan.as_ref()?;
+        let path = self.current_path()?.to_string();
+        let paths = self.paths();
+        let recommended =
+            plan.position_of(&path, crate::domain::plan::OrderMode::Recommended, &paths)?;
+        let by_path = plan.position_of(&path, crate::domain::plan::OrderMode::Path, &paths)?;
+        // Short, because the tree pane's title is 34 columns wide and a position that
+        // is cut off is a position nobody can read (FR-3.5).
+        let total = plan.len(&paths);
+        Some(format!(
+            "{recommended}/{total} plan · {by_path}/{total} path"
+        ))
     }
 
     /// The split row that shows the cursor, and the rows after it.
@@ -540,6 +656,19 @@ impl DiffView {
                 }
                 self.rebuild();
             }
+            // A group folds like a directory: the rationale and its files are the
+            // detail, and the reader may want only the shape (FR-4.2).
+            TreeKind::Group { name, folded, .. } => {
+                if folded {
+                    self.folded_dirs.remove(&name);
+                } else {
+                    self.folded_dirs.insert(name);
+                }
+                self.rebuild_tree();
+            }
+            // The rationale is not a thing to act on; pressing Enter on it does
+            // nothing rather than something surprising.
+            TreeKind::Rationale { .. } => {}
             TreeKind::File { index } => {
                 self.tree_focused = false;
                 self.goto_file(index);
@@ -593,6 +722,74 @@ impl DiffView {
             file.size_label()
         ))
     }
+}
+
+/// Builds the tree the ordered view shows: one group per plan step, with its
+/// rationale above the files (FR-3.5, FR-4.2).
+///
+/// The files are the *same* files the path tree shows, referenced by index into the
+/// patch, so switching orders never touches the diff model and never re-runs git
+/// (FR-3.5).
+fn build_plan_tree(
+    plan: &crate::domain::plan::Plan,
+    patch: &Patch,
+    folded: &BTreeSet<String>,
+) -> Vec<TreeRow> {
+    let by_path: std::collections::BTreeMap<&str, usize> = patch
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| Some((file.path()?.as_str(), index)))
+        .collect();
+    let mut rows = Vec::new();
+    for group in &plan.groups {
+        let present: Vec<usize> = group
+            .files
+            .iter()
+            .filter_map(|path| by_path.get(path.as_str()).copied())
+            .collect();
+        if present.is_empty() {
+            continue;
+        }
+        let is_folded = folded.contains(&group.group);
+        rows.push(TreeRow {
+            depth: 0,
+            // The renderer adds the number, so the label is only the name.
+            label: group.group.clone(),
+            kind: TreeKind::Group {
+                name: group.group.clone(),
+                order: group.order,
+                files: present.len(),
+                folded: is_folded,
+            },
+        });
+        if !group.rationale.trim().is_empty() && !is_folded {
+            rows.push(TreeRow {
+                depth: 0,
+                label: group.rationale.clone(),
+                kind: TreeKind::Rationale {
+                    text: group.rationale.clone(),
+                },
+            });
+        }
+        if is_folded {
+            continue;
+        }
+        for index in present {
+            // The label is the file's own name, exactly as the path tree sets it, so
+            // the two orders name the same file the same way.
+            let label = patch.files.get(index).map_or_else(String::new, |file| {
+                let full = file.path().map_or_else(String::new, RelPath::to_string);
+                full.rsplit('/').next().unwrap_or(full.as_str()).to_owned()
+            });
+            rows.push(TreeRow {
+                depth: 1,
+                label,
+                kind: TreeKind::File { index },
+            });
+        }
+    }
+    rows
 }
 
 /// Flattens a patch into drawable rows.
@@ -918,6 +1115,134 @@ Binary files /dev/null and b/docs/logo.png differ
     }
 
     #[test]
+    fn the_recommended_order_groups_the_files_and_explains_each_group() {
+        let mut view = view();
+        let paths = view.paths();
+        assert!(paths.len() >= 2, "{paths:?}");
+        let plan = crate::domain::plan::Plan::heuristic("head1", &paths);
+        view.set_plan(Some(plan));
+
+        // A plan switches the view to the recommended order, because that is what
+        // analysing a pull request is for (FR-3.5).
+        assert_eq!(view.order, crate::domain::plan::OrderMode::Recommended);
+        let groups = view
+            .tree
+            .iter()
+            .filter(|row| matches!(row.kind, TreeKind::Group { .. }))
+            .count();
+        assert!(groups >= 1, "{:?}", view.tree);
+        // Every group that is shown explains its position (FR-4.2).
+        for (index, row) in view.tree.iter().enumerate() {
+            if matches!(row.kind, TreeKind::Group { .. }) {
+                assert!(
+                    matches!(
+                        view.tree.get(index + 1).map(|next| &next.kind),
+                        Some(TreeKind::Rationale { .. })
+                    ),
+                    "a group without a rationale: {row:?}"
+                );
+            }
+        }
+        // And every file is still there, exactly once.
+        let files: Vec<usize> = view
+            .tree
+            .iter()
+            .filter_map(|row| match row.kind {
+                TreeKind::File { index } => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files.len(), paths.len(), "{files:?}");
+    }
+
+    #[test]
+    fn switching_orders_keeps_the_file_the_cursor_is_in() {
+        let mut view = view();
+        let paths = view.paths();
+        view.set_plan(Some(crate::domain::plan::Plan::heuristic("head1", &paths)));
+        // Put the cursor in the second file of the patch.
+        view.goto_file(1);
+        let file = view.current_file();
+        assert_eq!(file, Some(1));
+        view.set_order(crate::domain::plan::OrderMode::Path);
+        assert_eq!(view.order, crate::domain::plan::OrderMode::Path);
+        // The diff cursor did not move, and the tree highlights the same file.
+        assert_eq!(view.current_file(), Some(1));
+        assert_eq!(
+            view.tree_cursor,
+            view.tree
+                .iter()
+                .position(|row| matches!(row.kind, TreeKind::File { index } if index == 1))
+                .unwrap()
+        );
+        assert_eq!(
+            view.tree.get(view.tree_cursor).map(|row| &row.kind),
+            Some(&TreeKind::File { index: 1 })
+        );
+        view.toggle_order();
+        assert_eq!(view.order, crate::domain::plan::OrderMode::Recommended);
+        assert_eq!(view.current_file(), Some(1));
+        assert_eq!(
+            view.tree.get(view.tree_cursor).map(|row| &row.kind),
+            Some(&TreeKind::File { index: 1 }),
+            "the file is still selected after toggling back"
+        );
+    }
+
+    #[test]
+    fn a_group_folds_like_a_directory() {
+        let mut view = view();
+        let paths = view.paths();
+        view.set_plan(Some(crate::domain::plan::Plan::heuristic("head1", &paths)));
+        let before = view.tree.len();
+        let group = view
+            .tree
+            .iter()
+            .position(|row| matches!(row.kind, TreeKind::Group { .. }))
+            .expect("a group");
+        view.tree_cursor = group;
+        view.activate_tree();
+        assert!(view.tree.len() < before, "the group folded");
+        view.activate_tree();
+        assert_eq!(view.tree.len(), before, "and it opens again");
+    }
+
+    #[test]
+    fn the_header_says_where_the_file_is_in_each_order() {
+        let mut view = view();
+        let paths = view.paths();
+        view.set_plan(Some(crate::domain::plan::Plan::heuristic("head1", &paths)));
+        view.goto_file(0);
+        let positions = view.order_positions().expect("both orders know the file");
+        assert!(positions.contains("plan"), "{positions}");
+        assert!(positions.contains("path"), "{positions}");
+        assert!(
+            positions.contains(&format!("/{} plan", paths.len())),
+            "{positions}"
+        );
+        // The shape is "position/total plan · position/total path", which is what the
+        // status line has room for (FR-3.5).
+        assert_eq!(
+            positions,
+            format!("1/{} plan · 1/{} path", paths.len(), paths.len())
+        );
+    }
+
+    #[test]
+    fn without_a_plan_the_view_stays_in_path_order() {
+        let view = view();
+        assert_eq!(view.order, crate::domain::plan::OrderMode::Path);
+        assert!(view.plan.is_none());
+        assert!(view.order_positions().is_none());
+        assert!(
+            !view
+                .tree
+                .iter()
+                .any(|row| matches!(row.kind, TreeKind::Group { .. }))
+        );
+    }
+
+    #[test]
     fn a_directory_reports_how_many_files_are_under_it() {
         let view = view();
         let src = view.tree.iter().find(|row| row.label == "src").unwrap();
@@ -926,7 +1251,7 @@ Binary files /dev/null and b/docs/logo.png differ
                 assert_eq!(*files, 1);
                 assert!(!folded);
             }
-            other @ TreeKind::File { .. } => panic!("expected a directory, got {other:?}"),
+            other => panic!("expected a directory, got {other:?}"),
         }
     }
 

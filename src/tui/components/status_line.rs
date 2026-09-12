@@ -15,6 +15,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::tui::app::{App, NoticeLevel};
 use crate::tui::components::padded_line;
+use crate::tui::diff_view::DiffView;
 use crate::tui::keymap::Mode;
 use crate::tui::theme::{Theme, element};
 
@@ -53,7 +54,13 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // In the review screen the cursor's file is what the user is reading, so it
         // belongs in the status line beside the pane name.
         Span::styled(current_file_label(app), background),
+        // Where the file sits in both orders, which is what makes the toggle a
+        // comparison rather than a leap of faith (FR-3.5).
+        Span::styled(order_positions_label(app), background),
         Span::styled(format!("· {} ", model_label(app)), background),
+        // The order and the analysis are what a reviewer is looking at in M2, so
+        // they get the columns the diff source and the model do not need (FR-3.5).
+        Span::styled(analysis_label(app), background),
         Span::styled("· 0 drafts ", background),
     ];
 
@@ -107,6 +114,34 @@ fn model_label(app: &App) -> String {
         (Some(_), Some(problem)) => format!("{PLACEHOLDER} ({problem})"),
         (Some(active), None) => format!("{}/{} (unverified)", active.provider, active.model),
         (None, _) => PLACEHOLDER.to_owned(),
+    }
+}
+
+/// The current file's position in both orders (FR-3.5).
+///
+/// Empty when there is no plan: "1/1 plan · 1/1 path" is a sentence that says nothing.
+fn order_positions_label(app: &App) -> String {
+    match app.review.as_ref().and_then(DiffView::order_positions) {
+        Some(positions) => format!("· {positions} "),
+        None => String::new(),
+    }
+}
+
+/// What the analysis is doing (FR-4.4).
+///
+/// Only the state, never the order: the order is named in the Files pane's title,
+/// where the user is looking when it matters, and a status line that repeats it is a
+/// status line that truncates the key hints for no gain. Empty when nothing is
+/// happening, so the line does not shift once per analysis.
+fn analysis_label(app: &App) -> String {
+    if app.review.is_none() {
+        return String::new();
+    }
+    // The stage while a run is in flight, the result otherwise: the status line is
+    // where a user looks to find out whether anything is happening (NFR-1.2).
+    match app.analysis_state() {
+        crate::tui::app::AnalysisState::Idle => String::new(),
+        state => format!("· {} ", state.label()),
     }
 }
 

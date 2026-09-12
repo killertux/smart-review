@@ -115,6 +115,16 @@ impl Home {
         self.cache().join("models.json")
     }
 
+    /// Cached analyses, one directory per pull request (FR-4.3).
+    ///
+    /// Beside the forge cache rather than inside it: an analysis is keyed by the
+    /// provider and the thinking settings as much as by the commit, so it does not
+    /// belong under the same layout as a pull request's metadata.
+    #[must_use]
+    pub fn analysis_cache(&self) -> PathBuf {
+        self.cache().join("analysis")
+    }
+
     /// Directory holding managed PR worktrees (FR-3.1).
     #[must_use]
     pub fn worktrees(&self) -> PathBuf {

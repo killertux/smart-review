@@ -33,7 +33,7 @@
 | **M0** | Skeleton, rules, CI | `smart-review` opens a themed TUI shell: status line, placeholder panes, modes, `?` help, `<leader>` menu, `:theme`, `:q`. `--version`, `--check`. | `scripts/validate/m0.sh` + manual demo | FR-7.1–7.4, 7.6–7.8, 8.1–8.3, 9.1, 9.2 | ratatui, crossterm, clap, serde, toml, thiserror, anyhow |
 | **M1** | PR browsing & diff reading | Inside a clone: list PRs, filter/search, open one, read metadata + full diff with vim navigation, mouse support, cached. | `scripts/validate/m1.sh` + manual demo | FR-1.1–1.3, 2.1–2.4, 3.2–3.4, 7.5, 7.7, 9.3 | serde_json, `time` (or chrono), unicode-width |
 | **M2a** | Workspace + model configuration | Read a PR from a managed worktree (local diff, context and whitespace toggles), and pick provider/model/thinking + paste a key **in the TUI**, with the choice verified against the provider. | `scripts/validate/m2a.sh` + manual demo | FR-3.1, 3.2 (local), 4.5, 4.7, 4.8 | llm, tokio, reqwest, toml_edit |
-| **M2b** | LLM analysis + ordered review | Press `<leader>a`: the analysis streams in, the panel fills, and the tree reorders to domain → application → infra; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/m2b.sh` + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
+| **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/m2b.sh` (35 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
 | **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/m3.sh` + manual demo | FR-5.1–5.4 | none new |
 | **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` prints commands only. | `scripts/validate/m4.sh` + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
 | **M5** | Polish & release | Visual ranges, thread replies, docs, `NO_COLOR`, release binary + `--version`; backlog items from §11. | `scripts/validate/m5.sh` + manual demo | backlog + NFR polish | decided then |
@@ -212,18 +212,26 @@ names the active model.
 
 **Goal:** the product's differentiator.
 
-**Runnable artifact:** on the PR from M2a, press `<leader>a`: the analysis streams in, the analysis panel fills, and the file tree reorders to domain → application → infra. Press `o` to toggle back to path order. Restart and re-open: cache hit, no network.
+**Runnable artifact:** on the PR from M2a, press `<leader>a`: the first press shows what would be sent and waits, the second streams the answer into a panel and reorders the file tree to the plan the analysis returned (domain → tests → unclassified in the validator's fixture). Press `o` to read the same files in path order. Restart and re-open: cache hit, no network.
 
 **Work items**
-- [ ] Analysis request/response: strict JSON schema + normalize (unknown paths dropped with warning, missing files appended as `unclassified`), one repair retry, raw text viewable on failure (FR-4.1, §7.1).
-- [ ] Analysis cache keyed by `(repo, pr, head_sha, provider, model, thinking, prompt_version)`, atomic writes, stale marking on head change (FR-4.3, DEC-15).
-- [ ] Context bundle builder: metadata + commits + diff + changed files at head + `AGENTS.md`/`CLAUDE.md`/`README.md`, redaction of `.env*`/ignored/oversize/binary, truncation order, token estimate, `:context` inspector + opt-in notice (FR-4.6).
-- [ ] Review plan UI: groups with rationale, recommended vs path order toggle, manual overrides persisted per PR (FR-3.5, FR-4.2, DEC-10 default).
-- [ ] Tests: analysis normalization/repair, cache key sensitivity to thinking, context truncation/redaction, cancellation and superseded-job discard.
+- [x] Analysis request/response: strict JSON schema + normalize (unknown paths dropped with warning, missing files appended as `unclassified`), one repair retry, raw text viewable on failure (FR-4.1, §7.1).
+- [x] Analysis cache keyed by `(repo, pr, head_sha, provider, model, thinking, prompt_version)`, atomic writes, stale marking on head change (FR-4.3, DEC-15).
+- [x] Context bundle builder: metadata + commits + diff + changed files at head + `AGENTS.md`/`CLAUDE.md`/`README.md`, redaction of `.env*`/ignored/oversize/binary, truncation order, token estimate, `:context` inspector + opt-in notice (FR-4.6).
+- [x] Review plan UI: groups with rationale, recommended vs path order toggle, manual overrides persisted per PR (FR-3.5, FR-4.2, DEC-10 default).
+- [x] Tests: analysis normalization/repair, cache key sensitivity to thinking, context truncation/redaction, cancellation and superseded-job discard.
+- [x] `scripts/validate/m2b.sh`: 35 checks, driven end to end against a scripted OpenAI-compatible provider (`scripts/validate/fake_llm.py`), including what the app actually sent.
+
+**Notes on what M2b decided, where it is not obvious from the requirements**
+- **`.gitignore` is enforced by construction.** Only paths that exist in the head revision are considered for the bundle (`git ls-tree`), so an ignored file is not a candidate in the first place; a `.env` that somebody committed by accident is caught by the secret denylist on top of that. The validator asserts on the wire that such a file never reaches the provider.
+- **The truncation order is implemented for the first two steps.** Per-file elision and diff context reduction are done and tested; "oldest chat turns dropped" waits for chat (M3) because there are no turns yet.
+- **The corrections and the repair flag are stored with the document.** They describe the answer rather than the run, so a cache hit reports them exactly as the run that wrote them did (FR-4.1).
+- **The passthrough route was wrong, and is fixed here.** `LLMBackend::OpenAI` speaks the Responses API (`/responses`), which most OpenAI-compatible providers do not implement; the passthrough now builds the crate's generic compatible provider, whose endpoint is `/chat/completions`. Appendix B records it. This was found by the validator, not by review.
+- **The analysis panel does not scroll yet.** It is capped at the terminal height and shows its key hints and its notices first, with `:plan` and `:context` as the escape hatches for what does not fit. Chat (M3) is where the panel gets real scrolling, and the panel was ordered so that the parts with another home come last.
 
 **FR coverage:** FR-3.5, 4.1–4.4, 4.6.
 **Crates to approve:** none new.
-**Risks:** token budgeting without a real tokenizer will be approximate; say so in the UI. A model that answers with prose instead of JSON is a normal outcome, not an exception, so the repair path and the raw-text view are features, not fallbacks.
+**Risks:** token budgeting without a real tokenizer is approximate (the UI says `~`, and Appendix B.3 fixes the approximation); a model that answers with prose instead of JSON is a normal outcome, not an exception, so the repair path and the raw-text view are features rather than fallbacks.
 
 ---
 

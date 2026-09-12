@@ -87,6 +87,8 @@ pub struct Startup {
     pub catalog: Arc<dyn ModelCatalogPort>,
     /// The LLM client (FR-4.4).
     pub llm: Arc<dyn LlmPort>,
+    /// Where analyses and their review-plan overrides are kept (FR-4.3).
+    pub analysis: Arc<dyn crate::ports::AnalysisCachePort>,
 }
 
 /// Resolves which repository to read: the flag wins, then the environment.
@@ -216,6 +218,9 @@ impl Startup {
             clock,
         ));
         let llm: Arc<dyn LlmPort> = Arc::new(LlmCrate::new());
+        let analysis: Arc<dyn crate::ports::AnalysisCachePort> = Arc::new(
+            crate::adapters::analysis_cache::DiskAnalysisCache::new(home.analysis_cache()),
+        );
 
         Ok(Self {
             home,
@@ -244,6 +249,7 @@ impl Startup {
             workspace_port,
             catalog,
             llm,
+            analysis,
         })
     }
 }

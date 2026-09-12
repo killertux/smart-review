@@ -9,14 +9,24 @@
 //! parser, the filter grammar and the check roll-up be tested without a network,
 //! a repository, or a terminal (NFR-5.2).
 
+pub mod analysis;
+pub mod context;
 pub mod diff;
 pub mod environment;
 pub mod model;
+pub mod plan;
 pub mod pr;
 pub mod query;
 pub mod repo;
 pub mod time;
 
+pub use analysis::{
+    ANALYSIS_VERSION, Analysis, AnalysisUsage, FileNote, PROMPT_VERSION, ParseFailure, PathIndex,
+    PlanGroup, RiskArea, Severity, UNCLASSIFIED,
+};
+pub use context::{
+    Bundle, BundleInputs, BundlePolicy, Disposition, Segment, SegmentKind, estimate_tokens,
+};
 pub use diff::{
     DiffLine, DiffSource, FileDiff, FileKind, FileStatus, Hunk, LineKind, Patch, PatchStats,
     RelPath,
@@ -26,6 +36,7 @@ pub use model::{
     Catalog, CatalogError, CatalogModel, Cost, EffortLevel, Limit, NativeBackend, Provider,
     ReasoningOption, Route, Thinking, ThinkingChoice, ThinkingError, ThinkingRequest,
 };
+pub use plan::{OrderMode, Plan, PlanSource};
 pub use pr::{
     CheckRun, CheckState, CheckSummary, Commit, PrState, PullRequestDetail, PullRequestRef,
     PullRequestSummary, Review, ReviewComment, ReviewDecision, ReviewState,

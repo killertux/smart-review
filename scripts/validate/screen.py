@@ -6,7 +6,17 @@ changed, so grepping the stream text matches fragments that were never on screen
 the same time. Replaying the escape sequences reconstructs what the user actually
 saw at the end, which is what the validation checks want to assert on.
 
-Usage: screen.py [--cols N] [--rows N] < captured.log
+Two modes:
+
+- the default prints the **final** screen, which is what a check about the tree, the
+  status line or the tabs wants;
+- `--when PATTERN` prints the screen **at the moment the pattern was on it**, which is
+  what a check about a popup wants: a popup is usually closed by the keystrokes that
+  quit the app, and its text cannot be grepped out of the raw stream because ratatui
+  writes only the cells that changed — the spaces between words are often never
+  written at all.
+
+Usage: screen.py [--cols N] [--rows N] [--when PATTERN] < captured.log
 """
 
 import argparse
@@ -117,11 +127,51 @@ def replay(data: str, cols: int, rows: int) -> str:
     return screen.text()
 
 
+def replay_until(raw: str, cols: int, rows: int, pattern: str) -> str | None:
+    """The screen as it was the first time `pattern` was on it.
+
+    The pattern is checked after every character, because a popup can be drawn and
+    closed inside one keystroke's worth of frames. Only the check is repeated; the
+    screen is rendered when the last character of a possible match has just been
+    written, which keeps this linear in the size of the capture.
+    """
+    matcher = re.compile(pattern)
+    screen = Screen(cols, rows)
+    index = 0
+    tail = pattern[-1]
+    while index < len(raw):
+        character = raw[index]
+        if character == "\x1b":
+            remainder = raw[index:]
+            match = CSI.match(remainder)
+            if match:
+                screen.csi(match.group(1), match.group(2))
+                index += match.end()
+                continue
+            osc = OSC.match(remainder)
+            if osc:
+                index += osc.end()
+                continue
+            index += 2
+            continue
+        screen.put(character)
+        index += 1
+        if character == tail:
+            rendered = screen.text()
+            if matcher.search(rendered):
+                return rendered
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cols", type=int, default=160)
     parser.add_argument("--rows", type=int, default=40)
     parser.add_argument("--path", help="read from this file instead of stdin")
+    parser.add_argument(
+        "--when",
+        help="print the screen as it was when this pattern was visible (text or regex)",
+    )
     arguments = parser.parse_args()
 
     if arguments.path:
@@ -130,7 +180,17 @@ def main() -> int:
     else:
         raw = sys.stdin.buffer.read()
 
-    print(replay(raw.decode("utf-8", errors="replace"), arguments.cols, arguments.rows))
+    text = raw.decode("utf-8", errors="replace")
+    if arguments.when:
+        found = replay_until(text, arguments.cols, arguments.rows, arguments.when)
+        if found is None:
+            # Nothing printed: the pattern was never on screen. A checker compares the
+            # output against what it expected, so silence is the negative answer.
+            return 1
+        print(found)
+        return 0
+
+    print(replay(text, arguments.cols, arguments.rows))
     return 0
 
 

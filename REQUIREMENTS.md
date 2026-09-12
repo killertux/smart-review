@@ -257,7 +257,7 @@ Acceptance criteria:
 - [ ] Mapping onto the `llm` crate is explicit and documented (Appendix B): toggle → `.reasoning(bool)`, effort → `.reasoning_effort(..)`, budget → `.reasoning_budget_tokens(u32)`. Where the crate cannot express a catalog option (e.g. an `effort` value the crate does not model), the app MUST refuse the combination with an explanation instead of silently downgrading it.
 - [ ] Reasoning token consumption from the provider is displayed alongside the response's token usage (the crate exposes `usage.reasoning_tokens`).
 - [ ] **v1 does not display the reasoning/thinking trace.** Nothing streams reasoning (`StreamDelta` carries `content` and `tool_calls` only), and only the Anthropic backend's non-streamed response exposes one, so the UI MUST NOT imply a trace is viewable when thinking is on. (Displaying it is DEC-18; Appendix B records what the pinned crate exposes as of M2a.)
-- [ ] Thinking settings are part of the analysis cache key (FR-4.3), so flipping thinking never yields a stale cache hit.
+- [ ] Thinking settings are part of the analysis cache key (FR-4.3), so flipping thinking never yields a stale cache hit. *(M2b: `AnalysisKey::digest` covers provider, model and thinking; tested.)*
 - [ ] Thinking changes are shown in the status line so the user can never be unsure which mode produced an answer.
 
 ### FR-5 Chat
@@ -776,6 +776,7 @@ Rules: unknown fields tolerated; `review_plan[].files` MUST be a subset of the c
 ### 7.3 Prompt contract (normative properties, wording is free)
 - System prompt: role (senior reviewer), output format (the JSON schema above, no prose outside JSON for analysis), grounding rules (only claim what is in the provided context and name the file when asserting), language (mirror the PR's language), and the repository conventions extracted from `AGENTS.md`.
 - Analysis is requested once for the whole PR; per-file explanation is a separate, smaller request (FR-4.1 granularity, M2).
+- **The analysis is one streamed request, and a repair is a second one** (M2b): the first answer is normalized against the diff, and only a failure to parse triggers the retry, which quotes the reason and the previous text. A model that answers with prose is a normal event, so the raw text is kept and shown (`:analyze raw`) whether or not the retry worked.
 - Chat uses a separate system prompt: cite file paths for claims, admit uncertainty, prefer asking for a file when the context lacks it (only if tool use is enabled), never fabricate line numbers.
 - Every request records `prompt_version`; changing prompt semantics bumps it and invalidates cache.
 
@@ -949,6 +950,7 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 - Analysis = one async request returning JSON (schema §7.1) with a repair retry; per-file explanation = one small request per file, cached individually (FR-4.1); chat = streaming, history trimmed per FR-4.6.
 - Streaming MUST be used for analysis and chat (FR-4.4).
 - Pin the resolved crate version in `Cargo.toml` and record it plus the re-verified API surface here at M2. The `agent` feature is **not** needed in v1 (DEC-2: no tool loop).
+- **The passthrough route must not use `LLMBackend::OpenAI` (verified at M2b, `llm` 1.3.8).** That backend sends both chat and streaming to the **Responses API** (`{base_url}/responses`), which OpenAI implements and most "OpenAI-compatible" providers do not — pointing it at another provider's `api` URL 404s on every request. The passthrough therefore builds `providers::openai_compatible::OpenAICompatibleProvider<T>` directly with a `T` whose `CHAT_ENDPOINT` is `chat/completions`; the crate's own OpenAI-compatible backends (openrouter, mistral, groq, cohere, xai, huggingface) are the same generic provider, which is why only the OpenAI entry needed the workaround. `adapters/llm.rs` holds the adapter as `Box<dyn ChatProvider>` (the crate's `LLMProvider` is a `ChatProvider`; the box upcast is stable since Rust 1.86) so both kinds travel the same path.
 - Extend Appendix C at M2 with: pick a provider/model with no key → masked prompt → key stored `0600` → analysis runs; then flip thinking on/off and confirm the analysis cache misses.
 
 ### B.3 Budgeting
@@ -962,5 +964,6 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 - [ ] 80×24 terminal is usable; resizing never loses the cursor position.
 - [ ] `Ctrl-C`, `SIGTERM`, and a forced panic all restore the terminal.
 - [ ] Kill the network mid-analysis and mid-chat → cancellable, explained, no lost draft.
+- [ ] `<leader>a` on a real pull request: the estimate and the file list first, then the analysis streaming in, then the tree in the recommended order; `o` returns to path order, `J`/`K` moves a group, and restarting the app shows the analysis from cache without calling the provider (verify in `logs/`).
 - [ ] `--dry-run` prints the exact commands for fetch, worktree, and publish and performs no mutation.
 - [ ] Second launch reuses cache and workspace and makes no unnecessary network calls (`:` shows the job log).
