@@ -14,13 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  tests:
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +25,23 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache the build
+      - name: Cache the cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          # Kache (next step) caches compiled artifacts content-addressed; keep
+          # rust-cache only for the registry/git downloads so the two do not
+          # store two copies of `target/` under GitHub's cache quota.
+          cache-targets: "false"
+
+      - name: Cache compiled artifacts (kache)
+        uses: kunobi-ninja/kache-action@v1
+        with:
+          # PRs restore read-only; only pushes to the default branch publish.
+          save-cache: ${{ github.ref_name == github.event.repository.default_branch }}
+          # No sticky PR comment; the job summary still reports cache stats.
+          pr-comment: "false"
+          # rustls pulls in `ring`, which compiles C and assembly through `cc`.
+          cache-c-cpp: "true"
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -44,13 +54,13 @@ jobs:
       - name: Tests
         run: cargo test --all-features
 
-      - name: Release build
-        run: cargo build --release
+      - name: Build
+        run: cargo build
 
       - name: Smoke test the binary
         run: |
-          ./target/release/smart-review --version
-          ./target/release/smart-review --help
+          ./target/debug/smart-review --version
+          ./target/debug/smart-review --help
 
       # `--check` runs the same detection the interface does, so on a runner with no
       # `gh auth login` it reports an unusable environment and exits 2 — which is the
@@ -59,7 +69,7 @@ jobs:
       - name: Environment report
         run: |
           set +e
-          SMART_REVIEW_HOME="$(mktemp -d)" ./target/release/smart-review --check >/tmp/check.txt 2>&1
+          SMART_REVIEW_HOME="$(mktemp -d)" ./target/debug/smart-review --check >/tmp/check.txt 2>&1
           code=$?
           set -e
           cat /tmp/check.txt
@@ -79,20 +89,17 @@ jobs:
       # The milestones' own gates: formatting, lints, tests, first-run layout,
       # permissions, configuration robustness, and — for M1 — the whole browsing
       # and diff chain driven through a fake `gh`, with the screen reconstructed
-      # from the pty capture. Ubuntu only, because the pty steps need GNU script.
+      # from the pty capture (the pty steps need GNU `script`).
       - name: Milestone validation (M0)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m0.sh
 
       - name: Milestone validation (M1)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m1.sh
 
       # M2a adds a managed worktree, a local diff and the model picker: the validator
       # builds a real repository with a pull request ref, serves the catalog from a
       # local HTTP server, and drives the picker through a pty.
       - name: Milestone validation (M2a)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m2a.sh
 
       # M2b adds the analysis path: the validator stands in for the provider with a
@@ -100,5 +107,4 @@ jobs:
       # stream, normalize, cache, ordered review — runs offline, and the request the
       # app actually sent is checked on the wire for what must and must not be in it.
       - name: Milestone validation (M2b)
-        if: runner.os == 'Linux'
         run: bash scripts/validate/m2b.sh

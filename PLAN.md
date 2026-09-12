@@ -65,7 +65,7 @@ Inside the TUI: switch modes (`:` command line), open `?` help, press `<leader>`
 - [ ] `scripts/validate/m0.sh` — formatting, lints, tests, release build, CLI surface, first-run layout and permissions, graceful degradation on an unusable config value, clean failure on unparseable TOML, and proof that nothing is written inside the repository.
 - [ ] `README.md`: what it is, prerequisites (`git` ≥ 2.30, `gh` ≥ 2.40), quick start, where state lives.
 - [ ] `AGENTS.md` — see the required content below. This is the first file an agent reads; write it before writing code.
-- [ ] `.github/workflows/ci.yml` — jobs `fmt`, `clippy`, `test` on `ubuntu-latest` + `macos-latest`, triggered on pushes to `main` and on all PRs, with `concurrency` cancellation and a Rust build cache. `clippy` runs `-D warnings`; `test` runs `--all-features`.
+- [ ] `.github/workflows/ci.yml` — a single `tests` job on `ubuntu-latest`, triggered on pushes to `main` and on all PRs, with `concurrency` cancellation and a Rust build cache. `clippy` runs `-D warnings`; `test` runs `--all-features`.
 
 *`AGENTS.md` required content (the hard rules)*
 - [ ] Project one-liner + pointers: read `REQUIREMENTS.md` first, then this plan; requirement IDs are the vocabulary for commit messages and PRs.

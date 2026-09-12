@@ -22,7 +22,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP="$(mktemp -d)"
-BIN="target/release/smart-review"
+BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 MODELS="$ROOT/tests/fixtures/models/providers.json"
 
@@ -117,36 +117,29 @@ ttl_hours = 24
 EOF
 }
 
-# Keys are sent in groups separated by `~`, each followed by a pause: opening a pull
-# request is a background job, and the catalog arrives over a socket, so a screen
-# check that races either of them is a check that fails once in ten runs.
+# Keys are sent in groups separated by `~`, each followed by a wait for the group's
+# effect to appear on screen. The drive is the same as m1.sh's: see the comment there.
 run_tui() {
-  local home="$1" keys="$2" fake="$3" log="$4" settle="${5:-1.5}"
-  set +e
-  (sleep 1.5
-   IFS='~' read -ra groups <<<"$keys"
-   for group in "${groups[@]}"; do
-     printf '%b' "$group"
-     sleep "$settle"
-   done
-   sleep 1) \
-    | PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" timeout 40 \
-      script -qefc "stty rows 40 cols 160 2>/dev/null; '$ROOT/$BIN' --repo acme/service ${EXTRA_ARGS:-}" /dev/null \
-    >"$log" 2>&1
-  set -e
+  local home="$1" keys="$2" waits="$3" fake="$4" log="$5" step_timeout="${6:-15}"
+  PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" \
+    python3 "$ROOT/scripts/validate/drive.py" \
+      --cols 160 --rows 40 --log "$log" \
+      --ready "Add retry to the webhook dispatcher" \
+      --step-timeout "$step_timeout" \
+      --keys "$keys" --waits "$waits" -- \
+      "$ROOT/$BIN" --repo acme/service ${EXTRA_ARGS:-}
   if [ -f "$home/logs/smart-review.log" ] && grep -q 'panicked' "$home/logs/smart-review.log"; then
     printf '  note: the interface panicked; see %s\n' "$home/logs/smart-review.log"
   fi
-  python3 "$ROOT/scripts/validate/screen.py" --path "$log" --cols 160 --rows 40
 }
 
 saw() { grep -q "$1"; }
 
 step "1/7 build"
-if cargo build --release --quiet 2>"$TMP/build.log"; then
-  ok "the release binary builds"
+if cargo build --quiet 2>"$TMP/build.log"; then
+  ok "the debug binary builds"
 else
-  bad "the release binary does not build"
+  bad "the debug binary does not build"
   sed -n '1,20p' "$TMP/build.log"
   printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
   exit 1
@@ -158,7 +151,7 @@ make_fake_gh "$FAKE"
 step "2/7 the catalog adapter"
 HOME_CATALOG="$TMP/home-catalog"
 make_home "$HOME_CATALOG"
-SCREEN="$(run_tui "$HOME_CATALOG" ' m~' "$FAKE" "$TMP/catalog.log" 3)"
+SCREEN="$(run_tui "$HOME_CATALOG" ' m~' 'providers,~' "$FAKE" "$TMP/catalog.log")"
 
 if printf '%s' "$SCREEN" | saw "providers,"; then
   ok "the catalog is fetched and summarised"
@@ -182,7 +175,7 @@ fi
 step "3/7 the picker"
 HOME_PICKER="$TMP/home-picker"
 make_home "$HOME_PICKER"
-SCREEN="$(run_tui "$HOME_PICKER" ' m~' "$FAKE" "$TMP/picker.log" 3)"
+SCREEN="$(run_tui "$HOME_PICKER" ' m~' 'providers,~' "$FAKE" "$TMP/picker.log")"
 
 for expected in "DeepSeek" "OpenRouter" "Anthropic"; do
   if printf '%s' "$SCREEN" | saw "$expected"; then
@@ -217,7 +210,8 @@ HOME_FLOW="$TMP/home-flow"
 make_home "$HOME_FLOW"
 # provider (filtered) → model (filtered) → thinking "on" → key → Enter.
 SCREEN="$(run_tui "$HOME_FLOW" \
-  ' m~deep\r~pro\r~\r~sk-validate-key~:q\r' "$FAKE" "$TMP/flow.log" 2)"
+  ' m~deep\r~pro\r~\r~sk-validate-key~:q\r' \
+  'providers,~~~~~deepseek/deepseek-v4-pro' "$FAKE" "$TMP/flow.log")"
 
 if grep -q 'provider = "deepseek"' "$HOME_FLOW/config.toml" 2>/dev/null; then
   ok "the chosen provider is written to config.toml"
@@ -274,7 +268,8 @@ cat >>"$HOME_KEEP/config.toml" <<'EOF'
 [review]
 my_custom_key = "kept"
 EOF
-run_tui "$HOME_KEEP" ' m~deep\r~pro\r~\r~sk-second-key~:q\r' "$FAKE" "$TMP/keep.log" 2 >/dev/null
+run_tui "$HOME_KEEP" ' m~deep\r~pro\r~\r~sk-second-key~:q\r' \
+  'providers,~~~~~deepseek/deepseek-v4-pro' "$FAKE" "$TMP/keep.log" >/dev/null
 if grep -q 'my own notes' "$HOME_KEEP/config.toml" 2>/dev/null; then
   ok "a comment in config.toml survives the write-back"
 else
@@ -331,7 +326,7 @@ document["baseRefName"] = "main"
 json.dump(document, open(path, "w"), indent=1)
 PY
 
-EXTRA_ARGS="--path '$REPO/clone'" run_tui "$HOME_WS" '\r~q' "$FAKE" "$TMP/ws.log" 6 >"$TMP/ws.screen"
+EXTRA_ARGS="--path $REPO/clone" run_tui "$HOME_WS" '\r~q' 'src\.rs~' "$FAKE" "$TMP/ws.log" >"$TMP/ws.screen"
 
 WORKTREE="$HOME_WS/worktrees/acme-service/pr-142"
 if [ -d "$WORKTREE" ]; then
@@ -374,7 +369,7 @@ fi
 
 # Cleaning from a different directory still works: the worktree resolves to the
 # repository that owns it, and the ref was deleted before the worktree that located it.
-SCREEN="$(run_tui "$HOME_WS" ':workspace clean --all\r~q' "$FAKE" "$TMP/clean.log" 2)"
+SCREEN="$(run_tui "$HOME_WS" ':workspace clean --all\r~q' 'removed 1 worktree~' "$FAKE" "$TMP/clean.log")"
 if printf '%s' "$SCREEN" | saw "removed 1 worktree"; then
   ok ":workspace clean removes the worktree"
 else
@@ -393,7 +388,7 @@ step "6/7 offline behaviour"
 kill "$SERVER_PID" 2>/dev/null
 SERVER_PID=""
 sleep 0.5
-SCREEN="$(run_tui "$HOME_CATALOG" ' m~' "$FAKE" "$TMP/catalog-offline.log" 3)"
+SCREEN="$(run_tui "$HOME_CATALOG" ' m~' 'providers,~' "$FAKE" "$TMP/catalog-offline.log")"
 if printf '%s' "$SCREEN" | saw "cached"; then
   ok "a cached catalog is used when the server is gone"
 else
@@ -415,7 +410,7 @@ theme = "dark"
 url = "https://models.dev/api.json"
 ttl_hours = 24
 EOF
-SCREEN="$(run_tui "$HOME_LIVE" ' m~' "$FAKE" "$TMP/live.log" 6)"
+SCREEN="$(run_tui "$HOME_LIVE" ' m~' 'providers,|could not be fetched~' "$FAKE" "$TMP/live.log" 40)"
 if printf '%s' "$SCREEN" | saw "providers,"; then
   ok "the published catalog is readable"
   if printf '%s' "$SCREEN" | saw "unreadable"; then

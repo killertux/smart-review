@@ -724,7 +724,7 @@ Default bindings (all remappable; this is the compiled-in default set):
 **NFR-1.2 Responsiveness** — the event loop MUST NOT block > 50 ms. All IO is job-based (ARCH-5).
 **NFR-1.3 Large inputs** — 10 000-line diffs and 400-file diffs remain usable (virtualized rendering, no full re-layout per frame); memory should stay under ~300 MB for such a PR, excluding cached JSON.
 **NFR-1.4 Cancellation** — every long operation is cancellable within 200 ms of `Esc`.
-**NFR-2.1 Portability** — Linux and macOS are tier 1 (CI on both). Terminal support: any xterm-compatible terminal with 256-color; truecolor used when detected.
+**NFR-2.1 Portability** — Linux and macOS are tier 1 (CI runs on Linux for now; the macOS CI job was removed until the pty steps are portable — see DEC-22). Terminal support: any xterm-compatible terminal with 256-color; truecolor used when detected.
 **NFR-2.2 Dependencies on the environment** — requires `git` ≥ 2.30 and `gh` ≥ 2.40 on `PATH`; absence is a clean, explained failure, never a crash.
 **NFR-2.3 Windows** — best effort; no tier-1 guarantees in v1; paths and process spawning MUST avoid Unix-only assumptions where cheap to do so.
 **NFR-3.1 Secrets** — API keys are stored only in `${SMART_REVIEW_HOME}/credentials.toml` (`0600`, atomic write) and MUST never appear in `config.toml`, cache, logs, error messages or the UI. Key entry is masked; overwriting an existing key requires confirmation; `:key clear <provider>` deletes it. `doctor` and `:model show` report key presence and source (`env` vs `file`), never the value. Provider environment variables (per the catalog's `env` field) are still honored and take precedence when set.
@@ -897,6 +897,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | **DEC-19** | *(decided)* How does the model picker write `[llm.active]` back without destroying the user's file? | **Add `toml_edit` in M2** and edit the document in place, so comments and formatting survive. Alternative: keep never writing configuration and require the user to edit it by hand. `toml` 1.x has no comment-preserving API (verified at M0). | FR-4.5, FR-8.2, FR-8.6, the M2 dependency ledger in PLAN.md §5. |
 | **DEC-20** | `?` was listed both as help and as backward search. Which wins? | **Help.** `?` is the TUI convention for the keybinding popup and the app already shows `? help` in its status line. Backward search entry is dropped; `N` repeats a search backwards, and `/` re-opens the prompt. Recorded because the same key cannot mean two things and silently picking one later would change a habit. | FR-7.3, FR-7.4, the §5.4 keymap. |
 | **DEC-21** | Are the diff options a submenu popup or leader continuations? | **Continuations**: `<leader>d s`, `<leader>d c`, `<leader>d w`. The keymap engine already resolves multi-key sequences and the leader menu lists them, so a popup would add a mode for no gain. The cost is that `<leader>d` alone does nothing (like vim's `g`), which the leader menu makes discoverable. | FR-3.2, FR-3.3, FR-7.2, the §5.4 keymap. |
+| **DEC-22** | *(decided)* Is macOS kept in CI alongside Ubuntu? | **Not for now.** The milestone validators (m0–m2b) only run on Ubuntu because they need GNU `script`, so the macOS job ran only fmt/clippy/test/build and added wall-clock without covering the milestone gates. CI is a single Ubuntu `tests` job until the pty steps are portable. | NFR-2.1, the CI workflow. |
 
 ### 11.1 Decision log
 | Date | ID | Decision | By |
@@ -908,6 +909,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | — | DEC-5 | Provider/model/thinking are configured **inside the TUI**; keys are entered there and saved to `credentials.toml` (0600), with env vars as an override. | owner |
 | — | DEC-6 | No default provider or model. The user must configure one; the model list comes from `https://models.dev/api.json`, which also drives thinking options, limits and cost. | owner |
 | — | DEC-19 (decided) | Config write-back in M2a needs `toml_edit` to preserve comments; recorded here so the dependency is approved with the M2 batch rather than discovered mid-implementation. | — |
+| 2026-09-12 | DEC-22 (decided) | macOS CI removed for now: the milestone validators need GNU `script` and only ran on Ubuntu, so the macOS job added time without covering the milestone gates. CI is a single Ubuntu `tests` job. | owner |
 
 ---
 
