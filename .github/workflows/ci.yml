@@ -25,8 +25,23 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache the build
+      - name: Cache the cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          # Kache (next step) caches compiled artifacts content-addressed; keep
+          # rust-cache only for the registry/git downloads so the two do not
+          # store two copies of `target/` under GitHub's cache quota.
+          cache-targets: "false"
+
+      - name: Cache compiled artifacts (kache)
+        uses: kunobi-ninja/kache-action@v1
+        with:
+          # PRs restore read-only; only pushes to the default branch publish.
+          save-cache: ${{ github.ref_name == github.event.repository.default_branch }}
+          # No sticky PR comment; the job summary still reports cache stats.
+          pr-comment: "false"
+          # rustls pulls in `ring`, which compiles C and assembly through `cc`.
+          cache-c-cpp: "true"
 
       - name: Formatting
         run: cargo fmt --all --check
