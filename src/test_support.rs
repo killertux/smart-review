@@ -744,6 +744,140 @@ impl crate::ports::AnalysisCachePort for InMemoryAnalysis {
     }
 }
 
+/// A sample pull request, for tests that need a detail but are not about parsing one.
+pub(crate) fn sample_detail() -> crate::domain::pr::PullRequestDetail {
+    let summary = crate::domain::pr::PullRequestSummary {
+        number: 141,
+        title: "Round half up".to_owned(),
+        author: "someone".to_owned(),
+        created_at: crate::domain::time::from_unix_secs(0),
+        updated_at: crate::domain::time::from_unix_secs(0),
+        is_draft: false,
+        base_ref: "main".to_owned(),
+        head_ref: "rounding".to_owned(),
+        head_sha: "abc123".to_owned(),
+        additions: 10,
+        deletions: 2,
+        changed_files: 1,
+        labels: vec!["bug".to_owned()],
+        review_decision: None,
+        checks: crate::domain::pr::CheckSummary::default(),
+        state: crate::domain::pr::PrState::Open,
+        url: "https://example.invalid/141".to_owned(),
+        is_cross_repository: false,
+    };
+    crate::domain::pr::PullRequestDetail {
+        summary,
+        body: "Fixes a rounding bug.".to_owned(),
+        merge_state_status: None,
+        reviewers: Vec::new(),
+        commits: vec![crate::domain::pr::Commit {
+            sha: "abcdef1234567890".to_owned(),
+            summary: "round half up".to_owned(),
+            author: "someone".to_owned(),
+            committed_at: crate::domain::time::from_unix_secs(0),
+        }],
+        checks: Vec::new(),
+        reviews: Vec::new(),
+        comments: Vec::new(),
+        base_sha: None,
+    }
+}
+
+/// An [`LlmPort`](crate::ports::LlmPort) that answers from a list and records what it
+/// was asked.
+///
+/// It records the *history* as well as the prompt, because "what the provider saw" is
+/// the thing a chat test is about (FR-5.3): a fake that only kept the prompt would pass
+/// while sending the whole conversation nowhere.
+#[derive(Debug, Default)]
+pub(crate) struct FakeLlm {
+    /// The answers, in the order they will be given.
+    answers: Mutex<std::collections::VecDeque<String>>,
+    /// `(system, prompt)` per request.
+    pub(crate) prompts: Mutex<Vec<(Option<String>, String)>>,
+    /// The conversation that came with each request.
+    pub(crate) histories: Mutex<Vec<Vec<(crate::domain::chat::Role, String)>>>,
+    /// A failure to return instead of an answer.
+    failure: Option<crate::ports::LlmError>,
+}
+
+impl FakeLlm {
+    /// A fake that answers with these texts, in order.
+    pub(crate) fn answering(answers: &[&str]) -> Self {
+        Self {
+            answers: Mutex::new(answers.iter().map(|a| (*a).to_owned()).collect()),
+            ..Self::default()
+        }
+    }
+
+    /// A fake that always fails this way.
+    pub(crate) fn failing(error: crate::ports::LlmError) -> Self {
+        Self {
+            failure: Some(error),
+            ..Self::default()
+        }
+    }
+}
+
+impl crate::ports::LlmPort for FakeLlm {
+    fn complete(
+        &self,
+        _request: &crate::ports::ChatRequest,
+        _cancel: &crate::ports::Cancel,
+    ) -> Result<crate::ports::ChatOutcome, crate::ports::LlmError> {
+        Err(crate::ports::LlmError::Request {
+            provider: "test".to_owned(),
+            reason: "this fake implements `stream` only".to_owned(),
+        })
+    }
+
+    fn stream(
+        &self,
+        request: &crate::ports::ChatRequest,
+        cancel: &crate::ports::Cancel,
+        on_delta: &mut crate::ports::DeltaHandler<'_>,
+    ) -> Result<crate::ports::ChatOutcome, crate::ports::LlmError> {
+        self.prompts
+            .lock()
+            .expect("lock")
+            .push((request.system.clone(), request.prompt.clone()));
+        self.histories
+            .lock()
+            .expect("lock")
+            .push(request.history.clone());
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        let answer = self
+            .answers
+            .lock()
+            .expect("lock")
+            .pop_front()
+            .unwrap_or_else(|| "{}".to_owned());
+        on_delta(&answer);
+        if cancel.is_cancelled() {
+            // A cancelled call reports what arrived, which is what the chat path reads
+            // to keep partial text (FR-5.2).
+            return Ok(crate::ports::ChatOutcome {
+                text: answer,
+                usage: None,
+                thinking: None,
+            });
+        }
+        Ok(crate::ports::ChatOutcome {
+            text: answer,
+            usage: Some(crate::ports::TokenUsage {
+                prompt: 10,
+                completion: 20,
+                total: 30,
+                reasoning: Some(5),
+            }),
+            thinking: None,
+        })
+    }
+}
+
 /// A job runner wired for tests: the real ports detection needs, and the two the
 /// picker uses replaced by ones that refuse.
 pub(crate) fn test_job_runner(

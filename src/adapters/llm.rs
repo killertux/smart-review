@@ -95,9 +95,26 @@ impl LlmCrate {
             .map_err(|error| translate(&request.provider, &error))
     }
 
-    /// One turn as the crate's message type.
+    /// The conversation as the crate's message types.
+    ///
+    /// The system prompt is *not* here: `ChatRole` has no system variant, so the crate
+    /// takes it through the builder, which is why the chat path puts the context bundle
+    /// there rather than in the first message (FR-5.3).
     fn messages(request: &ChatRequest) -> Vec<ChatMessage> {
-        vec![ChatMessage::user().content(request.prompt.clone()).build()]
+        let mut messages: Vec<ChatMessage> = request
+            .history
+            .iter()
+            .map(|(role, text)| match role {
+                crate::domain::chat::Role::User => {
+                    ChatMessage::user().content(text.clone()).build()
+                }
+                crate::domain::chat::Role::Assistant => {
+                    ChatMessage::assistant().content(text.clone()).build()
+                }
+            })
+            .collect();
+        messages.push(ChatMessage::user().content(request.prompt.clone()).build());
+        messages
     }
 }
 

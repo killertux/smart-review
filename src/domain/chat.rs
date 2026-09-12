@@ -517,15 +517,29 @@ pub fn references_in(text: &str, index: &PathIndex) -> Vec<Reference> {
 
 /// Splits `path:12` into the path and the line, tolerating the punctuation a sentence
 /// wraps a path in.
+///
+/// The two kinds of decoration nest in either order: a backtick-quoted path at the end
+/// of a sentence has the full stop *after* the closing backtick, while a parenthesised
+/// one has it before the bracket. They are therefore stripped in a loop until nothing
+/// changes rather than in one pass — a single pass leaves the backtick attached to the
+/// line number, the number stops parsing, and a jumpable reference silently becomes no
+/// reference at all.
 fn split_line_suffix(token: &str) -> Option<(&str, Option<u32>)> {
-    let trimmed = token
-        .trim_matches(|c: char| {
-            matches!(
-                c,
-                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '*' | ','
-            )
-        })
-        .trim_end_matches(['.', ';', ':', '!', '?']);
+    /// Quote-like characters a sentence wraps a path in.
+    const WRAPPING: &[char] = &[
+        '`', '"', '\'', '(', ')', '[', ']', '{', '}', '<', '>', '*', ',',
+    ];
+    /// Trailing punctuation that ends the *sentence* rather than the path.
+    const TRAILING: &[char] = &['.', ';', ':', '!', '?'];
+
+    let mut trimmed = token;
+    loop {
+        let next = trimmed.trim_matches(WRAPPING).trim_end_matches(TRAILING);
+        if next.len() == trimmed.len() {
+            break;
+        }
+        trimmed = next;
+    }
     if trimmed.is_empty() {
         return None;
     }
@@ -739,6 +753,29 @@ mod tests {
             "a question with no path mentions nothing"
         );
         assert_eq!(Message::user(question, 1).text, question);
+    }
+
+    #[test]
+    fn a_path_wrapped_in_a_code_span_and_ending_a_sentence_still_resolves() {
+        // The shape a markdown-ish answer produces most often, and the one that made a
+        // reference disappear: the full stop is outside the closing backtick.
+        let found = references_in("Look at `src/infra/pg.rs:88`.", &index());
+        assert_eq!(
+            found,
+            vec![Reference {
+                path: "src/infra/pg.rs".to_owned(),
+                line: Some(88)
+            }]
+        );
+        // And the other order.
+        let found = references_in("(see src/infra/pg.rs.)", &index());
+        assert_eq!(
+            found,
+            vec![Reference {
+                path: "src/infra/pg.rs".to_owned(),
+                line: None
+            }]
+        );
     }
 
     #[test]

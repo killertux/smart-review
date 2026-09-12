@@ -11,6 +11,8 @@
 //! what to do with the answer.
 
 pub mod analysis;
+pub mod chat;
+pub mod context;
 pub mod environment;
 pub mod models;
 pub mod prs;

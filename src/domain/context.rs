@@ -327,6 +327,28 @@ impl Bundle {
         self.text.len()
     }
 
+    /// Appends a file the user added with `:context add` (FR-5.3).
+    ///
+    /// Added after the bundle is built rather than as another input, because the two
+    /// are answers to different questions: everything in `build` is what the app
+    /// decided to send, and this is what the user decided to add. Same rules, same
+    /// budget, and the same account of what was elided and why — but last in the
+    /// truncation order, so a file the user asked for is dropped only when everything
+    /// already decided filled the budget.
+    pub fn push_user_file(&mut self, path: &str, bytes: &[u8], policy: &BundlePolicy) {
+        let used = self.text.len();
+        let mut builder = Builder {
+            policy,
+            text: std::mem::take(&mut self.text),
+            segments: std::mem::take(&mut self.segments),
+            used,
+        };
+        builder.push_optional_file(SegmentKind::UserFile, path, bytes);
+        self.text = builder.text;
+        self.segments = builder.segments;
+        self.estimated_tokens = estimate_tokens(self.text.len());
+    }
+
     /// How many segments are actually in the bundle.
     #[must_use]
     pub fn included(&self) -> usize {

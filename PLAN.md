@@ -14,6 +14,7 @@
 - **Crates are gated.** No dependency is added without explicit owner approval (DEP-1). The ledger in §5 lists everything each milestone would need, with justification, so approvals can be granted in one batch per milestone.
 - **`REQUIREMENTS.md` wins.** If implementation reveals a requirement is wrong, stop and change the requirement first (DEV-5), then the code.
 - **Nothing is committed or pushed unless asked** (DEV-6).
+- **Every milestone PR ends with a manual test recipe** (owner's request, M3 onwards): environment, numbered steps with what to look for, what to check on disk, and the one or two behaviours no automated check covers. The PR is where the reviewer decides whether to believe the milestone; a diff is not evidence that a stream arrives or a click lands.
 
 ### 0.1 Definition of done (applies to every milestone)
 - [ ] `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean, including `clippy::pedantic` and the workspace restriction lints (DEV-8). No blanket `#[allow]`: every suppression is item-scoped and carries a comment.

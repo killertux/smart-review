@@ -36,6 +36,14 @@ pub struct ChatRequest {
     pub api_key: ApiKey,
     /// System prompt.
     pub system: Option<String>,
+    /// Earlier turns, oldest first, as `(role, text)` (FR-5.2, FR-5.3).
+    ///
+    /// Empty for one-shot requests (an analysis, a connection check). A chat sends the
+    /// conversation it wants the model to have, already trimmed
+    /// ([`crate::domain::chat::replayable_history`]) — the port carries roles rather
+    /// than a flattened transcript because providers accept roles, and flattening them
+    /// here would throw away the distinction every provider makes.
+    pub history: Vec<(crate::domain::chat::Role, String)>,
     /// The user message.
     pub prompt: String,
     /// Output cap. The catalog's `limit.output` bounds it (FR-4.7).
@@ -59,6 +67,9 @@ impl fmt::Debug for ChatRequest {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key)
             .field("system", &self.system.as_ref().map(|_| "<set>"))
+            // The history is the user's own words and the model's answers, so it is
+            // described rather than printed, for the same reason the prompt is.
+            .field("history", &format!("{} messages", self.history.len()))
             .field("prompt_bytes", &self.prompt.len())
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
@@ -85,6 +96,7 @@ impl ChatRequest {
             base_url: None,
             api_key,
             system: None,
+            history: Vec::new(),
             prompt: prompt.into(),
             max_tokens: None,
             temperature: None,
@@ -237,6 +249,25 @@ mod tests {
             ApiKey::new("sk-secret", KeySource::File),
             "review this",
         )
+    }
+
+    #[test]
+    fn a_request_describes_its_history_rather_than_printing_it() {
+        let mut request = request();
+        request.history = vec![
+            (
+                crate::domain::chat::Role::User,
+                "what does money() do?".to_owned(),
+            ),
+            (
+                crate::domain::chat::Role::Assistant,
+                "it sums lines".to_owned(),
+            ),
+        ];
+        let debug = format!("{request:?}");
+        assert!(debug.contains("2 messages"), "{debug}");
+        assert!(!debug.contains("sums lines"), "{debug}");
+        assert!(!debug.contains("money()"), "{debug}");
     }
 
     #[test]
