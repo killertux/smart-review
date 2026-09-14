@@ -70,24 +70,32 @@ pub fn composer_split(area: Rect, open: bool) -> (Rect, Option<Rect>) {
 /// the user is writing about something they cannot see.
 pub fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, composer: &Composer) {
     let theme = &app.theme;
+    let verb = if composer.target.is_staged() {
+        "comment on"
+    } else {
+        "post to"
+    };
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(theme.style(element::CHAT_INPUT))
         .title(format!(
-            " comment on {} via {} ",
+            " {verb} {} via {} ",
             text_util::truncate(
-                &composer.anchor.label(),
+                &composer.target.label(),
                 area.width.saturating_sub(24) as usize
             ),
-            keyboard_hint()
+            composer.target.enter_hint()
         ));
 
     let mut lines = composer_lines(composer, theme, area.width);
-    if composer.anchor.start_line.is_none() {
-        // A range is worth pointing out, because the key that makes one is `V`, which
+    let anchored_line = composer
+        .anchor()
+        .is_some_and(|anchor| anchor.start_line.is_none());
+    if composer.target.is_staged() && anchored_line {
+        // A range is worth pointing out, because the key that makes one is `v`, which
         // nobody guesses from a composer.
         lines.push(Line::from(Span::styled(
-            "   V then j/k then c makes this a range".to_owned(),
+            "   v then j/k then c makes this a range".to_owned(),
             theme.style(element::MUTED),
         )));
     }
@@ -104,7 +112,9 @@ pub fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, composer: &
 /// How the composer names its own keys.
 ///
 /// One place, because the pane and the help popup disagreeing about how to send a
-/// comment is exactly the kind of drift this project keeps paying for.
+/// comment is exactly the kind of drift this project keeps paying for. The target
+/// decides the sentence: `Enter` stages a line comment and shows a reply first, and a
+/// hint that said the wrong one would be worse than none.
 #[must_use]
 pub fn keyboard_hint() -> &'static str {
     "Enter stages it · Alt-Enter for a new line"
@@ -272,11 +282,21 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
     frame.render_widget(Clear, area);
 
     let decision = drafts.draft.effective_decision();
-    let mut title = format!(
-        " publish review · #{} · {} ",
-        drafts.draft.pr,
-        decision.label()
-    );
+    // One modal, two subjects (FR-6.3, FR-6.4): a review and a reply are both words
+    // about to go to GitHub, and both get the same two Enters. The title is what differs,
+    // because what differs is the only thing that must not be got wrong.
+    let mut title = match drafts.post.as_ref() {
+        Some(post) => format!(
+            " post · #{} · {} ",
+            drafts.draft.pr,
+            text_util::truncate(&post.target.title(), 46)
+        ),
+        None => format!(
+            " publish review · #{} · {} ",
+            drafts.draft.pr,
+            decision.label()
+        ),
+    };
     if drafts.status.is_publishing() {
         title.push_str("· sending… ");
     }
@@ -312,7 +332,11 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
             theme.style(element::NOTICE_ERROR),
         )));
         footer.push(Line::from(Span::styled(
-            " nothing was posted · the draft is still here · Enter tries again".to_owned(),
+            if drafts.post.is_some() {
+                " nothing was posted · the comment is still here · Enter tries again".to_owned()
+            } else {
+                " nothing was posted · the draft is still here · Enter tries again".to_owned()
+            },
             theme.style(element::MUTED),
         )));
     } else if app.is_dry_run() {
@@ -330,7 +354,7 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
             theme.style(element::NOTICE_WARN),
         )));
         footer.push(Line::from(Span::styled(
-            " a is approve · r requests changes · c comments · Esc goes back".to_owned(),
+            decision_keys(drafts),
             theme.style(element::MUTED),
         )));
     } else {
@@ -339,8 +363,7 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
             theme.style(element::FG),
         )));
         footer.push(Line::from(Span::styled(
-            " a is approve · r requests changes · c comments · :draft body writes the body"
-                .to_owned(),
+            decision_keys(drafts),
             theme.style(element::MUTED),
         )));
     }
@@ -352,11 +375,47 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
     );
 }
 
+/// The second footer line: what else the modal's keys do.
+///
+/// A post has no decision to make — a reply is a reply — so the line that offers one is
+/// not drawn for it. Suggesting `a` next to a comment about to be posted would be an
+/// offer to approve somebody's pull request by accident.
+fn decision_keys(drafts: &DraftState) -> String {
+    if drafts.post.is_some() {
+        " Esc goes back · :draft shows the review, which is a different thing".to_owned()
+    } else {
+        " a is approve · r requests changes · c comments · :draft body writes the body".to_owned()
+    }
+}
+
 /// The modal's contents: the decision, the body, then every comment verbatim.
 fn modal_lines(app: &App, drafts: &DraftState, width: u16) -> Vec<Line<'static>> {
     let theme = &app.theme;
     let inner = usize::from(width.saturating_sub(6));
     let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // A pending post is the whole content: the words, and what they answer (FR-6.4).
+    if let Some(post) = drafts.post.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled(" to        ".to_owned(), theme.style(element::MUTED)),
+            Span::styled(post.target.label(), theme.style(element::FG)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            " comment".to_owned(),
+            theme.style(element::MUTED),
+        )));
+        for line in markdown::render(&post.body, inner, theme) {
+            let mut spans = vec![Span::styled("   ".to_owned(), theme.style(element::BG))];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            " sent verbatim, as it is above".to_owned(),
+            theme.style(element::MUTED),
+        )));
+        return lines;
+    }
 
     lines.push(Line::from(vec![
         Span::styled(" decision  ".to_owned(), theme.style(element::MUTED)),
@@ -435,7 +494,7 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::drafts::{Anchor, Composer, DraftState};
+    use crate::tui::drafts::{Anchor, Composer, DraftState, Target};
 
     /// The text of a set of lines, for assertions about what a surface says.
     fn flatten(lines: &[Line<'_>]) -> String {
@@ -453,17 +512,21 @@ mod tests {
 
     #[test]
     fn the_composer_shows_what_is_typed_and_where_it_will_land() {
-        let mut composer = Composer::new(Anchor::line(
+        let mut composer = Composer::new(Target::Line(Anchor::line(
             "src/domain/invoice.rs",
             crate::domain::draft::Side::New,
             31,
-        ));
+        )));
         composer.input.insert_str("this rounds up");
         let text = flatten(&composer_lines(&composer, &Theme::default(), 100));
         assert!(text.contains("this rounds up"), "{text}");
 
         // An empty composer says what to write rather than showing nothing.
-        let empty = Composer::new(Anchor::line("src/a.rs", crate::domain::draft::Side::New, 1));
+        let empty = Composer::new(Target::Line(Anchor::line(
+            "src/a.rs",
+            crate::domain::draft::Side::New,
+            1,
+        )));
         let text = flatten(&composer_lines(&empty, &Theme::default(), 100));
         assert!(text.contains("what should change"), "{text}");
     }
@@ -472,8 +535,11 @@ mod tests {
     fn a_refusal_is_shown_in_the_composer_rather_than_only_reported() {
         // A keypress that appears to do nothing is the failure mode this avoids: the
         // reason appears where the text is, not in a notice that expires.
-        let mut composer =
-            Composer::new(Anchor::line("src/a.rs", crate::domain::draft::Side::New, 1));
+        let mut composer = Composer::new(Target::Line(Anchor::line(
+            "src/a.rs",
+            crate::domain::draft::Side::New,
+            1,
+        )));
         composer.refusal = Some("a comment needs a body".to_owned());
         let text = flatten(&composer_lines(&composer, &Theme::default(), 100));
         assert!(text.contains("a comment needs a body"), "{text}");
@@ -481,16 +547,19 @@ mod tests {
 
     #[test]
     fn a_range_anchor_is_labelled_as_one() {
-        let mut composer = Composer::new(Anchor {
+        let mut composer = Composer::new(Target::Line(Anchor {
             path: "src/a.rs".to_owned(),
             side: crate::domain::draft::Side::Old,
             line: 31,
             start_line: Some(28),
-        });
+        }));
         composer.input.insert_str("this whole block");
         let text = flatten(&composer_lines(&composer, &Theme::default(), 100));
         assert!(text.contains("this whole block"), "{text}");
-        assert_eq!(composer.anchor.label(), "src/a.rs:28-31 (old)");
+        assert_eq!(
+            composer.anchor().expect("a line").label(),
+            "src/a.rs:28-31 (old)"
+        );
     }
 
     #[test]

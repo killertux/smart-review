@@ -362,6 +362,7 @@ fn detail() -> smart_review::domain::pr::PullRequestDetail {
         checks: Vec::new(),
         reviews: Vec::new(),
         comments: Vec::new(),
+        conversation: Vec::new(),
         base_sha: None,
     }
 }

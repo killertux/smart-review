@@ -349,6 +349,7 @@ impl GhDetail {
                 .map(GhReview::into_domain)
                 .collect(),
             comments: Vec::new(),
+            conversation: Vec::new(),
             base_sha: None,
         }
     }
@@ -396,6 +397,46 @@ impl GhReviewComment {
             created_at: parse_timestamp(self.created_at.as_deref()),
             in_reply_to: self.in_reply_to_id,
             diff_hunk: self.diff_hunk,
+            url: self.html_url,
+            // Filled in by the thread read, which is a second call: the REST endpoint
+            // this type comes from does not mention threads at all (FR-6.4).
+            thread_id: None,
+            resolved: false,
+            outdated: false,
+        }
+    }
+}
+
+/// A comment on the pull request's conversation, from `gh api .../issues/N/comments`.
+///
+/// A pull request is an issue on GitHub, which is why the conversation lives under
+/// `issues/`: there is no pull-request route for it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GhIssueComment {
+    /// The comment id.
+    pub id: u64,
+    /// Who wrote it.
+    pub user: Option<GhAuthor>,
+    /// The body.
+    pub body: Option<String>,
+    /// When it was written.
+    pub created_at: Option<String>,
+    /// The browser URL.
+    pub html_url: Option<String>,
+}
+
+impl GhIssueComment {
+    /// Converts to the domain type.
+    #[must_use]
+    pub fn into_domain(self) -> crate::domain::pr::ConversationComment {
+        crate::domain::pr::ConversationComment {
+            id: self.id,
+            author: self
+                .user
+                .as_ref()
+                .map_or_else(|| "ghost".to_owned(), GhAuthor::display),
+            body: self.body.unwrap_or_default(),
+            created_at: parse_timestamp(self.created_at.as_deref()),
             url: self.html_url,
         }
     }

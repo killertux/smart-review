@@ -347,11 +347,7 @@ impl ReviewState {
     }
 }
 
-/// An inline review comment anchored to a line of the diff (FR-2.4).
-///
-/// Inline comments are not rendered on the diff until the publishing flow arrives
-/// in M4; M1 fetches and caches them so opening a PR does not need a second round
-/// trip later.
+/// An inline review comment anchored to a line of the diff (FR-2.4, FR-6.4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewComment {
     /// GitHub's comment id.
@@ -372,6 +368,49 @@ pub struct ReviewComment {
     pub in_reply_to: Option<u64>,
     /// The diff hunk GitHub shows above the comment.
     pub diff_hunk: Option<String>,
+    /// The browser URL.
+    pub url: Option<String>,
+    /// The thread this comment belongs to, when the forge can say (FR-6.4).
+    ///
+    /// GitHub's own thread id, which is what resolving and unresolving needs: the
+    /// REST comments endpoint does not mention threads at all, so this arrives from a
+    /// second read and stays `None` when that read failed. `None` means "cannot be
+    /// resolved", never "not in a thread".
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Whether the comment's thread has been resolved (FR-6.4).
+    ///
+    /// A property of the *thread*, denormalised onto each of its comments because the
+    /// thread is not a thing this application models: the diff draws comments, and
+    /// asking each comment whether it is resolved is one lookup instead of two. Every
+    /// comment of one thread carries the same value, which
+    /// `threads_carry_their_state_on_every_comment` checks.
+    #[serde(default)]
+    pub resolved: bool,
+    /// Whether GitHub considers the anchor out of date (FR-6.4).
+    ///
+    /// Also a thread property: the line the comment was made on has moved since, so
+    /// the comment is drawn where GitHub reports it, not where it was written.
+    #[serde(default)]
+    pub outdated: bool,
+}
+
+/// A comment on the pull request itself, not on a line of it (FR-6.4, DEC-16).
+///
+/// The conversation is flat on GitHub: there are no threads here, no lines to anchor
+/// to and nothing to resolve. It is a separate type from [`ReviewComment`] for that
+/// reason — the two share an author and a body and nothing else, and giving them one
+/// type would give every renderer a set of fields it must remember to ignore.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationComment {
+    /// GitHub's comment id.
+    pub id: u64,
+    /// Who wrote it.
+    pub author: String,
+    /// The body, as markdown.
+    pub body: String,
+    /// When it was written.
+    pub created_at: Timestamp,
     /// The browser URL.
     pub url: Option<String>,
 }
@@ -395,6 +434,15 @@ pub struct PullRequestDetail {
     pub reviews: Vec<Review>,
     /// Inline comments.
     pub comments: Vec<ReviewComment>,
+    /// Comments on the pull request's conversation (FR-6.4).
+    ///
+    /// Read with the rest of the detail, in the same job: "has anyone said anything
+    /// about this pull request" is part of what a detail is, and a panel that fetched
+    /// its own contents would need its own loading state, its own failure and its own
+    /// cache. Refreshing it is refreshing the detail, which is what happens after a
+    /// comment is posted.
+    #[serde(default)]
+    pub conversation: Vec<ConversationComment>,
     /// The merge base of base and head, resolved with `git` (Appendix A).
     ///
     /// `None` in remote-only mode, which is all M1 has: `gh` cannot report
@@ -738,6 +786,7 @@ mod tests {
                 },
             ],
             comments: Vec::new(),
+            conversation: Vec::new(),
             base_sha: None,
         };
         assert_eq!(detail.review_counts(), (1, 1));

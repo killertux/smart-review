@@ -112,6 +112,46 @@ impl TerminalGuard {
         self.mouse = enabled;
         Ok(())
     }
+
+    /// Gives the terminal back for one blocking external program, then takes it back.
+    ///
+    /// The operation and the attempt to resume are both returned. In particular, an
+    /// editor may have written useful prose even when a later terminal setup fails;
+    /// callers can preserve the scratch file rather than treating the two outcomes as
+    /// one opaque failure.
+    pub(crate) fn suspend<T>(
+        &mut self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> Suspension<T> {
+        restore();
+        let operation = operation();
+        let resume = self.resume();
+        Suspension { operation, resume }
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        enable_raw_mode()?;
+        TAKEOVER.begin();
+        match setup(self.mouse) {
+            Ok(terminal) => {
+                self.terminal = terminal;
+                Ok(())
+            }
+            Err(error) => {
+                restore();
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The independent outcomes of a suspended terminal operation.
+#[derive(Debug)]
+pub(crate) struct Suspension<T> {
+    /// What the program run with the terminal restored returned.
+    pub(crate) operation: io::Result<T>,
+    /// Whether smart-review could take the terminal over again afterwards.
+    pub(crate) resume: io::Result<()>,
 }
 
 fn setup(mouse: bool) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {

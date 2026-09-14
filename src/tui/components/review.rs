@@ -656,6 +656,7 @@ index 1a2b3c4..5d6e7f8 100644
             checks: Vec::new(),
             reviews: Vec::new(),
             comments: Vec::new(),
+            conversation: Vec::new(),
             base_sha: None,
         }
     }

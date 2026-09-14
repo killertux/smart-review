@@ -1,10 +1,8 @@
  smart-review v0.1.0 config: built-in defaults                                         acme/service
 │ filters [is:open] <leader>f adds one                                                             │
 │ search / filters what has been fetched; :filter asks GitHub                                      │
-┌ no repository · open · showing 0 ────────────────────────────────────────────────────────────────┐
-│Looking for the repository and gh…                                                                │
-│                         ┌ leader <Space> ──────────────────────────────┐                         │
-│                         │  ?           Show the help popup             │                         │
+┌ no repository · open · s┌ leader <Space> ──────────────────────────────┐─────────────────────────┐
+│Looking for the repositor│  ?           Show the help popup             │                         │
 │                         │  T           Switch to the next theme        │                         │
 │                         │  a           Analyse the pull request, or ope│                         │
 │                         │  c           Talk about this pull request    │                         │
@@ -13,6 +11,10 @@
 │                         │  dw          Ignore whitespace-only changes  │                         │
 │                         │  f           Add a filter chip               │                         │
 │                         │  m           Choose the provider, model and t│                         │
+│                         │  pc          The pull request's own conversat│                         │
+│                         │  pr          Answer the comment under the cur│                         │
+│                         │  pt          Resolve or reopen the thread und│                         │
+│                         │  pw          Write a comment on the conversat│                         │
 │                         │  q           Quit smart-review               │                         │
 │                         │  ra          Stage an approval (<leader>ra)  │                         │
 │                         │  rc          Stage a request for changes (<le│                         │
@@ -23,7 +25,5 @@
 │                         │  s           Change the sort order           │                         │
 │                         │  t           Choose a theme                  │                         │
 │                         └──────────────────────────────────────────────┘                         │
-│                                                                                                  │
-│                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
  NORMAL list · acme/service · — · —                          ? help · <leader> actions · : commands

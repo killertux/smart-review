@@ -16,7 +16,9 @@ pub mod chat;
 pub mod clipboard;
 pub mod components;
 pub mod diff_view;
+pub mod discussion;
 pub mod drafts;
+pub(crate) mod editor;
 pub mod event;
 pub mod input;
 pub mod jobs;
@@ -185,6 +187,62 @@ pub fn run(startup: Startup) -> Result<()> {
     Ok(())
 }
 
+/// Opens `$EDITOR` with the compose buffer after restoring the user's terminal.
+///
+/// The editor scratch file is only removed after terminal resume succeeds. If resume
+/// fails the regular draw loop cannot safely promise to show another frame, so the
+/// log and the attempted notice name the recovery file instead of discarding prose.
+fn edit_composer(app: &mut App, terminal: &mut terminal::TerminalGuard, body: &str) {
+    let scratch = match editor::EditorFile::create(&app.home, body) {
+        Ok(file) => file,
+        Err(error) => {
+            app.notice(
+                app::NoticeLevel::Error,
+                format!("could not prepare $EDITOR: {error}"),
+            );
+            return;
+        }
+    };
+    let suspended = terminal.suspend(|| scratch.run());
+    if let Err(error) = suspended.resume {
+        let message = format!(
+            "could not restore the terminal after $EDITOR: {error}; your comment is in {}",
+            scratch.path().display()
+        );
+        logging::log(Level::Error, &message);
+        // The next draw may fail too, but recording this state makes the failure
+        // visible whenever the backend did recover enough to draw it.
+        app.notice(app::NoticeLevel::Error, message);
+        return;
+    }
+
+    match suspended.operation {
+        Ok(exit) => match scratch.read_and_remove() {
+            Ok(edited) => {
+                app.replace_composer_text(edited);
+                if let Some(warning) = exit.warning() {
+                    app.notice(app::NoticeLevel::Warn, warning);
+                } else {
+                    app.notice(app::NoticeLevel::Info, "composer updated from $EDITOR");
+                }
+            }
+            Err(error) => app.notice(
+                app::NoticeLevel::Error,
+                format!("could not read the file $EDITOR wrote: {error}"),
+            ),
+        },
+        Err(error) => {
+            // Nothing had an opportunity to edit the file if the shell itself could
+            // not start. Remove it best-effort; the existing composer text remains.
+            let _ = scratch.read_and_remove();
+            app.notice(
+                app::NoticeLevel::Error,
+                format!("could not run $EDITOR: {error}"),
+            );
+        }
+    }
+}
+
 /// Performs whatever the reducer asked for.
 ///
 /// This is the only function in `tui` that touches the outside world, which is what
@@ -217,6 +275,9 @@ pub(crate) fn apply(
         | Effect::LoadMore
         | Effect::OpenPullRequest(_)
         | Effect::PublishDraft
+        | Effect::PostReply { .. }
+        | Effect::PostConversation { .. }
+        | Effect::ResolveThread { .. }
         | Effect::RunDoctor => {
             let context = app.doctor_request();
             if let Some(job) = jobs::job_for(&effect, &app.list, context, &app.drafts.draft) {
@@ -268,6 +329,8 @@ pub(crate) fn apply(
                 ),
             }
         }
+
+        Effect::EditComposer(body) => edit_composer(app, terminal, &body),
 
         // The analysis effects are their own group for the same reason the model
         // ones are: they share state, and they queue each other (a gather is followed

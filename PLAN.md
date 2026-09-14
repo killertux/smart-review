@@ -37,7 +37,7 @@
 | **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/m2b.sh` (35 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
 | **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/m3.sh` + manual demo | FR-5.1–5.4 | none new |
 | **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` writes the commands it would run to `logs/dry-run.log`. | `scripts/validate/m4.sh` (23 checks) + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
-| **M5** | Polish & release | Visual ranges, thread replies, docs, `NO_COLOR`, release binary + `--version`; backlog items from §11. | `scripts/validate/m5.sh` + manual demo | backlog + NFR polish | decided then |
+| **M5** | Polish & release | Visual ranges, replies/resolution, PR conversation comments, `$EDITOR`, checked docs and tagged Linux/macOS releases. | `scripts/validate/m5.sh` + manual demo | backlog + NFR polish | no new crates |
 
 Each milestone is a strictly larger subset of the same binary — never a rewrite. M0's TUI shell, action registry, job framework and config loader are load-bearing for M1–M5, which is why they get disproportionate care up front.
 
@@ -300,7 +300,7 @@ names the active model.
 
 **FR coverage:** FR-6.1–6.5, FR-3.3 (existing discussion, drawn inline).
 **Crates to approve:** none new.
-**Risks:** the anchor is a line number, so a force-push between writing and publishing can move it; the draft records the commit it was written against and the panel warns when it differs, but re-anchoring is manual. Replying to a thread is M5 (DEC-16).
+**Risks:** the anchor is a line number, so a force-push between writing and publishing can move it; the draft records the commit it was written against and the panel warns when it differs, but re-anchoring is manual. M5 adds a reply to an existing thread, not re-anchoring of an old inline comment.
 
 ---
 
@@ -309,12 +309,14 @@ names the active model.
 **Goal:** something you would hand to a colleague.
 
 **Work items**
-- [ ] Visual-mode line/range selection for comments (FR-7.1).
-- [ ] Thread replies/resolution if DEC-16/backlog is approved; manual review-order override UX finalized.
-- [ ] Docs: `README.md`, generated `docs/keymaps.md` (from the action registry) with a test that it stays in sync, `docs/themes.md`, `docs/configuration.md`.
-- [ ] `NO_COLOR` support (MAY in FR-7.7) if it does not break the UI.
-- [ ] Release: `--version` from Cargo metadata, release profile tuning (`lto`, `strip`), a tag-driven GitHub Actions release job producing Linux + macOS binaries (owner approval for the workflow).
-- [ ] Backlog decisions from `REQUIREMENTS.md` §11 as approved: syntax highlighting (DEC-4 revisit), agentic file reading (DEC-2), Windows tier.
+- [x] Visual line/range selection for comments (FR-7.1; delivered in M4's compose flow).
+- [x] Thread replies/resolution and top-level PR conversation comments (DEC-16): REST replies and issue comments, GraphQL thread state/mutations, confirmation, failure preservation and dry-run coverage.
+- [x] `$EDITOR` for a comment composer through `<C-e>`: terminal suspension, text re-read, and scratch-file recovery if resume fails.
+- [x] Docs: updated `README.md`, generated `docs/keymaps.md` checked against the action registry, `docs/themes.md`, and `docs/configuration.md`.
+- [x] Release: Cargo metadata version, `thin` LTO / stripped release profile, and a tag-triggered GitHub Actions job for Linux x86_64 and macOS Intel/Apple Silicon.
+- [x] Deliberate scope calls: `NO_COLOR`, syntax highlighting, agentic file reading, and Windows support remain deferred; they would broaden v1 without adding review-loop value.
+
+**Manual demo:** open a sandbox PR with an existing inline thread, use `r` to reply and `<leader>pt` to resolve it, then `<leader>pc`/`<leader>pw` to read and post to its conversation. Open `c` on a diff line, press `<C-e>` with `$EDITOR` set, stage and publish it. Repeat under `--dry-run`, inspect `logs/dry-run.log`, then tag a test release only after reviewing the three uploaded archives.
 
 ---
 

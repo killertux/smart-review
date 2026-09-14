@@ -16,6 +16,7 @@ pub mod context;
 pub mod drafts;
 pub mod environment;
 pub mod models;
+pub mod posts;
 pub mod prs;
 
 pub use environment::{DetectRequest, detect, gh_program};

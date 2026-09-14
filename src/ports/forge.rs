@@ -6,19 +6,37 @@
 
 use crate::domain::diff::Patch;
 use crate::domain::draft::Draft;
-use crate::domain::pr::{CheckRun, PullRequestDetail, PullRequestSummary, Review, ReviewComment};
+use crate::domain::pr::{
+    CheckRun, ConversationComment, PullRequestDetail, PullRequestSummary, Review, ReviewComment,
+};
 use crate::domain::query::PrQuery;
 use std::sync::Arc;
 
 use crate::ports::Cancel;
 
 /// What the forge can do, so the UI can hide what it cannot (ARCH-2).
+///
+/// Four independent yes/no questions, read one at a time by different code. A state
+/// machine for four booleans would be a bigger change than the problem, so the lint is
+/// answered rather than obeyed.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeCapabilities {
     /// Whether a review can be submitted with inline comments in one call.
     pub batched_review: bool,
     /// Whether inline review comments can be read.
     pub inline_comments: bool,
+    /// Whether threads can be resolved and unresolvable, and whether their state can
+    /// be read at all (FR-6.4).
+    ///
+    /// GitHub has no REST route for either: resolution is a GraphQL mutation, and the
+    /// resolved flag is a GraphQL field. A forge without this still publishes reviews
+    /// and still reads comments — the resolved marker and the key that toggles it are
+    /// what would be missing.
+    pub thread_resolution: bool,
+    /// Whether comments on the pull request's own conversation can be read and posted
+    /// (FR-6.4, DEC-16).
+    pub conversation_comments: bool,
 }
 
 impl Default for ForgeCapabilities {
@@ -26,6 +44,8 @@ impl Default for ForgeCapabilities {
         Self {
             batched_review: true,
             inline_comments: true,
+            thread_resolution: true,
+            conversation_comments: true,
         }
     }
 }
@@ -41,6 +61,21 @@ pub struct ReviewPosted {
     ///
     /// The caller must not clear the draft when this is set: the review is still
     /// sitting in front of the user.
+    pub dry_run: bool,
+}
+
+/// What posting one comment produced (FR-6.4).
+///
+/// The same three facts as [`ReviewPosted`] and deliberately not the same type: a
+/// review and a comment are posted by different routes, and a caller that confused them
+/// would clear a draft that was never sent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommentPosted {
+    /// The comment's id, when the forge reported one.
+    pub id: Option<u64>,
+    /// The browser URL of the comment, when the forge reported one.
+    pub url: Option<String>,
+    /// Whether this was a dry run, so nothing was sent at all (FR-6.5).
     pub dry_run: bool,
 }
 
@@ -229,6 +264,61 @@ pub trait ForgePort: std::fmt::Debug + Send + Sync {
         draft: &Draft,
         cancel: &Cancel,
     ) -> crate::Result<ReviewPosted>;
+
+    /// Replies into an existing review thread (FR-6.4).
+    ///
+    /// A reply is **not** part of a review and cannot be batched with one: GitHub's
+    /// review API takes only new inline comments, so answering something already said
+    /// is its own call, made when the user sends it rather than when they publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the comment does not exist, when the body is empty or too
+    /// long, or when `gh` cannot be run.
+    fn reply_to_review_comment(
+        &self,
+        number: u64,
+        comment_id: u64,
+        body: &str,
+        cancel: &Cancel,
+    ) -> crate::Result<CommentPosted>;
+
+    /// Comments on the pull request's own conversation (FR-6.4, DEC-16).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reply_to_review_comment`], minus the comment that must exist.
+    fn comment_on_conversation(
+        &self,
+        number: u64,
+        body: &str,
+        cancel: &Cancel,
+    ) -> crate::Result<CommentPosted>;
+
+    /// Resolves or unresolves a review thread (FR-6.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the thread is not one GitHub knows, or when `gh` cannot
+    /// be run. A forge that cannot do this must refuse rather than pretend: the caller
+    /// reports it, and the thread stays as it was.
+    fn set_thread_resolved(
+        &self,
+        thread_id: &str,
+        resolved: bool,
+        cancel: &Cancel,
+    ) -> crate::Result<()>;
+
+    /// Comments on the pull request's conversation (FR-6.4).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_pull_request`].
+    fn list_conversation(
+        &self,
+        number: u64,
+        cancel: &Cancel,
+    ) -> crate::Result<Vec<ConversationComment>>;
 
     /// The unified diff of a PR, as text (FR-3.2).
     ///

@@ -681,6 +681,7 @@ pub(crate) fn analysis_detail() -> crate::domain::pr::PullRequestDetail {
         checks: Vec::new(),
         reviews: Vec::new(),
         comments: Vec::new(),
+        conversation: Vec::new(),
         base_sha: None,
     }
 }
@@ -1029,6 +1030,7 @@ pub(crate) fn sample_detail() -> crate::domain::pr::PullRequestDetail {
         checks: Vec::new(),
         reviews: Vec::new(),
         comments: Vec::new(),
+        conversation: Vec::new(),
         base_sha: None,
     }
 }

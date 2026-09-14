@@ -400,6 +400,36 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
+        id: "review.reply",
+        description: "Answer the comment under the cursor (r)",
+        group: Group::Review,
+        hint: true,
+    },
+    ActionDef {
+        id: "review.edit_composer",
+        description: "Edit the open comment in $EDITOR (Ctrl-E)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.toggle_resolved",
+        description: "Resolve or reopen the thread under the cursor (<leader>pt)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.conversation",
+        description: "The pull request's own conversation (<leader>pc)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.comment_conversation",
+        description: "Write a comment on the conversation",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
         id: "review.drafts",
         description: "Show the staged comments (\u{3c}leader\u{3e}rd)",
         group: Group::Review,

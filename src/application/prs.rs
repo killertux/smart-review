@@ -594,6 +594,49 @@ mod tests {
                 .ok_or_else(|| crate::Error::forge("gh", "no diff configured"))
         }
 
+        fn reply_to_review_comment(
+            &self,
+            _number: u64,
+            _comment_id: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> Result<crate::ports::CommentPosted> {
+            self.maybe_fail()?;
+            Err(crate::Error::forge("gh", "this fake does not post replies"))
+        }
+
+        fn comment_on_conversation(
+            &self,
+            _number: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> Result<crate::ports::CommentPosted> {
+            self.maybe_fail()?;
+            Err(crate::Error::forge(
+                "gh",
+                "this fake does not post comments",
+            ))
+        }
+
+        fn set_thread_resolved(
+            &self,
+            _thread_id: &str,
+            _resolved: bool,
+            _cancel: &Cancel,
+        ) -> Result<()> {
+            self.maybe_fail()?;
+            Err(crate::Error::forge("gh", "this fake cannot resolve"))
+        }
+
+        fn list_conversation(
+            &self,
+            _number: u64,
+            _cancel: &Cancel,
+        ) -> Result<Vec<crate::domain::pr::ConversationComment>> {
+            self.maybe_fail()?;
+            Ok(Vec::new())
+        }
+
         fn submit_review(
             &self,
             number: u64,
@@ -645,6 +688,7 @@ mod tests {
             checks: Vec::new(),
             reviews: Vec::new(),
             comments: Vec::new(),
+            conversation: Vec::new(),
             base_sha: None,
         }
     }
