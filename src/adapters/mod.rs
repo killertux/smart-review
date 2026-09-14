@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod chat_store;
 pub mod clock;
 pub mod credentials;
+pub mod draft_store;
 pub mod fs;
 pub mod gh;
 pub mod git;
