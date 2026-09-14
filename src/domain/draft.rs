@@ -70,7 +70,23 @@ impl Decision {
         }
     }
 
-    /// The `PullRequestReviewEvent` this decision submits, as GraphQL spells it.
+    /// The `gh pr review` flag for this decision.
+    ///
+    /// The short form of a review that carries no inline comments (FR-6.3), which is
+    /// the one case `gh pr review` is used for.
+    #[must_use]
+    pub const fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::RequestChanges => "request-changes",
+            Self::Comment => "comment",
+        }
+    }
+
+    /// The `PullRequestReviewEvent` this decision submits.
+    ///
+    /// One spelling, two APIs: REST's `event` and GraphQL's `event` take the same
+    /// words, which is why this is named after the event rather than after a route.
     #[must_use]
     pub const fn event(self) -> &'static str {
         match self {
@@ -289,24 +305,6 @@ impl DraftComment {
         }
         let (start, end) = self.range();
         (start..=end).contains(&line)
-    }
-
-    /// The comment as it will be sent: path, side, line and body, nothing else.
-    #[must_use]
-    pub fn payload(&self) -> serde_json::Value {
-        let mut payload = serde_json::json!({
-            "path": self.path,
-            "line": self.line,
-            "side": self.side.api(),
-            "body": self.body,
-        });
-        if let Some(start) = self.start_line {
-            payload["startLine"] = serde_json::json!(start);
-            // A multi-line comment needs to know which end the range starts from;
-            // without it GitHub reads `startLine` as the *newer* line of the two.
-            payload["startSide"] = serde_json::json!(self.side.api());
-        }
-        payload
     }
 }
 
@@ -675,25 +673,6 @@ mod tests {
         assert_eq!(comment.range(), (28, 31));
         assert_eq!(comment.anchor(), "src/a.rs:28-31 (new)");
         assert_eq!(comment.anchor(), comment.anchor());
-    }
-
-    #[test]
-    fn a_range_sends_both_ends_and_a_single_line_sends_one() {
-        let single = comment("src/a.rs", 31, "why?").payload();
-        assert_eq!(single["line"], 31);
-        assert_eq!(single["side"], "RIGHT");
-        assert!(single.get("startLine").is_none());
-
-        let range = DraftComment::new("src/a.rs", Side::Old, 31, Some(28), "why?")
-            .expect("valid")
-            .payload();
-        assert_eq!(range["line"], 31);
-        assert_eq!(range["startLine"], 28);
-        assert_eq!(range["side"], "LEFT");
-        assert_eq!(
-            range["startSide"], "LEFT",
-            "without startSide GitHub reads startLine from the other end"
-        );
     }
 
     #[test]

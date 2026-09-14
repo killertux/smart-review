@@ -34,6 +34,7 @@ pub use catalog::{CatalogFetchError, CatalogLoad, CatalogPolicy, CatalogSource, 
 pub use chat::{ChatStoreError, ChatStorePort};
 pub use forge::{
     ForgeCapabilities, ForgeFactory, ForgePort, ForgeProbe, ForgeStatus, PullRequestPage,
+    ReviewPosted,
 };
 pub use llm::{ChatOutcome, ChatRequest, DeltaHandler, LlmError, LlmPort, TokenUsage};
 pub use secret::{ApiKey, KeySource, KeyStatus, SecretError, SecretStore};

@@ -20,19 +20,20 @@
 
 pub mod json;
 pub mod probe;
+mod review;
 
 use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 
-use crate::adapters::process::{CommandSpec, ProcessRunner};
+use crate::adapters::process::{CommandSpec, Output, ProcessRunner};
 use crate::domain::pr::{CheckRun, PullRequestDetail, Review, ReviewComment};
 use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::error::{Error, Result};
 use crate::logging::{self, Level};
-use crate::ports::Cancel;
 use crate::ports::forge::{ForgeCapabilities, ForgeFactory, ForgePort, PullRequestPage};
+use crate::ports::{Cancel, ReviewPosted};
 
 use json::{
     DETAIL_FIELDS, GhDetail, GhReview, GhReviewComment, GhSummary, GraphQlResponse, LIST_FIELDS,
@@ -206,6 +207,32 @@ impl GhCliForge {
         Ok(output.stdout)
     }
 
+    /// Runs a command that changes something outside this process (FR-6.5).
+    ///
+    /// Under `--dry-run` the call is recorded and `Ok(None)` comes back: the caller
+    /// must then behave as if nothing happened, because nothing did. Every mutating
+    /// call in this adapter goes through here, so there is one place where the
+    /// dry-run promise is kept rather than one per feature.
+    fn mutate(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<Option<Output>> {
+        logging::log(Level::Debug, format!("running {}", spec.render()));
+        let output = self.runner.run(spec, cancel).map_err(|error| {
+            Error::forge(
+                spec.render(),
+                match error {
+                    crate::adapters::process::ProcessError::NotFound { .. } => {
+                        "the GitHub CLI was not found; install it from https://cli.github.com"
+                            .to_owned()
+                    }
+                    other => other.to_string(),
+                },
+            )
+        })?;
+        if output.dry_run {
+            return Ok(None);
+        }
+        Ok(Some(output))
+    }
+
     /// The search string for the count query.
     fn search_query(&self, query: &PrQuery) -> String {
         let mut parts = vec![format!("repo:{}", self.repo.slug()), "is:pr".to_owned()];
@@ -370,6 +397,15 @@ impl ForgePort for GhCliForge {
         let spec = self.spec(&["pr", "diff", &number, "--patch"]);
         self.text(&spec, cancel)
     }
+
+    fn submit_review(
+        &self,
+        number: u64,
+        draft: &crate::domain::draft::Draft,
+        cancel: &Cancel,
+    ) -> Result<ReviewPosted> {
+        self.submit_review(number, draft, cancel)
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +441,15 @@ mod tests {
             let mut script = format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{path}\"\nprintf '\\037\\n' >> \"{path}\"\n",
                 path = argv.display()
+            );
+            // Keep a copy of anything passed with `--input`: the adapter deletes the
+            // payload file once the call succeeds, and a test still has to be able to
+            // see what was sent — asserting on what the fake *received* is the only
+            // way to check the wire rather than the code that built it.
+            let _ = writeln!(
+                script,
+                "prev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = \"--input\" ] && [ -f \"$arg\" ]; then\n    cp \"$arg\" \"{captured}\"\n  fi\n  prev=\"$arg\"\ndone",
+                captured = dir.path().join("input.json").display()
             );
             // The keys are matched against `$1:$2` rather than `$*`: a `case`
             // pattern may not contain whitespace (dash treats it as a separator
@@ -454,6 +499,13 @@ mod tests {
         fn last_call(&self) -> Vec<String> {
             self.calls().pop().unwrap_or_default()
         }
+
+        /// The JSON body passed with `--input`, as the fake received it.
+        fn input(&self) -> serde_json::Value {
+            let text = std::fs::read_to_string(self.dir.path().join("input.json"))
+                .expect("the fake kept a copy of --input");
+            serde_json::from_str(&text).expect("valid JSON")
+        }
     }
 
     const LIST: &str = include_str!("../../../tests/fixtures/gh/pr-list.json");
@@ -463,6 +515,200 @@ mod tests {
         include_str!("../../../tests/fixtures/gh/review-comments-page2.json");
     const COUNT: &str = include_str!("../../../tests/fixtures/gh/graphql-count.json");
     const DIFF: &str = include_str!("../../../tests/fixtures/gh/pr-diff.patch");
+
+    fn a_draft_with(comments: usize) -> crate::domain::draft::Draft {
+        use crate::domain::draft::{Decision, Draft, DraftComment, Side};
+        let now = crate::domain::time::from_unix_secs(1_700_000_000);
+        let mut draft = Draft::new(141, now);
+        draft.set_decision(Some(Decision::RequestChanges), now);
+        draft.set_body("One thing to fix.", now);
+        draft.head_sha = Some("abc123".to_owned());
+        for index in 0..comments {
+            draft.add(
+                DraftComment::new(
+                    format!("src/domain/file{index}.rs"),
+                    Side::New,
+                    31 + u32::try_from(index).unwrap_or(0),
+                    Some(28),
+                    "this rounds up",
+                )
+                .expect("valid"),
+                now,
+            );
+        }
+        draft
+    }
+
+    #[test]
+    fn a_review_without_comments_goes_through_gh_pr_review() {
+        let fake = FakeGh::scripted(&[("pr:review", "Approved pull request #141")]);
+        let forge = fake.forge("acme/service");
+
+        let posted = forge
+            .submit_review(141, &a_draft_with(0), &Cancel::new())
+            .expect("published");
+
+        assert!(!posted.dry_run);
+        assert_eq!(
+            fake.last_call(),
+            vec![
+                "pr",
+                "review",
+                "141",
+                "--request-changes",
+                "--body",
+                "One thing to fix.",
+                "--repo",
+                "acme/service",
+            ],
+            "the body is one argv element, never interpolated into a shell"
+        );
+    }
+
+    #[test]
+    fn an_approval_carries_no_body_when_there_is_none() {
+        use crate::domain::draft::{Decision, Draft};
+        let fake = FakeGh::scripted(&[("pr:review", "ok")]);
+        let forge = fake.forge("acme/service");
+        let now = crate::domain::time::from_unix_secs(1_700_000_000);
+        let mut draft = Draft::new(141, now);
+        draft.set_decision(Some(Decision::Approve), now);
+
+        forge
+            .submit_review(141, &draft, &Cancel::new())
+            .expect("published");
+        assert_eq!(
+            fake.last_call(),
+            vec!["pr", "review", "141", "--approve", "--repo", "acme/service"]
+        );
+    }
+
+    #[test]
+    fn a_review_with_comments_is_one_batched_call() {
+        // The requirement is one review rather than N comments (FR-6.3), so the test
+        // asserts the *count* of calls as well as their shape: one `gh api` call, and
+        // the comments inside the payload rather than in arguments of their own.
+        let fake = FakeGh::scripted(&[(
+            "api:-X",
+            r#"{"id": 4242, "html_url": "https://example.test/review/4242"}"#,
+        )]);
+        let forge = fake.forge("acme/service");
+
+        let posted = forge
+            .submit_review(141, &a_draft_with(3), &Cancel::new())
+            .expect("published");
+
+        assert_eq!(posted.id, Some(4242));
+        assert_eq!(
+            posted.url.as_deref(),
+            Some("https://example.test/review/4242")
+        );
+        assert_eq!(fake.calls().len(), 1, "one review, one request");
+        let call = fake.last_call();
+        assert_eq!(call[0], "api");
+        assert_eq!(call[1], "-X");
+        assert_eq!(call[2], "POST");
+        assert_eq!(call[3], "repos/acme/service/pulls/141/reviews");
+        assert_eq!(call[4], "--input");
+
+        // The payload is a file, and it held every comment verbatim — read back from
+        // the copy the fake kept, because the adapter deletes the original.
+        let payload = fake.input();
+        assert_eq!(payload["event"], "REQUEST_CHANGES");
+        assert_eq!(payload["body"], "One thing to fix.");
+        assert_eq!(payload["commit_id"], "abc123");
+        let comments = payload["comments"].as_array().expect("an array");
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0]["path"], "src/domain/file0.rs");
+        assert_eq!(comments[0]["line"], 31);
+        assert_eq!(comments[0]["start_line"], 28);
+        assert_eq!(comments[0]["side"], "RIGHT");
+        assert_eq!(comments[2]["line"], 33);
+    }
+
+    #[test]
+    fn the_payload_file_is_cleaned_up_after_a_review() {
+        let fake = FakeGh::scripted(&[("api:-X", r#"{"id": 1}"#)]);
+        let forge = fake.forge("acme/service");
+        forge
+            .submit_review(141, &a_draft_with(1), &Cancel::new())
+            .expect("published");
+        let path = fake.last_call()[5].clone();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a payload file left behind is prose in the temporary directory forever: {path}"
+        );
+        assert_eq!(
+            fake.input()["comments"].as_array().map(Vec::len),
+            Some(1),
+            "and it was the review that was sent"
+        );
+    }
+
+    #[test]
+    fn a_refused_review_is_reported_with_the_draft_still_in_hand() {
+        // The draft is the caller's, so "preserved" here means the adapter did not
+        // consume it — and the error is a sentence rather than an HTTP body.
+        let fake = FakeGh::scripted(&[]);
+        let forge = fake.forge("acme/service");
+        let draft = a_draft_with(1);
+        let error = forge
+            .submit_review(141, &draft, &Cancel::new())
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("this rounds up") || error.to_string().contains("fake gh"),
+            "what gh said: {error}"
+        );
+        assert_eq!(draft.comments.len(), 1, "the draft is untouched");
+    }
+
+    #[test]
+    fn a_draft_with_nothing_to_say_is_refused_before_any_call() {
+        use crate::domain::draft::Draft;
+        let fake = FakeGh::scripted(&[("pr:review", "ok")]);
+        let forge = fake.forge("acme/service");
+        let draft = Draft::new(141, crate::domain::time::from_unix_secs(1_700_000_000));
+        let error = forge
+            .submit_review(141, &draft, &Cancel::new())
+            .expect_err("refused");
+        assert!(error.to_string().contains("nothing to send"), "{error}");
+        assert!(fake.calls().is_empty(), "nothing was sent to GitHub");
+    }
+
+    #[test]
+    fn a_dry_run_records_the_review_instead_of_posting_it() {
+        let fake = FakeGh::scripted(&[("pr:review", "ok"), ("api:-X", "{}")]);
+        let runner =
+            ProcessRunner::new().with_dry_run(crate::adapters::process::DryRunLedger::new());
+        let ledger = runner.dry_run_ledger().expect("a ledger").clone();
+        let forge = fake.forge("acme/service").with_runner(runner);
+
+        let posted = forge
+            .submit_review(141, &a_draft_with(2), &Cancel::new())
+            .expect("recorded");
+
+        assert!(posted.dry_run);
+        assert!(fake.calls().is_empty(), "nothing reached gh");
+        let commands = ledger.commands();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            commands[0].contains("api -X POST repos/acme/service/pulls/141/reviews --input"),
+            "{}",
+            commands[0]
+        );
+        // The command is one a person can run: the payload it names exists.
+        let path = commands[0]
+            .rsplit("--input ")
+            .next()
+            .expect("a path")
+            .trim()
+            .to_owned();
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "a dry run writes the payload so the recorded command works: {path}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn a_list_call_passes_the_repository_state_limit_search_and_fields() {

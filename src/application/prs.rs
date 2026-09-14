@@ -506,6 +506,7 @@ mod tests {
         count: Mutex<Option<u32>>,
         fail: Mutex<Option<String>>,
         calls: AtomicU64,
+        submitted: Mutex<Option<(u64, crate::domain::draft::Draft)>>,
     }
 
     impl FakeForge {
@@ -591,6 +592,21 @@ mod tests {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| crate::Error::forge("gh", "no diff configured"))
+        }
+
+        fn submit_review(
+            &self,
+            number: u64,
+            draft: &crate::domain::draft::Draft,
+            _cancel: &Cancel,
+        ) -> Result<crate::ports::ReviewPosted> {
+            self.maybe_fail()?;
+            *self.submitted.lock().unwrap() = Some((number, draft.clone()));
+            Ok(crate::ports::ReviewPosted {
+                id: Some(9),
+                url: Some(format!("https://example.test/review/{number}")),
+                dry_run: false,
+            })
         }
     }
 

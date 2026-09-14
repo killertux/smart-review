@@ -1268,6 +1268,18 @@ mod tests {
             ForgeCapabilities::default()
         }
 
+        fn submit_review(
+            &self,
+            number: u64,
+            _draft: &crate::domain::draft::Draft,
+            _cancel: &Cancel,
+        ) -> crate::Result<crate::ports::ReviewPosted> {
+            Err(crate::Error::forge(
+                format!("review #{number}"),
+                "this fake does not publish",
+            ))
+        }
+
         fn list_pull_requests(
             &self,
             _query: &PrQuery,
@@ -1562,6 +1574,18 @@ mod tests {
     impl ForgePort for PanicForge {
         fn capabilities(&self) -> ForgeCapabilities {
             ForgeCapabilities::default()
+        }
+
+        fn submit_review(
+            &self,
+            number: u64,
+            _draft: &crate::domain::draft::Draft,
+            _cancel: &Cancel,
+        ) -> crate::Result<crate::ports::ReviewPosted> {
+            Err(crate::Error::forge(
+                format!("review #{number}"),
+                "this fake does not publish",
+            ))
         }
 
         fn list_pull_requests(&self, _q: &PrQuery, _c: &Cancel) -> crate::Result<PullRequestPage> {

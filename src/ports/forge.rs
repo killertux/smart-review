@@ -5,6 +5,7 @@
 //! that the user must be able to abandon (NFR-1.4).
 
 use crate::domain::diff::Patch;
+use crate::domain::draft::Draft;
 use crate::domain::pr::{CheckRun, PullRequestDetail, PullRequestSummary, Review, ReviewComment};
 use crate::domain::query::PrQuery;
 use std::sync::Arc;
@@ -27,6 +28,20 @@ impl Default for ForgeCapabilities {
             inline_comments: true,
         }
     }
+}
+
+/// What publishing a review produced (FR-6.3, FR-6.5).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewPosted {
+    /// The review's id, when the forge reported one.
+    pub id: Option<u64>,
+    /// The browser URL of the review, when the forge reported one.
+    pub url: Option<String>,
+    /// Whether this was a dry run, so nothing was sent at all (FR-6.5).
+    ///
+    /// The caller must not clear the draft when this is set: the review is still
+    /// sitting in front of the user.
+    pub dry_run: bool,
 }
 
 /// A page of pull requests, with what is known about the total.
@@ -191,6 +206,29 @@ pub trait ForgePort: std::fmt::Debug + Send + Sync {
     ///
     /// As [`Self::get_pull_request`].
     fn list_checks(&self, number: u64, cancel: &Cancel) -> crate::Result<Vec<CheckRun>>;
+
+    /// Publishes one review carrying the draft's decision, body and comments (FR-6.3).
+    ///
+    /// **One call.** The forge creates the review and its inline comments together,
+    /// so a failure means nothing was posted, rather than a review the user has to go
+    /// and delete. A forge that cannot do it in one call must refuse rather than post
+    /// N separate comments — the requirement is one review, not N notifications.
+    ///
+    /// A draft that cannot be sent is refused here as well as in the composer: this
+    /// is the boundary that can post something public, so it checks rather than
+    /// trusting its caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the draft is not publishable, when the forge refuses the
+    /// review (see the adapter's translation of GitHub's refusals), or when `gh`
+    /// cannot be run.
+    fn submit_review(
+        &self,
+        number: u64,
+        draft: &Draft,
+        cancel: &Cancel,
+    ) -> crate::Result<ReviewPosted>;
 
     /// The unified diff of a PR, as text (FR-3.2).
     ///
