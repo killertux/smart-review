@@ -87,6 +87,17 @@ pub enum Slot {
     ChatAsk,
     /// Publishing a review (FR-6.3).
     Review,
+    /// Replying into a thread, and commenting on the conversation (FR-6.4).
+    ///
+    /// One slot for both because they are the same resource — words added to the pull
+    /// request — and the modal already prevents a second post from starting while one
+    /// is in flight.
+    Post,
+    /// Resolving or unresolving a thread (FR-6.4).
+    ///
+    /// Its own slot, deliberately: resolving is not a post, and superseding a reply
+    /// with a resolve would cancel a request that may already have reached GitHub.
+    Thread,
 }
 
 /// What a job was asked to do.
@@ -216,6 +227,33 @@ pub enum Job {
         /// variant's payload, and every job crosses a channel.
         context: Box<Context>,
     },
+    /// Reply into a review thread (FR-6.4).
+    ///
+    /// The body travels in the job rather than being read from the interface inside
+    /// it: the words that are sent must be the words the user confirmed, whatever they
+    /// type next.
+    PostReply {
+        /// Which pull request.
+        number: u64,
+        /// The comment being answered, which is where GitHub attaches the reply.
+        comment_id: u64,
+        /// What to say.
+        body: String,
+    },
+    /// Comment on the pull request's conversation (FR-6.4, DEC-16).
+    PostConversation {
+        /// Which pull request.
+        number: u64,
+        /// What to say.
+        body: String,
+    },
+    /// Resolve or unresolve a thread (FR-6.4).
+    ResolveThread {
+        /// GitHub's thread id.
+        thread_id: String,
+        /// Which way.
+        resolved: bool,
+    },
 }
 
 impl Job {
@@ -252,6 +290,8 @@ impl Job {
             Self::LoadChat { .. } | Self::GatherChat { .. } => Slot::Chat,
             Self::AskChat { .. } => Slot::ChatAsk,
             Self::SubmitReview { .. } => Slot::Review,
+            Self::PostReply { .. } | Self::PostConversation { .. } => Slot::Post,
+            Self::ResolveThread { .. } => Slot::Thread,
         }
     }
 
@@ -352,6 +392,17 @@ pub enum Outcome {
         session: Box<crate::domain::chat::Session>,
         /// The question that asked for it.
         question: String,
+    },
+    /// A reply or a conversation comment was posted, or recorded by a dry run
+    /// (FR-6.4, FR-6.5).
+    CommentPosted(Box<crate::ports::CommentPosted>),
+    /// A thread's state was changed (FR-6.4).
+    ThreadResolved {
+        /// Which thread, so the drawn discussion can be updated without waiting for the
+        /// refresh that will confirm it.
+        thread_id: String,
+        /// What the thread is now.
+        resolved: bool,
     },
     /// The review was posted, or recorded by a dry run (FR-6.3, FR-6.5).
     ReviewPosted(Box<crate::ports::ReviewPosted>),
@@ -587,6 +638,16 @@ impl Executor {
                 self.chat_job(job, cancel, sink)
             }
             Job::SubmitReview { draft } => self.submit_review(draft, cancel),
+            Job::PostReply {
+                number,
+                comment_id,
+                body,
+            } => self.post_reply(*number, *comment_id, body, cancel),
+            Job::PostConversation { number, body } => self.post_conversation(*number, body, cancel),
+            Job::ResolveThread {
+                thread_id,
+                resolved,
+            } => self.resolve_thread(thread_id, *resolved, cancel),
             // Detection, the report, the catalog, the worktree and the connection
             // check do not need a repository resolved through the forge, so
             // `JobRunner` handles them directly.
@@ -624,6 +685,36 @@ impl Executor {
                 }
                 Outcome::ReviewPosted(Box::new(posted))
             }
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+
+    /// Posts a reply, through the service that validates it (FR-6.4).
+    fn post_reply(&self, number: u64, comment_id: u64, body: &str, cancel: &Cancel) -> Outcome {
+        let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
+        match posts.reply(number, comment_id, body, cancel) {
+            Ok(posted) => Outcome::CommentPosted(Box::new(posted)),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+
+    /// Posts a comment on the pull request's conversation (FR-6.4).
+    fn post_conversation(&self, number: u64, body: &str, cancel: &Cancel) -> Outcome {
+        let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
+        match posts.comment(number, body, cancel) {
+            Ok(posted) => Outcome::CommentPosted(Box::new(posted)),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+
+    /// Resolves or unresolves a thread (FR-6.4).
+    fn resolve_thread(&self, thread_id: &str, resolved: bool, cancel: &Cancel) -> Outcome {
+        let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
+        match posts.resolve(thread_id, resolved, cancel) {
+            Ok(()) => Outcome::ThreadResolved {
+                thread_id: thread_id.to_owned(),
+                resolved,
+            },
             Err(error) => Outcome::Failed(error.to_string()),
         }
     }
@@ -1186,6 +1277,26 @@ pub fn job_for(
         // confirmed, whatever they type while it is in flight.
         Effect::PublishDraft => Some(Job::SubmitReview {
             draft: Box::new(draft.clone()),
+        }),
+        Effect::PostReply {
+            number,
+            comment_id,
+            body,
+        } => Some(Job::PostReply {
+            number: *number,
+            comment_id: *comment_id,
+            body: body.clone(),
+        }),
+        Effect::PostConversation { number, body } => Some(Job::PostConversation {
+            number: *number,
+            body: body.clone(),
+        }),
+        Effect::ResolveThread {
+            thread_id,
+            resolved,
+        } => Some(Job::ResolveThread {
+            thread_id: thread_id.clone(),
+            resolved: *resolved,
         }),
         Effect::RunDoctor => Some(Job::Report {
             context: Box::new(context),

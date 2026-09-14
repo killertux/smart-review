@@ -156,6 +156,29 @@ pub enum Effect {
     ClearDraft,
     /// Send the staged review (FR-6.3).
     PublishDraft,
+    /// Reply into a review thread (FR-6.4).
+    PostReply {
+        /// Which pull request.
+        number: u64,
+        /// The comment being answered.
+        comment_id: u64,
+        /// What to say.
+        body: String,
+    },
+    /// Comment on the pull request's conversation (FR-6.4).
+    PostConversation {
+        /// Which pull request.
+        number: u64,
+        /// What to say.
+        body: String,
+    },
+    /// Resolve or unresolve a thread (FR-6.4).
+    ResolveThread {
+        /// GitHub's thread id.
+        thread_id: String,
+        /// Which way.
+        resolved: bool,
+    },
     /// Give up on the publish in flight, keeping the draft (FR-6.3).
     CancelPublish,
     /// Write the calls a dry run recorded to `logs/dry-run.log` (FR-6.5).
@@ -228,6 +251,11 @@ fn effect_name(effect: &Effect) -> String {
         Effect::LoadMore => "load-more".to_owned(),
         Effect::CountPullRequests => "count-pull-requests".to_owned(),
         Effect::OpenPullRequest(number) => format!("open-pull-request({number})"),
+        // The body is deliberately not in the name: an effect name is written to the
+        // log, and a comment is prose the user wrote about someone's code.
+        Effect::PostReply { comment_id, .. } => format!("post-reply({comment_id})"),
+        Effect::PostConversation { number, .. } => format!("post-conversation({number})"),
+        Effect::ResolveThread { resolved, .. } => format!("resolve-thread({resolved})"),
         Effect::ReloadDiff => "reload-diff".to_owned(),
         Effect::CopyPath(_) => "copy-path".to_owned(),
         Effect::SetMouse(enabled) => format!("set-mouse({enabled})"),
@@ -372,6 +400,8 @@ pub enum Overlay {
     Publish,
     /// A destructive action waiting for a second key (FR-6.5).
     Confirm,
+    /// The comments on the pull request itself (FR-6.4, DEC-16).
+    Conversation,
 }
 
 /// A destructive action, and the question that stands in front of it (FR-6.5).
@@ -800,6 +830,8 @@ pub struct App {
     pub(crate) chat_store: std::sync::Arc<dyn crate::ports::ChatStorePort>,
     /// The review draft and everything the review actions own (FR-6.1–FR-6.3).
     pub(crate) drafts: crate::tui::drafts::DraftState,
+    /// The conversation panel, and the resolve in flight (FR-6.4).
+    pub(crate) discussion: crate::tui::discussion::DiscussionState,
     /// Where drafts are kept between runs (FR-6.1).
     pub(crate) draft_store: std::sync::Arc<dyn crate::ports::DraftStorePort>,
     /// The draft service, once the repository is known (FR-6.1).
@@ -931,6 +963,7 @@ impl App {
             chat_bundle_for: None,
             chat_store,
             drafts: crate::tui::drafts::DraftState::default(),
+            discussion: crate::tui::discussion::DiscussionState::default(),
             draft_store,
             draft_service: None,
             confirmation: None,
@@ -1136,6 +1169,13 @@ impl App {
             // outcome arrived, and the id it was gated on had never been recorded —
             // so the interface said nothing at all, success or failure.
             Effect::PublishDraft => self.drafts.job = id,
+            // FR-6.4's two posting slots, recorded for the same reason publishing is: the
+            // id is what the completion is gated on, and a slot whose id is never recorded
+            // is a slot whose result — success or failure — is dropped in silence.
+            Effect::PostReply { .. } | Effect::PostConversation { .. } => {
+                self.drafts.post_job = id;
+            }
+            Effect::ResolveThread { .. } => self.discussion.job = id,
             // The rest ask for no job, or are handled by `apply` rather than here.
             _ => {}
         }
@@ -1224,6 +1264,15 @@ impl App {
             Outcome::ReviewPosted(posted) if job == self.drafts.job => {
                 Some(self.apply_review_posted(&posted))
             }
+            Outcome::CommentPosted(posted) if job == self.drafts.post_job => {
+                Some(self.apply_comment_posted(&posted))
+            }
+            Outcome::ThreadResolved {
+                thread_id,
+                resolved,
+            } if job == self.discussion.job => {
+                Some(self.apply_thread_resolved(&thread_id, resolved))
+            }
             // The analysis group has its own handler: three outcomes that share the
             // panel's state, and a match with twenty arms is one where the interesting
             // ones hide.
@@ -1263,6 +1312,8 @@ impl App {
             | Outcome::ModelChecked(_)
             | Outcome::WorkspacesCleaned { .. }
             | Outcome::ReviewPosted(_)
+            | Outcome::CommentPosted(_)
+            | Outcome::ThreadResolved { .. }
             | Outcome::Stored { .. }
             | Outcome::Context { .. }
             | Outcome::Analyzed(_)
@@ -1667,7 +1718,12 @@ impl App {
     /// Whether the comment composer has the keyboard (FR-6.2).
     #[must_use]
     pub fn draft_is_composing(&self) -> bool {
-        self.drafts.is_composing() && self.overlay == Overlay::None && self.pending.is_empty()
+        // The conversation panel is the one overlay a compose box may sit inside: the
+        // panel is where you read what was said, and `c` in it writes the next thing
+        // (FR-6.4). Every other overlay is a different question being asked.
+        self.drafts.is_composing()
+            && matches!(self.overlay, Overlay::None | Overlay::Conversation)
+            && self.pending.is_empty()
     }
 
     /// A key pressed while the comment composer has the keyboard (FR-6.2).
@@ -1680,7 +1736,15 @@ impl App {
     fn on_draft_input_key(&mut self, combo: KeyCombo) -> Effect {
         if combo.code == KeyCode::Esc {
             self.drafts.cancel_composer();
-            self.mode = Mode::Normal;
+            // Leaving the composer returns to what is behind it: the conversation panel
+            // is a popup and takes its keys back, and with no overlay there is normal
+            // mode. Setting this to `Normal` unconditionally left the panel open and
+            // unreachable.
+            self.mode = if self.overlay == Overlay::None {
+                Mode::Normal
+            } else {
+                Mode::Popup
+            };
             return Effect::None;
         }
         if combo.code == KeyCode::Enter
@@ -1688,7 +1752,10 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
-            return self.stage_comment();
+            // What Enter does depends on what is being written: a line comment is staged
+            // into the review, a reply is shown and then posted. The composer's own
+            // target says which, so there is no second key to learn.
+            return self.confirm_composer();
         }
         let printable = matches!(combo.code, KeyCode::Char(_))
             && !combo
@@ -1892,6 +1959,11 @@ impl App {
         if self.overlay == Overlay::Confirm {
             return self.take_confirmed().unwrap_or(Effect::None);
         }
+        if self.overlay == Overlay::Conversation {
+            // Inside the conversation panel, Enter is "write something": an empty panel
+            // has nothing to publish, and a full one has a cursor, not a pending action.
+            return self.start_conversation_comment();
+        }
         if self.overlay == Overlay::Publish {
             return self.confirm_publish();
         }
@@ -1920,6 +1992,234 @@ impl App {
             // effect is nothing, so the composer stays open with the text intact.
             Err(_) => Effect::None,
         }
+    }
+
+    /// Opens the draft panel (FR-6.1).
+    /// The conversation panel's state (FR-6.4).
+    #[must_use]
+    pub fn discussion(&self) -> &crate::tui::discussion::DiscussionState {
+        &self.discussion
+    }
+
+    /// The comments on the pull request itself (FR-6.4).
+    #[must_use]
+    pub fn conversation(&self) -> &[crate::domain::pr::ConversationComment] {
+        self.detail
+            .as_ref()
+            .map_or(&[], |detail| detail.conversation.as_slice())
+    }
+
+    /// Opens the conversation panel (FR-6.4).
+    pub(crate) fn open_conversation(&mut self) -> Effect {
+        if self.detail.is_none() {
+            self.notice(
+                NoticeLevel::Warn,
+                "open a pull request first; its conversation belongs to one",
+            );
+            return Effect::None;
+        }
+        let count = self.conversation().len();
+        self.discussion.open(count);
+        self.open_overlay(Overlay::Conversation);
+        if count == 0 {
+            self.notice(
+                NoticeLevel::Info,
+                "nothing has been said on this pull request yet — c writes the first comment",
+            );
+        }
+        Effect::None
+    }
+
+    /// Opens the composer to answer the thread under the cursor (FR-6.4).
+    pub(crate) fn start_reply(&mut self) -> Effect {
+        let Some(thread) = self.review.as_ref().and_then(DiffView::current_thread) else {
+            self.notice(
+                NoticeLevel::Warn,
+                "put the cursor on a comment to answer it; the discussion is drawn under \
+                 the line it is about",
+            );
+            return Effect::None;
+        };
+        let Some(anchor) = self.current_anchor() else {
+            return Effect::None;
+        };
+        self.drafts
+            .compose_reply(anchor, thread.root, thread.thread.clone());
+        self.mode = Mode::Insert;
+        self.focus = Pane::Diff;
+        Effect::None
+    }
+
+    /// Opens the composer for the pull request's conversation (FR-6.4).
+    pub(crate) fn start_conversation_comment(&mut self) -> Effect {
+        if self.detail.is_none() {
+            self.notice(NoticeLevel::Warn, "open a pull request first");
+            return Effect::None;
+        }
+        self.drafts.panel = false;
+        // The overlay first, the mode last: opening an overlay sets the mode to popup,
+        // and a composer inside a popup panel has to be the thing that ends up with the
+        // keyboard (FR-6.4).
+        self.open_overlay(Overlay::Conversation);
+        self.drafts.compose_conversation();
+        self.mode = Mode::Insert;
+        Effect::None
+    }
+
+    /// Shows what is about to be posted, or stages a comment (FR-6.2, FR-6.4, FR-6.5).
+    ///
+    /// The two Enters of FR-6.3 apply to a reply as well, and for the same reason: the
+    /// modal is the last place a mistake can be seen, and a reply is also something
+    /// other people will read. A line comment is the different case — it is staged
+    /// locally, reversible, and not sent until the whole review is.
+    pub(crate) fn confirm_composer(&mut self) -> Effect {
+        let Some(composer) = self.drafts.composer.as_ref() else {
+            return Effect::None;
+        };
+        if composer.target.is_staged() {
+            return self.stage_comment();
+        }
+        let target = composer.target.clone();
+        let body = composer.body().to_owned();
+        if let Err(error) = crate::domain::draft::Post::new(body.clone()) {
+            if let Some(composer) = self.drafts.composer.as_mut() {
+                composer.refusal = Some(error.to_string());
+            }
+            return Effect::None;
+        }
+        self.drafts.post = Some(crate::tui::drafts::PendingPost { target, body });
+        self.drafts.composer = None;
+        self.drafts.armed = false;
+        self.drafts.scroll = 0;
+        self.drafts.modal = true;
+        self.mode = Mode::Normal;
+        self.open_overlay(Overlay::Publish);
+        Effect::None
+    }
+
+    /// Sends the reply or the conversation comment that was confirmed (FR-6.4).
+    ///
+    /// The post is deliberately **not** taken here: it stays until GitHub accepts it, so
+    /// a failure leaves the words where the user can send them again. That is the same
+    /// rule as the draft keeping its comments (NFR-3.4), applied to the other surface
+    /// that can put words on the internet.
+    fn send_post(&mut self) -> Effect {
+        let Some(number) = self.detail.as_ref().map(|detail| detail.summary.number) else {
+            self.notice(NoticeLevel::Warn, "no pull request is open");
+            return Effect::None;
+        };
+        let Some(post) = self.drafts.post.as_ref() else {
+            return Effect::None;
+        };
+        self.drafts.armed = false;
+        self.drafts.status = crate::tui::drafts::DraftStatus::Publishing;
+        match &post.target {
+            crate::tui::drafts::Target::Thread { root, .. } => Effect::PostReply {
+                number,
+                comment_id: *root,
+                body: post.body.clone(),
+            },
+            crate::tui::drafts::Target::Conversation => Effect::PostConversation {
+                number,
+                body: post.body.clone(),
+            },
+            // Unreachable by construction: a line comment is staged rather than posted.
+            // Kept as a refusal rather than a panic because the wrong thing to do here is
+            // obvious and cheap, and the right thing is not worth a crash over.
+            crate::tui::drafts::Target::Line(_) => {
+                self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+                self.notice(
+                    NoticeLevel::Warn,
+                    "a comment on a line is staged into the review, not posted on its own",
+                );
+                Effect::None
+            }
+        }
+    }
+
+    /// Asks before changing a thread's state (FR-6.4, FR-6.5).
+    pub(crate) fn ask_toggle_thread(&mut self) -> Effect {
+        let Some(thread) = self.review.as_ref().and_then(DiffView::current_thread) else {
+            self.notice(
+                NoticeLevel::Warn,
+                "put the cursor on a comment to resolve its thread",
+            );
+            return Effect::None;
+        };
+        let Some(id) = thread.thread.clone() else {
+            self.notice(
+                NoticeLevel::Warn,
+                "GitHub's thread ids could not be read for this pull request, so its threads \
+                 cannot be resolved",
+            );
+            return Effect::None;
+        };
+        let verb = if thread.resolved { "reopen" } else { "resolve" };
+        self.ask(
+            format!("{verb} this thread on GitHub?"),
+            Effect::ResolveThread {
+                thread_id: id,
+                resolved: !thread.resolved,
+            },
+        );
+        Effect::None
+    }
+
+    /// Says what a posted comment did, and refreshes what it changed (FR-6.4).
+    fn apply_comment_posted(&mut self, posted: &crate::ports::CommentPosted) -> Effect {
+        self.drafts.post_job = 0;
+        self.drafts.armed = false;
+        if posted.dry_run {
+            self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+            self.notice(
+                NoticeLevel::Info,
+                "dry run: nothing was posted; the comment is still here",
+            );
+            return Effect::WriteDryRun;
+        }
+        self.drafts.post = None;
+        self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+        self.drafts.modal = false;
+        self.close_overlay();
+        let what = match posted.url.as_deref() {
+            Some(url) => format!("comment posted: {url}"),
+            None => "comment posted".to_owned(),
+        };
+        self.notice(NoticeLevel::Info, what);
+        logging::log(Level::Info, "a comment was posted to GitHub");
+        // The pull request now says something it did not a moment ago, and the panel and
+        // the diff are both drawn from the detail: re-reading it is what makes the new
+        // comment appear where it belongs (FR-6.4).
+        self.reload_after_publish()
+    }
+
+    /// Applies a thread's new state, and re-reads the pull request (FR-6.4).
+    ///
+    /// The state is applied to the comments already in hand *before* the refresh, so the
+    /// tick appears on the keypress rather than a round trip later. The refresh is still
+    /// what makes it true: GitHub is the authority on whether a thread is resolved, and
+    /// a failed resolve says so instead of leaving a tick that means nothing.
+    fn apply_thread_resolved(&mut self, thread_id: &str, resolved: bool) -> Effect {
+        self.discussion.job = 0;
+        if let Some(detail) = self.detail.as_mut() {
+            for comment in &mut detail.comments {
+                if comment.thread_id.as_deref() == Some(thread_id) {
+                    comment.resolved = resolved;
+                }
+            }
+        }
+        if let (Some(detail), Some(view)) = (self.detail.as_ref(), self.review.as_mut()) {
+            view.set_comments(&detail.comments);
+        }
+        self.notice(
+            NoticeLevel::Info,
+            if resolved {
+                "thread resolved".to_owned()
+            } else {
+                "thread reopened".to_owned()
+            },
+        );
+        self.reload_after_publish()
     }
 
     /// Opens the draft panel (FR-6.1).
@@ -1975,6 +2275,11 @@ impl App {
         if !self.drafts.armed {
             self.drafts.armed = true;
             return Effect::None;
+        }
+        // One modal, two subjects: a review and a reply are both "words about to go to
+        // GitHub", and the second Enter is what sends whichever is in the modal.
+        if self.drafts.post.is_some() {
+            return self.send_post();
         }
         self.publish_draft()
     }
@@ -3237,6 +3542,8 @@ impl App {
             || job == self.chat.job
             || job == self.chat.load_job
             || job == self.drafts.job
+            || job == self.drafts.post_job
+            || job == self.discussion.job
     }
 
     /// Records a job failure where the user will see it.
@@ -3256,6 +3563,30 @@ impl App {
                 format!("the review was not posted: {message}"),
             );
             logging::log(Level::Warn, format!("the review was not posted: {message}"));
+            return;
+        }
+        if job == self.drafts.post_job {
+            self.drafts.post_job = 0;
+            // The words stay: the modal keeps the comment it could not post, and the
+            // reason is in it. Losing a reply to a network error is the failure mode this
+            // whole shape exists to avoid (NFR-3.4).
+            self.drafts.publish_failed(message);
+            self.notice(
+                NoticeLevel::Error,
+                format!("the comment was not posted: {message}"),
+            );
+            logging::log(Level::Warn, format!("a comment was not posted: {message}"));
+            return;
+        }
+        if job == self.discussion.job {
+            self.discussion.job = 0;
+            // Nothing was drawn as resolved — the optimistic tick is applied only when
+            // GitHub answers — so there is nothing to undo, only something to say.
+            self.notice(
+                NoticeLevel::Error,
+                format!("the thread was not changed: {message}"),
+            );
+            logging::log(Level::Warn, format!("a thread was not changed: {message}"));
             return;
         }
         if job == self.chat.job {
@@ -3846,6 +4177,7 @@ impl App {
         self.help_filter = None;
         self.drafts.panel = false;
         self.drafts.close_modal();
+        self.discussion.close();
         self.confirmation = None;
     }
 
@@ -4664,6 +4996,32 @@ impl App {
             KeyCode::Char('u') if self.overlay == Overlay::Analysis => {
                 self.panel.scroll = self.panel.scroll.saturating_sub(10);
                 Effect::None
+            }
+            // The conversation panel: `j`/`k` walk the comments, `c` writes one, `R`
+            // re-reads them (FR-6.4).
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Conversation => {
+                let count = self.conversation().len();
+                self.discussion.move_cursor(1, count);
+                Effect::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Conversation => {
+                let count = self.conversation().len();
+                self.discussion.move_cursor(-1, count);
+                Effect::None
+            }
+            KeyCode::Char('d') if self.overlay == Overlay::Conversation => {
+                self.discussion.scroll = self.discussion.scroll.saturating_add(10);
+                Effect::None
+            }
+            KeyCode::Char('u') if self.overlay == Overlay::Conversation => {
+                self.discussion.scroll = self.discussion.scroll.saturating_sub(10);
+                Effect::None
+            }
+            KeyCode::Char('c') if self.overlay == Overlay::Conversation => {
+                self.start_conversation_comment()
+            }
+            KeyCode::Char('R') if self.overlay == Overlay::Conversation => {
+                self.reload_after_publish()
             }
             // The confirmation is the only popup where a bare `y` means yes: it has no
             // list to move in, and typing is not possible (FR-6.5).
@@ -6160,7 +6518,13 @@ mod tests {
         assert!(app.draft_is_composing(), "the composer opened");
         assert_eq!(app.mode(), Mode::Insert);
         assert_eq!(
-            app.drafts().composer.as_ref().expect("open").anchor.label(),
+            app.drafts()
+                .composer
+                .as_ref()
+                .expect("open")
+                .anchor()
+                .expect("a line")
+                .label(),
             "src/domain/money.rs:2 (new)"
         );
     }
@@ -6186,6 +6550,418 @@ mod tests {
         assert_eq!(app.mode(), Mode::Normal);
         assert_eq!(app.drafts().draft.comments.len(), 1);
         assert!(app.drafts().dirty, "and the loop is what clears this");
+    }
+
+    /// An app with a diff open whose discussion has one comment in it (FR-6.4).
+    fn discussion_app(resolved: bool, thread_id: Option<&str>) -> (TempHome, App) {
+        let (dir, mut app) = draft_app();
+        let patch = crate::domain::diff::parse_patch(concat!(
+            "diff --git a/src/domain/money.rs b/src/domain/money.rs\n",
+            "--- a/src/domain/money.rs\n",
+            "+++ b/src/domain/money.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " pub fn round(cents: i64) -> i64 {\n",
+            "-    cents\n",
+            "+    (cents + 5) / 10 * 10\n",
+            " }\n",
+        ));
+        let mut detail = crate::test_support::sample_detail();
+        detail.conversation = vec![crate::domain::pr::ConversationComment {
+            id: 900,
+            author: "carol".to_owned(),
+            body: "this came out of the incident".to_owned(),
+            created_at: crate::domain::time::from_unix_secs(1_700_000_000),
+            url: None,
+        }];
+        detail.comments = vec![crate::domain::pr::ReviewComment {
+            id: 1001,
+            author: "alice".to_owned(),
+            path: "src/domain/money.rs".to_owned(),
+            line: Some(2),
+            side: Some("RIGHT".to_owned()),
+            body: "this rounds up".to_owned(),
+            created_at: crate::domain::time::from_unix_secs(1_700_000_000),
+            in_reply_to: None,
+            diff_hunk: None,
+            url: None,
+            thread_id: thread_id.map(str::to_owned),
+            resolved,
+            outdated: false,
+        }];
+        app.open_review(detail, DiffView::new(patch));
+        (dir, app)
+    }
+
+    /// Puts the cursor on the discussion row, which is the row the keys act on.
+    fn on_the_comment(app: &mut App) {
+        let view = app.review.as_ref().expect("a review");
+        let index = view
+            .rows
+            .iter()
+            .position(|row| row.kind == crate::tui::diff_view::RowKind::Discussion)
+            .expect("a discussion row");
+        app.review_mut().expect("a review").cursor = index;
+    }
+
+    #[test]
+    fn a_reply_is_shown_and_then_posted_to_the_comment_it_answers() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+
+        assert_eq!(press(&mut app, "r"), Effect::None);
+        assert!(
+            app.draft_is_composing(),
+            "the composer opened on the thread"
+        );
+        assert!(
+            app.drafts()
+                .composer
+                .as_ref()
+                .expect("open")
+                .target
+                .is_reply(),
+            "and it knows it is a reply rather than a line comment"
+        );
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("agreed, fixed in 9f2c1ab");
+
+        // The first Enter shows it; nothing leaves the machine.
+        assert_eq!(press(&mut app, "<Enter>"), Effect::None);
+        assert!(app.drafts().modal, "the modal is up");
+        assert_eq!(
+            app.mode(),
+            Mode::Popup,
+            "and the modal is a popup, so it takes the keys"
+        );
+        let post = app.drafts().post.as_ref().expect("a pending post");
+        assert_eq!(post.body, "agreed, fixed in 9f2c1ab");
+        assert!(app.drafts().draft.is_empty(), "and nothing was staged");
+
+        // The second arms, the third sends — and it names the comment it answers.
+        assert_eq!(press(&mut app, "<Enter>"), Effect::None);
+        assert!(app.drafts().armed);
+        let effect = press(&mut app, "<Enter>");
+        assert_eq!(
+            effect,
+            Effect::PostReply {
+                number: 141,
+                comment_id: 1001,
+                body: "agreed, fixed in 9f2c1ab".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_is_refused_where_it_is_typed() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+        press(&mut app, "r");
+        assert_eq!(press(&mut app, "<Enter>"), Effect::None);
+        assert!(!app.drafts().modal, "an empty comment opens nothing");
+        assert!(app.draft_is_composing(), "the composer stays open");
+        assert!(
+            app.drafts()
+                .composer
+                .as_ref()
+                .expect("open")
+                .refusal
+                .is_some(),
+            "with the reason on screen"
+        );
+    }
+
+    #[test]
+    fn the_cursor_on_an_ordinary_line_has_nothing_to_reply_to() {
+        // The commonest mistake: pressing `r` in the diff. The answer is a sentence, not
+        // a composer opened on the nearest comment.
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        app.review_mut().expect("a review").cursor = 1;
+        assert_eq!(press(&mut app, "r"), Effect::None);
+        assert!(!app.draft_is_composing());
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.text.contains("cursor on a comment")),
+            "and it says why: {:?}",
+            app.notices
+                .iter()
+                .map(|notice| notice.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_failed_reply_keeps_the_words_and_stays_in_the_modal() {
+        // The failure mode this shape exists to avoid: a comment that reached nobody and
+        // left nothing behind.
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+        press(&mut app, "r");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("half a thought");
+        press(&mut app, "<Enter>");
+        let job = 41;
+        app.record_job(
+            &Effect::PostReply {
+                number: 141,
+                comment_id: 1001,
+                body: "half a thought".to_owned(),
+            },
+            job,
+        );
+        assert_eq!(app.drafts().post_job, job);
+
+        app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::Failed(
+                "your token is not allowed to comment".to_owned(),
+            ),
+        });
+
+        assert_eq!(app.drafts().post_job, 0);
+        assert!(app.drafts().modal, "the modal stays up");
+        assert_eq!(
+            app.drafts().post.as_ref().map(|post| post.body.as_str()),
+            Some("half a thought"),
+            "and the words are still here"
+        );
+        assert!(!app.drafts().armed, "the confirmation is forgotten");
+        assert!(
+            app.drafts().status.label().contains("token"),
+            "the reason is in the modal: {}",
+            app.drafts().status.label()
+        );
+    }
+
+    #[test]
+    fn a_posted_reply_clears_the_comment_and_re_reads_the_pull_request() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+        press(&mut app, "r");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("agreed");
+        press(&mut app, "<Enter>");
+        let job = 42;
+        app.record_job(
+            &Effect::PostReply {
+                number: 141,
+                comment_id: 1001,
+                body: "agreed".to_owned(),
+            },
+            job,
+        );
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::CommentPosted(Box::new(
+                crate::ports::CommentPosted {
+                    id: Some(11),
+                    url: Some("https://example.test/c/11".to_owned()),
+                    dry_run: false,
+                },
+            )),
+        });
+
+        assert_eq!(
+            effect,
+            Some(Effect::OpenPullRequest(141)),
+            "the pull request now says something it did not"
+        );
+        assert!(app.drafts().post.is_none(), "the comment is gone");
+        assert!(!app.drafts().modal, "and the modal with it");
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.text.contains("comment posted")),
+            "with the url, so it can be read"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_post_keeps_the_comment_and_writes_the_calls() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+        press(&mut app, "r");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("agreed");
+        press(&mut app, "<Enter>");
+        let job = 43;
+        app.record_job(
+            &Effect::PostReply {
+                number: 141,
+                comment_id: 1001,
+                body: "agreed".to_owned(),
+            },
+            job,
+        );
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::CommentPosted(Box::new(
+                crate::ports::CommentPosted {
+                    dry_run: true,
+                    ..crate::ports::CommentPosted::default()
+                },
+            )),
+        });
+        assert_eq!(effect, Some(Effect::WriteDryRun));
+        assert!(
+            app.drafts().post.is_some(),
+            "nothing was posted, so the comment is still here (FR-6.5)"
+        );
+    }
+
+    #[test]
+    fn resolving_a_thread_changes_what_is_drawn_before_the_refresh_arrives() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+        assert_eq!(press(&mut app, "<leader>pt"), Effect::None);
+        assert!(
+            app.confirmation().is_some(),
+            "FR-6.5: changing something on GitHub is confirmed"
+        );
+        let effect = app.take_confirmed().expect("the confirmed effect");
+        assert_eq!(
+            effect,
+            Effect::ResolveThread {
+                thread_id: "PRRT_1".to_owned(),
+                resolved: true
+            }
+        );
+
+        let job = 44;
+        app.record_job(&effect, job);
+        assert_eq!(app.discussion().job, job);
+        let some = app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::ThreadResolved {
+                thread_id: "PRRT_1".to_owned(),
+                resolved: true,
+            },
+        });
+
+        assert_eq!(some, Some(Effect::OpenPullRequest(141)), "and re-reads it");
+        assert!(
+            app.detail()
+                .expect("a detail")
+                .comments
+                .iter()
+                .all(|comment| comment.resolved),
+            "the tick is drawn at once"
+        );
+        let drawn = app
+            .review
+            .as_ref()
+            .expect("a review")
+            .rows
+            .iter()
+            .filter(|row| row.kind == crate::tui::diff_view::RowKind::Discussion)
+            .any(|row| row.text.contains('✓'));
+        assert!(drawn, "and the row says so");
+    }
+
+    #[test]
+    fn a_thread_whose_id_could_not_be_read_says_so_instead_of_pretending() {
+        // The GraphQL read failed: there is no thread id, so there is nothing to resolve.
+        // Saying that is the only honest answer — a silent keypress would look like a bug
+        // in the app rather than a fact about the pull request.
+        let (_dir, mut app) = discussion_app(false, None);
+        on_the_comment(&mut app);
+        assert_eq!(press(&mut app, "<leader>pt"), Effect::None);
+        assert!(app.confirmation().is_none(), "nothing was asked");
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.text.contains("thread ids could not be read")),
+            "{:?}",
+            app.notices
+                .iter()
+                .map(|notice| notice.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_resolve_that_github_refused_leaves_no_tick_behind() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        on_the_comment(&mut app);
+        press(&mut app, "<leader>pt");
+        let effect = app.take_confirmed().expect("confirmed");
+        let job = 45;
+        app.record_job(&effect, job);
+        app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::Failed(
+                "Could not resolve to a node with the global id of 'PRRT_1'".to_owned(),
+            ),
+        });
+
+        assert_eq!(app.discussion().job, 0);
+        assert!(
+            app.detail()
+                .expect("a detail")
+                .comments
+                .iter()
+                .all(|comment| !comment.resolved),
+            "nothing was changed, so nothing is drawn as changed"
+        );
+        assert!(
+            app.notices
+                .iter()
+                .any(|notice| notice.text.contains("was not changed")),
+            "{:?}",
+            app.notices
+                .iter()
+                .map(|notice| notice.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_conversation_panel_writes_its_first_comment() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        assert_eq!(press(&mut app, "<leader>pc"), Effect::None);
+        assert_eq!(app.overlay(), Overlay::Conversation);
+        assert_eq!(app.conversation().len(), 1);
+
+        // `c` inside the panel opens the composer for the conversation itself.
+        assert_eq!(press(&mut app, "c"), Effect::None);
+        assert!(app.draft_is_composing());
+        assert_eq!(app.overlay(), Overlay::Conversation, "and stays readable");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("thanks, looking now");
+
+        press(&mut app, "<Enter>");
+        assert!(app.drafts().modal);
+        press(&mut app, "<Enter>");
+        let effect = press(&mut app, "<Enter>");
+        assert_eq!(
+            effect,
+            Effect::PostConversation {
+                number: 141,
+                body: "thanks, looking now".to_owned()
+            }
+        );
     }
 
     #[test]

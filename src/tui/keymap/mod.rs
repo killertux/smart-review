@@ -335,7 +335,14 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     // move rather than a tab character, which is worth saying out loud.
     (Scope::In(Mode::Insert), "<Tab>", "pane.next"),
     (Scope::In(Mode::Insert), "<S-Tab>", "pane.prev"),
-    (Scope::In(Mode::Normal), "r", "chat.retry"),
+    // Repeating the last question is `<C-r>`, in both modes. It used to be a bare `r`
+    // in normal mode, which was reachable *only* by tabbing away from the chat pane —
+    // because a pane that has the keyboard is in insert mode, where a bare key is
+    // text (FR-5.2). Binding it to a modifier makes it work while the compose box is
+    // open, which is where the question you want to ask again was asked, and it frees
+    // `r` for the diff, where it answers the comment under the cursor (FR-6.4).
+    (Scope::In(Mode::Insert), "<C-r>", "chat.retry"),
+    (Scope::In(Mode::Normal), "<C-r>", "chat.retry"),
     (Scope::In(Mode::Insert), "<Enter>", "chat.send"),
     // Enter sends, so a newline needs a modifier. `S-Enter` is what the requirement
     // names; not every terminal can send it, which is why `C-j` (the line feed every
@@ -354,6 +361,22 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Normal), "v", "review.range"),
     (Scope::In(Mode::Normal), "V", "review.range"),
     (Scope::In(Mode::Normal), "<leader>rd", "review.drafts"),
+    // FR-6.4, under a `p` for "the pull request as a conversation": `r` alone answers
+    // the comment under the cursor, because that is the common case and it costs one
+    // keypress; the leader spells the same thing out for anyone who has not learnt it.
+    (Scope::In(Mode::Normal), "r", "review.reply"),
+    (Scope::In(Mode::Normal), "<leader>pr", "review.reply"),
+    (
+        Scope::In(Mode::Normal),
+        "<leader>pt",
+        "review.toggle_resolved",
+    ),
+    (Scope::In(Mode::Normal), "<leader>pc", "review.conversation"),
+    (
+        Scope::In(Mode::Normal),
+        "<leader>pw",
+        "review.comment_conversation",
+    ),
     (Scope::In(Mode::Normal), "<leader>rr", "review.publish"),
     // The decision keys, as §5.4 lists them (FR-6.1). They stage a verdict rather than
     // sending one: the modal is still what publishes.

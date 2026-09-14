@@ -16,6 +16,7 @@ pub mod chat;
 pub mod clipboard;
 pub mod components;
 pub mod diff_view;
+pub mod discussion;
 pub mod drafts;
 pub mod event;
 pub mod input;
@@ -217,6 +218,9 @@ pub(crate) fn apply(
         | Effect::LoadMore
         | Effect::OpenPullRequest(_)
         | Effect::PublishDraft
+        | Effect::PostReply { .. }
+        | Effect::PostConversation { .. }
+        | Effect::ResolveThread { .. }
         | Effect::RunDoctor => {
             let context = app.doctor_request();
             if let Some(job) = jobs::job_for(&effect, &app.list, context, &app.drafts.draft) {

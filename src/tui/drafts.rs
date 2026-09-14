@@ -81,11 +81,81 @@ impl Anchor {
     }
 }
 
-/// The comment being written (FR-6.2).
+/// What a comment is being written about (FR-6.2, FR-6.4).
+///
+/// Three shapes, and the difference between them is not cosmetic: the first is
+/// *staged* into the draft and sent later as part of one review, and the other two are
+/// posted on their own the moment they are confirmed. One compose box, three
+/// consequences — which is exactly why the target is a type rather than a flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A line (or range) of the diff: staged, not posted (FR-6.2).
+    Line(Anchor),
+    /// A thread that already exists: the reply is posted on its own (FR-6.4).
+    ///
+    /// `root` is the comment being answered, which is where GitHub attaches a reply.
+    /// `thread` is GitHub's thread id, which is what resolving needs — `None` when the
+    /// thread read failed, in which case the reply still works and resolving does not.
+    Thread {
+        /// Where the thread is, for the label.
+        anchor: Anchor,
+        /// The comment being answered.
+        root: u64,
+        /// GitHub's thread id, when it is known.
+        thread: Option<String>,
+    },
+    /// The pull request's own conversation (FR-6.4, DEC-16).
+    Conversation,
+}
+
+impl Target {
+    /// Where the comment will land, for the composer's title.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Line(anchor) => anchor.label(),
+            Self::Thread { anchor, .. } => format!("reply on {}", anchor.label()),
+            Self::Conversation => "the pull request's conversation".to_owned(),
+        }
+    }
+
+    /// The anchor, when there is one.
+    #[must_use]
+    pub fn anchor(&self) -> Option<&Anchor> {
+        match self {
+            Self::Line(anchor) | Self::Thread { anchor, .. } => Some(anchor),
+            Self::Conversation => None,
+        }
+    }
+
+    /// Whether this is staged into the draft rather than posted on its own (FR-6.1).
+    #[must_use]
+    pub fn is_staged(&self) -> bool {
+        matches!(self, Self::Line(_))
+    }
+
+    /// Whether this is a reply into an existing thread (FR-6.4).
+    #[must_use]
+    pub fn is_reply(&self) -> bool {
+        matches!(self, Self::Thread { .. })
+    }
+
+    /// What `Enter` does, which is not the same thing in all three cases.
+    #[must_use]
+    pub fn enter_hint(&self) -> &'static str {
+        if self.is_staged() {
+            "Enter stages it · Alt-Enter for a new line"
+        } else {
+            "Enter to review it, then Enter again to post · Alt-Enter for a new line"
+        }
+    }
+}
+
+/// The comment being written (FR-6.2, FR-6.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composer {
-    /// What the comment will be anchored to.
-    pub anchor: Anchor,
+    /// What the comment is about, which decides what happens when it is confirmed.
+    pub target: Target,
     /// The text so far.
     pub input: TextInput,
     /// Why the last attempt to stage it was refused.
@@ -93,14 +163,20 @@ pub struct Composer {
 }
 
 impl Composer {
-    /// Opens a composer for an anchor.
+    /// Opens a composer for a target.
     #[must_use]
-    pub fn new(anchor: Anchor) -> Self {
+    pub fn new(target: Target) -> Self {
         Self {
-            anchor,
+            target,
             input: TextInput::new(),
             refusal: None,
         }
+    }
+
+    /// The anchor, when the comment has one.
+    #[must_use]
+    pub fn anchor(&self) -> Option<&Anchor> {
+        self.target.anchor()
     }
 
     /// The text, trimmed of the trailing newline a paste tends to leave.
@@ -108,6 +184,18 @@ impl Composer {
     pub fn body(&self) -> &str {
         self.input.text().trim_end()
     }
+}
+
+/// A message waiting for its second Enter (FR-6.4, FR-6.5).
+///
+/// The same two-step the review gets: the modal is the last place a mistake can be
+/// seen, and this is the other surface that can put words on the internet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPost {
+    /// What is being answered, or that it is the conversation.
+    pub target: Target,
+    /// What it says, as it was when the composer was confirmed.
+    pub body: String,
 }
 
 /// What the review actions are doing (FR-6.1–FR-6.3).
@@ -159,6 +247,11 @@ pub struct DraftState {
     pub open: bool,
     /// The comment being written, when the composer is open (FR-6.2).
     pub composer: Option<Composer>,
+    /// The reply or conversation comment waiting for its second Enter (FR-6.4).
+    ///
+    /// Separate from the composer because it is what will be *sent*: the composer is
+    /// what the user is typing, and this is the frozen copy they confirmed.
+    pub post: Option<PendingPost>,
     /// Where a range selection started, when one is in progress (FR-6.2).
     pub selection: Option<Anchor>,
     /// Whether the draft panel is what the overlay shows (FR-6.1).
@@ -171,6 +264,12 @@ pub struct DraftState {
     pub status: DraftStatus,
     /// The job id of the publish in flight (FR-6.3).
     pub job: u64,
+    /// The job id of the reply or conversation comment in flight (FR-6.4).
+    ///
+    /// Its own field rather than `job`: a review and a reply are separate slots in the
+    /// runner and can be in flight at once, and one field for both would drop the
+    /// completion of whichever started first.
+    pub post_job: u64,
     /// The number in the draft panel the user is on, for `remove`.
     pub cursor: usize,
     /// Whether the draft has changed since it was last written.
@@ -194,12 +293,14 @@ impl Default for DraftState {
             draft: Draft::new(0, Timestamp::default()),
             open: false,
             composer: None,
+            post: None,
             selection: None,
             panel: false,
             modal: false,
             armed: false,
             status: DraftStatus::Idle,
             job: 0,
+            post_job: 0,
             cursor: 1,
             dirty: false,
             warning: None,
@@ -217,8 +318,10 @@ impl DraftState {
         self.modal = false;
         self.armed = false;
         self.composer = None;
+        self.post = None;
         self.selection = None;
         self.status = DraftStatus::Idle;
+        self.post_job = 0;
         self.cursor = 1;
         self.scroll = 0;
         self.dirty = false;
@@ -233,8 +336,10 @@ impl DraftState {
         self.modal = false;
         self.armed = false;
         self.composer = None;
+        self.post = None;
         self.selection = None;
         self.status = DraftStatus::Idle;
+        self.post_job = 0;
         self.cursor = 1;
         self.scroll = 0;
         self.dirty = false;
@@ -255,7 +360,26 @@ impl DraftState {
 
     /// Opens the composer for one line (FR-6.2).
     pub fn compose(&mut self, anchor: Anchor) {
-        self.composer = Some(Composer::new(anchor));
+        self.compose_target(Target::Line(anchor));
+    }
+
+    /// Opens the composer to answer a comment that is already there (FR-6.4).
+    pub fn compose_reply(&mut self, anchor: Anchor, root: u64, thread: Option<String>) {
+        self.compose_target(Target::Thread {
+            anchor,
+            root,
+            thread,
+        });
+    }
+
+    /// Opens the composer for the pull request's own conversation (FR-6.4).
+    pub fn compose_conversation(&mut self) {
+        self.compose_target(Target::Conversation);
+    }
+
+    /// Opens the composer for any target, which is the only place it is set.
+    pub fn compose_target(&mut self, target: Target) {
+        self.composer = Some(Composer::new(target));
         self.selection = None;
     }
 
@@ -278,7 +402,7 @@ impl DraftState {
     /// pane shows.
     pub fn compose_range(&mut self, start: &Anchor, end: Anchor) -> Result<(), String> {
         let Some(range) = start.extended_to(&end) else {
-            let mut composer = Composer::new(end);
+            let mut composer = Composer::new(Target::Line(end));
             let reason = format!(
                 "a range has to be in one file and on one side — the selection starts at {}",
                 start.label()
@@ -309,11 +433,21 @@ impl DraftState {
         let Some(composer) = self.composer.as_mut() else {
             return Err(DraftError::EmptyBody);
         };
+        // A reply is not staged: it cannot be, because GitHub's review API takes only
+        // new inline comments, so answering something already said is its own request
+        // (FR-6.4). Asking to stage one is a programming error, and says so.
+        let Target::Line(anchor) = &composer.target else {
+            let mut composer = Composer::new(composer.target.clone());
+            composer.refusal =
+                Some("a reply is posted on its own; Enter shows it before it goes".to_owned());
+            self.composer = Some(composer);
+            return Err(DraftError::EmptyBody);
+        };
         let staged = DraftComment::new(
-            composer.anchor.path.clone(),
-            composer.anchor.side,
-            composer.anchor.line,
-            composer.anchor.start_line,
+            anchor.path.clone(),
+            anchor.side,
+            anchor.line,
+            anchor.start_line,
             composer.body(),
         );
         match staged {
@@ -526,17 +660,17 @@ mod tests {
             .compose_range(&top.clone(), bottom.clone())
             .expect("a range");
         let composer = state.composer.as_ref().expect("a range");
-        assert_eq!(composer.anchor.start_line, Some(28));
-        assert_eq!(composer.anchor.line, 31);
-        assert_eq!(composer.anchor.lines(), 4);
+        assert_eq!(composer.anchor().expect("a line").start_line, Some(28));
+        assert_eq!(composer.anchor().expect("a line").line, 31);
+        assert_eq!(composer.anchor().expect("a line").lines(), 4);
 
         // Bottom to top gives the same range.
         let mut state = fresh();
         state.start_selection(bottom.clone());
         state.compose_range(&bottom, top).expect("a range");
         let composer = state.composer.as_ref().expect("a range");
-        assert_eq!(composer.anchor.start_line, Some(28));
-        assert_eq!(composer.anchor.line, 31);
+        assert_eq!(composer.anchor().expect("a line").start_line, Some(28));
+        assert_eq!(composer.anchor().expect("a line").line, 31);
     }
 
     #[test]
@@ -549,8 +683,12 @@ mod tests {
             .expect_err("refused");
         assert!(refusal.contains("one file"), "{refusal}");
         let composer = state.composer.as_ref().expect("the composer explains");
-        assert_eq!(composer.anchor.path, "src/b.rs");
-        assert_eq!(composer.anchor.start_line, None, "no range was made");
+        assert_eq!(composer.anchor().expect("a line").path, "src/b.rs");
+        assert_eq!(
+            composer.anchor().expect("a line").start_line,
+            None,
+            "no range was made"
+        );
         assert!(composer.refusal.is_some(), "and the reason is on screen");
     }
 

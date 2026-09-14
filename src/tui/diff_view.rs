@@ -31,6 +31,22 @@ pub enum RowKind {
     Discussion,
 }
 
+/// The thread a discussion row belongs to (FR-6.4).
+///
+/// Carried on every row of a thread rather than looked up from the cursor's line: the
+/// key that answers a comment and the key that resolves it act on *the row under the
+/// cursor*, and a lookup by line would pick the wrong thread on a context line where two
+/// threads could share a number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRef {
+    /// The comment being answered, which is where a reply is attached.
+    pub root: u64,
+    /// GitHub's thread id, when the thread read succeeded.
+    pub thread: Option<String>,
+    /// Whether the thread has been resolved.
+    pub resolved: bool,
+}
+
 /// One drawable row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffRow {
@@ -50,6 +66,8 @@ pub struct DiffRow {
     pub line_kind: Option<LineKind>,
     /// Whether the file has no newline at the end here.
     pub no_newline: bool,
+    /// The thread this row belongs to, for a discussion row (FR-6.4).
+    pub thread: Option<ThreadRef>,
 }
 
 impl DiffRow {
@@ -309,6 +327,16 @@ impl DiffView {
         if self.tree_cursor >= self.tree.len() {
             self.tree_cursor = self.tree.len().saturating_sub(1);
         }
+    }
+
+    /// The thread under the cursor, when the cursor is on a discussion row (FR-6.4).
+    ///
+    /// The key that answers a comment and the key that resolves a thread both need this,
+    /// and both need it to be the row the user is *looking at* — which is why it comes
+    /// from the row rather than from a lookup by line number.
+    #[must_use]
+    pub fn current_thread(&self) -> Option<ThreadRef> {
+        self.current()?.thread.clone()
     }
 
     /// The paths the patch changed, in the patch's own order.
@@ -841,6 +869,7 @@ fn flatten(
             text: format!("{} {}", file.status.marker(), file.display_path()),
             line_kind: None,
             no_newline: false,
+            thread: None,
         });
 
         if let Some(placeholder) = file.placeholder() {
@@ -853,6 +882,7 @@ fn flatten(
                 text: placeholder,
                 line_kind: None,
                 no_newline: false,
+                thread: None,
             });
             continue;
         }
@@ -867,6 +897,7 @@ fn flatten(
                 text: hunk.header(),
                 line_kind: None,
                 no_newline: false,
+                thread: None,
             });
 
             if folded.contains(&(file_index, hunk_index)) {
@@ -879,6 +910,7 @@ fn flatten(
                     text: format!("… {} lines folded (za to open)", hunk.lines.len()),
                     line_kind: None,
                     no_newline: false,
+                    thread: None,
                 });
                 continue;
             }
@@ -893,6 +925,7 @@ fn flatten(
                     text: line.content.clone(),
                     line_kind: Some(line.kind),
                     no_newline: line.no_newline,
+                    thread: None,
                 });
                 // FR-6.4: the discussion about this line, under it. The *side* is part
                 // of the lookup: a context line is on both sides at once, and a comment
@@ -906,16 +939,17 @@ fn flatten(
                     let Some(thread) = threads.get(&(file_index, old_side, line_number)) else {
                         continue;
                     };
-                    for text in thread {
+                    for entry in thread {
                         rows.push(DiffRow {
                             kind: RowKind::Discussion,
                             file: file_index,
                             hunk: Some(hunk_index),
                             old_line: line.old_line,
                             new_line: line.new_line,
-                            text: text.clone(),
+                            text: entry.text.clone(),
                             line_kind: None,
                             no_newline: false,
+                            thread: Some(entry.thread.clone()),
                         });
                     }
                 }
@@ -954,7 +988,7 @@ const DISCUSSION_WRAP: usize = 100;
 fn threads_by_line(
     patch: &Patch,
     comments: &[crate::domain::pr::ReviewComment],
-) -> std::collections::HashMap<(usize, bool, u32), Vec<String>> {
+) -> std::collections::HashMap<(usize, bool, u32), Vec<ThreadLine>> {
     use std::collections::{HashMap, HashSet};
 
     let by_id: HashMap<u64, usize> = comments
@@ -982,7 +1016,7 @@ fn threads_by_line(
         }
     }
 
-    let mut threads: HashMap<(usize, bool, u32), Vec<String>> = HashMap::new();
+    let mut threads: HashMap<(usize, bool, u32), Vec<ThreadLine>> = HashMap::new();
     for root in roots {
         let Some((anchored_path, old_side, line)) = anchor_of(&comments[root]) else {
             continue;
@@ -997,7 +1031,14 @@ fn threads_by_line(
             continue;
         };
         let mut lines = Vec::new();
-        write_thread(&mut lines, comments, root, &children, 0);
+        write_thread(
+            &mut lines,
+            comments,
+            root,
+            &children,
+            0,
+            &thread_ref(comments, root),
+        );
         threads
             .entry((file, old_side, line))
             .or_default()
@@ -1021,7 +1062,14 @@ fn threads_by_line(
             continue;
         };
         let mut lines = Vec::new();
-        write_thread(&mut lines, comments, index, &children, 0);
+        write_thread(
+            &mut lines,
+            comments,
+            index,
+            &children,
+            0,
+            &thread_ref(comments, index),
+        );
         threads
             .entry((file, old_side, line))
             .or_default()
@@ -1031,13 +1079,51 @@ fn threads_by_line(
     threads
 }
 
+/// One drawable line of a discussion, with the thread it belongs to (FR-6.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadLine {
+    /// The row's text.
+    text: String,
+    /// The thread every row of this discussion acts on.
+    thread: ThreadRef,
+}
+
+/// The thread a root comment heads.
+///
+/// `root` is the comment a reply would answer — the one the cursor is nearest when it is
+/// on a reply's row, because the thread is what is being answered even when the words
+/// being quoted are the reply's.
+fn thread_ref(comments: &[crate::domain::pr::ReviewComment], index: usize) -> ThreadRef {
+    // Walk up `in_reply_to` to the first comment whose parent is not in the list: the
+    // same "root" the grouping above arrived at, arrived at from the other direction.
+    let mut current = index;
+    let mut guard = 0;
+    while let Some(parent) = comments[current].in_reply_to {
+        guard += 1;
+        if guard > comments.len() {
+            break;
+        }
+        match comments.iter().position(|comment| comment.id == parent) {
+            Some(position) if position != current => current = position,
+            _ => break,
+        }
+    }
+    let root = &comments[current];
+    ThreadRef {
+        root: root.id,
+        thread: root.thread_id.clone(),
+        resolved: root.resolved,
+    }
+}
+
 /// One comment and its replies, as lines.
 fn write_thread(
-    lines: &mut Vec<String>,
+    lines: &mut Vec<ThreadLine>,
     comments: &[crate::domain::pr::ReviewComment],
     index: usize,
     children: &std::collections::HashMap<usize, Vec<usize>>,
     depth: usize,
+    thread: &ThreadRef,
 ) {
     let comment = &comments[index];
     let indent = "  ".repeat(depth);
@@ -1057,25 +1143,48 @@ fn write_thread(
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let opening = format!("{indent}{} {author}{side}: ", thread_marker(depth));
+    // A resolved thread says so in words as well as in its marker: a colour or a
+    // character alone is not something a reader can rely on, and "is this still open"
+    // is the question the marker exists to answer.
+    let resolved = if depth == 0 && thread.resolved {
+        " · resolved"
+    } else {
+        ""
+    };
+    let opening = format!(
+        "{indent}{} {author}{side}{resolved}: ",
+        thread_marker(depth, thread.resolved)
+    );
     for (position, line) in wrap_text(&format!("{opening}{body}"), DISCUSSION_WRAP)
         .into_iter()
         .enumerate()
     {
-        if position == 0 {
-            lines.push(line);
+        let text = if position == 0 {
+            line
         } else {
-            lines.push(format!("{indent}   {line}"));
-        }
+            format!("{indent}   {line}")
+        };
+        lines.push(ThreadLine {
+            text,
+            thread: thread.clone(),
+        });
     }
     for child in children.get(&index).into_iter().flatten() {
-        write_thread(lines, comments, *child, children, depth + 1);
+        write_thread(lines, comments, *child, children, depth + 1, thread);
     }
 }
 
 /// The character in front of a thread's first line.
-fn thread_marker(depth: usize) -> &'static str {
-    if depth == 0 { "▸" } else { "↳" }
+///
+/// A resolved thread is marked with a tick rather than a different shade: the same
+/// character in the same column means the reader can compare two threads at a glance
+/// instead of remembering what a colour meant.
+fn thread_marker(depth: usize, resolved: bool) -> &'static str {
+    match (depth, resolved) {
+        (0, true) => "✓",
+        (0, false) => "▸",
+        (_, _) => "↳",
+    }
 }
 
 /// Wraps text at `width` columns, keeping the paragraph as one block.

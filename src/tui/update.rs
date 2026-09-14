@@ -148,6 +148,10 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "review.discard" => app.ask_clear_draft(),
         "review.range" => app.start_selection(),
         "review.drafts" => app.open_drafts(),
+        "review.reply" => app.start_reply(),
+        "review.toggle_resolved" => app.ask_toggle_thread(),
+        "review.conversation" => app.open_conversation(),
+        "review.comment_conversation" => app.start_conversation_comment(),
         "review.publish" => app.open_publish(),
         "review.remove" => app.remove_staged(),
         "app.analyze_panel" => {
