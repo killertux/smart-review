@@ -57,6 +57,14 @@ impl GitCli {
         self
     }
 
+    /// Uses a prepared runner, which is how `--dry-run` reaches the destructive git
+    /// calls (FR-6.5).
+    #[must_use]
+    pub fn with_runner(mut self, runner: ProcessRunner) -> Self {
+        self.runner = runner;
+        self
+    }
+
     /// Runs every command in this directory instead of the current one.
     #[must_use]
     pub fn in_dir(mut self, dir: impl Into<PathBuf>) -> Self {

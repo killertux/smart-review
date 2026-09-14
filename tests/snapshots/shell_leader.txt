@@ -3,9 +3,6 @@
 │ search / filters what has been fetched; :filter asks GitHub                                      │
 ┌ no repository · open · showing 0 ────────────────────────────────────────────────────────────────┐
 │Looking for the repository and gh…                                                                │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
 │                         ┌ leader <Space> ──────────────────────────────┐                         │
 │                         │  ?           Show the help popup             │                         │
 │                         │  T           Switch to the next theme        │                         │
@@ -17,13 +14,16 @@
 │                         │  f           Add a filter chip               │                         │
 │                         │  m           Choose the provider, model and t│                         │
 │                         │  q           Quit smart-review               │                         │
+│                         │  ra          Stage an approval (<leader>ra)  │                         │
+│                         │  rc          Stage a request for changes (<le│                         │
+│                         │  rd          Show the staged comments (<leade│                         │
+│                         │  rm          Stage a comment with no verdict │                         │
+│                         │  rr          Publish the staged review (<lead│                         │
+│                         │  rx          Throw the staged review away (<l│                         │
 │                         │  s           Change the sort order           │                         │
 │                         │  t           Choose a theme                  │                         │
 │                         └──────────────────────────────────────────────┘                         │
 │                                                                                                  │
 │                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
-│                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
- NORMAL list · acme/service · — · — · 0 drafts               ? help · <leader> actions · : commands
+ NORMAL list · acme/service · — · —                          ? help · <leader> actions · : commands

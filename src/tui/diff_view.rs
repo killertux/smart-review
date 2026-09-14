@@ -27,6 +27,8 @@ pub enum RowKind {
     Placeholder,
     /// The sentence shown for a folded hunk.
     Folded,
+    /// A line of an existing discussion, drawn under the line it is about (FR-6.4).
+    Discussion,
 }
 
 /// One drawable row.
@@ -243,6 +245,10 @@ pub struct DiffView {
     /// Whether the diff was produced with whitespace ignored. Read-only in M1, for
     /// the same reason as [`Self::context`].
     pub ignore_whitespace: bool,
+    /// The reviews and comments GitHub already has, grouped by the line they are on
+    /// (FR-6.4). Read-only in v1: replying is M5, and drawing them where they belong
+    /// is what makes the diff readable next to a discussion about it.
+    pub comments: Vec<crate::domain::pr::ReviewComment>,
     /// Which order the tree is in (FR-3.5).
     pub order: crate::domain::plan::OrderMode,
     /// The review plan, when there is one. The heuristic plan is present as soon as a
@@ -283,6 +289,7 @@ impl DiffView {
             ignore_whitespace: false,
             order: crate::domain::plan::OrderMode::Path,
             plan: None,
+            comments: Vec::new(),
         };
         view.rebuild();
         view
@@ -293,7 +300,7 @@ impl DiffView {
     /// This is the only place that walks the patch, and it runs when the patch or a
     /// fold changes rather than per frame.
     pub fn rebuild(&mut self) {
-        self.rows = flatten(&self.patch, &self.folded_hunks);
+        self.rows = flatten(&self.patch, &self.folded_hunks, &self.comments);
         let (split, index) = build_split(&self.rows);
         self.split_rows = split;
         self.split_index = index;
@@ -312,6 +319,30 @@ impl DiffView {
             .iter()
             .filter_map(|file| file.path().map(ToString::to_string))
             .collect()
+    }
+
+    /// Sets the existing discussion, drawn inline (FR-6.4).
+    pub fn set_comments(&mut self, comments: &[crate::domain::pr::ReviewComment]) {
+        if self.comments == comments {
+            return;
+        }
+        // The cursor is kept on the same *line* rather than the same row index: adding
+        // rows above it would otherwise move what the user is reading.
+        let anchor = self
+            .current()
+            .map(|row| (row.file, row.new_line, row.old_line));
+        self.comments = comments.to_vec();
+        self.rebuild();
+        if let Some((file, new_line, old_line)) = anchor
+            && let Some(index) = self.rows.iter().position(|row| {
+                row.kind == RowKind::Line
+                    && row.file == file
+                    && row.new_line == new_line
+                    && row.old_line == old_line
+            })
+        {
+            self.cursor = index;
+        }
     }
 
     /// Sets the review plan, keeping the order mode.
@@ -793,7 +824,12 @@ fn build_plan_tree(
 }
 
 /// Flattens a patch into drawable rows.
-fn flatten(patch: &Patch, folded: &BTreeSet<(usize, usize)>) -> Vec<DiffRow> {
+fn flatten(
+    patch: &Patch,
+    folded: &BTreeSet<(usize, usize)>,
+    comments: &[crate::domain::pr::ReviewComment],
+) -> Vec<DiffRow> {
+    let threads = threads_by_line(patch, comments);
     let mut rows = Vec::new();
     for (file_index, file) in patch.files.iter().enumerate() {
         rows.push(DiffRow {
@@ -858,6 +894,31 @@ fn flatten(patch: &Patch, folded: &BTreeSet<(usize, usize)>) -> Vec<DiffRow> {
                     line_kind: Some(line.kind),
                     no_newline: line.no_newline,
                 });
+                // FR-6.4: the discussion about this line, under it. The *side* is part
+                // of the lookup: a context line is on both sides at once, and a comment
+                // anchored to one of them would otherwise be drawn twice — which is how
+                // this first read "one short comment" as two rows.
+                let lookups = [(false, line.new_line), (true, line.old_line)];
+                for (old_side, side_line) in lookups {
+                    let Some(line_number) = side_line else {
+                        continue;
+                    };
+                    let Some(thread) = threads.get(&(file_index, old_side, line_number)) else {
+                        continue;
+                    };
+                    for text in thread {
+                        rows.push(DiffRow {
+                            kind: RowKind::Discussion,
+                            file: file_index,
+                            hunk: Some(hunk_index),
+                            old_line: line.old_line,
+                            new_line: line.new_line,
+                            text: text.clone(),
+                            line_kind: None,
+                            no_newline: false,
+                        });
+                    }
+                }
             }
         }
     }
@@ -873,6 +934,181 @@ fn flatten(patch: &Patch, folded: &BTreeSet<(usize, usize)>) -> Vec<DiffRow> {
 ///
 /// Returns the rows and, for each unified row, the index of the split row that shows
 /// it.
+/// How wide a discussion line is wrapped to, before the pane truncates it.
+///
+/// A fixed number rather than the pane's width because a row is built once and drawn at
+/// whatever width the terminal has: wrapping at draw time would mean rebuilding rows on
+/// every resize, and this is the compromise that keeps scrolling cheap.
+const DISCUSSION_WRAP: usize = 100;
+
+/// The existing discussion, keyed by the file and line it is about (FR-6.4).
+///
+/// Grouped by *thread*, not by comment: a reply belongs under the comment it answers,
+/// and GitHub reports the two as one flat list with an `in_reply_to` link. A reply whose
+/// parent is not in the list (deleted since, or on another page) starts a thread of its
+/// own rather than disappearing.
+///
+/// Each thread becomes a list of ready-to-draw lines, because a row is one terminal row:
+/// a body of three lines takes three rows, and the wrapping happens here so that what a
+/// row holds is what the renderer truncates.
+fn threads_by_line(
+    patch: &Patch,
+    comments: &[crate::domain::pr::ReviewComment],
+) -> std::collections::HashMap<(usize, bool, u32), Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+
+    let by_id: HashMap<u64, usize> = comments
+        .iter()
+        .enumerate()
+        .map(|(index, comment)| (comment.id, index))
+        .collect();
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    let mut is_root: HashSet<usize> = HashSet::new();
+    let mut claimed: HashSet<usize> = HashSet::new();
+    for (index, comment) in comments.iter().enumerate() {
+        match comment
+            .in_reply_to
+            .and_then(|parent| by_id.get(&parent).copied())
+        {
+            Some(parent) if parent != index => {
+                children.entry(parent).or_default().push(index);
+                claimed.insert(index);
+            }
+            _ => {
+                roots.push(index);
+                is_root.insert(index);
+            }
+        }
+    }
+
+    let mut threads: HashMap<(usize, bool, u32), Vec<String>> = HashMap::new();
+    for root in roots {
+        let Some((anchored_path, old_side, line)) = anchor_of(&comments[root]) else {
+            continue;
+        };
+        // A file index rather than a path: the caller looks rows up by file, and the
+        // same path can appear twice in a patch (a rename).
+        let Some(file) = patch.files.iter().position(|candidate| {
+            candidate
+                .path()
+                .is_some_and(|own| own.as_str() == anchored_path)
+        }) else {
+            continue;
+        };
+        let mut lines = Vec::new();
+        write_thread(&mut lines, comments, root, &children, 0);
+        threads
+            .entry((file, old_side, line))
+            .or_default()
+            .append(&mut lines);
+    }
+
+    // A reply whose root is gone is still a comment: it is drawn as its own thread
+    // rather than dropped, which is what keeps the count in the tab honest.
+    for (index, comment) in comments.iter().enumerate() {
+        if claimed.contains(&index) || is_root.contains(&index) {
+            continue;
+        }
+        let Some((anchored_path, old_side, line)) = anchor_of(comment) else {
+            continue;
+        };
+        let Some(file) = patch.files.iter().position(|candidate| {
+            candidate
+                .path()
+                .is_some_and(|own| own.as_str() == anchored_path)
+        }) else {
+            continue;
+        };
+        let mut lines = Vec::new();
+        write_thread(&mut lines, comments, index, &children, 0);
+        threads
+            .entry((file, old_side, line))
+            .or_default()
+            .append(&mut lines);
+    }
+
+    threads
+}
+
+/// One comment and its replies, as lines.
+fn write_thread(
+    lines: &mut Vec<String>,
+    comments: &[crate::domain::pr::ReviewComment],
+    index: usize,
+    children: &std::collections::HashMap<usize, Vec<usize>>,
+    depth: usize,
+) {
+    let comment = &comments[index];
+    let indent = "  ".repeat(depth);
+    let author = if comment.author.trim().is_empty() {
+        "someone"
+    } else {
+        comment.author.trim()
+    };
+    // The side is worth naming: line 31 is two different lines in a hunk, and a comment
+    // on the old one is usually about what was removed.
+    let side = match comment.side.as_deref() {
+        Some("LEFT") => " (old side)",
+        _ => "",
+    };
+    let body = comment
+        .body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let opening = format!("{indent}{} {author}{side}: ", thread_marker(depth));
+    for (position, line) in wrap_text(&format!("{opening}{body}"), DISCUSSION_WRAP)
+        .into_iter()
+        .enumerate()
+    {
+        if position == 0 {
+            lines.push(line);
+        } else {
+            lines.push(format!("{indent}   {line}"));
+        }
+    }
+    for child in children.get(&index).into_iter().flatten() {
+        write_thread(lines, comments, *child, children, depth + 1);
+    }
+}
+
+/// The character in front of a thread's first line.
+fn thread_marker(depth: usize) -> &'static str {
+    if depth == 0 { "▸" } else { "↳" }
+}
+
+/// Wraps text at `width` columns, keeping the paragraph as one block.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push("(empty)".to_owned());
+    }
+    lines
+}
+
+/// The file, side and line a comment is anchored to, when GitHub still knows it.
+fn anchor_of(comment: &crate::domain::pr::ReviewComment) -> Option<(&str, bool, u32)> {
+    let line = u32::try_from(comment.line?).ok()?;
+    let old_side = comment.side.as_deref() == Some("LEFT");
+    Some((comment.path.as_str(), old_side, line))
+}
+
 fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
     let mut split: Vec<SplitRow> = Vec::with_capacity(rows.len());
     let mut index = Vec::with_capacity(rows.len());
@@ -1007,6 +1243,162 @@ pub fn file_marker(status: FileStatus, kind: FileKind) -> &'static str {
             _ => " ",
         },
         FileKind::Text => status.marker(),
+    }
+}
+
+#[cfg(test)]
+mod discussion_tests {
+    use super::*;
+    use crate::domain::pr::ReviewComment;
+    use crate::domain::time::from_unix_secs;
+
+    const PATCH: &str = concat!(
+        "diff --git a/src/domain/money.rs b/src/domain/money.rs\n",
+        "--- a/src/domain/money.rs\n",
+        "+++ b/src/domain/money.rs\n",
+        "@@ -1,3 +1,3 @@\n",
+        " pub fn round(cents: i64) -> i64 {\n",
+        "-    cents\n",
+        "+    (cents + 5) / 10 * 10\n",
+        " }\n",
+    );
+
+    fn comment(
+        id: u64,
+        author: &str,
+        line: u64,
+        body: &str,
+        reply_to: Option<u64>,
+    ) -> ReviewComment {
+        ReviewComment {
+            id,
+            author: author.to_owned(),
+            path: "src/domain/money.rs".to_owned(),
+            line: Some(line),
+            side: Some("RIGHT".to_owned()),
+            body: body.to_owned(),
+            created_at: from_unix_secs(0),
+            in_reply_to: reply_to,
+            diff_hunk: None,
+            url: None,
+        }
+    }
+
+    fn view_with(comments: &[ReviewComment]) -> DiffView {
+        let mut view = DiffView::new(crate::domain::diff::parse_patch(PATCH));
+        view.set_comments(comments);
+        view
+    }
+
+    #[test]
+    fn a_comment_is_drawn_under_the_line_it_is_about() {
+        let view = view_with(&[comment(1, "alice", 2, "this rounds up", None)]);
+        let rows: Vec<&DiffRow> = view
+            .rows
+            .iter()
+            .filter(|row| row.kind == RowKind::Discussion)
+            .collect();
+        assert_eq!(rows.len(), 1, "one row for one short comment");
+        assert!(rows[0].text.contains("alice"), "{}", rows[0].text);
+        assert!(rows[0].text.contains("this rounds up"), "{}", rows[0].text);
+        // And it is *after* the line it belongs to, which is what "under" means.
+        let annotated = view
+            .rows
+            .iter()
+            .position(|row| row.kind == RowKind::Line && row.new_line == Some(2))
+            .expect("the added line");
+        let drawn = view
+            .rows
+            .iter()
+            .position(|row| row.kind == RowKind::Discussion)
+            .expect("the comment");
+        assert_eq!(drawn, annotated + 1);
+    }
+
+    #[test]
+    fn a_reply_is_drawn_under_the_comment_it_answers() {
+        let view = view_with(&[
+            comment(1, "alice", 2, "this rounds up", None),
+            comment(2, "bruno", 2, "fixed, thank you", Some(1)),
+        ]);
+        let texts: Vec<String> = view
+            .rows
+            .iter()
+            .filter(|row| row.kind == RowKind::Discussion)
+            .map(|row| row.text.clone())
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts[0].contains("alice"), "{texts:?}");
+        assert!(texts[1].contains("bruno"), "{texts:?}");
+        assert!(texts[1].starts_with("↳"), "marked as a reply: {texts:?}");
+    }
+
+    #[test]
+    fn a_reply_whose_parent_is_gone_is_still_drawn() {
+        // GitHub reports a flat list and deletions happen: a reply with no visible
+        // parent is a comment, not a reason to draw nothing.
+        let view = view_with(&[comment(2, "bruno", 2, "fixed, thank you", Some(999))]);
+        assert_eq!(
+            view.rows
+                .iter()
+                .filter(|row| row.kind == RowKind::Discussion)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_long_comment_takes_several_rows_and_stays_readable() {
+        let long = "word ".repeat(80);
+        let view = view_with(&[comment(1, "alice", 2, long.trim(), None)]);
+        let rows: Vec<&DiffRow> = view
+            .rows
+            .iter()
+            .filter(|row| row.kind == RowKind::Discussion)
+            .collect();
+        assert!(rows.len() > 1, "a long body wraps");
+        assert!(
+            rows.iter()
+                .all(|row| row.text.chars().count() <= DISCUSSION_WRAP + 8),
+            "no row is wider than the wrap plus its indent"
+        );
+        // The first row carries the author; the rest are continuation lines.
+        assert!(rows[0].text.contains("alice"));
+        assert!(rows[1].text.starts_with("   "), "{:?}", rows[1].text);
+    }
+
+    #[test]
+    fn a_comment_on_a_line_the_diff_does_not_show_is_skipped() {
+        // An outdated comment (the pull request moved) has a line number that is no
+        // longer in the patch. Drawing it at the end of the file would be worse than
+        // not drawing it: it would look like a comment about that line.
+        let view = view_with(&[comment(1, "alice", 400, "old news", None)]);
+        assert!(view.rows.iter().all(|row| row.kind != RowKind::Discussion));
+    }
+
+    #[test]
+    fn setting_the_same_comments_twice_does_not_move_the_cursor() {
+        let mut view = view_with(&[comment(1, "alice", 2, "this rounds up", None)]);
+        view.cursor = view.rows.len() - 1;
+        let before = view.cursor;
+        view.set_comments(&[comment(1, "alice", 2, "this rounds up", None)]);
+        assert_eq!(view.cursor, before, "nothing changed, so nothing moved");
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_line_when_the_discussion_arrives() {
+        // The comments arrive with the detail, which can be a frame after the diff: the
+        // user is already reading a line, and inserting rows above it must not move it.
+        let mut view = DiffView::new(crate::domain::diff::parse_patch(PATCH));
+        view.cursor = 3;
+        let before = (
+            view.rows[3].file,
+            view.rows[3].new_line,
+            view.rows[3].old_line,
+        );
+        view.set_comments(&[comment(1, "alice", 1, "the first line", None)]);
+        let now = &view.rows[view.cursor];
+        assert_eq!((now.file, now.new_line, now.old_line), before);
     }
 }
 

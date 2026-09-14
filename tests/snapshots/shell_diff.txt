@@ -20,4 +20,4 @@
 │                                ││                                                                          │
 │                                ││                                                                          │
 └────────────────────────────────┘└──────────────────────────────────────────────────────────────────────────┘
- NORMAL diff · acme/service · — · github · M src/domain/invoice.rs +2 −1 · — · 0 drafts ? help · <leader> acti
+ NORMAL diff · acme/service · — · github · M src/domain/invoice.rs +2 −1 · — ? help · <leader> actions · : com

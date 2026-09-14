@@ -13,6 +13,7 @@
 pub mod analysis;
 pub mod chat;
 pub mod context;
+pub mod drafts;
 pub mod environment;
 pub mod models;
 pub mod prs;

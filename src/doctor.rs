@@ -554,6 +554,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let startup = Startup::load(&cli).unwrap();
         (dir, startup.doctor_context())

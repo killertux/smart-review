@@ -6,7 +6,9 @@
 pub mod analysis;
 pub mod chat;
 pub mod command_line;
+pub mod confirm;
 pub mod doctor;
+pub mod drafts;
 pub mod filter_bar;
 pub mod header;
 pub mod help;
@@ -53,6 +55,9 @@ pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Overlay::Analysis => analysis::render(frame, area, app),
         Overlay::Context => analysis::render_context(frame, area, app),
         Overlay::RawAnswer => analysis::render_raw(frame, area, app),
+        Overlay::Draft => drafts::render_panel(frame, area, app, app.drafts()),
+        Overlay::Publish => drafts::render_modal(frame, area, app, app.drafts()),
+        Overlay::Confirm => confirm::render(frame, area, app),
     }
 }
 

@@ -36,7 +36,7 @@
 | **M2a** | Workspace + model configuration | Read a PR from a managed worktree (local diff, context and whitespace toggles), and pick provider/model/thinking + paste a key **in the TUI**, with the choice verified against the provider. | `scripts/validate/m2a.sh` + manual demo | FR-3.1, 3.2 (local), 4.5, 4.7, 4.8 | llm, tokio, reqwest, toml_edit |
 | **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/m2b.sh` (35 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
 | **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/m3.sh` + manual demo | FR-5.1–5.4 | none new |
-| **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` prints commands only. | `scripts/validate/m4.sh` + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
+| **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` writes the commands it would run to `logs/dry-run.log`. | `scripts/validate/m4.sh` (23 checks) + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
 | **M5** | Polish & release | Visual ranges, thread replies, docs, `NO_COLOR`, release binary + `--version`; backlog items from §11. | `scripts/validate/m5.sh` + manual demo | backlog + NFR polish | decided then |
 
 Each milestone is a strictly larger subset of the same binary — never a rewrite. M0's TUI shell, action registry, job framework and config loader are load-bearing for M1–M5, which is why they get disproportionate care up front.
@@ -273,21 +273,34 @@ names the active model.
 
 **Goal:** finish the job — leave a real, correctly-formed review on GitHub without ever posting something by accident.
 
-**Runnable artifact:** `c` on a diff line opens the composer; three comments land in the draft panel; `<leader>rr` opens the publish modal showing decision + body + every comment verbatim; confirm; the PR gets **one** review on GitHub; `:draft` is cleared. `--dry-run` prints the exact `gh`/GraphQL calls instead.
+**Runnable artifact:** `c` on a diff line opens the composer; two comments land in the draft panel (`<leader>rd`); `<leader>rr` opens the publish modal showing the decision, the body and every comment verbatim; `Enter` twice posts **one** review to GitHub; the draft is cleared and the status line says what was sent. `--dry-run` records the exact `gh` calls in `logs/dry-run.log` instead.
 
 **Work items**
-- [ ] Draft model + persistence per PR: decision, body, inline comments with side/line/range (FR-6.1, §7.2).
-- [ ] Comment composer: line and range (same file, same side, start ≤ end), empty-body rejection, multi-line input, `:edit` via `$EDITOR` with recoverable terminal restore (FR-6.2).
-- [ ] Draft markers in the diff gutter; draft panel with remove/clear + confirmation (FR-6.1).
-- [ ] `submit_review` on `ForgePort` with two paths behind one method: batched GraphQL pending-review + submit (with inline comments) and `gh pr review` (no inline comments) (FR-6.3, DEC-3).
-- [ ] Publish modal, in-flight guard/idempotency, own-PR and "no commits between" error translation, draft preserved on failure, refresh after success (FR-6.3).
-- [ ] Existing reviews/comments/threads displayed read-only, reachable from the affected diff line (FR-6.4).
-- [ ] `--dry-run` honored by every mutating adapter, printing argv/GraphQL body (FR-6.5).
-- [ ] Tests: comment validation, publish-payload construction snapshots, failure-preserves-draft, double-submit prevention, fake-`gh` argv assertions, GraphQL body golden files.
+- [x] Draft model + persistence per PR: decision, body, inline comments with side/line/range (FR-6.1, §7.2). Kept at `<home>/drafts/…`, not under `cache/`.
+- [x] Comment composer: line and range (same file, same side, start ≤ end), empty-body rejection, multi-line input (FR-6.2).
+- [x] Draft markers in the diff gutter; draft panel with remove, `:draft clear` and a confirmation (FR-6.1).
+- [x] `submit_review` on `ForgePort` with two paths behind one method: one batched request with the comments, and `gh pr review` when there are none (FR-6.3, DEC-3).
+- [x] Publish modal, in-flight guard/idempotency, own-PR and bad-anchor translation, draft preserved on failure, refresh after success (FR-6.3).
+- [x] Existing reviews/comments/threads displayed read-only, under the affected diff line (FR-6.4).
+- [x] `--dry-run` honoured by every mutating adapter: the gate is a property of the process runner, so `:workspace clean` is covered by the same promise (FR-6.5).
+- [x] Tests: comment validation, payload construction, failure-preserves-draft, double-submit prevention, fake-`gh` argv and payload assertions.
+- [x] `scripts/validate/m4.sh`: 23 checks over the whole flow, including that the batched request is the *only* mutating call, that a dry run reaches nothing, and that an existing thread is drawn.
 
-**FR coverage:** FR-6.1–6.5, FR-3.3 (existing discussion overlay).
-**Crates to approve:** none expected.
-**Risks:** the GraphQL pending-review → submit flow is the least-documented surface here; validate against a sandbox PR behind `SMART_REVIEW_CONTRACT_REPO` and keep the fallback path for bodies without inline comments.
+**Notes on what M4 decided, where it is not obvious from the requirements**
+- **One REST call, not two GraphQL ones.** DEC-3 chose a batched review and recorded `gh api graphql` as the route; the route changed at the owner's suggestion once the shape was clear. `POST /repos/{owner}/{repo}/pulls/{N}/reviews` takes the decision, the body and every comment in **one** request, so "one review" cannot half-happen — and the payload is built by `serde_json` and passed as a file, so nothing ever escapes user prose by hand. A list of GraphQL input objects cannot be passed as a variable over argv, which is what the two-call route would have required. DEC-3's *decision* (one batched review, inline comments in v1) is unchanged; only its recorded route is, and REQUIREMENTS says so.
+- **`gh pr review` remains for the one case it can do**: a verdict with nothing anchored to a line.
+- **A dry run is a property of the runner, not of a feature.** A call says whether it mutates; the runner records mutating calls instead of running them. A forgotten mark fails *visibly* (the call runs during a dry run) rather than invisibly (a real call that silently does not happen). Reads still run: a dry run that could not read would have nothing to describe. `git fetch` is deliberately not marked: it writes only into this application's own ref namespace, and holding it back would mean the app could not show a diff at all.
+- **The draft is the UI's document and the service keeps none of it.** `Drafts` is handed a document to write or send; the reducer owns the draft and sets a `dirty` flag, and the loop writes. This is what makes the key that opens the composer instant whatever the disk is doing, and it is why `:draft export`, `:draft list` and even the `:workspace` listing became effects.
+- **Enter stages a comment where it sends a question in the chat pane.** The two compose boxes look alike; the difference is what the key costs. Staging is local and reversible, sending a question is paid for. A modifier adds a line in both, so the muscle memory transfers.
+- **Publishing takes two Enters.** The first arms, the second sends: a modal that both shows and does it on one keypress makes reading it optional, and this is the only surface that can put words on the internet.
+- **A failed publish keeps the draft and says so in the modal**, not only in a notice that expires. That is the moment the draft matters most, and the moment a modal that closed itself would leave the user unsure whether anything had been posted.
+- **A comment whose line is no longer in the diff is not drawn.** Attaching an outdated comment to the nearest line would look like a comment about *that* line — a worse lie than an omission. The tab's count still includes it.
+- **The failure message names the most informative error.** The same rule M3 arrived at for providers applies to the forge: GitHub's own sentence, translated (`"Can not approve your own pull request"` → "this pull request is yours, so GitHub will not let you approve it").
+- **A job slot needs three edits, and only two of them fail loudly.** `record_job` had no arm for publishing, so the job id was never stored and *every* publish completion — success and failure — was dropped by the id check. The same shape as M3's invisible provider failure, in the same place. Worth stating plainly: this class of bug is found by driving the real flow, not by reading the code.
+
+**FR coverage:** FR-6.1–6.5, FR-3.3 (existing discussion, drawn inline).
+**Crates to approve:** none new.
+**Risks:** the anchor is a line number, so a force-push between writing and publishing can move it; the draft records the commit it was written against and the panel warns when it differs, but re-anchoring is manual. Replying to a thread is M5 (DEC-16).
 
 ---
 

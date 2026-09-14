@@ -380,6 +380,13 @@ pub struct ForgeConfig {
     pub gh_path: String,
     /// `gh` page size for list operations.
     pub page_size: usize,
+    /// Record mutating calls instead of running them (FR-6.5).
+    ///
+    /// Lives under `[forge]` because everything it holds back is a call that would
+    /// change something outside this process: publishing a review and removing a
+    /// worktree. Reads still happen — a dry run that could not read would have nothing
+    /// to describe.
+    pub dry_run: bool,
 }
 
 impl Default for ForgeConfig {
@@ -388,6 +395,7 @@ impl Default for ForgeConfig {
             remote: None,
             gh_path: "gh".to_owned(),
             page_size: 50,
+            dry_run: false,
         }
     }
 }
@@ -793,6 +801,14 @@ impl ConfigDocument {
                 config.forge.page_size,
                 usize
             );
+            apply_key!(
+                warnings,
+                "forge",
+                table,
+                "dry_run",
+                config.forge.dry_run,
+                bool
+            );
             if let Some(value) = table.get("remote") {
                 match value.clone().try_into::<String>() {
                     Ok(remote) => config.forge.remote = Some(remote),
@@ -933,7 +949,7 @@ const LLM_KEYS: &[&str] = &[
     "max_tool_calls",
 ];
 const CATALOG_KEYS: &[&str] = &["url", "ttl_hours"];
-const FORGE_KEYS: &[&str] = &["remote", "gh_path", "page_size"];
+const FORGE_KEYS: &[&str] = &["remote", "gh_path", "page_size", "dry_run"];
 const CACHE_KEYS: &[&str] = &["ttl_list_secs", "ttl_detail_secs"];
 const LOG_KEYS: &[&str] = &["level", "path"];
 

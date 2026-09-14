@@ -65,7 +65,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // reports its own state. Only once there is something to report: a `0 turns`
         // segment on every screen would be noise.
         Span::styled(chat_label(app), background),
-        Span::styled("· 0 drafts ", background),
+        // FR-6.1: what is staged for this pull request. The column existed as a
+        // placeholder from M1 and now says something: a count that is visible without
+        // opening the panel, and brightened only when there is work to publish.
+        Span::styled(
+            drafts_label(app).0,
+            if drafts_label(app).1 {
+                theme.style(element::COMMENT_MARKER)
+            } else {
+                background
+            },
+        ),
     ];
 
     let right = match app.latest_notice() {
@@ -83,6 +93,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(padded_line(left, right, area.width)).style(background),
         area,
     );
+}
+
+/// The staged review: how many comments are waiting, and whether any are (FR-6.1).
+fn drafts_label(app: &App) -> (String, bool) {
+    let drafts = app.drafts();
+    if !drafts.open {
+        return (String::new(), false);
+    }
+    let count = drafts.draft.comments.len();
+    let word = if count == 1 { "draft" } else { "drafts" };
+    (format!("· {count} {word} "), count > 0)
 }
 
 /// The conversation's cost, when there is one (FR-5.4).

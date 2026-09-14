@@ -97,6 +97,79 @@ pub(crate) fn temp_home() -> TempHome {
     TempHome::new()
 }
 
+/// An in-memory [`DraftStorePort`](crate::ports::DraftStorePort) for tests.
+///
+/// In memory rather than on disk because most of these tests are about what the
+/// interface does with a draft, not about where it is kept — and a test that writes to
+/// a real directory has to be believed about cleaning up after itself.
+#[derive(Debug, Default)]
+pub(crate) struct FakeDraftStore {
+    drafts: Mutex<std::collections::BTreeMap<(String, u64), crate::domain::draft::Draft>>,
+    /// Set to make every write fail, which is how "the draft could not be saved" is
+    /// exercised.
+    pub(crate) fail: bool,
+}
+
+impl crate::ports::DraftStorePort for FakeDraftStore {
+    fn load(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        number: u64,
+    ) -> Result<Option<crate::domain::draft::Draft>, crate::ports::DraftStoreError> {
+        Ok(self
+            .drafts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(repo.key(), number))
+            .cloned())
+    }
+
+    fn save(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        draft: &crate::domain::draft::Draft,
+    ) -> Result<(), crate::ports::DraftStoreError> {
+        if self.fail {
+            return Err(crate::ports::DraftStoreError::Io {
+                action: "write the draft",
+                path: std::path::PathBuf::from("/dev/null"),
+                source: std::io::Error::other("the fake was told to fail"),
+            });
+        }
+        self.drafts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((repo.key(), draft.pr), draft.clone());
+        Ok(())
+    }
+
+    fn remove(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        number: u64,
+    ) -> Result<(), crate::ports::DraftStoreError> {
+        self.drafts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(repo.key(), number));
+        Ok(())
+    }
+
+    fn list(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+    ) -> Result<Vec<crate::domain::draft::Draft>, crate::ports::DraftStoreError> {
+        Ok(self
+            .drafts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|((key, _), _)| key == &repo.key())
+            .map(|(_, draft)| draft.clone())
+            .collect())
+    }
+}
+
 /// An in-memory [`CacheStore`](crate::ports::CacheStore) for tests.
 ///
 /// Exists so the cache-first and offline paths of the application layer can be

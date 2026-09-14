@@ -12,15 +12,19 @@
 //! - every call has a timeout, and the child is killed when it expires;
 //! - a call is cancellable, and the child is killed within one poll interval;
 //! - a non-zero exit becomes an error carrying the exit code and a tail of
-//!   stderr, which is what the user needs to see.
+//!   stderr, which is what the user needs to see;
+//! - a *mutating* call is recorded rather than run when `--dry-run` is in force
+//!   (FR-6.5), and the caller is told so.
 
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::logging::{self, Level};
 use crate::ports::Cancel;
 
 /// How long a child may run before it is killed.
@@ -58,6 +62,7 @@ pub struct CommandSpec {
     args: Vec<OsString>,
     timeout: Option<Duration>,
     cwd: Option<PathBuf>,
+    mutating: bool,
 }
 
 impl CommandSpec {
@@ -68,6 +73,7 @@ impl CommandSpec {
             args: Vec::new(),
             timeout: None,
             cwd: None,
+            mutating: false,
         }
     }
 
@@ -104,6 +110,25 @@ impl CommandSpec {
     pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
         self
+    }
+
+    /// Marks this call as one that changes something outside the process (FR-6.5).
+    ///
+    /// Everything is a *read* unless it says otherwise, because the default that
+    /// matters is the safe one: a forgotten mark makes a call run during a dry run
+    /// (visible, harmless), while a wrong mark makes a real call silently not happen
+    /// (invisible, and the bug this flag exists to prevent). Callers therefore mark
+    /// writes explicitly, and every such call site says why.
+    #[must_use]
+    pub fn mutating(mut self) -> Self {
+        self.mutating = true;
+        self
+    }
+
+    /// Whether this call changes something outside the process.
+    #[must_use]
+    pub fn is_mutating(&self) -> bool {
+        self.mutating
     }
 
     /// The program.
@@ -173,6 +198,12 @@ pub struct Output {
     pub stderr_truncated: bool,
     /// How long the child ran.
     pub duration: Duration,
+    /// Whether this is a call that was recorded instead of run (FR-6.5).
+    ///
+    /// A dry run reports success — nothing failed — so a caller that would otherwise
+    /// carry on as if the world had changed must ask this. `status` is a successful
+    /// exit status in that case, and the streams are empty.
+    pub dry_run: bool,
 }
 
 impl Output {
@@ -232,11 +263,93 @@ pub enum ProcessError {
     },
 }
 
+/// The calls a dry run would have made, in order (FR-6.5).
+///
+/// Shared rather than owned: the runner is built per adapter and cloned into every
+/// worker, while the list belongs to the run as a whole — one file to hand to the
+/// user, in the order things would have happened.
+#[derive(Debug, Clone, Default)]
+pub struct DryRunLedger {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl DryRunLedger {
+    /// An empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a call that was *not* run.
+    fn record(&self, spec: &CommandSpec) -> String {
+        let rendered = spec.render();
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(rendered.clone());
+        }
+        rendered
+    }
+
+    /// The recorded calls, in the order they would have run.
+    #[must_use]
+    pub fn commands(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .map(|calls| calls.clone())
+            .unwrap_or_default()
+    }
+
+    /// How many calls have been recorded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.calls.lock().map_or(0, |calls| calls.len())
+    }
+
+    /// Whether nothing has been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Forgets every recorded call.
+    pub fn clear(&self) {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.clear();
+        }
+    }
+
+    /// Appends the recorded calls to `path`, creating its directory (FR-6.5).
+    ///
+    /// Appended rather than replaced: two dry runs in one session are two records of
+    /// what the user said, and the file is the only place a dry run says anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the directory or the file cannot be written.
+    pub fn write_to(&self, path: &Path) -> std::io::Result<usize> {
+        use std::io::Write as _;
+        let commands = self.commands();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let stamp = chrono::Utc::now().to_rfc3339();
+        writeln!(file, "# dry run {stamp}")?;
+        for command in &commands {
+            writeln!(file, "{command}")?;
+        }
+        Ok(commands.len())
+    }
+}
+
 /// Runs child processes with a timeout, an output cap and cancellation.
 #[derive(Debug, Clone)]
 pub struct ProcessRunner {
     timeout: Duration,
     output_cap: usize,
+    dry_run: Option<DryRunLedger>,
 }
 
 impl Default for ProcessRunner {
@@ -244,6 +357,7 @@ impl Default for ProcessRunner {
         Self {
             timeout: DEFAULT_TIMEOUT,
             output_cap: DEFAULT_OUTPUT_CAP,
+            dry_run: None,
         }
     }
 }
@@ -269,6 +383,25 @@ impl ProcessRunner {
         self
     }
 
+    /// Records mutating calls instead of running them (FR-6.5).
+    #[must_use]
+    pub fn with_dry_run(mut self, ledger: DryRunLedger) -> Self {
+        self.dry_run = Some(ledger);
+        self
+    }
+
+    /// Whether a dry run is in force.
+    #[must_use]
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run.is_some()
+    }
+
+    /// The ledger mutating calls are recorded in, if a dry run is in force.
+    #[must_use]
+    pub fn dry_run_ledger(&self) -> Option<&DryRunLedger> {
+        self.dry_run.as_ref()
+    }
+
     /// Runs a command to completion.
     ///
     /// A non-zero exit is *not* an error here: the caller decides whether it
@@ -280,6 +413,10 @@ impl ProcessRunner {
     /// Returns [`ProcessError`] when the program cannot be started, when it
     /// exceeds its timeout, or when it is cancelled.
     pub fn run(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<Output, ProcessError> {
+        if let Some(recorded) = self.dry_run_output(spec) {
+            return Ok(recorded);
+        }
+
         let program = spec.program.display().to_string();
         // Only a program given *as a path* is pre-checked. A bare name is meant to
         // be found on PATH, and the operating system is the only thing that can do
@@ -381,6 +518,32 @@ impl ProcessRunner {
             stdout_truncated,
             stderr_truncated,
             duration: started.elapsed(),
+            dry_run: false,
+        })
+    }
+
+    /// The stand-in for a mutating call during a dry run (FR-6.5).
+    ///
+    /// Checked *before* the program-exists check, so a dry run touches nothing at all
+    /// — not even to ask whether the program is there. Reads run for real: they change
+    /// nothing outside the process, and a dry run that could not read would have
+    /// nothing to describe.
+    fn dry_run_output(&self, spec: &CommandSpec) -> Option<Output> {
+        let ledger = self.dry_run.as_ref()?;
+        if !spec.is_mutating() {
+            return None;
+        }
+        let command = ledger.record(spec);
+        logging::log(Level::Warn, format!("dry run, not running: {command}"));
+        Some(Output {
+            status: ExitStatus::default(),
+            stdout: String::new(),
+            stdout_bytes: Vec::new(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: Duration::ZERO,
+            dry_run: true,
         })
     }
 
@@ -554,6 +717,117 @@ mod tests {
 
     fn shell(script: &str) -> CommandSpec {
         CommandSpec::new("/bin/sh").args(["-c", script])
+    }
+
+    #[test]
+    fn a_dry_run_records_a_write_instead_of_running_it() {
+        // The whole promise of `--dry-run` (FR-6.5) is that the side effect does not
+        // happen, so the test asserts the side effect's *absence*: the file the shell
+        // would have written must not exist.
+        let dir = crate::test_support::temp_home();
+        let marker = dir.path().join("touched");
+        let ledger = DryRunLedger::new();
+        let dry = ProcessRunner::new().with_dry_run(ledger.clone());
+
+        let spec = shell(&format!("touch {}", marker.display())).mutating();
+        let output = dry.run(&spec, &Cancel::new()).unwrap();
+
+        assert!(output.dry_run, "the caller is told nothing really ran");
+        assert!(output.success(), "nothing failed");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        assert!(!marker.exists(), "the write did not happen");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger.commands(), vec![spec.render()]);
+    }
+
+    #[test]
+    fn a_dry_run_still_reads() {
+        // A dry run that could not read would have nothing to describe: only calls
+        // that change something outside the process are held back.
+        let ledger = DryRunLedger::new();
+        let dry = ProcessRunner::new().with_dry_run(ledger.clone());
+        let output = dry.run(&shell("echo hello"), &Cancel::new()).unwrap();
+        assert!(!output.dry_run);
+        assert_eq!(output.stdout.trim(), "hello");
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn only_writes_are_recorded() {
+        let ledger = DryRunLedger::new();
+        let dry = ProcessRunner::new().with_dry_run(ledger.clone());
+        let _ = dry.run(&shell("true"), &Cancel::new()).unwrap();
+        let _ = dry.run(&shell("true").mutating(), &Cancel::new()).unwrap();
+        let _ = dry.run(&shell("true").mutating(), &Cancel::new()).unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert!(!ledger.is_empty());
+        ledger.clear();
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_records_what_a_read_would_also_have_shown() {
+        // The recorded line is the command a person can paste, `cd` and quoting
+        // included — the runner's own rendering, so the log cannot disagree with what
+        // the call would have been.
+        let ledger = DryRunLedger::new();
+        let dry = ProcessRunner::new().with_dry_run(ledger.clone());
+        let spec = CommandSpec::new("gh")
+            .args([
+                "pr",
+                "review",
+                "141",
+                "--approve",
+                "-b",
+                "looks good; really",
+            ])
+            .mutating();
+        let _ = dry.run(&spec, &Cancel::new()).unwrap();
+        assert_eq!(
+            ledger.commands(),
+            vec!["gh pr review 141 --approve -b 'looks good; really'".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_ledger_is_written_to_a_file_in_order() {
+        let dir = crate::test_support::temp_home();
+        let path = dir.path().join("logs/dry-run.log");
+        let ledger = DryRunLedger::new();
+        let dry = ProcessRunner::new().with_dry_run(ledger.clone());
+        let _ = dry
+            .run(
+                &CommandSpec::new("git").args(["a", "b"]).mutating(),
+                &Cancel::new(),
+            )
+            .unwrap();
+        let _ = dry
+            .run(
+                &CommandSpec::new("gh").args(["c"]).mutating(),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert_eq!(ledger.write_to(&path).unwrap(), 2);
+        let written = std::fs::read_to_string(&path).expect("the log exists");
+        let lines: Vec<&str> = written.lines().collect();
+        assert!(lines[0].starts_with("# dry run "), "stamped: {}", lines[0]);
+        assert_eq!(lines[1], "git a b");
+        assert_eq!(lines[2], "gh c");
+
+        // Appended, not replaced: a second dry run is a second record.
+        assert_eq!(ledger.write_to(&path).unwrap(), 2);
+        let written = std::fs::read_to_string(&path).expect("the log exists");
+        assert_eq!(written.matches("git a b").count(), 2);
+    }
+
+    #[test]
+    fn a_runner_without_a_ledger_runs_everything() {
+        assert!(!ProcessRunner::new().is_dry_run());
+        assert!(ProcessRunner::new().dry_run_ledger().is_none());
+        let dry = ProcessRunner::new().with_dry_run(DryRunLedger::new());
+        assert!(dry.is_dry_run());
+        assert!(dry.dry_run_ledger().is_some());
     }
 
     #[test]

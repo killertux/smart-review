@@ -85,7 +85,16 @@ impl GitCli {
         cancel: &Cancel,
     ) -> Result<(bool, String, String), WorkspaceError> {
         let spec = CommandSpec::new(&self.program).args(args).current_dir(dir);
-        match self.runner.run(&spec, cancel) {
+        self.run_in_spec(&spec, cancel)
+    }
+
+    /// Runs a prepared spec, so a caller can mark a destructive call as such.
+    fn run_in_spec(
+        &self,
+        spec: &CommandSpec,
+        cancel: &Cancel,
+    ) -> Result<(bool, String, String), WorkspaceError> {
+        match self.runner.run(spec, cancel) {
             Ok(output) => Ok((output.success(), output.stdout, output.stderr)),
             Err(ProcessError::NotFound { .. }) => Err(WorkspaceError::GitUnavailable(
                 "install git and make sure it is on PATH".to_owned(),
@@ -310,8 +319,14 @@ impl GitCli {
         let dir = self.repo_dir(path);
         if path.is_dir() {
             let path_arg = path.to_string_lossy().into_owned();
-            let (_, _, stderr) =
-                self.run_in(&dir, &["worktree", "remove", "--force", &path_arg], cancel)?;
+            // Destructive, so `--dry-run` records it instead of removing anything
+            // (FR-6.5): the worktree is the user's only copy of nothing, but saying
+            // what would be deleted is the point of a dry run.
+            let spec = CommandSpec::new(&self.program)
+                .args(["worktree", "remove", "--force", &path_arg])
+                .current_dir(&dir)
+                .mutating();
+            let (_, _, stderr) = self.run_in_spec(&spec, cancel)?;
             if path.exists() {
                 // `worktree remove` refuses a directory with local modifications or
                 // an untracked file it would lose; the message says what to delete,
@@ -328,7 +343,11 @@ impl GitCli {
                 )));
             }
         }
-        let _ = self.run_in(&dir, &["worktree", "prune"], cancel);
+        let spec = CommandSpec::new(&self.program)
+            .args(["worktree", "prune"])
+            .current_dir(&dir)
+            .mutating();
+        let _ = self.run_in_spec(&spec, cancel);
         Ok(())
     }
 
@@ -338,11 +357,12 @@ impl GitCli {
     /// that could not be deleted is untidy rather than wrong.
     pub(crate) fn delete_head_ref(&self, repo: &RepoId, number: u64, cancel: &Cancel) {
         let dir = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
-        let _ = self.run_in(
-            &dir,
-            &["update-ref", "-d", &Self::head_ref(repo, number)],
-            cancel,
-        );
+        // Deleting a ref is destructive, so a dry run records it (FR-6.5).
+        let spec = CommandSpec::new(&self.program)
+            .args(["update-ref", "-d", &Self::head_ref(repo, number)])
+            .current_dir(&dir)
+            .mutating();
+        let _ = self.run_in_spec(&spec, cancel);
     }
 
     /// Every managed worktree, newest names last (FR-3.1).

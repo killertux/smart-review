@@ -18,14 +18,15 @@ use crate::adapters::gh::probe::GhCliProbe;
 use crate::adapters::git::GitCli;
 use crate::adapters::http::ReqwestFetcher;
 use crate::adapters::llm::LlmCrate;
+use crate::adapters::process::ProcessRunner;
 use crate::cli::Cli;
 use crate::config::{Config, ConfigDocument};
 use crate::doctor::Context;
 use crate::error::Result;
 use crate::paths::Home;
 use crate::ports::{
-    CacheStore, Clock, ConfigStore, ForgeFactory, ForgeProbe, LlmPort, ModelCatalogPort,
-    SecretStore, StateStore, WorkspacePort,
+    CacheStore, Clock, ConfigStore, DraftStorePort, ForgeFactory, ForgeProbe, LlmPort,
+    ModelCatalogPort, SecretStore, StateStore, WorkspacePort,
 };
 use crate::state::AppState;
 use crate::tui::keymap::{self, Keymap};
@@ -92,6 +93,13 @@ pub struct Startup {
     /// Where chat sessions are kept (FR-5.1). Disposable, like everything else under
     /// `cache/`, but written carefully: the conversation is the user's own words.
     pub chat: Arc<dyn crate::ports::ChatStorePort>,
+    /// Where review drafts are kept (FR-6.1). Deliberately *not* under `cache/`: a
+    /// draft cannot be fetched again.
+    pub drafts: Arc<dyn DraftStorePort>,
+    /// Whether mutating calls are recorded rather than run (FR-6.5).
+    pub dry_run: bool,
+    /// The calls a dry run recorded, which the loop writes out (FR-6.5).
+    pub dry_run_ledger: crate::adapters::process::DryRunLedger,
 }
 
 /// The adapters a startup builds.
@@ -120,6 +128,8 @@ struct Ports {
     analysis: Arc<dyn crate::ports::AnalysisCachePort>,
     /// Where conversations live (FR-5.1).
     chat: Arc<dyn crate::ports::ChatStorePort>,
+    drafts: Arc<dyn DraftStorePort>,
+    dry_run_ledger: crate::adapters::process::DryRunLedger,
 }
 
 impl Ports {
@@ -131,18 +141,37 @@ impl Ports {
         home: &Home,
         config: &crate::config::Config,
         path: Option<std::path::PathBuf>,
+        dry_run: bool,
     ) -> Self {
         let workspace_root = home.worktrees();
+        // The dry-run gate is built once and cloned into every adapter: one gate, one
+        // promise, and one list of calls to hand to the user (FR-6.5).
+        let ledger = crate::adapters::process::DryRunLedger::new();
+        let runner = || {
+            let runner = ProcessRunner::new();
+            if dry_run {
+                runner.with_dry_run(ledger.clone())
+            } else {
+                runner
+            }
+        };
         let workspace: Arc<dyn WorkspacePort> = Arc::new(match path {
-            Some(path) => GitCli::new().in_dir(path).with_worktrees(workspace_root),
-            None => GitCli::new().with_worktrees(workspace_root),
+            Some(path) => GitCli::new()
+                .with_runner(runner())
+                .in_dir(path)
+                .with_worktrees(workspace_root),
+            None => GitCli::new()
+                .with_runner(runner())
+                .with_worktrees(workspace_root),
         });
         let workspace_port = Arc::clone(&workspace);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let cache: Arc<dyn CacheStore> = Arc::new(DiskCache::new(home.cache()));
         Self {
             probe: Arc::new(GhCliProbe::new(config.forge.gh_path.clone())),
-            forge_factory: Arc::new(GhForgeFactory::new(config.forge.gh_path.clone())),
+            forge_factory: Arc::new(
+                GhForgeFactory::new(config.forge.gh_path.clone()).with_runner(runner()),
+            ),
             secret_store: Arc::new(FileSecrets::new(home.credentials(), Arc::new(RealEnv))),
             catalog: Arc::new(ModelsDevCatalog::new(
                 config.catalog.url.clone(),
@@ -158,6 +187,10 @@ impl Ports {
             chat: Arc::new(crate::adapters::chat_store::FileChatStore::new(
                 home.cache(),
             )),
+            drafts: Arc::new(crate::adapters::draft_store::FileDraftStore::new(
+                home.root(),
+            )),
+            dry_run_ledger: ledger,
             workspace,
             workspace_port,
             cache,
@@ -264,7 +297,8 @@ impl Startup {
 
         let keymap = keymap::load(&home, &loaded.config.ui, &mut warnings)?;
 
-        let ports = Ports::build(&home, &loaded.config, cli.path.clone());
+        let dry_run = cli.dry_run || loaded.config.forge.dry_run;
+        let ports = Ports::build(&home, &loaded.config, cli.path.clone(), dry_run);
 
         Ok(Self {
             home,
@@ -295,6 +329,9 @@ impl Startup {
             llm: ports.llm,
             analysis: ports.analysis,
             chat: ports.chat,
+            drafts: ports.drafts,
+            dry_run,
+            dry_run_ledger: ports.dry_run_ledger,
         })
     }
 }
@@ -315,6 +352,7 @@ mod tests {
             home: Some(home.to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         }
     }
 

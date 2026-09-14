@@ -26,4 +26,4 @@
 │                                                                                                  │
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
- POPUP list · acme/service · — · — · 0 drafts                ? help · <leader> actions · : commands
+ POPUP list · acme/service · — · —                           ? help · <leader> actions · : commands
