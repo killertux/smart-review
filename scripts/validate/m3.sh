@@ -52,15 +52,18 @@ PY
 CATALOG_PORT="$(free_port)"
 LLM_PORT="$(free_port)"
 LLM_URL="http://127.0.0.1:$LLM_PORT/v1"
+# Somewhere nothing answers: `dead` is the provider whose request cannot succeed.
+DEAD_PORT="$(free_port)"
+DEAD_URL="http://127.0.0.1:$DEAD_PORT/v1"
 
 # ---------------------------------------------------------------------------
 # The fake catalog: one provider, reached through the passthrough, with the
 # reasoning options the thinking tests need.
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/srv"
-python3 - "$TMP/srv/api.json" "$LLM_URL" <<'PY'
+python3 - "$TMP/srv/api.json" "$LLM_URL" "$DEAD_URL" <<'PY'
 import json, sys
-path, api = sys.argv[1], sys.argv[2]
+path, api, dead_api = sys.argv[1], sys.argv[2], sys.argv[3]
 document = {
     "fake": {
         "id": "fake",
@@ -85,6 +88,46 @@ document = {
             }
         },
     }
+}
+
+# Two more, for step 8. `deepseek` is a provider the pinned `llm` crate has a *native*
+# backend for, and that backend implements no streaming: the route is native, cannot
+# stream, and has to reach this same local server through the OpenAI-compatible
+# passthrough to answer at all. This is the shape of the bug a real DeepSeek user hit,
+# reproduced offline.
+#
+# `dead` points at a port nothing is listening on: the request fails, and what is being
+# checked is that the pane *says so* instead of waiting forever.
+document["deepseek"] = {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "env": ["DEEPSEEK_API_KEY"],
+    "api": api,
+    "doc": "https://example.invalid/deepseek",
+    "models": {
+        "deepseek-v4-pro": {
+            "id": "deepseek-v4-pro",
+            "name": "DeepSeek V4 Pro",
+            "family": "deepseek",
+            "limit": {"context": 40000, "output": 4000},
+            "cost": {"input": 0.1, "output": 0.2},
+        }
+    },
+}
+document["dead"] = {
+    "id": "dead",
+    "name": "Unreachable",
+    "env": ["DEAD_API_KEY"],
+    "api": dead_api,
+    "doc": "https://example.invalid/dead",
+    "models": {
+        "dead-1": {
+            "id": "dead-1",
+            "name": "Unreachable 1",
+            "family": "dead",
+            "limit": {"context": 40000, "output": 4000},
+        }
+    },
 }
 json.dump(document, open(path, "w"), indent=1)
 PY
@@ -295,7 +338,12 @@ shown() {
 
 run_tui() {
   local home="$1" keys="$2" waits="$3" log="$4"
-  PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" FAKE_API_KEY=sk-fake-validation \
+  # Every provider in the fake catalog gets a key: which variable holds it is the
+  # catalog's business (FR-4.5), and a step that fails for want of a key would be
+  # testing the credential lookup instead of what it names.
+  PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
+    FAKE_API_KEY=sk-fake-validation DEEPSEEK_API_KEY=sk-fake-deepseek \
+    DEAD_API_KEY=sk-fake-dead \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
       --ready "Add retry to the webhook dispatcher" \
@@ -326,7 +374,7 @@ ASK='why does it round?\r~\r'
 # line of the confirmation (that one says "tokens (" and never "tokens · ").
 ASK_WAIT='Nothing has been sent yet~tokens · ~'
 
-step "1/7 build"
+step "1/8 build"
 if cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
@@ -340,7 +388,7 @@ fi
 HOME_MAIN="$TMP/home"
 make_home "$HOME_MAIN"
 
-step "2/7 the pane, and typing in it"
+step "2/8 the pane, and typing in it"
 # Letters are letters, including the ones bound in normal mode: a question with a `?`
 # in it must not open the help popup.
 FRAMES="$TMP/typing.log"
@@ -376,7 +424,7 @@ else
   bad "typing sent something"
 fi
 
-step "3/7 the first question asks before it sends"
+step "3/8 the first question asks before it sends"
 # A home that has never agreed, which is the state the notice exists for (FR-4.6).
 HOME_FRESH="$TMP/fresh"
 make_home "$HOME_FRESH"
@@ -415,7 +463,7 @@ else
 fi
 keep_requests step3
 
-step "4/7 the question, the context and the answer"
+step "4/8 the question, the context and the answer"
 echo chat >"$TMP/mode"
 : >"$TMP/requests.jsonl"
 FRAMES="$TMP/chat.log"
@@ -464,7 +512,7 @@ else
   bad "the stored conversation has no question"
 fi
 
-step "5/7 what was sent"
+step "5/8 what was sent"
 if [ -s "$TMP/requests.jsonl" ]; then
   ok "the provider was asked"
 else
@@ -516,7 +564,7 @@ PASS=$((PASS + $(printf '%s\n' "$WIRE" | grep -c '^  PASS')))
 FAIL=$((FAIL + $(printf '%s\n' "$WIRE" | grep -c '^  FAIL')))
 keep_requests step5
 
-step "6/7 a second question, and stopping one"
+step "6/8 a second question, and stopping one"
 # The second question must carry the first exchange: that is what makes this a
 # conversation rather than a series of unrelated questions (FR-5.2, FR-5.3). The answer
 # quotes the question, which is how the wait tells this answer from the one already in
@@ -571,7 +619,7 @@ else
 fi
 keep_requests step6
 
-step "7/7 the conversation survives, and can be exported"
+step "7/8 the conversation survives, and can be exported"
 # Opening the pull request again reads the conversation back from the store: no typing,
 # no question, and what was said last is on screen.
 echo chat >"$TMP/mode"
@@ -641,7 +689,132 @@ if [ -n "$EXPORTED" ] && grep -q "rounds half up for positive" "$EXPORTED"; then
 else
   bad "the transcript's answers are incomplete"
 fi
-keep_requests step7
+step "8/8 a provider this crate cannot stream, and one that does not answer"
+# The user's report, offline. `deepseek` has a native backend in the pinned crate which
+# implements no streaming, so the old code asked for the structured stream, got the
+# crate's refusal, and — because `is_current_job` did not know the chat slot — dropped
+# the failure on the floor: the pane said "asking deepseek-v4-pro" forever.
+#
+# Both halves of that are checked here. The answer must arrive (through the passthrough,
+# which streams), and a provider that genuinely fails must *say* so.
+
+deepseek_home() {
+  local home="$1"
+  make_home "$home"
+  python3 - "$home/config.toml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+text = text.replace('provider = "fake"', 'provider = "deepseek"')
+text = text.replace('model = "fake-analysis-1"', 'model = "deepseek-v4-pro"')
+open(path, "w").write(text)
+PY
+}
+
+HOME_DEEPSEEK="$TMP/home-deepseek"
+deepseek_home "$HOME_DEEPSEEK"
+echo chat >"$TMP/mode"
+: >"$TMP/requests.jsonl"
+FRAMES="$TMP/deepseek.log"
+SCREEN="$(run_tui "$HOME_DEEPSEEK" "$OPEN~why does it round?\r" \
+  "$OPEN_WAIT~You asked: \"why does it round\?\"" "$FRAMES")"
+if printf '%s' "$SCREEN" | grep -qi "not supported for this provider"; then
+  bad "the answer never came: the crate's refusal was shown instead"
+  printf '%s\n' "$SCREEN" | tail -8
+elif printf '%s' "$SCREEN" | grep -q "rounds half up for positive"; then
+  ok "a provider with no streaming of its own still answered"
+else
+  bad "the question produced no answer"
+  printf '%s\n' "$SCREEN" | tail -12
+fi
+# And it *streamed*: the passthrough request asks for `stream`, so the answer arrives in
+# pieces rather than as one block. Without this the check above would also pass if the
+# fallback had been a single un-streamed request — which is what Groq and Mistral get.
+if python3 - "$TMP/requests.jsonl" <<'PY'
+import json, sys
+bodies = [json.loads(line)["body"] for line in open(sys.argv[1]) if line.strip()]
+streamed = [b for b in bodies if b.get("stream") and b.get("model") == "deepseek-v4-pro"]
+sys.exit(0 if streamed else 1)
+PY
+then
+  ok "the provider that cannot stream was reached through /chat/completions"
+else
+  bad "the streaming fallback did not use the compatible route"
+  head -4 "$TMP/requests.jsonl"
+fi
+keep_requests step8-deepseek
+
+# A provider that cannot be reached at all: the failure has to be *visible*. This is the
+# other half of the same bug — before it, this run sat at "asking dead-1" until the
+# timeout, with the reason only in the log.
+dead_home() {
+  local home="$1"
+  make_home "$home"
+  python3 - "$home/config.toml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+text = text.replace('provider = "fake"', 'provider = "dead"')
+text = text.replace('model = "fake-analysis-1"', 'model = "dead-1"')
+open(path, "w").write(text)
+PY
+}
+
+HOME_DEAD="$TMP/home-dead"
+dead_home "$HOME_DEAD"
+FRAMES="$TMP/dead.log"
+# The wait names the failure itself: if the pane never says it, the step times out
+# rather than reporting a passing run that proves nothing.
+SCREEN="$(run_tui "$HOME_DEAD" "$OPEN~why does it round?\r" "$OPEN_WAIT~failed: " "$FRAMES")"
+# Asserted on the *pane*, not on the notice: a notice says "the question failed" and
+# expires after six seconds, so grepping for "failed: " would be satisfied by a flash the
+# user may never read — and it was, when the pane itself drew nothing.
+if shown "$FRAMES" "model \\(failed\\)"; then
+  ok "the chat pane marks the failed request"
+else
+  bad "the pane did not mark the failure"
+  printf '%s\n' "$SCREEN" | tail -10
+fi
+# "Still asking" is about the *last* frame, not about any frame: `shown` answers "was
+# this ever on screen", and it certainly was, a second before the failure.
+if printf '%s' "$SCREEN" | grep -qi "asking dead-1"; then
+  bad "the pane is still saying it is asking"
+else
+  ok "the pane stopped saying it was asking"
+fi
+# The reason in the transport's own words, which is what a person acts on.
+if shown "$FRAMES" "error sending request"; then
+  ok "the reason is shown in the pane, not just the word failed"
+else
+  bad "the pane shows no reason"
+  printf '%s\n' "$SCREEN" | tail -10
+fi
+keep_requests step8-dead
+
+# The same failure on the *analysis* path, which is a different slot in the reducer and
+# a different pane: the user reported this one too ("nor can I see anything in the
+# analysis"). A dead provider has to leave the panel saying so rather than "asking the
+# provider" forever.
+FRAMES="$TMP/dead-analysis.log"
+SCREEN="$(run_tui "$HOME_DEAD" ':pr 141\r~ a~ a' 'money\.rs~~' "$FRAMES")"
+if shown "$FRAMES" "the provider did not answer"; then
+  ok "a failed analysis is shown in the panel"
+else
+  bad "the analysis panel did not report the failure"
+  printf '%s\n' "$SCREEN" | tail -10
+fi
+if shown "$FRAMES" "failed: "; then
+  ok "the panel names the failure in its title"
+else
+  bad "the panel title does not say the analysis failed"
+fi
+if shown "$FRAMES" "asking the provider"; then
+  bad "the panel is still saying it is asking the provider"
+else
+  ok "the panel stopped saying it was asking"
+fi
+keep_requests step8-dead-analysis
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]
+

@@ -409,6 +409,15 @@ pub enum AnalysisState {
         /// Why, in the model's words where possible.
         reason: String,
     },
+    /// The request never produced an answer (FR-9.1).
+    ///
+    /// A different state from [`Self::Unusable`], because a different thing happened:
+    /// nothing arrived, so there is no text to show and no `:analyze raw` to offer,
+    /// and what the user needs is the provider's own reason.
+    Failed {
+        /// What the provider or the transport said.
+        reason: String,
+    },
     /// The user stopped it (FR-4.4).
     Cancelled,
 }
@@ -439,6 +448,7 @@ impl AnalysisState {
             Self::Running { stage } | Self::Streaming { stage } => stage.clone(),
             Self::Ready => "analysed".to_owned(),
             Self::Unusable { reason } => format!("unusable answer: {reason}"),
+            Self::Failed { reason } => format!("failed: {reason}"),
             Self::Cancelled => "cancelled".to_owned(),
         }
     }
@@ -2600,6 +2610,12 @@ impl App {
     /// Whether `job` is the newest request for the slot it belongs to.
     #[must_use]
     pub fn is_current_job(&self, job: u64) -> bool {
+        // Every slot this state can hold a job id for belongs here, including the
+        // analysis and chat slots below. Omitting one does not make its failure
+        // harmless, it makes it *invisible*: the outcome falls through to the
+        // catch-all, the pane keeps saying "asking <model>", and the only way to find
+        // out what happened is the log. That is what a provider which cannot stream
+        // looked like before this list was complete.
         job == self.environment_job
             || job == self.list_job
             || job == self.count_job
@@ -2609,23 +2625,80 @@ impl App {
             || job == self.catalog_job
             || job == self.workspace_job
             || job == self.check_job
+            || job == self.panel.job
+            || job == self.panel.context_job
+            || job == self.panel.stored_job
+            || job == self.chat.job
+            || job == self.chat.load_job
     }
 
     /// Records a job failure where the user will see it.
     fn report_job_failure(&mut self, job: u64, message: &str) {
         if job == self.chat.job {
+            self.chat.job = 0;
             self.chat.status = crate::tui::chat::ChatStatus::Failed {
                 reason: message.to_owned(),
             };
             self.chat.pending = None;
+            // The streaming preview is dropped: a failure means there is no answer
+            // arriving, and leaving half a preview next to "failed" would suggest the
+            // text is a partial answer when it is not.
+            self.chat.stream.clear();
             self.notice(
                 NoticeLevel::Error,
                 format!("the question failed: {message}"),
             );
+            logging::log(Level::Warn, format!("the question failed: {message}"));
             return;
         }
         if job == self.chat.load_job {
             self.chat.load_job = 0;
+            // A gather that failed leaves a question staged with no bundle; sending it
+            // would send the question to a model that cannot see the pull request.
+            self.chat.staged = None;
+            self.chat.awaiting_confirmation = None;
+            if self.chat.status.is_running() {
+                self.chat.status = crate::tui::chat::ChatStatus::Failed {
+                    reason: message.to_owned(),
+                };
+            }
+            self.notice(
+                NoticeLevel::Error,
+                format!("could not assemble the context: {message}"),
+            );
+            return;
+        }
+        if job == self.panel.job {
+            self.panel.job = 0;
+            self.panel.stream.clear();
+            self.panel.state = AnalysisState::Failed {
+                reason: message.to_owned(),
+            };
+            // The panel, not just the status line: the run was started from there, and a
+            // notice expires after six seconds while the reason has to stay readable.
+            self.open_overlay(Overlay::Analysis);
+            self.notice(
+                NoticeLevel::Error,
+                format!("the analysis failed: {message}"),
+            );
+            logging::log(Level::Warn, format!("the analysis failed: {message}"));
+            return;
+        }
+        if job == self.panel.context_job || job == self.panel.stored_job {
+            if job == self.panel.context_job {
+                self.panel.context_job = 0;
+            } else {
+                self.panel.stored_job = 0;
+            }
+            // Whatever was waiting on this has nothing coming: leaving the panel saying
+            // "gathering the context" is the same stuck pane in a different costume.
+            if self.panel.state.is_running() {
+                self.panel.state = AnalysisState::Idle;
+            }
+            self.notice(
+                NoticeLevel::Error,
+                format!("could not read what to send: {message}"),
+            );
             return;
         }
         if job == self.list_job {
@@ -5164,6 +5237,102 @@ mod tests {
         assert!(app.analysis_opt_in_recorded());
         assert!(app.take_state_dirty(), "the opt-in is worth writing");
         assert!(!app.take_state_dirty(), "and only once");
+    }
+
+    #[test]
+    fn a_failed_question_is_shown_as_failed_not_as_still_asking() {
+        // The bug a real DeepSeek provider found: `is_current_job` did not know about
+        // the chat slot, so this outcome fell through the catch-all and was dropped. The
+        // pane kept saying "asking deepseek-flash" forever, and the reason — the
+        // provider's own words — was only in the log.
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        press(&mut app, "why?");
+        press(&mut app, "<Enter>");
+        // Job ids come from the worker, so the test assigns the one the reducer will be
+        // told about — the same shape the runner has.
+        let job = 21;
+        app.chat.job = job;
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::Failed(
+                "the provider refused: model not found".to_owned(),
+            ),
+        });
+        assert!(effect.is_none());
+        assert_eq!(app.chat.job, 0, "the failure released the slot");
+        let status = format!("{:?}", app.chat.status);
+        assert!(status.contains("Failed"), "{status}");
+        assert!(status.contains("model not found"), "{status}");
+        assert!(
+            app.chat.status.label().contains("model not found"),
+            "the pane shows the reason: {}",
+            app.chat.status.label()
+        );
+        // And it is a notice too, because the pane may not be on screen.
+        let notice = format!("{:?}", app.latest_notice().map(|n| n.text.clone()));
+        assert!(notice.contains("the question failed"), "{notice}");
+    }
+
+    #[test]
+    fn a_failed_analysis_is_shown_in_the_panel() {
+        // The same bug on the other path: an analysis run that fails now says so in the
+        // panel that started it, and the panel is not left saying "asking the provider".
+        let (_dir, mut app) = review_app();
+        app.begin_analysis();
+        let job = 22;
+        app.record_analysis_job(job);
+
+        app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::Failed(
+                "Structured streaming not supported for this provider".to_owned(),
+            ),
+        });
+        assert_eq!(app.panel.job, 0);
+        assert!(!app.panel.state.is_running(), "{:?}", app.panel.state);
+        let label = app.panel.state.label();
+        assert!(label.contains("not supported"), "{label}");
+        assert_eq!(app.overlay(), Overlay::Analysis, "the reason is on screen");
+    }
+
+    #[test]
+    fn a_failed_context_gather_does_not_leave_the_panel_gathering() {
+        // A gather that fails has nothing coming either, and leaving the panel in
+        // "gathering the context" is the same stuck pane in a different costume.
+        let (_dir, mut app) = review_app();
+        app.panel.state = AnalysisState::Gathering;
+        let job = 24;
+        app.panel.context_job = job;
+        app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::Failed("the worktree is gone".to_owned()),
+        });
+        assert_eq!(app.panel.context_job, 0);
+        assert!(!app.panel.state.is_running(), "{:?}", app.panel.state);
+    }
+
+    #[test]
+    fn a_failed_gather_cancels_the_question_that_was_waiting_on_it() {
+        // Sending a question whose bundle never arrived would send it to a model that
+        // cannot see the pull request — the one thing the confirmation exists to prevent.
+        let (_dir, mut app, _store) = chat_app();
+        press(&mut app, "<Space>c");
+        press(&mut app, "why?");
+        press(&mut app, "<Enter>");
+        app.chat.staged = Some("why?".to_owned());
+        app.chat.status = crate::tui::chat::ChatStatus::Sending {
+            stage: "gathering".to_owned(),
+        };
+        let job = 23;
+        app.record_chat_load(job);
+        app.apply_completion(crate::tui::jobs::Completion {
+            job,
+            outcome: crate::tui::jobs::Outcome::Failed("the worktree is gone".to_owned()),
+        });
+        assert!(app.chat.staged.is_none(), "nothing is left to send");
+        assert!(!app.chat.status.is_running(), "{:?}", app.chat.status);
     }
 
     #[test]
