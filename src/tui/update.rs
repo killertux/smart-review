@@ -136,6 +136,11 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "app.model_picker" => app.open_model_picker(),
+        "review.comment" => app.start_comment(),
+        "review.range" => app.start_selection(),
+        "review.drafts" => app.open_drafts(),
+        "review.publish" => app.open_publish(),
+        "review.remove" => app.remove_staged(),
         "app.analyze_panel" => {
             // `<leader>a` opens what is there and runs what is not: a user who has an
             // analysis wants to read it, and a user who has none wants one.
@@ -936,6 +941,7 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "key" => key_command(app, argument),
         "catalog" => catalog_command(app, argument),
         "workspace" => workspace_command(app, argument),
+        "draft" => draft_command(app, argument),
         "context" => context_command(app, argument),
         "chat" => chat_command(app, argument),
         "analyze" => start_analysis(app, argument),
@@ -1240,37 +1246,52 @@ fn catalog_command(app: &mut App, argument: &str) -> Effect {
 /// `:workspace clean [--all]` (FR-3.1).
 fn workspace_command(app: &mut App, argument: &str) -> Effect {
     match argument {
-        "clean" => Effect::CleanWorkspaces(false),
-        "clean --all" | "clean all" => Effect::CleanWorkspaces(true),
-        // With no argument, say what the worktrees are and what the options do.
-        "" => {
-            match app.worktrees() {
-                Ok(entries) if entries.is_empty() => app.notice(
-                    NoticeLevel::Info,
-                    "no worktrees yet; one is created when a pull request is opened",
-                ),
-                Ok(entries) => {
-                    let total: u64 = entries
-                        .iter()
-                        .filter_map(|entry| entry.age_secs)
-                        .sum::<u64>();
-                    app.notice(
-                        NoticeLevel::Info,
-                        format!(
-                            "{} worktree(s) using about {} MiB; `:workspace clean` removes the ones older than {} days",
-                            entries.len(),
-                            total / 1024,
-                            app.config.workspace.auto_clean_days
-                        ),
-                    );
-                }
-                Err(error) => app.notice(NoticeLevel::Warn, format!("worktrees: {error}")),
-            }
+        "clean" => app.ask_clean_workspaces(false),
+        "clean --all" | "clean all" => app.ask_clean_workspaces(true),
+        // With no argument, say what the worktrees are and what the options do. The
+        // listing happens in the loop: the reducer does no file system work.
+        "" => Effect::ListWorktrees,
+        other => {
+            app.command_error(format!(
+                "`:workspace {other}` is not an option; try `:workspace clean [--all]`"
+            ));
+            Effect::None
+        }
+    }
+}
+
+/// `:draft` — the staged review (FR-6.1–FR-6.3).
+fn draft_command(app: &mut App, argument: &str) -> Effect {
+    let argument = argument.trim();
+    let (word, rest) = match argument.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim()),
+        None => (argument, ""),
+    };
+    match word {
+        // With no argument, show what is staged: the panel is where the comments are
+        // read, and a list of them in the status line would not fit (FR-6.1).
+        "" | "show" => app.open_drafts(),
+        "list" => app.list_drafts(),
+        "remove" | "rm" => {
+            let Ok(number) = rest.parse::<usize>() else {
+                app.command_error(format!("`:draft remove {rest}` needs a number"));
+                return Effect::None;
+            };
+            app.remove_draft_number(number)
+        }
+        "clear" => app.ask_clear_draft(),
+        "decision" => app.set_draft_decision(rest),
+        "body" => app.set_draft_body(rest),
+        "publish" | "push" => app.open_publish(),
+        "export" => app.export_draft(rest),
+        "path" => {
+            app.notice(NoticeLevel::Info, app.draft_path_label());
             Effect::None
         }
         other => {
             app.command_error(format!(
-                "`:workspace {other}` is not an option; try `:workspace clean [--all]`"
+                "`:draft {other}` is not an option; try `:draft [list|remove <n>|clear|\
+                 decision <d>|body <text>|export [md|json]]`"
             ));
             Effect::None
         }

@@ -25,6 +25,8 @@ pub enum Group {
     Theme,
     /// Talking about a pull request (M3).
     Chat,
+    /// Writing, reviewing and publishing a review (M4).
+    Review,
 }
 
 impl Group {
@@ -39,6 +41,7 @@ impl Group {
             Self::Diff => "Diff",
             Self::Theme => "Theme",
             Self::Chat => "Chat",
+            Self::Review => "Review",
         }
     }
 }
@@ -361,6 +364,36 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
+        id: "review.comment",
+        description: "Comment on the line under the cursor (c)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.range",
+        description: "Start a range: V, move, then c",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.drafts",
+        description: "Show the staged comments (\u{3c}leader\u{3e}rd)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.publish",
+        description: "Publish the staged review (\u{3c}leader\u{3e}rr)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.remove",
+        description: "Remove the selected staged comment (x)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
         id: "pane.next",
         description: "Focus the next pane",
         group: Group::Pane,
@@ -421,6 +454,7 @@ pub fn groups() -> &'static [Group] {
         Group::Diff,
         Group::Theme,
         Group::Chat,
+        Group::Review,
     ]
 }
 

@@ -216,9 +216,10 @@ pub(crate) fn apply(
         | Effect::CountPullRequests
         | Effect::LoadMore
         | Effect::OpenPullRequest(_)
+        | Effect::PublishDraft
         | Effect::RunDoctor => {
             let context = app.doctor_request();
-            if let Some(job) = jobs::job_for(&effect, &app.list, context) {
+            if let Some(job) = jobs::job_for(&effect, &app.list, context, &app.drafts.draft) {
                 let id = runner.submit(job);
                 app.record_job(&effect, id);
             }
@@ -277,6 +278,20 @@ pub(crate) fn apply(
         | Effect::CancelAnalysis
         | Effect::SavePlan(_) => {
             let _ = apply_analysis_effect(&effect, app, runner, &mut pending_effects);
+        }
+
+        // The review effects are their own group: they are the only ones that write
+        // something other people can see, and keeping them together makes that
+        // auditable in one place (FR-6.3, FR-6.5).
+        Effect::LoadDraft
+        | Effect::SaveDraft
+        | Effect::ClearDraft
+        | Effect::CancelPublish
+        | Effect::WriteDryRun
+        | Effect::ListDrafts
+        | Effect::ExportDraft(_)
+        | Effect::ListWorktrees => {
+            apply_draft_effect(&effect, app, runner);
         }
 
         // The chat effects are their own group for the same reason: they share the
@@ -839,6 +854,175 @@ fn drain_effects(
     }
 }
 
+/// Applies the effects that touch the review draft (FR-6.1–FR-6.5).
+///
+/// This is the loop, so this is where the file system work happens: the reducer
+/// decided *that* the draft changed, and the store is here.
+fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
+    match effect {
+        Effect::LoadDraft => {
+            let Some(service) = app.draft_service.as_ref() else {
+                return;
+            };
+            let Some(number) = app.detail.as_ref().map(|detail| detail.summary.number) else {
+                return;
+            };
+            let (draft, warning) = service.load(number, app.now());
+            let head = app.open_head_sha().map(str::to_owned);
+            app.drafts.open(draft, warning);
+            if let Some(head) = head {
+                app.drafts.anchor_to(&head);
+            }
+        }
+        Effect::SaveDraft => {
+            let Some(service) = app.draft_service.as_ref() else {
+                return;
+            };
+            if let Err(error) = service.save(&app.drafts.draft) {
+                // The text is still in memory and the user can carry on, but a draft
+                // that is not on disk must never look like one that is (NFR-3.4).
+                let message = format!("the draft could not be saved: {error}");
+                app.drafts.warning = Some(message.clone());
+                app.notice(app::NoticeLevel::Warn, message);
+            } else {
+                app.drafts.dirty = false;
+            }
+        }
+        Effect::ClearDraft => {
+            app.drafts.clear(app.now());
+            if let Some(service) = app.draft_service.as_ref()
+                && let Err(error) = service.remove(app.drafts.draft.pr)
+            {
+                app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("the draft could not be removed: {error}"),
+                );
+            }
+            app.drafts.dirty = false;
+            app.notice(app::NoticeLevel::Info, "the draft is empty");
+        }
+        Effect::CancelPublish => {
+            runner.cancel(jobs::Slot::Review);
+            app.drafts.job = 0;
+            app.drafts.armed = false;
+            app.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+            app.notice(
+                app::NoticeLevel::Warn,
+                "the review was not sent; the draft is still here",
+            );
+        }
+        Effect::WriteDryRun => write_dry_run(app),
+        Effect::ListDrafts => list_drafts(app),
+        Effect::ExportDraft(format) => export_draft(app, format),
+        Effect::ListWorktrees => list_worktrees(app),
+        _ => {}
+    }
+}
+
+/// Says which drafts this repository has (FR-6.1).
+fn list_drafts(app: &mut App) {
+    let Some(service) = app.draft_service.as_ref() else {
+        return;
+    };
+    match service.list() {
+        Err(error) => app.notice(app::NoticeLevel::Warn, format!("drafts: {error}")),
+        Ok(drafts) if drafts.is_empty() => app.notice(
+            app::NoticeLevel::Info,
+            "no staged reviews anywhere in this repository",
+        ),
+        Ok(drafts) => {
+            let list: Vec<String> = drafts
+                .iter()
+                .map(|draft| format!("#{} ({})", draft.pr, draft.summary()))
+                .collect();
+            app.notice(
+                app::NoticeLevel::Info,
+                format!("staged reviews: {}", list.join(", ")),
+            );
+        }
+    }
+}
+
+/// Writes the draft out as markdown or JSON (FR-6.1).
+fn export_draft(app: &mut App, format: &str) {
+    let (text, extension) = if format == "json" {
+        match app.drafts.draft.to_json() {
+            Ok(text) => (text, "json"),
+            Err(error) => {
+                app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not write the draft: {error}"),
+                );
+                return;
+            }
+        }
+    } else {
+        (app.drafts.draft.to_markdown(), "md")
+    };
+    let directory = app.home.exports();
+    let path = directory.join(format!("review-{}.{extension}", app.drafts.draft.pr));
+    if let Err(error) =
+        std::fs::create_dir_all(&directory).and_then(|()| std::fs::write(&path, text.as_bytes()))
+    {
+        app.notice(
+            app::NoticeLevel::Warn,
+            format!("could not write {}: {error}", path.display()),
+        );
+        return;
+    }
+    app.notice(
+        app::NoticeLevel::Info,
+        format!("wrote {}", crate::paths::shorten_for_display(&path, 40)),
+    );
+}
+
+/// Says what the managed worktrees are, and what `:workspace clean` would do (FR-3.1).
+fn list_worktrees(app: &mut App) {
+    match app.worktrees() {
+        Ok(entries) if entries.is_empty() => app.notice(
+            app::NoticeLevel::Info,
+            "no worktrees yet; one is created when a pull request is opened",
+        ),
+        Ok(entries) => {
+            let total: u64 = entries.iter().filter_map(|entry| entry.age_secs).sum();
+            app.notice(
+                app::NoticeLevel::Info,
+                format!(
+                    "{} worktree(s) using about {} MiB; `:workspace clean` removes the ones older than {} days",
+                    entries.len(),
+                    total / 1024,
+                    app.config.workspace.auto_clean_days
+                ),
+            );
+        }
+        Err(error) => app.notice(app::NoticeLevel::Warn, format!("worktrees: {error}")),
+    }
+}
+
+/// Writes the calls a dry run recorded to `logs/dry-run.log` (FR-6.5).
+fn write_dry_run(app: &mut App) {
+    let Some(ledger) = app.dry_run_ledger.clone() else {
+        return;
+    };
+    if ledger.is_empty() {
+        return;
+    }
+    let path = app.home.logs().join("dry-run.log");
+    match ledger.write_to(&path) {
+        Ok(count) => app.notice(
+            app::NoticeLevel::Info,
+            format!(
+                "dry run: nothing was sent; {count} command(s) in {}",
+                crate::paths::shorten_for_display(&path, 40)
+            ),
+        ),
+        Err(error) => app.notice(
+            app::NoticeLevel::Warn,
+            format!("dry run: could not write {}: {error}", path.display()),
+        ),
+    }
+}
+
 /// How many effects one input may queue behind it before the loop gives up.
 ///
 /// A number rather than "as many as it takes": a cycle in the follow-up graph would
@@ -856,6 +1040,7 @@ pub(crate) fn executor_for(
     llm: std::sync::Arc<dyn crate::ports::LlmPort>,
 ) -> Option<Arc<Executor>> {
     let chat = app.chat_store.clone();
+    let drafts = app.draft_store.clone();
     let repo: RepoId = app.environment.as_ref()?.repo.clone();
     Some(Arc::new(Executor::new(jobs::ExecutorPorts {
         forge: factory.forge(&repo),
@@ -864,6 +1049,7 @@ pub(crate) fn executor_for(
         workspace,
         analysis,
         chat,
+        drafts,
         llm,
         repo,
         policy: CachePolicy {

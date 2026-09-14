@@ -148,6 +148,24 @@ pub enum Effect {
     PruneChat,
     /// Store the files the user added to the context (FR-5.3).
     SaveContextFiles,
+    /// Read the stored draft for the open pull request (FR-6.1).
+    LoadDraft,
+    /// Write the draft, which the reducer changed but may not save itself (FR-6.1).
+    SaveDraft,
+    /// Forget the draft on disk as well as on screen (FR-6.1).
+    ClearDraft,
+    /// Send the staged review (FR-6.3).
+    PublishDraft,
+    /// Give up on the publish in flight, keeping the draft (FR-6.3).
+    CancelPublish,
+    /// Write the calls a dry run recorded to `logs/dry-run.log` (FR-6.5).
+    WriteDryRun,
+    /// List the drafts this repository has (FR-6.1).
+    ListDrafts,
+    /// Write the draft out as markdown or JSON (FR-6.1).
+    ExportDraft(String),
+    /// List the managed worktrees, for `:workspace` with no argument (FR-3.1).
+    ListWorktrees,
 }
 
 impl std::fmt::Debug for Effect {
@@ -235,6 +253,15 @@ fn effect_name(effect: &Effect) -> String {
         Effect::ExportChat(format) => format!("export-chat({format})"),
         Effect::PruneChat => "prune-chat".to_owned(),
         Effect::SaveContextFiles => "save-context-files".to_owned(),
+        Effect::LoadDraft => "load-draft".to_owned(),
+        Effect::SaveDraft => "save-draft".to_owned(),
+        Effect::ClearDraft => "clear-draft".to_owned(),
+        Effect::PublishDraft => "publish-draft".to_owned(),
+        Effect::CancelPublish => "cancel-publish".to_owned(),
+        Effect::WriteDryRun => "write-dry-run".to_owned(),
+        Effect::ListDrafts => "list-drafts".to_owned(),
+        Effect::ExportDraft(format) => format!("export-draft({format})"),
+        Effect::ListWorktrees => "list-worktrees".to_owned(),
     }
 }
 
@@ -339,6 +366,25 @@ pub enum Overlay {
     Context,
     /// The model's own text, when it could not be used as an analysis (FR-4.1).
     RawAnswer,
+    /// The staged comments (FR-6.1).
+    Draft,
+    /// The publish modal: what is about to be sent (FR-6.3).
+    Publish,
+    /// A destructive action waiting for a second key (FR-6.5).
+    Confirm,
+}
+
+/// A destructive action, and the question that stands in front of it (FR-6.5).
+///
+/// The effect is what will run if the user confirms, which is what makes the
+/// confirmation honest: the question and the action are one value, so there is no way
+/// to ask about one thing and do another.
+#[derive(Debug)]
+pub struct Confirmation {
+    /// What the user is agreeing to.
+    pub question: String,
+    /// What happens if they do.
+    pub effect: Effect,
 }
 
 /// Everything the analysis panel owns (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
@@ -758,6 +804,8 @@ pub struct App {
     pub(crate) draft_store: std::sync::Arc<dyn crate::ports::DraftStorePort>,
     /// The draft service, once the repository is known (FR-6.1).
     pub(crate) draft_service: Option<crate::application::drafts::Drafts>,
+    /// A destructive action waiting for a second key (FR-6.5).
+    pub(crate) confirmation: Option<Confirmation>,
     /// Whether mutating calls are recorded rather than run (FR-6.5).
     pub(crate) dry_run: bool,
     /// The calls a dry run recorded, written out by the loop (FR-6.5).
@@ -806,6 +854,11 @@ impl App {
     /// # Errors
     ///
     /// Returns an error when the startup state cannot be turned into an app.
+    ///
+    /// Long by construction: it is the one place every field is given its starting
+    /// value, and splitting that list would move the interesting part (what is
+    /// initialised to what) away from the type it describes.
+    #[allow(clippy::too_many_lines)]
     pub fn new(startup: Startup) -> Result<Self> {
         let Startup {
             home,
@@ -880,6 +933,7 @@ impl App {
             drafts: crate::tui::drafts::DraftState::default(),
             draft_store,
             draft_service: None,
+            confirmation: None,
             dry_run,
             dry_run_ledger: Some(dry_run_ledger),
             environment_job: 0,
@@ -1086,6 +1140,11 @@ impl App {
     ///
     /// Every arm is gated on the job id it answers, so a superseded result — an error
     /// as much as a success — is dropped rather than painted over a fresher answer.
+    /// Long by construction: every arm is one or two lines, and the list of outcomes
+    /// is the documentation of what this interface can be told. Splitting it would put
+    /// the arms that must stay together — the ones gated on a job id — in different
+    /// places.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_completion(&mut self, completion: jobs::Completion) -> Option<Effect> {
         let Completion { job, outcome } = completion;
 
@@ -1125,7 +1184,7 @@ impl App {
                 Some(Effect::ReloadDiff)
             }
             Outcome::Patch { outcome, source } if job == self.patch_job => {
-                self.apply_patch(*outcome, source)
+                Some(self.apply_patch(*outcome, source))
             }
             Outcome::Catalog(load) if job == self.catalog_job => {
                 self.apply_catalog(*load);
@@ -1151,6 +1210,9 @@ impl App {
                 self.workspace_job = 0;
                 self.report_worktrees_cleaned(removed, kept, &failed);
                 None
+            }
+            Outcome::ReviewPosted(posted) if job == self.drafts.job => {
+                Some(self.apply_review_posted(&posted))
             }
             // The analysis group has its own handler: three outcomes that share the
             // panel's state, and a match with twenty arms is one where the interesting
@@ -1190,6 +1252,7 @@ impl App {
             | Outcome::Workspace(_)
             | Outcome::ModelChecked(_)
             | Outcome::WorkspacesCleaned { .. }
+            | Outcome::ReviewPosted(_)
             | Outcome::Stored { .. }
             | Outcome::Context { .. }
             | Outcome::Analyzed(_)
@@ -1492,6 +1555,480 @@ impl App {
             std::sync::Arc::clone(&self.draft_store),
             repo.clone(),
         ));
+    }
+
+    /// The confirmation standing in front of a destructive action (FR-6.5).
+    #[must_use]
+    pub fn confirmation(&self) -> Option<&Confirmation> {
+        self.confirmation.as_ref()
+    }
+
+    /// Asks before doing something destructive (FR-6.5).
+    pub fn ask(&mut self, question: impl Into<String>, effect: Effect) {
+        self.confirmation = Some(Confirmation {
+            question: question.into(),
+            effect,
+        });
+        self.open_overlay(Overlay::Confirm);
+    }
+
+    /// Takes the effect the user confirmed, if any.
+    pub fn take_confirmed(&mut self) -> Option<Effect> {
+        let confirmation = self.confirmation.take()?;
+        self.close_overlay();
+        Some(confirmation.effect)
+    }
+
+    /// The anchor the diff cursor is on, for `c` (FR-6.2).
+    ///
+    /// A row with no line on either side (a file header, a placeholder) has nothing
+    /// to anchor a comment to, and saying so is better than picking the line below.
+    #[must_use]
+    pub fn current_anchor(&self) -> Option<crate::tui::drafts::Anchor> {
+        let view = self.review.as_ref()?;
+        let row = view.current()?;
+        let path = view
+            .patch
+            .files
+            .get(row.file)?
+            .path()
+            .map(crate::domain::diff::RelPath::as_str)?
+            .to_owned();
+        // A context line exists on both sides; an addition only on the new one and a
+        // deletion only on the old one. The side with a number is the side the comment
+        // can be anchored to, which is also the side GitHub will check.
+        match (row.new_line, row.old_line) {
+            (Some(line), _) => Some(crate::tui::drafts::Anchor::line(
+                path,
+                crate::domain::draft::Side::New,
+                line,
+            )),
+            (None, Some(line)) => Some(crate::tui::drafts::Anchor::line(
+                path,
+                crate::domain::draft::Side::Old,
+                line,
+            )),
+            (None, None) => None,
+        }
+    }
+
+    /// Opens the composer on the line under the cursor (FR-6.2).
+    pub(crate) fn start_comment(&mut self) -> Effect {
+        let Some(anchor) = self.current_anchor() else {
+            self.notice(
+                NoticeLevel::Warn,
+                "this row has no line to comment on; move to a line of the diff",
+            );
+            return Effect::None;
+        };
+        match self.drafts.selection.clone() {
+            Some(start) => {
+                if let Err(refusal) = self.drafts.compose_range(&start, anchor) {
+                    self.notice(NoticeLevel::Warn, refusal);
+                }
+            }
+            None => self.drafts.compose(anchor),
+        }
+        self.mode = Mode::Insert;
+        self.focus = Pane::Diff;
+        Effect::None
+    }
+
+    /// Marks the start of a range (FR-6.2).
+    pub(crate) fn start_selection(&mut self) -> Effect {
+        let Some(anchor) = self.current_anchor() else {
+            self.notice(NoticeLevel::Warn, "this row has no line to select");
+            return Effect::None;
+        };
+        if self.drafts.selection.is_some() {
+            self.drafts.selection = None;
+            self.notice(NoticeLevel::Info, "range selection cancelled");
+            return Effect::None;
+        }
+        let label = anchor.label();
+        self.drafts.start_selection(anchor);
+        self.notice(
+            NoticeLevel::Info,
+            format!("range starts at {label}; move and press c"),
+        );
+        Effect::None
+    }
+
+    /// Whether the comment composer has the keyboard (FR-6.2).
+    #[must_use]
+    pub fn draft_is_composing(&self) -> bool {
+        self.drafts.is_composing() && self.overlay == Overlay::None && self.pending.is_empty()
+    }
+
+    /// A key pressed while the comment composer has the keyboard (FR-6.2).
+    ///
+    /// The rule is the compose box's rule — a printable character is text, everything
+    /// else is a key — with one difference that is about consequences rather than
+    /// taste: **Enter stages the comment here, where it sends a question in the chat
+    /// pane.** Staging is local and reversible; sending costs money and cannot be
+    /// taken back. A modifier adds a line in both, so the muscle memory transfers.
+    fn on_draft_input_key(&mut self, combo: KeyCombo) -> Effect {
+        if combo.code == KeyCode::Esc {
+            self.drafts.cancel_composer();
+            self.mode = Mode::Normal;
+            return Effect::None;
+        }
+        if combo.code == KeyCode::Enter
+            && !combo
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return self.stage_comment();
+        }
+        let printable = matches!(combo.code, KeyCode::Char(_))
+            && !combo
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if !printable && let Some(effect) = self.resolve_insert_binding(combo) {
+            return effect;
+        }
+        let Some(composer) = self.drafts.composer.as_mut() else {
+            return Effect::None;
+        };
+        match combo.code {
+            KeyCode::Char(character) => composer.input.insert(character),
+            KeyCode::Backspace => composer.input.backspace(),
+            KeyCode::Delete => composer.input.delete(),
+            KeyCode::Left => composer.input.left(),
+            KeyCode::Right => composer.input.right(),
+            KeyCode::Up => composer.input.up(),
+            KeyCode::Down => composer.input.down(),
+            KeyCode::Home => composer.input.home(),
+            KeyCode::End => composer.input.end(),
+            KeyCode::Enter => composer.input.newline(),
+            // `Tab` leaves the composer for the next pane; an unbound modified key
+            // does nothing rather than inserting its letter (FR-7.2).
+            _ => return self.on_normal_key(combo),
+        }
+        Effect::None
+    }
+
+    /// Removes the staged comment the panel's cursor is on (FR-6.1).
+    pub(crate) fn remove_staged(&mut self) -> Effect {
+        if self.overlay != Overlay::Draft {
+            return Effect::None;
+        }
+        let number = self.drafts.cursor;
+        let Some(removed) = self.drafts.remove(number, self.now()) else {
+            self.notice(NoticeLevel::Warn, "there is no comment to remove");
+            return Effect::None;
+        };
+        self.notice(
+            NoticeLevel::Info,
+            format!("removed the comment on {}", removed.anchor()),
+        );
+        Effect::SaveDraft
+    }
+
+    /// Lists the drafts this repository has, in the status line (FR-6.1).
+    ///
+    /// `:draft list` is about *other* pull requests: a draft is only visible while its
+    /// pull request is open, so without this there would be no way to find work left
+    /// half-done somewhere else.
+    pub(crate) fn list_drafts(&mut self) -> Effect {
+        if self.draft_service.is_none() {
+            self.notice(NoticeLevel::Warn, "no repository is open yet");
+            return Effect::None;
+        }
+        Effect::ListDrafts
+    }
+
+    /// Removes a staged comment by the number the panel shows (FR-6.1).
+    pub(crate) fn remove_draft_number(&mut self, number: usize) -> Effect {
+        let Some(removed) = self.drafts.remove(number, self.now()) else {
+            self.notice(
+                NoticeLevel::Warn,
+                format!("there is no comment {number}; `:draft` lists what is staged"),
+            );
+            return Effect::None;
+        };
+        self.notice(
+            NoticeLevel::Info,
+            format!("removed the comment on {}", removed.anchor()),
+        );
+        Effect::SaveDraft
+    }
+
+    /// Asks before removing worktrees (FR-6.5, FR-3.1).
+    ///
+    /// The requirement asks for a confirmation on destructive *local* actions, and this
+    /// is the other one: `:workspace clean` deletes directories the user cannot get
+    /// back. It is asked here rather than in the command table so the question can only
+    /// ever precede the same effect the answer runs.
+    pub(crate) fn ask_clean_workspaces(&mut self, all: bool) -> Effect {
+        let question = if all {
+            "remove every managed worktree? the pull requests stay on GitHub, but their \
+             checkouts are gone"
+                .to_owned()
+        } else {
+            format!(
+                "remove the worktrees older than {} days?",
+                self.config.workspace.auto_clean_days
+            )
+        };
+        self.ask(question, Effect::CleanWorkspaces(all));
+        Effect::None
+    }
+
+    /// Asks before emptying the draft (FR-6.5).
+    pub(crate) fn ask_clear_draft(&mut self) -> Effect {
+        if self.drafts.draft.is_empty() {
+            self.notice(NoticeLevel::Info, "the draft is already empty");
+            return Effect::None;
+        }
+        let question = format!(
+            "empty the draft for #{}? {} will be lost, and this cannot be undone",
+            self.drafts.draft.pr,
+            self.drafts.draft.summary()
+        );
+        self.ask(question, Effect::ClearDraft);
+        Effect::None
+    }
+
+    /// Records the decision (FR-6.1).
+    pub(crate) fn set_draft_decision(&mut self, value: &str) -> Effect {
+        if value.trim().is_empty() {
+            self.notice(
+                NoticeLevel::Info,
+                format!(
+                    "the decision is {}; `:draft decision approve|request-changes|comment|none` changes it",
+                    self.drafts
+                        .draft
+                        .decision
+                        .map_or("not chosen (it will be a comment)".to_owned(), |decision| {
+                            decision.label().to_owned()
+                        })
+                ),
+            );
+            return Effect::None;
+        }
+        let decision = if matches!(value.trim(), "none" | "clear" | "-") {
+            None
+        } else if let Some(decision) = crate::domain::draft::Decision::parse(value) {
+            Some(decision)
+        } else {
+            self.command_error(format!(
+                "`{value}` is not a decision; try approve, request-changes or comment"
+            ));
+            return Effect::None;
+        };
+        let label = decision.map_or("no decision (a comment)".to_owned(), |decision| {
+            decision.label().to_owned()
+        });
+        self.drafts.set_decision(decision, self.now());
+        self.notice(NoticeLevel::Info, format!("decision: {label}"));
+        Effect::SaveDraft
+    }
+
+    /// Records the review body (FR-6.1).
+    pub(crate) fn set_draft_body(&mut self, text: &str) -> Effect {
+        if text.trim().is_empty() {
+            self.notice(
+                NoticeLevel::Info,
+                "`:draft body <text>` writes the review body; `\n` in the text becomes a newline",
+            );
+            return Effect::None;
+        }
+        // A command line is one line, so a body written from here says where the line
+        // breaks go rather than pretending a terminal can type one: a typed `\n` is a
+        // newline, and everything else is literal.
+        let body = text.replace("\\n", "\n");
+        self.drafts.set_body(body, self.now());
+        self.notice(NoticeLevel::Info, "review body recorded");
+        Effect::SaveDraft
+    }
+
+    /// Writes the draft out, for the audit trail and for a different tool (FR-6.1).
+    ///
+    /// The format is checked here — a typo should be answered now rather than in the
+    /// loop — and the writing happens in the loop, like every other file write.
+    pub(crate) fn export_draft(&mut self, format: &str) -> Effect {
+        let format = format.trim();
+        match format {
+            "" | "md" | "markdown" => Effect::ExportDraft("md".to_owned()),
+            "json" => Effect::ExportDraft("json".to_owned()),
+            other => {
+                self.command_error(format!("`{other}` is not a format; try md or json"));
+                Effect::None
+            }
+        }
+    }
+
+    /// Where the draft for the open pull request is kept (FR-6.1).
+    #[must_use]
+    pub fn draft_path_label(&self) -> String {
+        format!(
+            "drafts are kept in {}",
+            crate::paths::shorten_for_display(&self.home.root().join("drafts"), 50)
+        )
+    }
+
+    /// The one key that means "yes" on whatever is open (FR-6.3, FR-6.5).
+    ///
+    /// Kept as one entry point because three surfaces want it and each of them has a
+    /// different idea of what yes means: a confirmation runs its effect, the publish
+    /// modal arms and then sends, the draft panel publishes.
+    pub(crate) fn confirm_prompt(&mut self) -> Effect {
+        if self.overlay == Overlay::Confirm {
+            return self.take_confirmed().unwrap_or(Effect::None);
+        }
+        if self.overlay == Overlay::Publish {
+            return self.confirm_publish();
+        }
+        if self.overlay == Overlay::Draft {
+            return self.open_publish();
+        }
+        Effect::None
+    }
+
+    /// Stages what the composer holds, and says what happened (FR-6.1, FR-6.2).
+    pub(crate) fn stage_comment(&mut self) -> Effect {
+        match self.drafts.stage(self.now()) {
+            Ok(()) => {
+                self.mode = Mode::Normal;
+                let count = self.drafts.draft.comments.len();
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "{count} comment{} staged · <leader>rr publishes",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                );
+                Effect::SaveDraft
+            }
+            // The refusal is already on the composer, which is where the text is; the
+            // effect is nothing, so the composer stays open with the text intact.
+            Err(_) => Effect::None,
+        }
+    }
+
+    /// Opens the draft panel (FR-6.1).
+    pub(crate) fn open_drafts(&mut self) -> Effect {
+        if !self.drafts.open {
+            self.notice(
+                NoticeLevel::Warn,
+                "open a pull request first; a draft belongs to one",
+            );
+            return Effect::None;
+        }
+        self.drafts.panel = true;
+        self.open_overlay(Overlay::Draft);
+        Effect::None
+    }
+
+    /// Opens the publish modal, or says why it will not (FR-6.3).
+    pub(crate) fn open_publish(&mut self) -> Effect {
+        if !self.drafts.open {
+            self.notice(
+                NoticeLevel::Warn,
+                "nothing is staged: no pull request is open",
+            );
+            return Effect::None;
+        }
+        if self.drafts.status.is_publishing() {
+            return Effect::None;
+        }
+        match self.drafts.open_modal() {
+            Ok(()) => {
+                self.open_overlay(Overlay::Publish);
+                Effect::None
+            }
+            Err(error) => {
+                self.notice(NoticeLevel::Warn, error.to_string());
+                Effect::None
+            }
+        }
+    }
+
+    /// Arms the publish, or sends it when it is already armed (FR-6.3).
+    ///
+    /// Two Enters, and the second one is the one that posts: the modal is the last
+    /// place a mistake can be seen, and a single key that both shows and sends would
+    /// make reading it and committing to it the same act.
+    pub(crate) fn confirm_publish(&mut self) -> Effect {
+        if self.drafts.status.is_publishing() {
+            // In flight: the key does nothing at all. This is the double-submit guard,
+            // and it is a state rather than a race — the job id is cleared when the
+            // answer arrives, never before.
+            return Effect::None;
+        }
+        if !self.drafts.armed {
+            self.drafts.armed = true;
+            return Effect::None;
+        }
+        self.publish_draft()
+    }
+
+    /// Sends the staged review (FR-6.3).
+    pub(crate) fn publish_draft(&mut self) -> Effect {
+        if !self.drafts.open || self.drafts.status.is_publishing() {
+            return Effect::None;
+        }
+        self.drafts.armed = false;
+        self.drafts.status = crate::tui::drafts::DraftStatus::Publishing;
+        // The anchor is recorded before the send, so the review says which revision
+        // its line numbers belong to even if the pull request moves while it is in
+        // flight (FR-6.3).
+        if let Some(head) = self.open_head_sha().map(str::to_owned) {
+            self.drafts.anchor_to(&head);
+        }
+        Effect::PublishDraft
+    }
+
+    /// Says what a finished publish did, and does what follows from it (FR-6.3).
+    ///
+    /// A dry run is not a publish: nothing was sent, so the draft stays and the only
+    /// thing left to do is write the recorded calls where the user can read them
+    /// (FR-6.5).
+    fn apply_review_posted(&mut self, posted: &crate::ports::ReviewPosted) -> Effect {
+        self.drafts.job = 0;
+        if posted.dry_run {
+            self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+            self.drafts.armed = false;
+            self.notice(
+                NoticeLevel::Info,
+                "dry run: nothing was sent; the draft is still here",
+            );
+            return Effect::WriteDryRun;
+        }
+        let what = match posted.url.as_deref() {
+            Some(url) => format!("review posted: {url}"),
+            None => "review posted".to_owned(),
+        };
+        self.notice(NoticeLevel::Info, what);
+        logging::log(Level::Info, "a review was posted to GitHub");
+        self.drafts.published(posted.url.as_deref(), self.now());
+        // The review is on GitHub now, so what the pull request says about itself has
+        // changed: the detail is refreshed rather than left describing the state before
+        // the submit (FR-6.3).
+        self.reload_after_publish()
+    }
+
+    /// Re-reads what the forge now knows about the pull request (FR-6.3).
+    ///
+    /// Returns the effects that do it: the detail is what lists reviews and inline
+    /// comments, and the analysis is not touched — a new review does not invalidate an
+    /// analysis of the same commit.
+    pub(crate) fn reload_after_publish(&mut self) -> Effect {
+        match self.detail.as_ref().map(|detail| detail.summary.number) {
+            Some(number) => Effect::OpenPullRequest(number),
+            None => Effect::None,
+        }
+    }
+
+    /// The draft's own idea of the commit on screen, for the drift check (FR-6.3).
+    #[must_use]
+    pub fn draft_drifted(&self) -> bool {
+        self.drafts.drifted(
+            self.detail
+                .as_ref()
+                .map(|detail| detail.summary.head_sha.as_str()),
+        )
     }
 
     /// Takes the gathered bundle when it is for the commit on screen (FR-4.6).
@@ -2575,7 +3112,7 @@ impl App {
         &mut self,
         outcome: FetchOutcome<crate::domain::diff::Patch>,
         source: DiffSource,
-    ) -> Option<Effect> {
+    ) -> Effect {
         self.diff_source = source;
         self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
         let patch = outcome.into_value();
@@ -2598,7 +3135,9 @@ impl App {
                 self.list.status_label()
             ),
         );
-        None
+        // The review screen is up, so this is where the draft is read: opening a pull
+        // request is the question "was I in the middle of reviewing this?" (FR-6.1).
+        Effect::LoadDraft
     }
 
     /// Notes that a pull request is being opened, which the indicator shows.
@@ -2682,10 +3221,28 @@ impl App {
             || job == self.panel.stored_job
             || job == self.chat.job
             || job == self.chat.load_job
+            || job == self.drafts.job
     }
 
     /// Records a job failure where the user will see it.
+    /// Long by construction: one branch per slot, and each branch is the answer to
+    /// "where does a failure in this pane become visible?" — which is exactly the
+    /// question that was answered wrongly once, silently, for two of them.
+    #[allow(clippy::too_many_lines)]
     fn report_job_failure(&mut self, job: u64, message: &str) {
+        if job == self.drafts.job {
+            self.drafts.job = 0;
+            // The draft is *kept*: this is the moment it matters most (NFR-3.4). The
+            // modal stays open with the reason in it, because a modal that closed
+            // itself would leave the user unsure whether anything had been sent.
+            self.drafts.publish_failed(message);
+            self.notice(
+                NoticeLevel::Error,
+                format!("the review was not posted: {message}"),
+            );
+            logging::log(Level::Warn, format!("the review was not posted: {message}"));
+            return;
+        }
         if job == self.chat.job {
             self.chat.job = 0;
             self.chat.status = crate::tui::chat::ChatStatus::Failed {
@@ -3029,9 +3586,13 @@ impl App {
 
     /// Records that the environment was resolved (FR-1.1).
     pub fn set_environment(&mut self, environment: Environment) {
+        // The draft store is keyed by the repository, so this is the first moment a
+        // draft can be read or written at all (FR-6.1).
+        let repo = environment.repo.clone();
         self.environment = Some(environment);
         self.environment_error = None;
         self.environment_running = false;
+        self.bind_drafts(&repo);
     }
 
     /// Records that the environment could not be resolved (FR-1.1).
@@ -3268,6 +3829,9 @@ impl App {
         self.mode = Mode::Normal;
         self.theme_before_picker = None;
         self.help_filter = None;
+        self.drafts.panel = false;
+        self.drafts.close_modal();
+        self.confirmation = None;
     }
 
     /// Closes a popup and undoes any preview it applied (FR-7.7).
@@ -3320,6 +3884,10 @@ impl App {
             // insert mode: a bare `j` is a letter in a question, and Enter sends
             // (FR-5.2). The keymap is consulted first so `<S-Enter>`, `<C-j>` and
             // `<Esc>` keep their meanings — they are the keys that are *not* text.
+            // The comment composer comes first: both it and the chat compose box are
+            // insert-mode text entry, and only one of them can be the thing the user is
+            // looking at (FR-6.2).
+            Mode::Insert if self.draft_is_composing() => self.on_draft_input_key(combo),
             Mode::Insert if self.chat_is_composing() => self.on_chat_input_key(combo),
             Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
@@ -3983,6 +4551,11 @@ impl App {
         }
     }
 
+    /// Long by construction: it is the keyboard of every popup in the application, and
+    /// each arm is guarded by the overlay it belongs to. The guards are the point —
+    /// one flat table of keys that meant different things in different popups would be
+    /// how the publish modal grows a `y` that approves something.
+    #[allow(clippy::too_many_lines)]
     fn on_popup_key(&mut self, combo: KeyCombo) -> Effect {
         // Popups resolve the popup scope first (globals included), so
         // `[keys.popup]` bindings work, multi-key sequences included. The arms
@@ -4005,6 +4578,13 @@ impl App {
 
         match combo.code {
             KeyCode::Esc => {
+                // Leaving the publish modal while a review is in flight stops the
+                // request and keeps the draft: the request is the user's to abandon,
+                // and a draft that vanished with it would be the worst outcome of a
+                // moment's impatience (FR-6.3).
+                if self.overlay == Overlay::Publish && self.drafts.status.is_publishing() {
+                    return Effect::CancelPublish;
+                }
                 self.cancel_overlay();
                 Effect::None
             }
@@ -4068,6 +4648,70 @@ impl App {
             }
             KeyCode::Char('u') if self.overlay == Overlay::Analysis => {
                 self.panel.scroll = self.panel.scroll.saturating_sub(10);
+                Effect::None
+            }
+            // The confirmation is the only popup where a bare `y` means yes: it has no
+            // list to move in, and typing is not possible (FR-6.5).
+            KeyCode::Char('y') if self.overlay == Overlay::Confirm => {
+                self.take_confirmed().unwrap_or(Effect::None)
+            }
+            // One Enter for all three surfaces, because each of them means "yes" — and
+            // because the modal that posts a review must not gain a second key path by
+            // accident (FR-6.3, FR-6.5).
+            KeyCode::Enter
+                if matches!(
+                    self.overlay,
+                    Overlay::Confirm | Overlay::Publish | Overlay::Draft
+                ) =>
+            {
+                self.confirm_prompt()
+            }
+            // The draft panel: `j`/`k` walk the staged comments, `x` removes the one
+            // under the cursor, Enter publishes what is there (FR-6.1).
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Draft => {
+                self.drafts.move_cursor(1);
+                Effect::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Draft => {
+                self.drafts.move_cursor(-1);
+                Effect::None
+            }
+            KeyCode::Char('d') if self.overlay == Overlay::Draft => {
+                self.drafts.scroll = self.drafts.scroll.saturating_add(10);
+                Effect::None
+            }
+            KeyCode::Char('u') if self.overlay == Overlay::Draft => {
+                self.drafts.scroll = self.drafts.scroll.saturating_sub(10);
+                Effect::None
+            }
+            // The publish modal: the decision keys, then Enter to arm and Enter to send
+            // (FR-6.3). `j`/`k` scroll it, because a review body can be long.
+            KeyCode::Char('a') if self.overlay == Overlay::Publish => {
+                self.drafts.armed = false;
+                self.set_draft_decision("approve")
+            }
+            KeyCode::Char('r') if self.overlay == Overlay::Publish => {
+                self.drafts.armed = false;
+                self.set_draft_decision("request-changes")
+            }
+            KeyCode::Char('c') if self.overlay == Overlay::Publish => {
+                self.drafts.armed = false;
+                self.set_draft_decision("comment")
+            }
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Publish => {
+                self.drafts.scroll = self.drafts.scroll.saturating_add(1);
+                Effect::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Publish => {
+                self.drafts.scroll = self.drafts.scroll.saturating_sub(1);
+                Effect::None
+            }
+            KeyCode::Char('d') if self.overlay == Overlay::Publish => {
+                self.drafts.scroll = self.drafts.scroll.saturating_add(10);
+                Effect::None
+            }
+            KeyCode::Char('u') if self.overlay == Overlay::Publish => {
+                self.drafts.scroll = self.drafts.scroll.saturating_sub(10);
                 Effect::None
             }
             KeyCode::Enter if self.overlay == Overlay::ThemePicker => {
@@ -5343,7 +5987,10 @@ mod tests {
                 "the provider refused: model not found".to_owned(),
             ),
         });
-        assert!(effect.is_none());
+        assert!(
+            !matches!(effect, Some(Effect::LoadDraft)),
+            "the keyboard must not move for a draft load either: {effect:?}"
+        );
         assert_eq!(app.chat.job, 0, "the failure released the slot");
         let status = format!("{:?}", app.chat.status);
         assert!(status.contains("Failed"), "{status}");
@@ -5439,7 +6086,10 @@ mod tests {
                 source: crate::domain::diff::DiffSource::Worktree,
             },
         });
-        assert!(effect.is_none());
+        // The effect that comes back is the draft load, and it must not move the focus
+        // either — a file read is not a reason to take the keyboard off a half-typed
+        // question (FR-6.1).
+        assert_eq!(effect, Some(Effect::LoadDraft));
         assert_eq!(app.focus(), Pane::Chat, "the compose box kept the keyboard");
         assert_eq!(app.mode(), Mode::Insert);
         press(&mut app, "why?");

@@ -29,6 +29,41 @@ pub const COMPOSER_HEIGHT: u16 = 8;
 /// How much of the screen the publish modal takes.
 pub const MODAL_PERCENT: u16 = 80;
 
+/// The fewest rows the diff keeps when the composer is open.
+///
+/// The composer is *not* a popup on purpose: the line a comment is about has to stay
+/// visible while it is being written, or the user is describing something they cannot
+/// see (FR-6.2).
+pub const DIFF_MIN_ROWS: u16 = 5;
+
+/// The composer's rows, when the terminal can spare them.
+pub const COMPOSER_ROWS: u16 = 7;
+
+/// Splits the diff pane to make room for the composer (FR-6.2).
+///
+/// One function for the renderer and the mouse handler, like every other split in this
+/// interface: two calculations of the same rectangle is how a click ends up one row
+/// away from what it looks like it clicked (FR-7.5).
+#[must_use]
+pub fn composer_split(area: Rect, open: bool) -> (Rect, Option<Rect>) {
+    if !open {
+        return (area, None);
+    }
+    // A body too short to hold both keeps the diff: a two-row composer over three rows
+    // of diff is worse than saying what to do, which the keybinding does.
+    if area.height < DIFF_MIN_ROWS + COMPOSER_HEIGHT.min(COMPOSER_ROWS)
+        || area.height < DIFF_MIN_ROWS + 4
+    {
+        return (area, None);
+    }
+    let rows = Layout::vertical([
+        Constraint::Min(DIFF_MIN_ROWS),
+        Constraint::Length(COMPOSER_ROWS.min(COMPOSER_HEIGHT)),
+    ])
+    .split(area);
+    (rows[0], Some(rows[1]))
+}
+
 /// The comment composer, at the bottom of the diff pane (FR-6.2).
 ///
 /// The composer is *not* a popup: the line it will anchor to has to stay visible, or
@@ -40,7 +75,10 @@ pub fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, composer: &
         .border_style(theme.style(element::CHAT_INPUT))
         .title(format!(
             " comment on {} via {} ",
-            text_util::truncate(&composer.anchor.label(), area.width.saturating_sub(24) as usize),
+            text_util::truncate(
+                &composer.anchor.label(),
+                area.width.saturating_sub(24) as usize
+            ),
             keyboard_hint()
         ));
 
@@ -129,7 +167,10 @@ pub fn render_panel(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
 
     let height = usize::from(area.height.saturating_sub(2));
     let lines = panel_lines(app, drafts, area.width.saturating_sub(2));
-    let offset = lines.len().saturating_sub(height).saturating_sub(drafts.scroll);
+    let offset = lines
+        .len()
+        .saturating_sub(height)
+        .saturating_sub(drafts.scroll);
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
     let footer = Line::from(Span::styled(
         format!(
@@ -163,12 +204,10 @@ fn panel_lines(app: &App, drafts: &DraftState, width: u16) -> Vec<Line<'static>>
     lines.push(Line::from(vec![
         Span::styled(" decision  ".to_owned(), theme.style(element::MUTED)),
         Span::styled(
-            drafts
-                .draft
-                .decision
-                .map_or("(not chosen: it will be a comment)".to_owned(), |decision| {
-                    decision.label().to_owned()
-                }),
+            drafts.draft.decision.map_or(
+                "(not chosen: it will be a comment)".to_owned(),
+                |decision| decision.label().to_owned(),
+            ),
             theme.style(element::FG),
         ),
     ]));
@@ -188,8 +227,7 @@ fn panel_lines(app: &App, drafts: &DraftState, width: u16) -> Vec<Line<'static>>
         // Anchors are line numbers: a force-push makes them quietly mean something
         // else, which is precisely the accident this line prevents (FR-6.3).
         lines.push(Line::from(Span::styled(
-            " ! the diff has moved since these were written: re-check the line numbers"
-                .to_owned(),
+            " ! the diff has moved since these were written: re-check the line numbers".to_owned(),
             theme.style(element::NOTICE_WARN),
         )));
     }
@@ -234,7 +272,11 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
     frame.render_widget(Clear, area);
 
     let decision = drafts.draft.effective_decision();
-    let mut title = format!(" publish review · #{} · {} ", drafts.draft.pr, decision.label());
+    let mut title = format!(
+        " publish review · #{} · {} ",
+        drafts.draft.pr,
+        decision.label()
+    );
     if drafts.status.is_publishing() {
         title.push_str("· sending… ");
     }
@@ -248,7 +290,10 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
 
     let height = usize::from(area.height.saturating_sub(2));
     let lines = modal_lines(app, drafts, area.width.saturating_sub(2));
-    let offset = lines.len().saturating_sub(height).saturating_sub(drafts.scroll);
+    let offset = lines
+        .len()
+        .saturating_sub(height)
+        .saturating_sub(drafts.scroll);
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
 
     let body = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(area);
@@ -418,11 +463,7 @@ mod tests {
         assert!(text.contains("this rounds up"), "{text}");
 
         // An empty composer says what to write rather than showing nothing.
-        let empty = Composer::new(Anchor::line(
-            "src/a.rs",
-            crate::domain::draft::Side::New,
-            1,
-        ));
+        let empty = Composer::new(Anchor::line("src/a.rs", crate::domain::draft::Side::New, 1));
         let text = flatten(&composer_lines(&empty, &Theme::default(), 100));
         assert!(text.contains("what should change"), "{text}");
     }
@@ -431,11 +472,8 @@ mod tests {
     fn a_refusal_is_shown_in_the_composer_rather_than_only_reported() {
         // A keypress that appears to do nothing is the failure mode this avoids: the
         // reason appears where the text is, not in a notice that expires.
-        let mut composer = Composer::new(Anchor::line(
-            "src/a.rs",
-            crate::domain::draft::Side::New,
-            1,
-        ));
+        let mut composer =
+            Composer::new(Anchor::line("src/a.rs", crate::domain::draft::Side::New, 1));
         composer.refusal = Some("a comment needs a body".to_owned());
         let text = flatten(&composer_lines(&composer, &Theme::default(), 100));
         assert!(text.contains("a comment needs a body"), "{text}");

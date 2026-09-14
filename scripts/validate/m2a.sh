@@ -135,6 +135,14 @@ run_tui() {
 
 saw() { grep -q "$1"; }
 
+# Whether a pattern was ever on screen, even for one frame. The final screen is not
+# enough for anything that expires or that the next keypress takes away — a
+# confirmation is both, and a notice is the first.
+shown() {
+  python3 "$ROOT/scripts/validate/screen.py" --cols 160 --rows 40 \
+    --path "$1" --when "$2" >/dev/null 2>&1
+}
+
 step "1/7 build"
 if cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
@@ -369,9 +377,25 @@ fi
 
 # Cleaning from a different directory still works: the worktree resolves to the
 # repository that owns it, and the ref was deleted before the worktree that located it.
-SCREEN="$(run_tui "$HOME_WS" ':workspace clean --all\r~q' 'removed 1 worktree~' "$FAKE" "$TMP/clean.log")"
+#
+# It asks first (FR-6.5): the removal is local and irreversible, so the command opens a
+# confirmation and the *second* key is the one that does it. The default answer is
+# nothing.
+SCREEN="$(run_tui "$HOME_WS" ':workspace clean --all\r~\033~q' 'are you sure~~' "$FAKE" "$TMP/clean-ask.log")"
+if shown "$TMP/clean-ask.log" "are you sure"; then
+  ok ":workspace clean asks before removing worktrees"
+else
+  bad "destructive local actions must confirm"
+  printf '%s\n' "$SCREEN" | tail -6
+fi
+if [ -d "$WORKTREE" ]; then
+  ok "asking removes nothing on its own"
+else
+  bad "the worktree was removed before the question was answered"
+fi
+SCREEN="$(run_tui "$HOME_WS" ':workspace clean --all\r~\r~q' 'are you sure~removed 1 worktree~' "$FAKE" "$TMP/clean.log")"
 if printf '%s' "$SCREEN" | saw "removed 1 worktree"; then
-  ok ":workspace clean removes the worktree"
+  ok ":workspace clean removes the worktree once confirmed"
 else
   bad ":workspace clean did not report a removal"
   printf '%s\n' "$SCREEN" | tail -6

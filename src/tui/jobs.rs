@@ -85,6 +85,8 @@ pub enum Slot {
     Chat,
     /// One chat answer (FR-5.2).
     ChatAsk,
+    /// Publishing a review (FR-6.3).
+    Review,
 }
 
 /// What a job was asked to do.
@@ -199,6 +201,15 @@ pub enum Job {
         /// What to ask.
         request: Box<ChatAsk>,
     },
+    /// Publish the staged review (FR-6.3).
+    ///
+    /// The draft travels in the job rather than being read from the store inside it:
+    /// the review that is sent must be the one the user was looking at when they
+    /// confirmed it, whatever they type next.
+    SubmitReview {
+        /// The document to send.
+        draft: Box<crate::domain::draft::Draft>,
+    },
     /// Collect the environment report (FR-9.3).
     Report {
         /// What to check. Boxed because the context is much larger than any other
@@ -240,6 +251,7 @@ impl Job {
             // newer request for the same thing.
             Self::LoadChat { .. } | Self::GatherChat { .. } => Slot::Chat,
             Self::AskChat { .. } => Slot::ChatAsk,
+            Self::SubmitReview { .. } => Slot::Review,
         }
     }
 
@@ -341,6 +353,8 @@ pub enum Outcome {
         /// The question that asked for it.
         question: String,
     },
+    /// The review was posted, or recorded by a dry run (FR-6.3, FR-6.5).
+    ReviewPosted(Box<crate::ports::ReviewPosted>),
     /// Worktrees were removed (FR-3.1).
     WorkspacesCleaned {
         /// How many were removed.
@@ -423,6 +437,9 @@ pub struct ExecutorPorts {
     pub analysis: Arc<dyn AnalysisCachePort>,
     /// Where chat sessions live (FR-5.1).
     pub chat: Arc<dyn crate::ports::ChatStorePort>,
+    /// Where review drafts live (FR-6.1). The publishing job reads and clears the
+    /// document it just sent, and that must not happen on the interface's thread.
+    pub drafts: Arc<dyn crate::ports::DraftStorePort>,
     /// The provider (FR-4.1).
     pub llm: Arc<dyn LlmPort>,
     /// Which repository these are scoped to.
@@ -450,6 +467,8 @@ pub struct Executor {
     analysis: Arc<dyn AnalysisCachePort>,
     /// Where chat sessions are read and written (FR-5.1).
     chat: Arc<dyn crate::ports::ChatStorePort>,
+    /// Where review drafts are read and written (FR-6.1).
+    drafts: Arc<dyn crate::ports::DraftStorePort>,
     /// The provider, for the analysis request itself (FR-4.1).
     llm: Arc<dyn LlmPort>,
     repo: RepoId,
@@ -467,6 +486,7 @@ impl Executor {
             workspace,
             analysis,
             chat,
+            drafts,
             llm,
             repo,
             policy,
@@ -478,6 +498,7 @@ impl Executor {
             workspace,
             analysis,
             chat,
+            drafts,
             llm,
             repo,
             policy,
@@ -565,6 +586,7 @@ impl Executor {
             Job::LoadChat { .. } | Job::GatherChat { .. } | Job::AskChat { .. } => {
                 self.chat_job(job, cancel, sink)
             }
+            Job::SubmitReview { draft } => self.submit_review(draft, cancel),
             // Detection, the report, the catalog, the worktree and the connection
             // check do not need a repository resolved through the forge, so
             // `JobRunner` handles them directly.
@@ -574,6 +596,35 @@ impl Executor {
             | Job::Workspace { .. }
             | Job::ModelCheck { .. }
             | Job::CleanWorkspaces { .. } => Outcome::Abandoned,
+        }
+    }
+
+    /// Sends one review and clears the draft it came from (FR-6.3).
+    ///
+    /// Clearing happens here, in the job, and only after the forge said yes: the
+    /// review is on GitHub by then, and a draft that outlived its own publication
+    /// would be sent a second time by the next person who pressed Enter.
+    ///
+    /// A dry run clears nothing — nothing was sent (FR-6.5) — and the loop writes the
+    /// recorded calls out where the user can read them.
+    fn submit_review(&self, draft: &crate::domain::draft::Draft, cancel: &Cancel) -> Outcome {
+        let service =
+            crate::application::drafts::Drafts::new(Arc::clone(&self.drafts), self.repo.clone());
+        match service.publish(self.forge.as_ref(), draft, cancel) {
+            Ok(posted) => {
+                if !posted.dry_run
+                    && let Err(error) = service.remove(draft.pr)
+                {
+                    // The review is on GitHub: a failure to tidy up afterwards is a
+                    // warning, never a failed publish.
+                    logging::log(
+                        Level::Warn,
+                        format!("the sent draft could not be removed: {error}"),
+                    );
+                }
+                Outcome::ReviewPosted(Box::new(posted))
+            }
+            Err(error) => Outcome::Failed(error.to_string()),
         }
     }
 
@@ -1111,7 +1162,12 @@ fn clean_workspaces(
 /// Keeping this mapping here rather than in the reducer is what lets the reducer stay
 /// a pure function of state: it says *what* it wants, and this decides *how*.
 #[must_use]
-pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<Job> {
+pub fn job_for(
+    effect: &Effect,
+    list: &PrListState,
+    context: Context,
+    draft: &crate::domain::draft::Draft,
+) -> Option<Job> {
     match effect {
         Effect::DetectEnvironment => Some(Job::Detect),
         Effect::LoadPullRequests => Some(Job::List {
@@ -1126,6 +1182,11 @@ pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<
             query: list.query(),
         }),
         Effect::OpenPullRequest(number) => Some(Job::Detail { number: *number }),
+        // The draft travels in the job: the review that is sent is the one the user
+        // confirmed, whatever they type while it is in flight.
+        Effect::PublishDraft => Some(Job::SubmitReview {
+            draft: Box::new(draft.clone()),
+        }),
         Effect::RunDoctor => Some(Job::Report {
             context: Box::new(context),
         }),
@@ -1152,6 +1213,14 @@ pub fn job_for(effect: &Effect, list: &PrListState, context: Context) -> Option<
         | Effect::ExportChat(_)
         | Effect::PruneChat
         | Effect::SaveContextFiles
+        | Effect::LoadDraft
+        | Effect::SaveDraft
+        | Effect::ClearDraft
+        | Effect::CancelPublish
+        | Effect::WriteDryRun
+        | Effect::ListDrafts
+        | Effect::ExportDraft(_)
+        | Effect::ListWorktrees
         | Effect::CancelInFlight
         | Effect::SetMouse(_)
         | Effect::None
@@ -1355,6 +1424,7 @@ mod tests {
         let forge = Arc::new(SlowForge::new(delay));
         runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
             chat: Arc::new(crate::test_support::FakeChatStore::default()),
+            drafts: Arc::new(crate::test_support::FakeDraftStore::default()),
             forge: Arc::clone(&forge) as Arc<dyn ForgePort>,
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),
@@ -1636,6 +1706,7 @@ mod tests {
         );
         runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
             chat: Arc::new(crate::test_support::FakeChatStore::default()),
+            drafts: Arc::new(crate::test_support::FakeDraftStore::default()),
             forge: Arc::new(PanicForge) as Arc<dyn ForgePort>,
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),
@@ -1724,31 +1795,43 @@ mod tests {
     fn effects_map_to_the_jobs_they_ask_for() {
         let list = PrListState::new(50, 120);
         assert!(matches!(
-            job_for(&Effect::DetectEnvironment, &list, context()),
+            job_for(&Effect::DetectEnvironment, &list, context(), &draft()),
             Some(Job::Detect)
         ));
         assert!(matches!(
-            job_for(&Effect::LoadPullRequests, &list, context()),
+            job_for(&Effect::LoadPullRequests, &list, context(), &draft()),
             Some(Job::List { .. })
         ));
         assert!(matches!(
-            job_for(&Effect::OpenPullRequest(141), &list, context()),
+            job_for(&Effect::OpenPullRequest(141), &list, context(), &draft()),
             Some(Job::Detail { number: 141 })
         ));
         assert!(matches!(
-            job_for(&Effect::RunDoctor, &list, context()),
+            job_for(&Effect::RunDoctor, &list, context(), &draft()),
             Some(Job::Report { .. })
         ));
-        assert!(job_for(&Effect::None, &list, context()).is_none());
-        assert!(job_for(&Effect::CopyPath("a".to_owned()), &list, context()).is_none());
+        assert!(job_for(&Effect::None, &list, context(), &draft()).is_none());
+        assert!(
+            job_for(
+                &Effect::CopyPath("a".to_owned()),
+                &list,
+                context(),
+                &draft()
+            )
+            .is_none()
+        );
 
         // `:load-more` asks for a bigger page, not the same one again.
         let mut grown = PrListState::new(50, 120);
         grown.limit = 50;
-        match job_for(&Effect::LoadMore, &grown, context()) {
+        match job_for(&Effect::LoadMore, &grown, context(), &draft()) {
             Some(Job::List { query }) => assert_eq!(query.limit, 100),
             other => panic!("expected a list job, got {other:?}"),
         }
+    }
+
+    fn draft() -> crate::domain::draft::Draft {
+        crate::domain::draft::Draft::new(141, crate::domain::time::from_unix_secs(0))
     }
 
     fn context() -> Context {

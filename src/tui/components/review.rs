@@ -39,8 +39,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (body, chat) = super::chat::chat_split(rows[1], app.chat_state().is_some());
     let columns =
         Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).split(body);
+
+    // The composer sits at the bottom of the diff pane, through the same split the
+    // mouse handler uses, so a click lands where the drawing is (FR-6.2, FR-7.5).
+    let (diff, composer) = super::drafts::composer_split(columns[1], app.drafts().is_composing());
     render_tree(frame, columns[0], app, view);
-    render_diff(frame, columns[1], app, view);
+    render_diff(frame, diff, app, view);
+    if let Some(composer_area) = composer
+        && let Some(composer) = app.drafts().composer.as_ref()
+    {
+        super::drafts::render_composer(frame, composer_area, app, composer);
+    }
     if let Some(chat) = chat {
         super::chat::render(frame, chat, app);
     }
@@ -283,12 +292,19 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App, view: &DiffView) {
         // row instead of two.
         let window = view.split_window(height);
         for row in window {
-            lines.push(split_line(theme, view, row, width));
+            lines.push(split_line(theme, view, row, width, app.drafts()));
         }
     } else {
         for index in view.visible_rows(height) {
             let selected = index == view.cursor;
-            lines.push(unified_line(theme, &view.rows[index], selected, width));
+            lines.push(unified_line(
+                theme,
+                &view.rows[index],
+                selected,
+                width,
+                view,
+                app.drafts(),
+            ));
         }
     }
 
@@ -337,11 +353,22 @@ fn diff_title(theme: &Theme, view: &DiffView, width: u16, app: &App) -> String {
 }
 
 /// One row of the unified view: gutters, marker, line.
-fn unified_line(theme: &Theme, row: &DiffRow, selected: bool, width: u16) -> Line<'static> {
+///
+/// The draft marker is a property of the *line*, so it is decided here, where the line
+/// number and the file are both in hand, rather than by a second pass over the patch
+/// (FR-6.1).
+fn unified_line(
+    theme: &Theme,
+    row: &DiffRow,
+    selected: bool,
+    width: u16,
+    view: &DiffView,
+    drafts: &crate::tui::drafts::DraftState,
+) -> Line<'static> {
     let gutter = gutter_style(theme, row, selected);
     let mut spans = vec![Span::styled(
         format!(
-            "{}{}{} ",
+            "{}{}{}{}",
             text::pad_left(
                 &row.old_line
                     .map_or_else(String::new, |line| line.to_string()),
@@ -353,8 +380,13 @@ fn unified_line(theme: &Theme, row: &DiffRow, selected: bool, width: u16) -> Lin
                 5
             ),
             row.line_kind.map_or(' ', LineKind::marker),
+            draft_marker(view, drafts, row),
         ),
-        gutter,
+        if draft_marker(view, drafts, row) == '●' {
+            theme.style(element::COMMENT_MARKER)
+        } else {
+            gutter
+        },
     )];
 
     match row.kind {
@@ -404,10 +436,16 @@ fn unified_line(theme: &Theme, row: &DiffRow, selected: bool, width: u16) -> Lin
 ///
 /// A full-width row (a banner, a hunk header, a placeholder) is drawn the same way
 /// in both modes, so the eye has something to anchor on while scrolling sideways.
-fn split_line(theme: &Theme, view: &DiffView, row: &SplitRow, width: u16) -> Line<'static> {
+fn split_line(
+    theme: &Theme,
+    view: &DiffView,
+    row: &SplitRow,
+    width: u16,
+    drafts: &crate::tui::drafts::DraftState,
+) -> Line<'static> {
     if let Some(full) = &row.full {
         let selected = full_is_selected(view, full);
-        return unified_line(theme, full, selected, width);
+        return unified_line(theme, full, selected, width, view, drafts);
     }
 
     let half = usize::from(width).saturating_sub(3) / 2;
@@ -458,6 +496,33 @@ fn split_line(theme: &Theme, view: &DiffView, row: &SplitRow, width: u16) -> Lin
     }
 
     Line::from(spans)
+}
+
+/// The character that says a line already has a staged comment (FR-6.1).
+///
+/// Its own column rather than a decoration of the existing marker: the `+`/`-` gutter
+/// says what the change is, and overwriting it would trade one answer for another.
+fn draft_marker(view: &DiffView, drafts: &crate::tui::drafts::DraftState, row: &DiffRow) -> char {
+    let Some(path) = view
+        .patch
+        .files
+        .get(row.file)
+        .and_then(crate::domain::diff::FileDiff::path)
+    else {
+        return ' ';
+    };
+    // A context line is on both sides; the comment is anchored to the side the user was
+    // looking at, and both are marked, because the marker is about the line on screen.
+    let marked = drafts.marks(
+        path.as_str(),
+        Some(crate::domain::draft::Side::New),
+        row.new_line,
+    ) || drafts.marks(
+        path.as_str(),
+        Some(crate::domain::draft::Side::Old),
+        row.old_line,
+    );
+    if marked { '●' } else { ' ' }
 }
 
 /// Whether a full-width split row is the one the cursor is on.
