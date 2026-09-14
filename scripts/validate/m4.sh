@@ -114,7 +114,7 @@ case "$1:$2" in
       *graphql*) cat "$fixtures/graphql-count.json" ;;
       # The review endpoints. `comments` first: the review POST is a different path
       # and the two patterns would otherwise overlap on a substring.
-      *pulls/*/comments*) printf '[]' ;;
+      *pulls/*/comments*) cat "$here/comments.json" ;;
       *pulls/*/reviews*)
         prev=""
         for arg in "$@"; do
@@ -144,6 +144,34 @@ printf '%s' "$FIXTURES" >"$FAKE/fixtures"
 printf '0' >"$FAKE/fail_review"
 printf '0' >"$FAKE/review_delay"
 cp "$TMP/diff.patch" "$FAKE/diff.patch"
+# What GitHub already says about one of the changed lines, with a reply (FR-6.4). The
+# line numbers are the ones in the patch above, so the thread has somewhere to land.
+cat >"$FAKE/comments.json" <<'JSON'
+[
+  {
+    "id": 9001,
+    "user": { "login": "carol" },
+    "path": "src/domain/money.rs",
+    "line": 2,
+    "side": "RIGHT",
+    "body": "Rounding twice loses money on ties.",
+    "created_at": "2026-09-10T10:01:00Z",
+    "in_reply_to_id": null,
+    "html_url": "https://example.invalid/discussion_r9001"
+  },
+  {
+    "id": 9002,
+    "user": { "login": "bruno" },
+    "path": "src/domain/money.rs",
+    "line": 2,
+    "side": "RIGHT",
+    "body": "Good catch, I will fix it in a follow-up.",
+    "created_at": "2026-09-10T11:01:00Z",
+    "in_reply_to_id": 9001,
+    "html_url": "https://example.invalid/discussion_r9002"
+  }
+]
+JSON
 : >"$FAKE/argv.txt"
 
 # How many calls mentioned `$1` at all. Counted by splitting on the unit separator the
@@ -213,7 +241,7 @@ LINES='}jjjj'
 COMMENT='c~the rounding is hidden behind a magic ten\r'
 EXTRA='c~and this file has no callers\r'
 
-step "1/7 build"
+step "1/8 build"
 if cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
@@ -221,7 +249,7 @@ else
   cat "$TMP/build.log" | tail -20
 fi
 
-step "2/7 a comment is staged on a line of the diff"
+step "2/8 a comment is staged on a line of the diff"
 HOME_ONE="$TMP/home-one"
 home_for "$HOME_ONE"
 FRAMES="$TMP/stage.log"
@@ -280,7 +308,7 @@ else
   cat "$TMP/check.log"
 fi
 
-step "3/7 an empty comment is refused, not sent"
+step "3/8 an empty comment is refused, not sent"
 FRAMES="$TMP/empty.log"
 SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$SETTLE~$LINES~c~\r" \
   "money.rs~comment on~needs a body" "$FRAMES")"
@@ -291,7 +319,7 @@ else
   printf '%s\n' "$SCREEN" | tail -8
 fi
 
-step "4/7 publishing sends one review, not N comments"
+step "4/8 publishing sends one review, not N comments"
 HOME_TWO="$TMP/home-two"
 home_for "$HOME_TWO"
 : >"$FAKE/argv.txt"
@@ -345,7 +373,7 @@ else
   ok "the draft is cleared once the review is posted"
 fi
 
-step "5/7 a refusal keeps the draft and explains itself"
+step "5/8 a refusal keeps the draft and explains itself"
 HOME_THREE="$TMP/home-three"
 home_for "$HOME_THREE"
 printf '1' >"$FAKE/fail_review"
@@ -373,7 +401,23 @@ else
 fi
 printf '0' >"$FAKE/fail_review"
 
-step "6/7 a dry run sends nothing and writes down what it would have sent"
+step "6/8 the discussion that is already there"
+FRAMES="$TMP/discussion.log"
+SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$SETTLE~$LINES~c~ok\r~q" \
+  "from the github~~M src/domain/money~comment on~1 comment staged~" "$FRAMES")"
+if shown "$FRAMES" "carol: Rounding twice loses money on ties."; then
+  ok "an existing comment is drawn under the line it is about"
+else
+  bad "the existing discussion was not drawn"
+  printf '%s\n' "$SCREEN" | tail -12
+fi
+if shown "$FRAMES" "bruno: Good catch"; then
+  ok "a reply is drawn under the comment it answers"
+else
+  bad "the reply was not grouped with its comment"
+fi
+
+step "7/8 a dry run sends nothing and writes down what it would have sent"
 HOME_DRY="$TMP/home-dry"
 home_for "$HOME_DRY"
 cat >>"$HOME_DRY/config.toml" <<'EOF'
@@ -409,7 +453,7 @@ else
   bad "a dry run cleared the draft"
 fi
 
-step "7/7 the second Enter sends once"
+step "8/8 the second Enter sends once"
 HOME_SLOW="$TMP/home-slow"
 home_for "$HOME_SLOW"
 printf '2' >"$FAKE/review_delay"

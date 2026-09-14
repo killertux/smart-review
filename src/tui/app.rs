@@ -1066,6 +1066,11 @@ impl App {
     /// with a compose box it silently turned a typed question into key bindings.
     pub fn open_review(&mut self, detail: PullRequestDetail, view: DiffView) {
         let opening = self.review.is_none();
+        let mut view = view;
+        // FR-6.4: what GitHub already says about these lines, drawn under them. Set
+        // here rather than in the caller because this is the one place where the detail
+        // and the diff are both in hand.
+        view.set_comments(&detail.comments);
         self.detail = Some(detail);
         self.review = Some(view);
         if opening {

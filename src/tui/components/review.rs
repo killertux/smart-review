@@ -408,7 +408,10 @@ fn unified_line(
                 body_style(theme, row, selected),
             ));
         }
-        RowKind::Placeholder | RowKind::Folded => {
+        // A placeholder, a folded hunk and a line of the discussion about the line
+        // above are all "some text, no line numbers": the only difference is the style
+        // `body_style` gives them, and the discussion is indented by its own text.
+        RowKind::Placeholder | RowKind::Folded | RowKind::Discussion => {
             spans.clear();
             spans.push(Span::styled(
                 format!("   {} ", text::truncate(&row.text, usize::from(width))),
@@ -538,6 +541,7 @@ fn body_style(theme: &Theme, row: &DiffRow, selected: bool) -> ratatui::style::S
         RowKind::HunkHeader => theme.style(element::DIFF_HUNK_HEADER),
         RowKind::Placeholder | RowKind::Folded => theme.style(element::DIFF_FOLDED),
         RowKind::FileHeader => theme.style(element::TITLE),
+        RowKind::Discussion => theme.style(element::COMMENT_MARKER),
         RowKind::Line => match row.line_kind {
             Some(LineKind::Add) => theme.style(element::DIFF_ADD),
             Some(LineKind::Delete) => theme.style(element::DIFF_DEL),
