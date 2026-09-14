@@ -1126,6 +1126,11 @@ impl App {
                 self.begin_opening(*number);
             }
             Effect::RunDoctor => self.doctor_job = id,
+            // Publishing is a job like any other, and this is the line whose absence
+            // made every publish completion invisible: the review was posted, the
+            // outcome arrived, and the id it was gated on had never been recorded —
+            // so the interface said nothing at all, success or failure.
+            Effect::PublishDraft => self.drafts.job = id,
             // The rest ask for no job, or are handled by `apply` rather than here.
             _ => {}
         }
@@ -1617,7 +1622,7 @@ impl App {
         let Some(anchor) = self.current_anchor() else {
             self.notice(
                 NoticeLevel::Warn,
-                "this row has no line to comment on; move to a line of the diff",
+                "this row has no line a comment could be anchored to; move to a line of the diff",
             );
             return Effect::None;
         };
@@ -6094,6 +6099,83 @@ mod tests {
         assert_eq!(app.mode(), Mode::Insert);
         press(&mut app, "why?");
         assert_eq!(app.chat.input.text(), "why?");
+    }
+
+    /// An app with a two-file patch open, whose second file is the one to comment on.
+    fn draft_app() -> (TempHome, App) {
+        let (dir, mut app) = list_app();
+        let patch = crate::domain::diff::parse_patch(concat!(
+            "diff --git a/src/domain/amount.rs b/src/domain/amount.rs\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            "+++ b/src/domain/amount.rs\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+pub fn currency(cents: i64) -> String {\n",
+            "+    format!(\"{cents}\")\n",
+            "diff --git a/src/domain/money.rs b/src/domain/money.rs\n",
+            "--- a/src/domain/money.rs\n",
+            "+++ b/src/domain/money.rs\n",
+            "@@ -1,3 +1,3 @@\n",
+            " pub fn round(cents: i64) -> i64 {\n",
+            "-    cents\n",
+            "+    (cents + 5) / 10 * 10\n",
+            " }\n",
+        ));
+        app.open_review(crate::test_support::sample_detail(), DiffView::new(patch));
+        (dir, app)
+    }
+
+    #[test]
+    fn a_comment_is_anchored_to_the_line_under_the_cursor() {
+        // The bug this navigator exists for: with the cursor on a *header* row the
+        // composer refuses, because a file header has no line number. The validator's
+        // first version pressed `j` twice and landed on one, so the check that the
+        // composer names a file and side failed — correctly.
+        let (_dir, mut app) = draft_app();
+        assert!(
+            app.current_anchor().is_none(),
+            "the first row is a file header"
+        );
+        // `}` jumps to the next file's header and `jjjj` reaches its last line. Both
+        // halves matter: the header itself has no line number, which is what the
+        // validator's first attempt at this pressed into.
+        press(&mut app, "}");
+        press(&mut app, "jjjj");
+        let anchor = app.current_anchor().expect("a line of money.rs");
+        assert_eq!(anchor.path, "src/domain/money.rs");
+        assert_eq!(anchor.side, crate::domain::draft::Side::New);
+        assert!(!app.draft_is_composing());
+
+        press(&mut app, "c");
+        assert!(app.draft_is_composing(), "the composer opened");
+        assert_eq!(app.mode(), Mode::Insert);
+        assert_eq!(
+            app.drafts().composer.as_ref().expect("open").anchor.label(),
+            "src/domain/money.rs:2 (new)"
+        );
+    }
+
+    #[test]
+    fn a_staged_comment_is_written_by_the_loop_and_cleared_by_a_publish() {
+        let (_dir, mut app) = draft_app();
+        app.draft_service = Some(crate::application::drafts::Drafts::new(
+            std::sync::Arc::new(crate::test_support::FakeDraftStore::default()),
+            crate::domain::repo::RepoId::parse("github.com/acme/service").expect("a repository"),
+        ));
+        press(&mut app, "}");
+        press(&mut app, "jjjj");
+        press(&mut app, "c");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("this rounds up");
+        let effect = press(&mut app, "<Enter>");
+        assert_eq!(effect, Effect::SaveDraft, "staging asks the loop to write");
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(app.drafts().draft.comments.len(), 1);
+        assert!(app.drafts().dirty, "and the loop is what clears this");
     }
 
     #[test]

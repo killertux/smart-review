@@ -26,5 +26,5 @@
  theme     Choose a theme, or :theme <name>|reload
 
 
- COMMAND list · acme/service · — · — · 0 drafts              ? help · <leader> actions · : commands
+ COMMAND list · acme/service · — · —                         ? help · <leader> actions · : commands
 : them
