@@ -1337,6 +1337,45 @@ mod tests {
             ForgeCapabilities::default()
         }
 
+        fn reply_to_review_comment(
+            &self,
+            _number: u64,
+            _comment_id: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> crate::Result<crate::ports::CommentPosted> {
+            Err(crate::Error::forge("gh", "this fake does not post replies"))
+        }
+
+        fn comment_on_conversation(
+            &self,
+            _number: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> crate::Result<crate::ports::CommentPosted> {
+            Err(crate::Error::forge(
+                "gh",
+                "this fake does not post comments",
+            ))
+        }
+
+        fn set_thread_resolved(
+            &self,
+            _thread_id: &str,
+            _resolved: bool,
+            _cancel: &Cancel,
+        ) -> crate::Result<()> {
+            Err(crate::Error::forge("gh", "this fake cannot resolve"))
+        }
+
+        fn list_conversation(
+            &self,
+            _number: u64,
+            _cancel: &Cancel,
+        ) -> crate::Result<Vec<crate::domain::pr::ConversationComment>> {
+            Ok(Vec::new())
+        }
+
         fn submit_review(
             &self,
             number: u64,
@@ -1644,6 +1683,45 @@ mod tests {
     impl ForgePort for PanicForge {
         fn capabilities(&self) -> ForgeCapabilities {
             ForgeCapabilities::default()
+        }
+
+        fn reply_to_review_comment(
+            &self,
+            _number: u64,
+            _comment_id: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> crate::Result<crate::ports::CommentPosted> {
+            Err(crate::Error::forge("gh", "this fake does not post replies"))
+        }
+
+        fn comment_on_conversation(
+            &self,
+            _number: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> crate::Result<crate::ports::CommentPosted> {
+            Err(crate::Error::forge(
+                "gh",
+                "this fake does not post comments",
+            ))
+        }
+
+        fn set_thread_resolved(
+            &self,
+            _thread_id: &str,
+            _resolved: bool,
+            _cancel: &Cancel,
+        ) -> crate::Result<()> {
+            Err(crate::Error::forge("gh", "this fake cannot resolve"))
+        }
+
+        fn list_conversation(
+            &self,
+            _number: u64,
+            _cancel: &Cancel,
+        ) -> crate::Result<Vec<crate::domain::pr::ConversationComment>> {
+            Ok(Vec::new())
         }
 
         fn submit_review(

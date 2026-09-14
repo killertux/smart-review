@@ -206,6 +206,42 @@ pub enum DraftError {
     },
 }
 
+/// A message posted on its own, outside the review draft (FR-6.4, DEC-16).
+///
+/// Two things are posted without being part of a review: a reply into a thread that is
+/// already there, and a comment on the pull request's own conversation. Neither carries
+/// a decision, neither can be batched with anything (GitHub's review API only accepts
+/// *new* inline comments), and both are the same value to validate — words and a limit.
+///
+/// Deliberately not a [`DraftComment`] with empty fields: the two are validated
+/// differently (one needs a line, the other must not have one) and a type that could be
+/// either would be one every caller has to check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Post {
+    /// What the user wrote.
+    pub body: String,
+}
+
+impl Post {
+    /// Validates a message (FR-6.4).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DraftError::EmptyBody`] for a body that is empty once trimmed, and
+    /// [`DraftError::TooLong`] past GitHub's limit — the same two sentences the
+    /// review composer uses, because they are the same two mistakes.
+    pub fn new(body: impl Into<String>) -> Result<Self, DraftError> {
+        let body = body.into();
+        if body.trim().is_empty() {
+            return Err(DraftError::EmptyBody);
+        }
+        if body.len() > MAX_TEXT_BYTES {
+            return Err(DraftError::TooLong { bytes: body.len() });
+        }
+        Ok(Self { body })
+    }
+}
+
 /// One staged inline comment (FR-6.1, §7.2).
 ///
 /// `start_line` is the *earlier* line of a range, as GitHub's `startLine` is, and is
@@ -604,6 +640,28 @@ mod tests {
 
     fn comment(path: &str, line: u32, body: &str) -> DraftComment {
         DraftComment::new(path, Side::New, line, None, body).expect("valid comment")
+    }
+
+    #[test]
+    fn a_post_is_validated_like_the_words_it_is() {
+        assert_eq!(Post::new("   \n "), Err(DraftError::EmptyBody));
+        assert_eq!(
+            Post::new("x".repeat(MAX_TEXT_BYTES + 1)),
+            Err(DraftError::TooLong {
+                bytes: MAX_TEXT_BYTES + 1
+            })
+        );
+        // A reply and a review comment share the limit, so a user who pastes
+        // something enormous is told the same thing in both composers.
+        let long = "y".repeat(MAX_TEXT_BYTES + 1);
+        assert_eq!(
+            Post::new(long.clone()).expect_err("too long").to_string(),
+            DraftComment::new("src/a.rs", Side::New, 1, None, long)
+                .expect_err("too long")
+                .to_string()
+        );
+        let post = Post::new("agreed, fixed in 9f2c1ab").expect("valid");
+        assert_eq!(post.body, "agreed, fixed in 9f2c1ab");
     }
 
     #[test]

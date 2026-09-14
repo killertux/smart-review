@@ -1281,6 +1281,9 @@ mod discussion_tests {
             in_reply_to: reply_to,
             diff_hunk: None,
             url: None,
+            thread_id: None,
+            resolved: false,
+            outdated: false,
         }
     }
 

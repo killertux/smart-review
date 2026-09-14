@@ -143,6 +143,7 @@ mod tests {
     use super::*;
     use crate::domain::draft::{Decision, DraftComment, Side};
     use crate::domain::time::from_unix_secs;
+    use crate::ports::CommentPosted;
     use crate::ports::forge::ReviewPosted;
     use crate::test_support::temp_home;
     use std::sync::Mutex;
@@ -238,6 +239,42 @@ mod tests {
         }
 
         fn pull_request_diff(&self, _number: u64, _cancel: &Cancel) -> crate::Result<String> {
+            Err(crate::Error::forge("gh", "not used"))
+        }
+
+        fn reply_to_review_comment(
+            &self,
+            _number: u64,
+            _comment_id: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> crate::Result<CommentPosted> {
+            Err(crate::Error::forge("gh", "not used"))
+        }
+
+        fn comment_on_conversation(
+            &self,
+            _number: u64,
+            _body: &str,
+            _cancel: &Cancel,
+        ) -> crate::Result<CommentPosted> {
+            Err(crate::Error::forge("gh", "not used"))
+        }
+
+        fn set_thread_resolved(
+            &self,
+            _thread_id: &str,
+            _resolved: bool,
+            _cancel: &Cancel,
+        ) -> crate::Result<()> {
+            Err(crate::Error::forge("gh", "not used"))
+        }
+
+        fn list_conversation(
+            &self,
+            _number: u64,
+            _cancel: &Cancel,
+        ) -> crate::Result<Vec<crate::domain::pr::ConversationComment>> {
             Err(crate::Error::forge("gh", "not used"))
         }
 

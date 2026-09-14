@@ -18,6 +18,7 @@
 //! so responses are read as a *stream* of values and flattened. That is what makes
 //! a PR with more than 100 inline comments work on gh 2.40 and on 2.45 alike.
 
+mod comments;
 pub mod json;
 pub mod probe;
 mod review;
@@ -27,13 +28,13 @@ use std::path::PathBuf;
 use serde::de::DeserializeOwned;
 
 use crate::adapters::process::{CommandSpec, Output, ProcessRunner};
-use crate::domain::pr::{CheckRun, PullRequestDetail, Review, ReviewComment};
+use crate::domain::pr::{CheckRun, ConversationComment, PullRequestDetail, Review, ReviewComment};
 use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::error::{Error, Result};
 use crate::logging::{self, Level};
 use crate::ports::forge::{ForgeCapabilities, ForgeFactory, ForgePort, PullRequestPage};
-use crate::ports::{Cancel, ReviewPosted};
+use crate::ports::{Cancel, CommentPosted, ReviewPosted};
 
 use json::{
     DETAIL_FIELDS, GhDetail, GhReview, GhReviewComment, GhSummary, GraphQlResponse, LIST_FIELDS,
@@ -351,7 +352,61 @@ impl ForgePort for GhCliForge {
                 format!("could not read the review comments of #{number}: {error}"),
             ),
         }
+        // FR-6.4: whether those comments' threads are resolved, and what GitHub calls
+        // them, is GraphQL-only. Fetched only when there is something to annotate — a
+        // pull request with no inline comments has no threads — and skipped silently
+        // free of charge when there are none.
+        if !detail.comments.is_empty() {
+            match self.read_review_threads(number, cancel) {
+                Ok(threads) => {
+                    comments::apply_threads(&mut detail.comments, &threads);
+                }
+                Err(error) => logging::log(
+                    Level::Warn,
+                    format!(
+                        "could not read the review threads of #{number}, so no thread can be \
+                         resolved: {error}"
+                    ),
+                ),
+            }
+        }
+        // The conversation is the issue's comment list: a different endpoint from the
+        // review comments, and separate for the same reason the domain types are.
+        match self.read_conversation(number, cancel) {
+            Ok(conversation) => detail.conversation = conversation,
+            Err(error) => logging::log(
+                Level::Warn,
+                format!("could not read the conversation of #{number}: {error}"),
+            ),
+        }
         Ok(detail)
+    }
+
+    fn reply_to_review_comment(
+        &self,
+        number: u64,
+        comment_id: u64,
+        body: &str,
+        cancel: &Cancel,
+    ) -> Result<CommentPosted> {
+        self.post_reply(number, comment_id, body, cancel)
+    }
+
+    fn comment_on_conversation(
+        &self,
+        number: u64,
+        body: &str,
+        cancel: &Cancel,
+    ) -> Result<CommentPosted> {
+        self.post_conversation_comment(number, body, cancel)
+    }
+
+    fn set_thread_resolved(&self, thread_id: &str, resolved: bool, cancel: &Cancel) -> Result<()> {
+        self.set_thread_resolution(thread_id, resolved, cancel)
+    }
+
+    fn list_conversation(&self, number: u64, cancel: &Cancel) -> Result<Vec<ConversationComment>> {
+        self.read_conversation(number, cancel)
     }
 
     fn list_reviews(&self, number: u64, cancel: &Cancel) -> Result<Vec<Review>> {
@@ -688,6 +743,178 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_goes_to_the_reply_route_with_the_body_as_one_argument() {
+        let fake = FakeGh::scripted(&[("-X", r#"{"id":7,"html_url":"https://example.test/c/7"}"#)]);
+        let forge = fake.forge("acme/service");
+        // Quotes and a backslash, but no newline: the fake records one argument per
+        // line, so a newline inside an argument is not something it can show back.
+        // Newlines in a body are covered by the review payload's own test, which
+        // reads the JSON that was sent rather than the argv.
+        let body = "agreed \"fixed\" in 9f2c1ab, and C:\\path too";
+        let posted = forge
+            .reply_to_review_comment(141, 1001, body, &Cancel::new())
+            .expect("posted");
+
+        assert_eq!(posted.id, Some(7));
+        assert_eq!(posted.url.as_deref(), Some("https://example.test/c/7"));
+        assert!(!posted.dry_run);
+
+        let call = &fake.calls()[0];
+        assert_eq!(call[0], "api");
+        assert!(
+            call.contains(&"repos/acme/service/pulls/141/comments/1001/replies".to_owned()),
+            "{call:?}"
+        );
+        // One argv element, quotes and newline and all: a body is prose, and the only
+        // thing standing between it and a shell is that it is never a string.
+        assert!(
+            call.iter().any(|arg| arg == &format!("body={body}")),
+            "{call:?}"
+        );
+    }
+
+    #[test]
+    fn a_conversation_comment_goes_to_the_issues_comment_list() {
+        let fake = FakeGh::scripted(&[("issues/141/comments", r#"{"id":8}"#)]);
+        let forge = fake.forge("acme/service");
+        forge
+            .comment_on_conversation(141, "thanks, looking now", &Cancel::new())
+            .expect("posted");
+
+        let call = &fake.calls()[0];
+        assert!(
+            call.contains(&"repos/acme/service/issues/141/comments".to_owned()),
+            "a pull request is an issue, and its conversation is the issue's comments: {call:?}"
+        );
+        assert!(
+            call.iter().any(|arg| arg == "body=thanks, looking now"),
+            "{call:?}"
+        );
+    }
+
+    #[test]
+    fn resolving_a_thread_is_a_graphql_mutation_naming_that_thread() {
+        let answer =
+            r#"{"data":{"resolveReviewThread":{"thread":{"id":"PRRT_1","isResolved":true}}}}"#;
+        let fake = FakeGh::scripted(&[("graphql", answer)]);
+        let forge = fake.forge("acme/service");
+        forge
+            .set_thread_resolved("PRRT_1", true, &Cancel::new())
+            .expect("resolved");
+
+        let call = &fake.calls()[0];
+        assert_eq!(call[0], "api");
+        assert_eq!(call[1], "graphql");
+        assert!(
+            call.iter().any(|arg| arg.contains("resolveReviewThread")),
+            "{call:?}"
+        );
+        assert!(
+            call.iter().any(|arg| arg == "id=PRRT_1"),
+            "the thread id is a variable: {call:?}"
+        );
+
+        // And the other direction is the other field, not the same one with a flag.
+        let fake = FakeGh::scripted(&[("graphql", answer)]);
+        let forge = fake.forge("acme/service");
+        forge
+            .set_thread_resolved("PRRT_1", false, &Cancel::new())
+            .expect("resolved");
+        let call = &fake.calls()[0];
+        assert!(
+            call.iter().any(|arg| arg.contains("unresolveReviewThread")),
+            "{call:?}"
+        );
+        assert!(
+            !call
+                .iter()
+                .any(|arg| arg.contains("mutation($id: ID!) {resolve")),
+            "and not the resolving one: {call:?}"
+        );
+    }
+
+    #[test]
+    fn a_graphql_error_in_a_zero_exit_answer_is_a_failure() {
+        // `gh api graphql` exits zero when the *query* failed and puts the reason in
+        // the body. Reporting success there would say a thread was resolved when
+        // nothing had happened.
+        let answer = r#"{"data":null,"errors":[{"message":"Could not resolve to a node with the global id of 'PRRT_nope'."}]}"#;
+        let fake = FakeGh::scripted(&[("graphql", answer)]);
+        let forge = fake.forge("acme/service");
+        let error = forge
+            .set_thread_resolved("PRRT_nope", true, &Cancel::new())
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("Could not resolve to a node"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_refused_reply_is_translated_rather_than_quoted() {
+        // The fake exits 1 for a call it has no answer for, and prints what a failing
+        // gh prints: the adapter must turn that into a sentence.
+        let dir = temp_home();
+        let script =
+            "#!/bin/sh\necho 'gh: Resource not accessible by integration (HTTP 403)' >&2\nexit 1\n";
+        dir.write_executable("gh", script);
+        let forge = GhCliForge::new(
+            dir.path().join("gh"),
+            RepoId::parse("acme/service").unwrap(),
+        );
+        let error = forge
+            .reply_to_review_comment(141, 1001, "hello", &Cancel::new())
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("token is not allowed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn posting_anything_during_a_dry_run_reaches_nothing() {
+        let fake = FakeGh::scripted(&[("-X", "{}"), ("graphql", "{}")]);
+        let runner =
+            ProcessRunner::new().with_dry_run(crate::adapters::process::DryRunLedger::new());
+        let ledger = runner.dry_run_ledger().expect("a ledger").clone();
+        let forge = fake.forge("acme/service").with_runner(runner);
+
+        let reply = forge
+            .reply_to_review_comment(141, 1001, "hello", &Cancel::new())
+            .expect("recorded");
+        let conversation = forge
+            .comment_on_conversation(141, "hello", &Cancel::new())
+            .expect("recorded");
+        forge
+            .set_thread_resolved("PRRT_1", true, &Cancel::new())
+            .expect("recorded");
+
+        assert!(reply.dry_run && conversation.dry_run);
+        assert!(
+            fake.calls().is_empty(),
+            "nothing reached gh: {:?}",
+            fake.calls()
+        );
+        let commands = ledger.commands();
+        assert_eq!(commands.len(), 3, "{commands:#?}");
+        assert!(
+            commands[0].contains("comments/1001/replies"),
+            "{}",
+            commands[0]
+        );
+        assert!(
+            commands[1].contains("issues/141/comments"),
+            "{}",
+            commands[1]
+        );
+        assert!(
+            commands[2].contains("resolveReviewThread"),
+            "{}",
+            commands[2]
+        );
+    }
+
+    #[test]
     fn a_dry_run_records_the_review_instead_of_posting_it() {
         let fake = FakeGh::scripted(&[("pr:review", "ok"), ("api:-X", "{}")]);
         let runner =
@@ -814,14 +1041,83 @@ mod tests {
         assert_eq!(detail.summary.number, 141);
         assert_eq!(detail.comments.len(), 2, "the second call filled these in");
 
+        // Four calls: the view, the inline comments, the thread state that annotates
+        // them, and the conversation. FR-6.4 needs all four to draw a pull request as
+        // it is rather than as a list of bodies.
         let calls = fake.calls();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 4, "{calls:#?}");
         assert_eq!(calls[0][1], "view");
         assert_eq!(calls[1][0], "api");
         assert_eq!(calls[1][1], "repos/acme/service/pulls/141/comments");
+        assert_eq!(calls[2][0], "api");
+        assert_eq!(calls[2][1], "graphql");
+        assert!(
+            calls[2].iter().any(|arg| arg.contains("reviewThreads")),
+            "the thread state is a GraphQL field: {calls:?}"
+        );
+        assert_eq!(
+            calls[3][1], "repos/acme/service/issues/141/comments",
+            "the conversation is the issue's comment list"
+        );
         assert!(
             !calls[1].contains(&"--repo".to_owned()),
             "gh api takes the repository in the path and has no --repo flag"
+        );
+    }
+
+    #[test]
+    fn thread_state_is_joined_onto_the_comments_it_belongs_to() {
+        let threads = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+            {"id":"PRRT_1","isResolved":true,"isOutdated":false,
+             "comments":{"nodes":[{"databaseId":1001},{"databaseId":1002}]}},
+            {"id":"PRRT_2","isResolved":false,"isOutdated":true,
+             "comments":{"nodes":[{"databaseId":1003}]}}
+        ]}}}}}"#;
+        let fake = FakeGh::scripted(&[
+            ("pr:view", VIEW),
+            ("comments", COMMENTS),
+            ("graphql", threads),
+        ]);
+        let forge = fake.forge("acme/service");
+        let detail = forge.get_pull_request(141, &Cancel::new()).unwrap();
+
+        let resolved = detail
+            .comments
+            .iter()
+            .find(|comment| comment.id == 1001)
+            .expect("the root comment");
+        assert_eq!(resolved.thread_id.as_deref(), Some("PRRT_1"));
+        assert!(resolved.resolved);
+        assert!(
+            !resolved.outdated,
+            "resolved and out of date are different things"
+        );
+        let reply = detail
+            .comments
+            .iter()
+            .find(|comment| comment.id == 1002)
+            .expect("the reply");
+        assert!(
+            reply.resolved,
+            "a reply is in the same thread as what it answers"
+        );
+    }
+
+    #[test]
+    fn a_failure_to_read_thread_state_leaves_every_thread_open_and_unresolvable() {
+        // The distinction the whole design turns on: no thread state means no thread
+        // can be resolved, which is *not* the same as every thread being open.
+        let fake = FakeGh::scripted(&[("pr:view", VIEW), ("comments", COMMENTS)]);
+        let forge = fake.forge("acme/service");
+        let detail = forge.get_pull_request(141, &Cancel::new()).unwrap();
+
+        assert_eq!(detail.comments.len(), 2, "the comments still arrived");
+        assert!(
+            detail
+                .comments
+                .iter()
+                .all(|comment| comment.thread_id.is_none() && !comment.resolved),
+            "and none of them claims to know its thread"
         );
     }
 
