@@ -109,7 +109,21 @@ pub enum Target {
 }
 
 impl Target {
-    /// Where the comment will land, for the composer's title.
+    /// What the composer's title says: the verb and where it lands.
+    ///
+    /// One string rather than a verb and a noun glued together at the renderer, because
+    /// the three cases do not share a verb: a comment on a line and a comment on the
+    /// conversation are both comments, and a reply is not.
+    #[must_use]
+    pub fn title(&self) -> String {
+        match self {
+            Self::Line(anchor) => format!("comment on {}", anchor.label()),
+            Self::Thread { anchor, .. } => format!("reply on {}", anchor.label()),
+            Self::Conversation => "comment on the pull request's conversation".to_owned(),
+        }
+    }
+
+    /// Where the comment will land, without the verb, for a modal that names it.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
@@ -141,12 +155,15 @@ impl Target {
     }
 
     /// What `Enter` does, which is not the same thing in all three cases.
+    ///
+    /// Short on purpose: it is drawn in a border title next to the destination, and a
+    /// title long enough to be truncated loses the part that says what the key does.
     #[must_use]
     pub fn enter_hint(&self) -> &'static str {
         if self.is_staged() {
-            "Enter stages it · Alt-Enter for a new line"
+            "Enter stages it · Alt-Enter adds a line"
         } else {
-            "Enter to review it, then Enter again to post · Alt-Enter for a new line"
+            "Enter shows it · Alt-Enter adds a line"
         }
     }
 }

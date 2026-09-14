@@ -94,6 +94,11 @@ pub enum Effect {
     ReloadDiff,
     /// Put a path on the clipboard through the terminal (FR-3.4).
     CopyPath(String),
+    /// Hand the open comment composer to `$EDITOR` (FR-6.2).
+    ///
+    /// The text is frozen in the effect so the reducer remains free of process and
+    /// file IO while the terminal is suspended.
+    EditComposer(String),
     /// Turn mouse capture on or off, which only the loop can do (FR-7.5).
     SetMouse(bool),
     /// Give up on the work in flight for the current screen (NFR-1.4).
@@ -258,6 +263,8 @@ fn effect_name(effect: &Effect) -> String {
         Effect::ResolveThread { resolved, .. } => format!("resolve-thread({resolved})"),
         Effect::ReloadDiff => "reload-diff".to_owned(),
         Effect::CopyPath(_) => "copy-path".to_owned(),
+        // A comment is user prose, so it must not enter logs through an effect name.
+        Effect::EditComposer(_) => "edit-composer".to_owned(),
         Effect::SetMouse(enabled) => format!("set-mouse({enabled})"),
         Effect::CancelInFlight => "cancel-in-flight".to_owned(),
         Effect::LoadCatalog(policy) => format!("load-catalog({policy:?})"),
@@ -3901,6 +3908,18 @@ impl App {
             .height
             .saturating_add(crate::tui::components::filter_bar::HEIGHT)
             .saturating_sub(3)
+    }
+
+    /// Replaces the open comment composer's text after `$EDITOR` exits.
+    ///
+    /// This is intentionally a small reducer-side operation: the file and process
+    /// belong to the event loop, while keeping the edited words in UI state belongs
+    /// here. A vanished composer is harmless (for example after a terminal error).
+    pub fn replace_composer_text(&mut self, body: String) {
+        if let Some(composer) = self.drafts.composer.as_mut() {
+            composer.input.set_text(body);
+            composer.refusal = None;
+        }
     }
 
     /// Opens the command line with a prefix already typed (FR-7.4).

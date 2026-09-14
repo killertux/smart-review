@@ -289,7 +289,7 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
         Some(post) => format!(
             " post · #{} · {} ",
             drafts.draft.pr,
-            text_util::truncate(&post.target.label(), 46)
+            text_util::truncate(&post.target.title(), 46)
         ),
         None => format!(
             " publish review · #{} · {} ",

@@ -1147,7 +1147,7 @@ fn write_thread(
     // character alone is not something a reader can rely on, and "is this still open"
     // is the question the marker exists to answer.
     let resolved = if depth == 0 && thread.resolved {
-        " · resolved"
+        " (resolved)"
     } else {
         ""
     };

@@ -406,6 +406,12 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: true,
     },
     ActionDef {
+        id: "review.edit_composer",
+        description: "Edit the open comment in $EDITOR (Ctrl-E)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
         id: "review.toggle_resolved",
         description: "Resolve or reopen the thread under the cursor (<leader>pt)",
         group: Group::Review,

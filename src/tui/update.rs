@@ -94,6 +94,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Show, extend or narrow what is sent: :context [add|remove <path>|0-1000]",
     ),
     (
+        "edit",
+        "app.command",
+        "Edit the open comment composer in $EDITOR",
+    ),
+    (
         "chat",
         "chat.open",
         "Talk about this pull request: :chat [new|list|open <id>|export [md|json]|retry]",
@@ -149,6 +154,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "review.range" => app.start_selection(),
         "review.drafts" => app.open_drafts(),
         "review.reply" => app.start_reply(),
+        "review.edit_composer" => edit_composer_command(app, ""),
         "review.toggle_resolved" => app.ask_toggle_thread(),
         "review.conversation" => app.open_conversation(),
         "review.comment_conversation" => app.start_conversation_comment(),
@@ -956,6 +962,7 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "workspace" => workspace_command(app, argument),
         "draft" => draft_command(app, argument),
         "context" => context_command(app, argument),
+        "edit" => edit_composer_command(app, argument),
         "chat" => chat_command(app, argument),
         "analyze" => start_analysis(app, argument),
         "plan" => plan_command(app, argument),
@@ -968,6 +975,22 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "set" => set_option(app, argument),
         other => unknown_command(app, other),
     }
+}
+
+/// Gives the open comment composer to `$EDITOR` (FR-6.2).
+fn edit_composer_command(app: &mut App, argument: &str) -> Effect {
+    if !argument.is_empty() {
+        app.command_error("usage: :edit (while a comment composer is open)");
+        return Effect::None;
+    }
+    let Some(composer) = app.drafts.composer.as_ref() else {
+        app.notice(
+            NoticeLevel::Warn,
+            "$EDITOR edits comment composers, not this input",
+        );
+        return Effect::None;
+    };
+    Effect::EditComposer(composer.input.text().to_owned())
 }
 
 /// Reports a command that does not exist, suggesting the nearest one (FR-7.3).
@@ -1725,6 +1748,9 @@ mod tests {
                 "set" => " ui.timeoutlen=250",
                 _ => "",
             };
+            if *name == "edit" {
+                app.drafts.compose_conversation();
+            }
             super::command(&mut app, &format!("{name}{argument}"));
             let error = app.command_error_text();
             assert!(

@@ -85,6 +85,15 @@ pub enum Scope {
 }
 
 impl Scope {
+    /// The `keybinds.toml` table that owns this scope.
+    #[must_use]
+    pub const fn table_name(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::In(mode) => mode.as_str(),
+        }
+    }
+
     /// Whether this scope applies while `mode` is active.
     #[must_use]
     pub const fn applies_to(self, mode: Mode) -> bool {
@@ -93,6 +102,69 @@ impl Scope {
             Self::In(scope) => scope as u8 == mode as u8,
         }
     }
+}
+
+/// Renders the built-in map as the checked source for `docs/keymaps.md`.
+///
+/// User bindings are deliberately not included: this is the map a new installation
+/// starts with. The per-row scope tells an override author which `[keys.*]` table
+/// owns a binding, and actions with no default still appear so their stable ids are
+/// discoverable and bindable.
+#[must_use]
+pub fn default_keymap_markdown() -> String {
+    let mut markdown = String::from(
+        "# Default keymap\n\n\
+         <!-- Generated from `src/tui/action.rs` and `DEFAULT_BINDINGS`; do not edit by hand. -->\n\n\
+         These are the compiled-in defaults. Add overrides to `${SMART_REVIEW_HOME:-~/.smart-review}/keybinds.toml`; \
+         the **scope** is the table name below `[keys]`. `<leader>` means the configured leader (default: Space).\n",
+    );
+
+    for group in action::groups() {
+        let _ = writeln!(markdown, "\n## {}\n", group.label());
+        markdown.push_str("| Action | Default binding(s) | Scope | Description |\n");
+        markdown.push_str("| --- | --- | --- | --- |\n");
+        for definition in action::all().iter().filter(|item| item.group == *group) {
+            let bindings: Vec<(&str, &str)> = DEFAULT_BINDINGS
+                .iter()
+                .filter(|(_, _, id)| *id == definition.id)
+                .map(|(scope, keys, _)| (*keys, scope.table_name()))
+                .collect();
+            let keys = if bindings.is_empty() {
+                "—".to_owned()
+            } else {
+                bindings
+                    .iter()
+                    .map(|(keys, _)| format!("`{keys}`"))
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
+            let scopes = if bindings.is_empty() {
+                "—".to_owned()
+            } else {
+                bindings
+                    .iter()
+                    .map(|(_, scope)| format!("`{scope}`"))
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
+            let _ = writeln!(
+                markdown,
+                "| `{}` | {keys} | {scopes} | {} |",
+                definition.id, definition.description
+            );
+        }
+    }
+    markdown.push_str(
+        "\n## Override example\n\n\
+         ```toml\n\
+         [keys.normal]\n\
+         # Bind `x` to a known action, or use `none` to remove a default binding.\n\
+         x = \"review.comment_line\"\n\
+         \"<leader>ra\" = \"none\"\n\
+         ```\n\n\
+         Run `:keymap` inside smart-review to see the effective map after overrides.\n",
+    );
+    markdown
 }
 
 /// A single key press.
@@ -343,6 +415,9 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     // `r` for the diff, where it answers the comment under the cursor (FR-6.4).
     (Scope::In(Mode::Insert), "<C-r>", "chat.retry"),
     (Scope::In(Mode::Normal), "<C-r>", "chat.retry"),
+    // The composer owns ordinary keys, so a real modifier is how `:edit` remains
+    // reachable while writing a comment. It deliberately does nothing for chat.
+    (Scope::In(Mode::Insert), "<C-e>", "review.edit_composer"),
     (Scope::In(Mode::Insert), "<Enter>", "chat.send"),
     // Enter sends, so a newline needs a modifier. `S-Enter` is what the requirement
     // names; not every terminal can send it, which is why `C-j` (the line feed every
@@ -1168,5 +1243,14 @@ mod tests {
         dir.write("keybinds.toml", "[keys.normal\n\"x\" =");
         let mut warnings = Vec::new();
         assert!(load(&home, &UiConfig::default(), &mut warnings).is_err());
+    }
+
+    #[test]
+    fn checked_keymap_documentation_is_generated_from_the_registry() {
+        assert_eq!(
+            default_keymap_markdown(),
+            include_str!("../../../docs/keymaps.md"),
+            "docs/keymaps.md is generated; update it from default_keymap_markdown"
+        );
     }
 }

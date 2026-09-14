@@ -1337,7 +1337,8 @@ pub fn job_for(
         | Effect::None
         | Effect::KeepPending
         | Effect::SaveState
-        | Effect::CopyPath(_) => None,
+        | Effect::CopyPath(_)
+        | Effect::EditComposer(_) => None,
     }
 }
 

@@ -4,10 +4,11 @@ A terminal client for reviewing GitHub pull requests, with LLM-assisted analysis
 and a review order that follows the project's architecture instead of the
 filesystem.
 
-> **Status: M4 — the review loop is closed.** List and read pull requests, analyse
-> them with an LLM and get a review order, talk about them, and publish a review
-> with inline comments — one batched call, confirmed in a modal that shows exactly
-> what will be sent. M5 (polish and release) is next (see [`PLAN.md`](PLAN.md)).
+> **Status: M5 — ready to hand over.** List and read pull requests, analyse them
+> with an LLM and get a review order, talk about them, and publish a review with
+> inline comments — one batched call, confirmed in a modal that shows exactly what
+> will be sent. Reply to and resolve review threads, comment on the PR conversation,
+> and use `$EDITOR` for a comment when the inline box is not enough.
 
 ## Prerequisites
 
@@ -27,6 +28,13 @@ cargo run                # open the interface
 cargo run -- --check     # environment report, exit 0 ready / 1 degraded / 2 unusable
 cargo run -- --help
 ```
+
+## Releases
+
+A `v*` tag builds native archives for Linux x86_64, macOS Intel, and macOS Apple
+Silicon and attaches them to the GitHub release. Extract the archive and put
+`smart-review` on `PATH`; it still needs `git` and an authenticated `gh`. Windows is
+not a supported release target yet.
 
 Inside the app:
 
@@ -48,12 +56,16 @@ Inside the app:
 | `<leader>a` | analyse the pull request, or open the analysis |
 | `<leader>c` | talk about the pull request (`Tab` reaches the pane too) |
 | `Enter` | send the question (`Alt-Enter` or `Ctrl-J` adds a line) |
-| `r` | repeat the last question |
+| `<C-r>` | repeat the last question |
 | `Esc` | stop the answer that is arriving, then leave the pane |
 | `c` | comment on the line under the cursor (`Enter` stages it, `Esc` cancels) |
+| `<C-e>` | open the comment composer in `$EDITOR` |
 | `v` / `V` | mark one end of a range, then move and press `c` |
 | `<leader>rd` | the staged comments: `j`/`k` walk them, `x` removes one |
 | `<leader>rr` | publish the review: the modal shows it verbatim, `Enter` twice sends |
+| `r` / `<leader>pr` | reply to the thread under the diff cursor |
+| `<leader>pt` | resolve or reopen that thread (it asks first) |
+| `<leader>pc` / `<leader>pw` | view / write on the pull request conversation |
 | `<leader>ra` / `rc` / `rm` | stage an approval / request changes / a comment with no verdict |
 | `<leader>rx` | throw the staged review away (it asks first) |
 | `o` | switch between the recommended and path orders |
@@ -81,7 +93,9 @@ Inside the app:
 running.
 
 `c` on a line opens the comment composer: `Enter` stages the comment, `Alt-Enter` adds
-a line, `Esc` throws it away, and `v` first turns it into a range. Staged comments are
+a line, `Esc` throws it away, and `v` first turns it into a range. Press `<C-e>` to
+hand that composer to `$EDITOR`; when the editor exits its file is read back into the
+same composer. Staged comments are
 marked `●` in the diff gutter, listed by `<leader>rd` (where `x` removes one), and saved
 as you write them in `~/.smart-review/drafts/` — a draft is the one thing here that
 cannot be fetched again, so it does not live under `cache/`. `<leader>rr` opens the
@@ -89,8 +103,10 @@ publish modal: the decision, the body and every comment, verbatim, and nothing i
 until you press `Enter` twice. A review with inline comments goes to GitHub in **one**
 request, so it arrives as a single review rather than as N notifications; a failure
 leaves the draft exactly where it was and says what GitHub said, in words. Threads that
-are already on the pull request are drawn under the lines they are about, read-only.
-`--dry-run` (or `[forge] dry_run = true`) records every command that would change
+are already on the pull request are drawn under the lines they are about: `r` writes a
+reply, and `<leader>pt` resolves or reopens the whole thread after confirmation. The PR
+conversation is available through `<leader>pc`; `<leader>pw` writes a top-level comment
+through GitHub's issue-comment endpoint. `--dry-run` (or `[forge] dry_run = true`) records every command that would change
 something — publishing, `:workspace clean` — in `logs/dry-run.log` and runs none of
 them.
 
@@ -176,6 +192,9 @@ how the tests isolate themselves.
   dependency approval ledger and the risk register.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layers, ports and adapters, and the
   concurrency model.
+- [`docs/keymaps.md`](docs/keymaps.md) — generated compiled-in keybindings.
+- [`docs/configuration.md`](docs/configuration.md) — every configuration default.
+- [`docs/themes.md`](docs/themes.md) — theme files, styles and colour formats.
 - [`AGENTS.md`](AGENTS.md) — the hard rules for working in this repository.
 
 ## Development
