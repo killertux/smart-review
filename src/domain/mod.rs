@@ -13,6 +13,7 @@ pub mod analysis;
 pub mod chat;
 pub mod context;
 pub mod diff;
+pub mod draft;
 pub mod environment;
 pub mod model;
 pub mod plan;
