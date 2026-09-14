@@ -368,6 +368,8 @@ pub struct PanelState {
     pub stored_job: u64,
     /// The text that has streamed in (FR-4.4).
     pub stream: StreamBuffer,
+    /// The first visible line of the panel, for j/k scrolling (FR-4.4).
+    pub scroll: usize,
     /// What normalization corrected (FR-4.1).
     pub warnings: Vec<String>,
     /// The model's unusable text, with the reason (FR-4.1).
@@ -1941,6 +1943,7 @@ impl App {
         self.panel.stale = None;
         self.panel.raw = None;
         self.panel.stream.clear();
+        self.panel.scroll = 0;
         self.panel.state = AnalysisState::Ready;
         self.panel.analysis = Some(Box::new(stored));
         if !keep {
@@ -3159,6 +3162,9 @@ impl App {
         if overlay == Overlay::Help {
             self.help_scroll = 0;
         }
+        if overlay == Overlay::Analysis {
+            self.panel.scroll = 0;
+        }
         match overlay {
             Overlay::Leader => {
                 self.overlay = Overlay::Leader;
@@ -3988,6 +3994,31 @@ impl App {
             }
             KeyCode::Char('u') if self.overlay == Overlay::Help => {
                 self.help_scroll = self.help_scroll.saturating_sub(10);
+                Effect::None
+            }
+            // The analysis panel is longer than most terminals, so it scrolls.
+            KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Analysis => {
+                self.panel.scroll = self.panel.scroll.saturating_add(1);
+                Effect::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.overlay == Overlay::Analysis => {
+                self.panel.scroll = self.panel.scroll.saturating_sub(1);
+                Effect::None
+            }
+            KeyCode::Char('g') if self.overlay == Overlay::Analysis => {
+                self.panel.scroll = 0;
+                Effect::None
+            }
+            KeyCode::Char('G') if self.overlay == Overlay::Analysis => {
+                self.panel.scroll = usize::MAX;
+                Effect::None
+            }
+            KeyCode::Char('d') if self.overlay == Overlay::Analysis => {
+                self.panel.scroll = self.panel.scroll.saturating_add(10);
+                Effect::None
+            }
+            KeyCode::Char('u') if self.overlay == Overlay::Analysis => {
+                self.panel.scroll = self.panel.scroll.saturating_sub(10);
                 Effect::None
             }
             KeyCode::Enter if self.overlay == Overlay::ThemePicker => {

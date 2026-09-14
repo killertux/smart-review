@@ -19,12 +19,11 @@ use crate::tui::theme::{Theme, element};
 /// Renders the analysis panel: the answer, or the progress towards it (FR-4.1).
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
-    // The notices and the key hints come first, because the panel is capped at the
-    // height of the terminal and an analysis is longer than any screen: a footer would
-    // be the first thing cut off, and "how do I leave" is not the thing to lose.
+    // The key hints come first, so "how do I leave" is never the thing cut off. The
+    // body is longer than most terminals, so the panel scrolls (j/k, g/G, d/u).
     let mut lines = vec![
         Line::from(Span::styled(
-            " a reopens this · o switches order · `:plan` and `:context` show the rest · Esc closes"
+            " a reopens this · o switches order · j/k scroll · `:plan` and `:context` show the rest · Esc closes"
                 .to_owned(),
             theme.style(element::MUTED),
         )),
@@ -44,6 +43,21 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let height = height_for(lines.len()).saturating_add(2).min(area.height);
     let popup = layout::centered(area, area.width.saturating_sub(4), height);
+
+    // Two rows are the border; the rest is scrollable content.
+    let visible = usize::from(popup.height.saturating_sub(2));
+    let offset = app.panel.scroll.min(lines.len().saturating_sub(visible));
+    let title = if lines.len() > visible {
+        format!(
+            "{} [{}/{}]",
+            panel_title(app).trim_end(),
+            (offset + visible).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        panel_title(app)
+    };
+
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
@@ -51,10 +65,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Block::new()
                     .borders(Borders::ALL)
                     .border_style(theme.style(element::BORDER_FOCUSED))
-                    .title(panel_title(app)),
+                    .title(title),
             )
             .style(theme.style(element::BG))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         popup,
     );
 }
@@ -115,26 +130,81 @@ fn running_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         )));
         return lines;
     }
-    // Only the tail is drawn: the interesting part of a stream is the end, and the
-    // answer is displayed properly once it has been parsed.
-    for line in text
-        .lines()
-        .rev()
-        .take(24)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", crate::tui::text::truncate(line, 120)),
-            theme.style(element::FG),
-        )));
+
+    // The JSON is still incomplete, so parse whatever has arrived whole and show it
+    // in the same shape the completed analysis will have (FR-4.4).
+    let preview = crate::domain::analysis::preview(text);
+    if preview.is_empty() {
+        // Nothing usable yet (prose before the object, or a token cut where a partial
+        // parse cannot read it). Show the raw tail, as before.
+        for line in text
+            .lines()
+            .rev()
+            .take(24)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", crate::tui::text::truncate(line, 120)),
+                theme.style(element::FG),
+            )));
+        }
+        if app.analysis_stream_truncated() {
+            lines.push(Line::from(Span::styled(
+                " … the preview is bounded; the full text is used once it is complete".to_owned(),
+                theme.style(element::MUTED),
+            )));
+        }
+        return lines;
     }
-    if app.analysis_stream_truncated() {
+
+    if !preview.summary.is_empty() {
+        lines.extend(section(theme, "Summary", &preview.summary));
+    }
+    if !preview.intent.is_empty() {
+        lines.push(Line::default());
+        lines.extend(section(theme, "Why", &preview.intent));
+    }
+    if !preview.risks.is_empty() {
+        let risks: Vec<(Severity, String, String)> = preview
+            .risks
+            .iter()
+            .map(|risk| (risk.severity, risk.title.clone(), risk.why.clone()))
+            .collect();
+        lines.extend(risk_lines(theme, &risks));
+    }
+    if !preview.questions.is_empty() {
+        lines.extend(question_lines(theme, &preview.questions));
+    }
+    if !preview.plan.is_empty() {
+        lines.extend(preview_plan_lines(theme, &preview.plan));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " … the answer is still streaming; what is shown is what has arrived so far".to_owned(),
+        theme.style(element::MUTED),
+    )));
+    lines
+}
+
+/// The review order as it streams in, before path normalization (FR-4.4).
+fn preview_plan_lines(
+    theme: &Theme,
+    plan: &[crate::domain::analysis::PreviewPlan],
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default(), heading(theme, "Review order")];
+    for (index, group) in plan.iter().enumerate() {
         lines.push(Line::from(Span::styled(
-            " … the preview is bounded; the full text is used once it is complete".to_owned(),
-            theme.style(element::MUTED),
+            format!("  {}. {}", index + 1, group.group),
+            theme.style(element::ACCENT),
         )));
+        for line in wrap_paragraph(&group.rationale, 88) {
+            lines.push(Line::from(Span::styled(
+                format!("      {line}"),
+                theme.style(element::MUTED),
+            )));
+        }
     }
     lines
 }
