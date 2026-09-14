@@ -387,6 +387,250 @@ pub fn tidy_path(raw: &str) -> String {
     without_prefix.trim_end_matches('/').to_owned()
 }
 
+/// What could be read from an answer that has not finished streaming (FR-4.4).
+///
+/// The model streams its JSON object field by field, so the interface shows the
+/// fields that have arrived whole and simply omits the rest, instead of painting the
+/// raw JSON as it accumulates. It is a display convenience: the completed answer is
+/// parsed and normalized the moment the stream ends, and that is what is stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preview {
+    /// What changed, in the model's words (may be cut mid-sentence).
+    pub summary: String,
+    /// Why, inferred (may be cut mid-sentence).
+    pub intent: String,
+    /// The risk areas that have streamed in whole.
+    pub risks: Vec<PreviewRisk>,
+    /// The plan steps that have streamed in whole.
+    pub plan: Vec<PreviewPlan>,
+    /// The questions that have streamed in whole.
+    pub questions: Vec<String>,
+}
+
+impl Preview {
+    /// Whether nothing usable has arrived yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.summary.is_empty()
+            && self.intent.is_empty()
+            && self.risks.is_empty()
+            && self.plan.is_empty()
+            && self.questions.is_empty()
+    }
+}
+
+/// One risk the model has finished describing, before path normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewRisk {
+    pub title: String,
+    pub severity: Severity,
+    pub why: String,
+}
+
+/// One plan step the model has finished describing, before path normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewPlan {
+    pub group: String,
+    pub rationale: String,
+}
+
+/// Reads whatever fields a not-yet-complete answer already contains (FR-4.4).
+///
+/// Tolerant of every truncation shape: a string cut mid-word, an array or object cut
+/// mid-entry, a value cut before it started, or a key cut before its colon. A field
+/// appears only once it is whole; the moment its closing token streams in it is picked
+/// up on the next frame.
+#[must_use]
+pub fn preview(text: &str) -> Preview {
+    let Some(object) = repair_object(text) else {
+        return Preview::default();
+    };
+    let risks = object
+        .get("risk_areas")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| entries.iter().filter_map(preview_risk).collect())
+        .unwrap_or_default();
+    let plan = object
+        .get("review_plan")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| entries.iter().filter_map(preview_plan).collect())
+        .unwrap_or_default();
+    let questions = object
+        .get("suggested_questions")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Preview {
+        summary: string_field(&object, "summary"),
+        intent: string_field(&object, "intent"),
+        risks,
+        plan,
+        questions,
+    }
+}
+
+/// A top-level string field, or the empty string when it has not arrived yet.
+fn string_field(object: &serde_json::Value, key: &str) -> String {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Rebuilds a balanced JSON object from a possibly-truncated answer.
+///
+/// Closes the string, array and object tokens the stream cut off, drops a key that was
+/// cut before its colon, and fills a value that never started with `null` — so the
+/// fields that did arrive whole can be read. The result is only used for display; the
+/// completed answer is parsed and normalized separately.
+fn repair_object(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let mut out = String::new();
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut string_start = 0_usize;
+    let mut string_is_key = false;
+    let mut last_significant = '\0';
+
+    for ch in text[start..].chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                string_is_key = last_significant == '{'
+                    || (last_significant == ',' && stack.last() == Some(&'}'));
+                string_start = out.len();
+                out.push(ch);
+            }
+            '{' => {
+                stack.push('}');
+                last_significant = '{';
+                out.push(ch);
+            }
+            '[' => {
+                stack.push(']');
+                last_significant = '[';
+                out.push(ch);
+            }
+            '}' | ']' => {
+                if stack.last() == Some(&ch) {
+                    stack.pop();
+                }
+                last_significant = ch;
+                out.push(ch);
+            }
+            ':' => {
+                last_significant = ':';
+                out.push(ch);
+            }
+            ',' => {
+                last_significant = ',';
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    // An incomplete escape at the very end is dropped.
+    if escaped {
+        out.pop();
+    }
+    if in_string {
+        if string_is_key {
+            // A key cut before its colon: drop it, and the comma that preceded it.
+            out.truncate(string_start);
+            while out.chars().next_back().is_some_and(char::is_whitespace) {
+                out.pop();
+            }
+            if out.ends_with(',') {
+                out.pop();
+            }
+        } else {
+            out.push('"');
+        }
+    }
+
+    // A value that never arrived, or an entry that never began.
+    while out.chars().next_back().is_some_and(char::is_whitespace) {
+        out.pop();
+    }
+    if out.ends_with(':') {
+        out.push_str("null");
+    } else if out.ends_with(',') {
+        out.pop();
+    }
+
+    while let Some(close) = stack.pop() {
+        out.push(close);
+    }
+    serde_json::from_str(&out).ok()
+}
+
+/// A complete risk area, or nothing when the entry is still missing its title.
+fn preview_risk(value: &serde_json::Value) -> Option<PreviewRisk> {
+    let title = value.get("title")?.as_str()?.trim().to_owned();
+    if title.is_empty() {
+        return None;
+    }
+    let severity = match value
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+    {
+        Some("high") => Severity::High,
+        Some("low") => Severity::Low,
+        _ => Severity::Medium,
+    };
+    Some(PreviewRisk {
+        title,
+        severity,
+        why: value
+            .get("why")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    })
+}
+
+/// A complete plan step, or nothing when the entry is still missing its group.
+fn preview_plan(value: &serde_json::Value) -> Option<PreviewPlan> {
+    let group = value.get("group")?.as_str()?.trim().to_owned();
+    if group.is_empty() {
+        return None;
+    }
+    Some(PreviewPlan {
+        group,
+        rationale: value
+            .get("rationale")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned(),
+    })
+}
+
 /// Parses the model's answer and normalizes it against the diff.
 ///
 /// # Errors
@@ -1272,5 +1516,71 @@ mod tests {
         assert_eq!(analysis.review_plan.len(), 1);
         assert_eq!(analysis.review_plan[0].group, UNCLASSIFIED);
         assert_eq!(analysis.review_plan[0].files.len(), index().len());
+    }
+
+    #[test]
+    fn a_summary_is_read_before_the_object_is_closed() {
+        let preview = preview(r#"{"summary": "Billing now rounds half-up.", "int"#);
+        assert_eq!(preview.summary, "Billing now rounds half-up.");
+        assert!(preview.intent.is_empty());
+        assert!(!preview.is_empty());
+    }
+
+    #[test]
+    fn a_value_cut_mid_word_is_shown_as_it_arrived() {
+        assert_eq!(
+            preview(r#"{"summary": "Money now ro"#).summary,
+            "Money now ro"
+        );
+    }
+
+    #[test]
+    fn a_truncated_risk_array_shows_what_arrived() {
+        let preview = preview(
+            r#"{"risk_areas": [{"title": "Rounding", "severity": "high", "why": "money"},
+                               {"title": "Par"#,
+        );
+        // The first entry is whole; the second shows its title as it streams in.
+        assert_eq!(preview.risks.len(), 2);
+        assert_eq!(preview.risks[0].title, "Rounding");
+        assert_eq!(preview.risks[0].severity, Severity::High);
+        assert_eq!(preview.risks[1].title, "Par");
+        assert_eq!(preview.risks[1].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn a_key_cut_before_its_colon_is_dropped_not_a_failure() {
+        let preview = preview(r#"{"summary": "done", "int"#);
+        assert_eq!(preview.summary, "done");
+        assert!(preview.intent.is_empty());
+    }
+
+    #[test]
+    fn a_value_that_never_started_is_not_a_failure() {
+        let preview = preview(r#"{"summary": "done", "intent":"#);
+        assert_eq!(preview.summary, "done");
+        assert!(preview.intent.is_empty());
+    }
+
+    #[test]
+    fn a_complete_object_previews_everything() {
+        let preview = preview(
+            r#"{"summary": "s", "intent": "i",
+                "risk_areas": [{"title": "R", "severity": "low", "why": "w"}],
+                "review_plan": [{"group": "domain", "rationale": "r"}],
+                "suggested_questions": ["q?"]}"#,
+        );
+        assert_eq!(preview.summary, "s");
+        assert_eq!(preview.intent, "i");
+        assert_eq!(preview.risks.len(), 1);
+        assert_eq!(preview.risks[0].severity, Severity::Low);
+        assert_eq!(preview.plan.len(), 1);
+        assert_eq!(preview.plan[0].group, "domain");
+        assert_eq!(preview.questions, ["q?"]);
+    }
+
+    #[test]
+    fn prose_without_json_yields_an_empty_preview() {
+        assert!(preview("I could not analyse this pull request.").is_empty());
     }
 }
