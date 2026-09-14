@@ -364,7 +364,7 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
-        id: "review.comment",
+        id: "review.comment_line",
         description: "Comment on the line under the cursor (c)",
         group: Group::Review,
         hint: false,
@@ -372,6 +372,30 @@ pub const ACTIONS: &[ActionDef] = &[
     ActionDef {
         id: "review.range",
         description: "Start a range: V, move, then c",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.approve",
+        description: "Stage an approval (<leader>ra)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.request_changes",
+        description: "Stage a request for changes (<leader>rc)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.comment_only",
+        description: "Stage a comment with no verdict (<leader>rm)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.discard",
+        description: "Throw the staged review away (<leader>rx)",
         group: Group::Review,
         hint: false,
     },

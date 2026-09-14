@@ -4,10 +4,10 @@ A terminal client for reviewing GitHub pull requests, with LLM-assisted analysis
 and a review order that follows the project's architecture instead of the
 filesystem.
 
-> **Status: M1 — browsing and reading.** List, filter and search pull requests,
-> then read the diff with vim motions, folding, mouse and a side-by-side view. The
-> managed worktree, the model picker, the LLM analysis, chat and review publishing
-> arrive in M2–M4 (see [`PLAN.md`](PLAN.md)).
+> **Status: M4 — the review loop is closed.** List and read pull requests, analyse
+> them with an LLM and get a review order, talk about them, and publish a review
+> with inline comments — one batched call, confirmed in a modal that shows exactly
+> what will be sent. M5 (polish and release) is next (see [`PLAN.md`](PLAN.md)).
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ filesystem.
 |---|---|---|
 | Rust | 1.88 | Ratatui 0.30.2 requires it |
 | `git` | 2.30 | Repository and worktree operations (M2) |
-| `gh` | 2.40, authenticated | Pull requests, review submission |
+| `gh` | 2.40, authenticated | Pull requests, and publishing a review (`gh pr review`, `gh api`) |
 
 `--check` runs the same detection the interface does and exits 0 ready / 1 degraded
 / 2 unusable, naming the first thing to fix.
@@ -50,6 +50,12 @@ Inside the app:
 | `Enter` | send the question (`Alt-Enter` or `Ctrl-J` adds a line) |
 | `r` | repeat the last question |
 | `Esc` | stop the answer that is arriving, then leave the pane |
+| `c` | comment on the line under the cursor (`Enter` stages it, `Esc` cancels) |
+| `v` / `V` | mark one end of a range, then move and press `c` |
+| `<leader>rd` | the staged comments: `j`/`k` walk them, `x` removes one |
+| `<leader>rr` | publish the review: the modal shows it verbatim, `Enter` twice sends |
+| `<leader>ra` / `rc` / `rm` | stage an approval / request changes / a comment with no verdict |
+| `<leader>rx` | throw the staged review away (it asks first) |
 | `o` | switch between the recommended and path orders |
 | `J` / `K` | move the selected review-plan group |
 | `<leader>dc` | cycle the diff context: 3, 10, 0 lines |
@@ -68,10 +74,25 @@ Inside the app:
 `:sort updated desc`, `:load-more`, `:copy-path`, `:theme <name>|next|reload`,
 `:analyze [--force|raw]`, `:plan [reset|path|move <file> <group>]`,
 `:context [add|remove <path>]`, `:chat [new|list|open <id>|export [md|json]|retry]`,
+`:draft [list|remove <n>|clear|decision <d>|body <text>|export [md|json]]`,
 `:model [show]`, `:key [clear <provider>]`, `:catalog [refresh]`,
 `:workspace [clean [--all]]`, `:set ui.timeoutlen=250`, `:keymap`, `:version`.
 `Esc` closes a popup, cancels a half-typed key sequence, or stops an analysis that is
 running.
+
+`c` on a line opens the comment composer: `Enter` stages the comment, `Alt-Enter` adds
+a line, `Esc` throws it away, and `v` first turns it into a range. Staged comments are
+marked `●` in the diff gutter, listed by `<leader>rd` (where `x` removes one), and saved
+as you write them in `~/.smart-review/drafts/` — a draft is the one thing here that
+cannot be fetched again, so it does not live under `cache/`. `<leader>rr` opens the
+publish modal: the decision, the body and every comment, verbatim, and nothing is sent
+until you press `Enter` twice. A review with inline comments goes to GitHub in **one**
+request, so it arrives as a single review rather than as N notifications; a failure
+leaves the draft exactly where it was and says what GitHub said, in words. Threads that
+are already on the pull request are drawn under the lines they are about, read-only.
+`--dry-run` (or `[forge] dry_run = true`) records every command that would change
+something — publishing, `:workspace clean` — in `logs/dry-run.log` and runs none of
+them.
 
 Opening a pull request also materialises it as a managed git worktree under
 `~/.smart-review/worktrees/`, so the diff can be produced locally: the context and
@@ -139,6 +160,7 @@ Everything the application owns goes under `$SMART_REVIEW_HOME`
   themes/*.toml      your themes; each inherits from `base`
   state.toml         remembered theme and last session
   cache/             disposable: PR lists, diffs, analyses and their plans, chats
+  drafts/            staged reviews, one file per pull request — not disposable
   worktrees/         per-pull-request checkouts owned by the app (M2)
   logs/              rotated logs; never contains secrets
 ```

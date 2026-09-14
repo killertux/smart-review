@@ -108,3 +108,17 @@ jobs:
       # app actually sent is checked on the wire for what must and must not be in it.
       - name: Milestone validation (M2b)
         run: bash scripts/validate/m2b.sh
+
+      # M3 adds the conversation: the validator stands in for the provider again, this
+      # time with a scripted answer that streams, and reads the wire for what a chat
+      # request must and must not carry — the bundle in the system prompt, the earlier
+      # turns in the history, and a committed `.env` never.
+      - name: Milestone validation (M3)
+        run: bash scripts/validate/m3.sh
+
+      # M4 adds publishing. The fake `gh` records its argv and keeps a copy of every
+      # `--input` payload, so the step that matters asserts on what reached the wire:
+      # one review, with the decision and every comment in it, and no per-comment call
+      # at all — plus a dry run that reaches nothing.
+      - name: Milestone validation (M4)
+        run: bash scripts/validate/m4.sh

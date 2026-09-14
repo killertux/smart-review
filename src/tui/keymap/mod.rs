@@ -346,12 +346,25 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Insert), "<Esc>", "chat.cancel"),
     // `c` comments on the line under the cursor (FR-6.2). It is unbound elsewhere in
     // normal mode, and it is what the requirement names.
-    (Scope::In(Mode::Normal), "c", "review.comment"),
-    // `V` marks the start of a range, in the spirit of visual mode: `V`, move, `c`
-    // (FR-6.2). Without it a range comment would need a key that acts twice.
+    (Scope::In(Mode::Normal), "c", "review.comment_line"),
+    // `v` marks the start of a range, in the spirit of visual mode: `v`, move, `c`
+    // (FR-6.2). `V` is bound to the same action because both spellings are in muscle
+    // memory and neither means anything else here. It is not vim's visual mode: there
+    // is nothing to operate on with an operator, only a second end for a comment.
+    (Scope::In(Mode::Normal), "v", "review.range"),
     (Scope::In(Mode::Normal), "V", "review.range"),
     (Scope::In(Mode::Normal), "<leader>rd", "review.drafts"),
     (Scope::In(Mode::Normal), "<leader>rr", "review.publish"),
+    // The decision keys, as §5.4 lists them (FR-6.1). They stage a verdict rather than
+    // sending one: the modal is still what publishes.
+    (Scope::In(Mode::Normal), "<leader>ra", "review.approve"),
+    (
+        Scope::In(Mode::Normal),
+        "<leader>rc",
+        "review.request_changes",
+    ),
+    (Scope::In(Mode::Normal), "<leader>rm", "review.comment_only"),
+    (Scope::In(Mode::Normal), "<leader>rx", "review.discard"),
     // `x` removes the selected staged comment *in the draft panel*, where the draft is
     // what the keyboard belongs to; elsewhere it still clears filters, which is what
     // the list pane wants (FR-6.1).

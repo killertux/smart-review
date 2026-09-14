@@ -113,9 +113,14 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 
 /// Runs an action.
 ///
+/// Long by construction: it is the one table mapping an action id to what it does, and
+/// every arm is a line or two. Splitting it would separate the ids from their
+/// behaviour, which is the pairing the tests and the help popup both read.
+///
 /// The returned [`Effect`] tells the event loop what it has to do; only the
 /// leader menu asks to keep the pending key sequence so the next key can
 /// complete it (FR-7.3).
+#[allow(clippy::too_many_lines)]
 pub fn dispatch(app: &mut App, id: &str) -> Effect {
     match id {
         "app.quit" => {
@@ -136,7 +141,11 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "app.model_picker" => app.open_model_picker(),
-        "review.comment" => app.start_comment(),
+        "review.comment_line" => app.start_comment(),
+        "review.approve" => app.set_draft_decision("approve"),
+        "review.request_changes" => app.set_draft_decision("request-changes"),
+        "review.comment_only" => app.set_draft_decision("comment"),
+        "review.discard" => app.ask_clear_draft(),
         "review.range" => app.start_selection(),
         "review.drafts" => app.open_drafts(),
         "review.publish" => app.open_publish(),

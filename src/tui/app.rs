@@ -1801,6 +1801,11 @@ impl App {
     }
 
     /// Records the decision (FR-6.1).
+    ///
+    /// Reachable from `<leader>ra`/`rc`/`rm` and from `:draft decision`, as well as
+    /// from the modal's own keys: the verdict is part of the draft, and a decision that
+    /// could only be made inside the publish modal would make the modal a form rather
+    /// than a confirmation.
     pub(crate) fn set_draft_decision(&mut self, value: &str) -> Effect {
         if value.trim().is_empty() {
             self.notice(

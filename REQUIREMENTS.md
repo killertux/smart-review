@@ -1,6 +1,6 @@
 # Smart Review — Requirements Specification
 
-**Status:** Draft v0.9 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M0–M3 are implemented: the shell, browsing and diffs, the workspace and model configuration, the analysis with its review order, and chat. §5's keymap reflects them. M4 (review publishing) is next.
+**Status:** Draft v1.0 (DEC-1 … DEC-6, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-16, DEC-18 pending, each with a proposed default). M0–M4 are implemented: the shell, browsing and diffs, the workspace and model configuration, the analysis with its review order, chat, and review publishing. §5's keymap reflects them. M5 (polish and release) is next.
 **Scope:** v1 (MVP) + post-v1 backlog
 **Source of truth:** this file. If code and this file disagree, the file wins or the file is updated in the same change.
 
@@ -291,32 +291,34 @@ Per-session token usage is displayed; `max_tokens`/`temperature` are configurabl
 **FR-6.1 Draft model** — MUST — M4 — *DEC-3 `[DECIDED]`: publish decision + body + batched inline comments*
 A review exists as a local Draft containing `decision: Option<Decision>`, `body: Option<String>`, `comments: Vec<DraftComment { path, side: Old|New, line, start_line: Option<u32>, body }>`.
 Acceptance criteria:
-- [ ] Drafts persist across restarts and are per PR.
+- [ ] Drafts persist across restarts and are per PR. *Implementation note (M4):* kept in `<home>/drafts/<host>/<owner>/<name>/pr-<N>.json`, written through an atomic replace. Deliberately **not** under `cache/`: a draft is the one document here that cannot be fetched again, so it must not share a directory with things that are meant to be evicted.
 - [ ] The draft panel lists staged comments with file/line; `x`/`:draft remove` deletes one; `:draft clear` clears all (with confirmation).
-- [ ] Staged comments are visible in the diff gutter as a distinct marker.
+- [ ] Staged comments are visible in the diff gutter as a distinct marker. *Implementation note (M4):* `●` in a column of its own, beside the `+`/`-` marker rather than replacing it — the two answer different questions.
 
 **FR-6.2 Inline comments** — MUST — M4 — *DEC-3 `[DECIDED]`: inline comments are published in v1*
 From the diff pane the user can create a comment on a line or a selected range on the new side or the old side.
 Acceptance criteria:
 - [ ] The comment editor shows file, side and line range; empty bodies are rejected.
 - [ ] A range selection requires start ≤ end on the same side and same file; invalid ranges are refused with a reason.
-- [ ] The composer supports multi-line input, and MAY open `$EDITOR` via `:edit` (on exit, content is re-read; a terminal-restore failure MUST be recoverable).
+- [ ] The composer supports multi-line input, and MAY open `$EDITOR` via `:edit` (on exit, content is re-read; a terminal-restore failure MUST be recoverable). *Implementation note (M4):* `Enter` stages the comment and `Alt-Enter`/`Ctrl-J` add a line — the same modifier split as the chat compose box, and the opposite of it for the unmodified key. Staging a comment is local and reversible; sending a question costs money and cannot be taken back, so the two boxes deliberately differ on the key that commits. `$EDITOR` is not wired yet (M5); the multi-line box covers the case. A range is written with `V`, then movement, then `c`; a selection that crosses a file or a side is refused with the reason rather than silently becoming one line.
 
 **FR-6.3 Publishing** — MUST — M4 — *DEC-3 `[DECIDED]`: batched review via GraphQL*
 Publishing MUST be explicit, confirmed, and atomic from the user's perspective.
 Acceptance criteria:
 - [ ] A publish modal shows the decision, the body, and every inline comment verbatim before sending.
-- [ ] With inline comments present, publishing MUST use a **batched** review (create pending review with comments → submit with the decision) so the PR receives one review, not N comments. `gh pr review` only supports `--approve/--request-changes/--comment --body` (verified on gh 2.45), so batching requires `gh api graphql` (Appendix A).
+- [ ] With inline comments present, publishing MUST use a **batched** review so the PR receives one review, not N comments. `gh pr review` only supports `--approve/--request-changes/--comment --body` (verified on gh 2.45). *Implementation note (M4):* the batch is one `POST /repos/{owner}/{repo}/pulls/{N}/reviews` carrying `event`, `body`, `commit_id` and every comment, sent with `gh api --input <file>`, rather than the GraphQL pair DEC-3 originally recorded. One request means "one review" cannot half-happen; the payload is built by `serde_json`, so no user text is ever escaped by hand; and the response carries the review's URL for the status line. A list of GraphQL input objects cannot be passed as a variable over argv, which is what the two-call route would have required. DEC-3's decision (one batched review, inline comments in v1) is unchanged — only its recorded route. See Appendix A.
 - [ ] `gh pr review` is used only when there are no inline comments; the adapter exposes both paths behind one `submit_review` port method.
 - [ ] Double-submit is prevented (in-flight guard + idempotency); the button is disabled after success.
 - [ ] GitHub's "cannot approve/request changes on your own PR" and "no commits between" errors are surfaced as human sentences, with the draft preserved.
-- [ ] After a successful publish, the draft is cleared, the PR detail is refreshed, and the status line confirms what was sent.
+- [ ] After a successful publish, the draft is cleared, the PR detail is refreshed, and the status line confirms what was sent. *Implementation note (M4):* the draft's file is **removed**, not rewritten empty, and a failure to remove it is a warning rather than a failed publish — the review is already on GitHub by then.
 
 **FR-6.4 Existing discussion** — SHOULD — M4
 Existing reviews, inline comments and replies MUST be visible (read-only in v1), grouped by thread, and reachable from the affected diff line.
+*Implementation note (M4):* drawn inline, under the line they were made on, from the comments the detail already fetches. Grouped by `in_reply_to`; a reply whose parent is not in the list becomes a thread of its own rather than disappearing. A comment whose line is no longer in the diff is **not** drawn: attaching it to the nearest surviving line would look like a comment about that line. Bodies wrap at a fixed 100 columns, because rows are built once and drawn at whatever width the terminal has.
 
 **FR-6.5 Safety** — MUST — M4
 No network-mutating action may occur without an explicit user confirmation. Destructive local actions (draft clear, workspace removal) also confirm. `--dry-run` (or `dry_run = true`) prints the exact `gh`/`git` commands that *would* run, and MUST be honored by all adapters.
+*Implementation note (M4):* the gate is a property of the command, not of a feature: a call says whether it mutates and the process runner records mutating calls instead of running them, appending them to `logs/dry-run.log`. A forgotten mark therefore fails *visibly* (the call runs during a dry run) rather than invisibly (a real call that silently does not happen). Reads still run — a dry run that could not read would have nothing to describe — and `git fetch` is deliberately not marked, because it writes only into this application's own ref namespace and holding it back would mean the app could not show a diff at all. In a terminal there is no stdout to print to, so the commands go to the log file and the status line names it.
 
 ### FR-7 UI shell
 
@@ -337,7 +339,7 @@ Acceptance criteria:
 The leader menu is a **hint**: it appears as soon as the leader is pressed rather than after `timeoutlen`, and the sequence stays open, so a continuation key still completes a longer binding and `Esc` dismisses it. Hints are declared in the registry, so another menu can opt in without special-casing an action id.
 
 **FR-7.4 Command line** — MUST — M0/M1
-Minimum commands: `:q`/`:qa`, `:help`, `:pr <N>`, `:filter <query>`, `:clear-filters`, `:sort <field>`, `:theme [<name>|next|reload]`, `:set <key>=<value>`, `:keymap`, `:model [show|save <name>|use <name>]`, `:key [set|clear] <provider>`, `:catalog refresh`, `:analyze [--force]`, `:context [add|remove <path>]`, `:chat new|list|export`, `:draft clear|remove`, `:workspace clean`, `:refresh`, `:doctor`, `:dry-run on|off`. Unknown commands produce an inline error; `Tab` completes.
+Minimum commands: `:q`/`:qa`, `:help`, `:pr <N>`, `:filter <query>`, `:clear-filters`, `:sort <field>`, `:theme [<name>|next|reload]`, `:set <key>=<value>`, `:keymap`, `:model [show|save <name>|use <name>]`, `:key [set|clear] <provider>`, `:catalog refresh`, `:analyze [--force]`, `:context [add|remove <path>]`, `:chat new|list|export`, `:draft [list|remove <n>|clear|decision <d>|body <text>|export [md|json]]`, `:workspace clean`, `:refresh`, `:doctor`, `:dry-run on|off`. Unknown commands produce an inline error; `Tab` completes.
 
 **FR-7.5 Mouse** — MUST — M1
 Enabled by default, toggleable via `:set mouse=false`. Scroll wheel scrolls the hovered/focused pane; left click focuses a pane; click selects a list row; click on the file tree toggles/opens; click on a diff line moves the cursor there (and is the entry point for a comment). Text drag-selection and right-click menus are MAY.
@@ -374,7 +376,7 @@ Root: `$SMART_REVIEW_HOME` if set, else `~/.smart-review`.
     repos/<host>_<owner>_<name>/pr-<N>/detail.json
     repos/<host>_<owner>_<name>/pr-<N>/analysis-<head_sha>.json
     repos/<host>_<owner>_<name>/pr-<N>/chat-<session>.json
-    repos/<host>_<owner>_<name>/pr-<N>/draft.json
+drafts/<host>/<owner>/<name>/pr-<N>.json
   worktrees/<owner>-<repo>/pr-<N>/
   logs/smart-review.log       # rotated, max 5 files × 2 MiB
   README.md                   # generated on first run: where things live
@@ -663,7 +665,7 @@ See DEV-1/DEP-1 in §8. Baseline expected dependencies (each still requires appr
 | `command` | `:` | `Esc`, `<CR>` | line editor with completion |
 | `search` | `/`, `?` | `Esc`, `<CR>` | incremental; `n`/`N` repeat |
 | `popup` | any popup | `Esc` | keys scoped to the popup |
-| `visual` | `v` (M5: line/range selection for comments, with publishing) | `Esc` | reserved; no action is bound yet |
+| `visual` | `v` (line/range selection for comments) | `Esc` | `v` marks one end of a comment's range and `c` finishes it; a full visual mode (operators over a selection) is M5 |
 
 Default bindings (all remappable; this is the compiled-in default set):
 | Keys | Action | Scope |
@@ -682,6 +684,8 @@ Default bindings (all remappable; this is the compiled-in default set):
 | `?` | `app.help` | also `<leader>?`; `?` is *not* backward search (DEC-20) |
 | `<leader>` | `app.leader_menu` | shown immediately, sequence stays open (FR-7.3) |
 | `Enter` | `nav.open` | open the selected PR |
+| `Enter` (composer) | `chat.send` / stage | in the comment composer: stages the comment (local, reversible). In the chat box: sends the question |
+| `<A-Enter>` `<C-j>` `<S-Enter>` | `chat.newline` | a newline in either compose box |
 | `<Tab>` | `pane.next` | tree ↔ diff (in the review screen) |
 | `] c` `[ c` | `diff.next_hunk` / `diff.prev_hunk` | diff |
 | `} {` | `diff.next_file` / `diff.prev_file` | diff |
@@ -690,8 +694,8 @@ Default bindings (all remappable; this is the compiled-in default set):
 | `<leader> d c` | `diff.cycle_context` | 3 → 10 → 0 → 3; 0/3 are local-mode only |
 | `<leader> d w` | `diff.toggle_whitespace` | local mode only; explains itself otherwise |
 | `o` | `review_order.toggle` | diff |
-| `c` | `review.comment_line` | diff (normal) |
-| `v` | `visual.start` | diff |
+| `c` | `review.comment_line` | diff (normal): opens the composer on the line under the cursor |
+| `v` `V` | `review.range` | diff: marks one end of a range, then move, then `c` |
 | `R` | `app.refresh` | |
 | `q` / `:q` / `:qa` | `app.quit` | |
 | `<leader> a` | `llm.analyze` | |
@@ -699,11 +703,12 @@ Default bindings (all remappable; this is the compiled-in default set):
 | `<leader> T` | `theme.toggle` | next theme, wrapping |
 | `<leader> f` | `filter.menu` | opens `:filter ` on the command line |
 | `<leader> l` | `review_order.menu` | |
-| `<leader> r r` | `review.publish` | |
-| `<leader> r a` | `review.approve` | sets decision |
-| `<leader> r c` | `review.request_changes` | |
-| `<leader> r m` | `review.comment_only` | |
-| `<leader> r x` | `review.discard` | with confirmation |
+| `<leader> r r` | `review.publish` | opens the publish modal; `Enter` arms it, `Enter` again sends (FR-6.3) |
+| `<leader> r a` | `review.approve` | stages an approval |
+| `<leader> r c` | `review.request_changes` | stages a request for changes |
+| `<leader> r m` | `review.comment_only` | stages a comment with no verdict |
+| `<leader> r x` | `review.discard` | empties the draft, with confirmation (FR-6.5) |
+| `<leader> r d` | `review.drafts` | the staged comments: `j`/`k` walk them, `x` removes one, `Enter` publishes |
 | `<leader> s` | `sort.menu` | opens `:sort ` on the command line |
 | `<leader> m` | `model.picker` | provider → model → thinking |
 | `<leader> t` | `theme.picker` | |
@@ -882,7 +887,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 |---|---|---|---|
 | **DEC-1** | How is the PR head materialized on disk? | `[DECIDED]` **Managed git worktree** at `~/.smart-review/worktrees/<owner>-<repo>/pr-<N>`, detached at the head SHA; the user's working tree, index, HEAD and branches are never modified. | Touches FR-3.1, FR-3.2, FR-4.6, persistence layout, safety story. |
 | **DEC-2** | Which LLM capabilities are in v1: analysis only, analysis + chat, or analysis + chat + agentic file reading (tool loop over the repo)? | `[DECIDED]` **Analysis + chat** over a deterministic context bundle. Agentic file reading is deferred to M5+ (cost, latency, privacy predictability); its guardrails are pre-specified in FR-5.3. | FR-5.3, ARCH-2 `LlmPort` (no tool surface in v1), prompt design, M2/M3 scope. |
-| **DEC-3** | Review publishing scope in v1: (a) local drafts only, (b) publish with `gh pr review` (no inline comments), (c) publish decision + body + batched inline comments via GraphQL. | `[DECIDED]` **(c)** — one batched review containing decision, body and inline comments, via `gh api graphql`; `gh pr review` only as the no-inline-comment shortcut. | FR-6.1–6.3, Appendix A, and the amount of GitHub API surface to absorb. |
+| **DEC-3** | Review publishing scope in v1: (a) local drafts only, (b) publish with `gh pr review` (no inline comments), (c) publish decision + body + batched inline comments. | `[DECIDED]` **(c)** — one batched review containing decision, body and inline comments; `gh pr review` only as the no-inline-comment shortcut. **The route was corrected at M4:** the batch is a single `POST …/pulls/{N}/reviews` with a JSON body (`gh api --input`), not the GraphQL pair this row originally recorded. One request cannot half-happen, and a list of GraphQL input objects cannot be passed as a variable over argv. See FR-6.3's implementation note and Appendix A. | FR-6.1–6.3, Appendix A, and the amount of GitHub API surface to absorb. |
 | **DEC-4** | Diff presentation: unified only, unified + side-by-side toggle, and is syntax highlighting required? | `[DECIDED]` **Unified default + side-by-side toggle at width ≥ 140**, delivered in M1. **Syntax highlighting deferred** (large dependency + per-language risk); no highlighting crate in v1. | FR-3.3, ARCH-8 dependency list, M1 scope. |
 | **DEC-5** | Where do LLM API keys live, and how are they set? | `[DECIDED]` Entered **in the TUI** (masked prompt inside the model picker) and saved to `${SMART_REVIEW_HOME}/credentials.toml` at `0600`. Provider env vars are honored as an override and the active source is shown in the UI. Keychain integration deferred. | FR-4.5, FR-8.1, §7.4, NFR-3.1, `--check`/doctor behavior. |
 | **DEC-6** | Default models per provider, and how many profiles? | `[DECIDED]` **No defaults at all.** On first run the user must choose provider + model + thinking in the TUI; provider/model metadata comes from `https://models.dev/api.json` (cached), which also supplies reasoning options, context limits and cost (FR-4.7). Presets are optional and user-created. | FR-4.5, FR-4.7, FR-4.8, §7.5, M2 scope. |
@@ -908,7 +913,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 |---|---|---|---|
 | — | DEC-1 | PR head is materialized in an app-owned `git worktree`, detached at the head SHA; the user's clone is never modified. | owner |
 | — | DEC-2 | v1 ships analysis + chat over a deterministic context bundle; agentic file reading deferred to M5+. | owner |
-| — | DEC-3 | v1 publishes one batched review (decision + body + inline comments) via `gh api graphql`. | owner |
+| M4 | DEC-3 | v1 publishes one batched review (decision + body + inline comments) — route corrected to one REST request (`gh api -X POST …/reviews --input`), which the owner chose over the GraphQL pair DEC-3 had recorded. | owner |
 | — | DEC-4 | Unified diff by default, side-by-side toggle at ≥140 cols, no syntax highlighting in v1. | owner |
 | — | DEC-5 | Provider/model/thinking are configured **inside the TUI**; keys are entered there and saved to `credentials.toml` (0600), with env vars as an override. | owner |
 | — | DEC-6 | No default provider or model. The user must configure one; the model list comes from `https://models.dev/api.json`, which also drives thinking options, limits and cost. | owner |
@@ -939,7 +944,7 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 | File list | `git -C <ws> ls-files --cached --others --exclude-standard` |
 | File content | `git -C <ws> show <head_sha>:<path>` (preferred: reads exactly the PR revision, independent of worktree state) |
 | Publish (body/decision) | `gh pr review N --approve|--request-changes|--comment --body-file -` (body via stdin) |
-| Publish (batched with inline comments) | `gh api graphql` → `addPullRequestReview(input:{pullRequestId, body, comments:[{path, line, side, startLine?, body}]})` then `submitPullRequestReview(input:{pullRequestReviewId, event: APPROVE|REQUEST_CHANGES|COMMENT})`; `<owner>/<repo>/pull/<n>` PR node id via `gh api repos/.../pulls/N --jq .node_id` |
+| Publish (batched with inline comments) | `gh api -X POST repos/{owner}/{repo}/pulls/N/reviews --input <payload.json>`, where the payload is `{"event":"APPROVE"\|"REQUEST_CHANGES"\|"COMMENT","body":…,"commit_id":…,"comments":[{"path":…,"line":…,"side":"LEFT"\|"RIGHT","start_line":…,"start_side":…,"body":…}]}`. One request, one review. **Verified on gh 2.45:** `--input` takes a file path, and the payload is what the adapter deletes when the call returns — so a dry run writes it and leaves it, because the recorded command names it. |
 | Current user | `gh api user --jq .login` (for own-PR detection, FR-6.3) |
 
 ## Appendix B — Prompt & model notes
@@ -976,5 +981,7 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 - [ ] A provider the crate cannot stream (DeepSeek, Groq, Mistral, OpenRouter): the answer arrives, and `logs/` says which way of asking produced it. A key that is wrong, or a provider that is unreachable, must leave the reason on screen — in the chat footer and in the analysis panel — rather than a pane that waits.
 - [ ] `<leader>a` on a real pull request: the estimate and the file list first, then the analysis streaming in, then the tree in the recommended order; `o` returns to path order, `J`/`K` moves a group, and restarting the app shows the analysis from cache without calling the provider (verify in `logs/`).
 - [ ] `<leader>c` on a real pull request: ask something the diff answers and something it does not, watch the second answer say what is missing, `:context add <that file>` and ask again; `Esc` mid-answer stops it and keeps what arrived; restarting shows the conversation; `:chat export md` opens in an editor as something a colleague could read.
-- [ ] `--dry-run` prints the exact commands for fetch, worktree, and publish and performs no mutation.
+- [ ] `c` on two lines of a real pull request, then `<leader>rr`: the modal shows the decision, the body and both comments verbatim, `Enter` twice posts **one** review with both inline comments, GitHub shows a single review (not two notifications), the draft is gone and `:draft list` no longer mentions it. Point the same flow at your own pull request: GitHub refuses, and the refusal is a sentence rather than a raw 422.
+- [ ] A pull request that already has review comments: the threads are drawn under the lines they are about, replies under their comment, and a comment whose line no longer exists is not drawn at all (the tab's count still includes it).
+- [ ] `--dry-run` records the exact commands for the mutating calls — publishing a review, `:workspace clean` — in `logs/dry-run.log`, performs no mutation, and keeps the draft. The recorded command must be runnable by hand.
 - [ ] Second launch reuses cache and workspace and makes no unnecessary network calls (`:` shows the job log).

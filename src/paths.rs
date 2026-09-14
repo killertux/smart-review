@@ -140,6 +140,16 @@ impl Home {
         self.root.join("worktrees")
     }
 
+    /// Directory holding staged reviews, one file per pull request (FR-6.1).
+    ///
+    /// Not under `cache/`, and created with the rest of the layout because it is the
+    /// one directory here whose contents cannot be fetched again: losing it loses the
+    /// review someone was in the middle of writing (FR-8.5's distinction).
+    #[must_use]
+    pub fn drafts(&self) -> PathBuf {
+        self.root.join("drafts")
+    }
+
     /// Directory holding logs (FR-9.2).
     #[must_use]
     pub fn logs(&self) -> PathBuf {
@@ -167,6 +177,7 @@ impl Home {
             self.root.clone(),
             self.themes(),
             self.cache(),
+            self.drafts(),
             self.exports(),
             self.worktrees(),
             self.logs(),
@@ -202,6 +213,7 @@ impl Home {
              - `state.toml` — window, theme and recently opened state.\n\
              - `themes/` — your own themes; each file inherits from `base`.\n\
              - `cache/` — disposable: PR lists, details, analyses and chats.\n\
+             - `drafts/` — staged reviews you have not published; not disposable.\n\
              - `exports/` — chat transcripts you asked to keep (`:chat export`).\n\
              - `worktrees/` — per-pull-request checkouts owned by the app.\n\
              - `logs/` — rotated logs; never contains secrets.\n\n\
