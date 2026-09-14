@@ -3,9 +3,12 @@
 //! Three rules shape this module, and all three exist because publishing is the one
 //! action in this application that other people can see:
 //!
-//! - **the draft is saved before anything is sent.** Every edit writes through to
-//!   disk, so the answer to "did I lose my comments?" is never yes, whatever happens
-//!   next — including the app being killed mid-publish.
+//! - **the draft is saved before anything is sent.** The caller saves it as it is
+//!   edited and again immediately before sending, so the answer to "did I lose my
+//!   comments?" is never yes, whatever happens next — including the app being killed
+//!   mid-publish. This type does not hold the draft: the UI owns the document, and
+//!   puts it here to be read, written or sent, which is what keeps a reducer free of
+//!   file system work.
 //! - **publishing is a single request through the forge port.** The port's contract is
 //!   one review, so this module never loops, and there is no path here that posts N
 //!   comments and hopes.
@@ -13,255 +16,97 @@
 //!   success — or the user saying so. An error is the moment the draft matters most,
 //!   and the moment it is the easiest to lose.
 
-use crate::domain::draft::{Draft, DraftComment, DraftError, Side};
+use crate::domain::draft::{Draft, DraftError};
 use crate::domain::repo::RepoId;
 use crate::domain::time::Timestamp;
-use crate::logging::{self, Level};
 use crate::ports::forge::ForgePort;
 use crate::ports::{Cancel, DraftStoreError, DraftStorePort, ReviewPosted};
 
-/// Staged comments, and the rules for keeping them (FR-6.1).
+/// The draft store, as the rest of the application uses it (FR-6.1, FR-6.3).
 ///
-/// Owns the draft and the store together, because a draft that was changed but not
-/// saved is exactly the state this type exists to make impossible.
+/// Stateless with respect to the draft on purpose: the document is the UI's, and is
+/// handed in to be written or sent. A service that owned it would put a file write
+/// inside every state transition, including the ones that run on a keypress.
 #[derive(Debug)]
-pub struct Drafter {
+pub struct Drafts {
     store: Box<dyn DraftStorePort>,
     repo: RepoId,
-    draft: Draft,
-    /// Whether the last save failed, for the status line to admit to.
-    save_error: Option<String>,
 }
 
-impl Drafter {
+impl Drafts {
+    /// Binds the service to a store and a repository.
+    #[must_use]
+    pub fn new(store: Box<dyn DraftStorePort>, repo: RepoId) -> Self {
+        Self { store, repo }
+    }
+
     /// Loads the draft for a pull request, or starts an empty one (FR-6.1).
     ///
     /// A draft that cannot be read is *reported* and replaced with an empty one: the
     /// alternative is refusing to open the pull request at all because of a file the
-    /// user may not know exists. The unreadable file is left where it is, and the
-    /// error is returned alongside so `:draft` can say what happened.
+    /// user may not know exists. The unreadable file is left where it is, so a build
+    /// that can read it still can.
     #[must_use]
-    pub fn open(
-        store: Box<dyn DraftStorePort>,
-        repo: RepoId,
-        pr: u64,
-        now: Timestamp,
-    ) -> (Self, Option<String>) {
-        match store.load(&repo, pr) {
-            Ok(Some(draft)) => (
-                Self {
-                    store,
-                    repo,
-                    draft,
-                    save_error: None,
-                },
-                None,
-            ),
-            Ok(None) => (
-                Self {
-                    store,
-                    repo,
-                    draft: Draft::new(pr, now),
-                    save_error: None,
-                },
-                None,
-            ),
-            Err(error) => (
-                Self {
-                    store,
-                    repo,
-                    draft: Draft::new(pr, now),
-                    save_error: None,
-                },
-                Some(error.to_string()),
-            ),
+    pub fn load(&self, pr: u64, now: Timestamp) -> (Draft, Option<String>) {
+        match self.store.load(&self.repo, pr) {
+            Ok(Some(draft)) => (draft, None),
+            Ok(None) => (Draft::new(pr, now), None),
+            Err(error) => (Draft::new(pr, now), Some(error.to_string())),
         }
     }
 
-    /// The draft as it stands.
-    #[must_use]
-    pub fn draft(&self) -> &Draft {
-        &self.draft
-    }
-
-    /// The last save failure, if there was one.
-    #[must_use]
-    pub fn save_error(&self) -> Option<&str> {
-        self.save_error.as_deref()
-    }
-
-    /// The pull request this drafter is for.
-    #[must_use]
-    pub fn pr(&self) -> u64 {
-        self.draft.pr
-    }
-
-    /// Remembers the commit the comments are being written against (FR-6.3).
-    ///
-    /// Recorded rather than asked for: the diff knows it, and a comment that cannot
-    /// say which revision it was written about cannot be checked later.
-    pub fn anchor_to(&mut self, head_sha: &str) {
-        if self.draft.head_sha.as_deref() == Some(head_sha) || head_sha.is_empty() {
-            return;
-        }
-        // No save: the head reaches disk with the next real edit. Writing a file
-        // because a pull request was opened would fill the drafts directory with empty
-        // documents for every pull request anyone ever looked at — and the head is not
-        // something the user typed, so it is not a change on its own.
-        self.draft.head_sha = Some(head_sha.to_owned());
-    }
-
-    /// Stages a comment and saves the draft (FR-6.1).
-    ///
-    /// The comment is validated before it can get near the draft: a refusal is a
-    /// sentence in the composer, not a 422 from GitHub after the modal is confirmed.
+    /// Writes a draft, replacing whatever was there (FR-6.1).
     ///
     /// # Errors
     ///
-    /// As [`DraftComment::new`].
-    pub fn stage(
-        &mut self,
-        path: impl Into<String>,
-        side: Side,
-        line: u32,
-        start_line: Option<u32>,
-        body: impl Into<String>,
-        now: Timestamp,
-    ) -> Result<(), DraftError> {
-        let comment = DraftComment::new(path, side, line, start_line, body)?;
-        self.draft.insert(comment, now);
-        self.save();
-        Ok(())
-    }
-
-    /// Removes the comment the panel numbers `number` (FR-6.1).
-    pub fn remove(&mut self, number: usize, now: Timestamp) -> Option<DraftComment> {
-        let removed = self.draft.remove(number, now);
-        if removed.is_some() {
-            self.save();
+    /// Returns the store's error when the document cannot be written.
+    pub fn save(&self, draft: &Draft) -> Result<(), DraftStoreError> {
+        if draft.is_empty() {
+            // Nothing staged, so there is nothing to keep: an empty document per
+            // visited pull request is what `:draft list` would then have to filter.
+            return self.store.remove(&self.repo, draft.pr);
         }
-        removed
+        self.store.save(&self.repo, draft)
     }
 
-    /// Clears every staged comment, the decision and the body (FR-6.1).
-    pub fn clear(&mut self, now: Timestamp) {
-        self.draft.clear(now);
-        self.save();
-    }
-
-    /// Records the decision (FR-6.1).
-    pub fn set_decision(
-        &mut self,
-        decision: Option<crate::domain::draft::Decision>,
-        now: Timestamp,
-    ) {
-        self.draft.set_decision(decision, now);
-        self.save();
-    }
-
-    /// Records the review body (FR-6.1).
-    pub fn set_body(&mut self, body: impl Into<String>, now: Timestamp) {
-        self.draft.set_body(body, now);
-        self.save();
-    }
-
-    /// Writes the draft to the store, remembering a failure rather than raising it.
-    ///
-    /// A save failure must not abort the edit — the text is still in memory and the
-    /// user can retry — but it must never be silent either, which is what
-    /// [`Self::save_error`] is for.
-    fn save(&mut self) {
-        match self.store.save(&self.repo, &self.draft) {
-            Ok(()) => self.save_error = None,
-            Err(error) => {
-                self.save_error = Some(error.to_string());
-            }
-        }
-    }
-
-    /// Forgets the draft once it has been sent (FR-6.3).
-    ///
-    /// The file is *removed* rather than rewritten empty: a draft that has been sent
-    /// is finished with, and leaving an empty document behind would fill the directory
-    /// with one file per reviewed pull request — and make `:draft list` claim work
-    /// that does not exist.
-    ///
-    /// A failure here is recorded, not raised: the review is already on GitHub, and no
-    /// failure to tidy up afterwards may be reported as a failure to publish.
-    fn forget(&mut self, now: Timestamp) {
-        self.draft.clear(now);
-        match self.store.remove(&self.repo, self.draft.pr) {
-            Ok(()) => self.save_error = None,
-            Err(error) => {
-                logging::log(
-                    Level::Warn,
-                    format!("the sent draft could not be removed: {error}"),
-                );
-                self.save_error = Some(error.to_string());
-            }
-        }
-    }
-
-    /// Whether there is anything to publish (FR-6.3).
+    /// Deletes the stored draft for a pull request (FR-6.1).
     ///
     /// # Errors
     ///
-    /// As [`Draft::publishable`].
-    pub fn publishable(&self) -> Result<(), DraftError> {
-        self.draft.publishable()
+    /// Returns the store's error when a file exists and cannot be removed.
+    pub fn remove(&self, pr: u64) -> Result<(), DraftStoreError> {
+        self.store.remove(&self.repo, pr)
     }
 
-    /// Sends the draft as one review, and clears it if it landed (FR-6.3).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PublishError::Refused`] when the draft cannot be sent, and
-    /// [`PublishError::Forge`] when GitHub or the network refused. In both cases the
-    /// draft is untouched: it is the caller's to keep, and it is kept here.
-    pub fn publish(
-        &mut self,
-        forge: &dyn ForgePort,
-        now: Timestamp,
-        cancel: &Cancel,
-    ) -> Result<ReviewPosted, PublishError> {
-        self.publishable().map_err(PublishError::Refused)?;
-
-        // Saved immediately before sending, so the record on disk is the review that
-        // was sent even if the app dies while the request is in flight.
-        self.save();
-        if let Some(error) = self.save_error.clone() {
-            return Err(PublishError::NotSaved(error));
-        }
-
-        let posted = forge
-            .submit_review(self.draft.pr, &self.draft, cancel)
-            .map_err(PublishError::Forge)?;
-        if posted.dry_run {
-            // Nothing was sent, so there is nothing to clear: the draft is still the
-            // thing the user was about to send (FR-6.5).
-            return Ok(posted);
-        }
-        self.forget(now);
-        Ok(posted)
-    }
-
-    /// Deletes the stored draft as well as the in-memory one (FR-6.1).
-    ///
-    /// # Errors
-    ///
-    /// Returns the store's error when the file cannot be removed.
-    pub fn discard(&mut self, now: Timestamp) -> Result<(), DraftStoreError> {
-        self.draft.clear(now);
-        self.store.remove(&self.repo, self.draft.pr)
-    }
-
-    /// The drafts this repository has, for `:draft list` (FR-6.1).
+    /// Every draft this repository has, for `:draft list` (FR-6.1).
     ///
     /// # Errors
     ///
     /// Returns the store's error when the directory cannot be read.
-    pub fn others(&self) -> Result<Vec<Draft>, DraftStoreError> {
+    pub fn list(&self) -> Result<Vec<Draft>, DraftStoreError> {
         self.store.list(&self.repo)
+    }
+
+    /// Sends a draft as one review (FR-6.3).
+    ///
+    /// Does **not** clear the draft on success: clearing is the caller's decision,
+    /// and the caller is the one that knows whether the review it just sent is the
+    /// review it is still showing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PublishError::Refused`] when the draft cannot be sent, and
+    /// [`PublishError::Forge`] when GitHub or the network refused.
+    pub fn publish(
+        &self,
+        forge: &dyn ForgePort,
+        draft: &Draft,
+        cancel: &Cancel,
+    ) -> Result<ReviewPosted, PublishError> {
+        draft.publishable().map_err(PublishError::Refused)?;
+        forge
+            .submit_review(draft.pr, draft, cancel)
+            .map_err(PublishError::Forge)
     }
 }
 
@@ -271,9 +116,6 @@ pub enum PublishError {
     /// The draft is not something that can be sent.
     #[error("{0}")]
     Refused(#[from] DraftError),
-    /// The draft could not be written, so sending it would lose it.
-    #[error("the draft could not be saved, so nothing was sent: {0}")]
-    NotSaved(String),
     /// The forge refused, in its own words (translated by the adapter).
     #[error("{0}")]
     Forge(#[source] crate::Error),
@@ -291,7 +133,7 @@ impl PublishError {
     pub fn command(&self) -> Option<&str> {
         match self {
             Self::Forge(error) => error.command(),
-            _ => None,
+            Self::Refused(_) => None,
         }
     }
 }
@@ -299,7 +141,7 @@ impl PublishError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::draft::Decision;
+    use crate::domain::draft::{Decision, DraftComment, Side};
     use crate::domain::time::from_unix_secs;
     use crate::ports::forge::ReviewPosted;
     use crate::test_support::temp_home;
@@ -313,20 +155,25 @@ mod tests {
         RepoId::parse("github.com/acme/service").expect("a repository")
     }
 
-    /// A drafter over an existing home, as a restart would build it.
-    fn open_at(home: &crate::test_support::TempHome, pr: u64) -> Drafter {
-        let store: Box<dyn DraftStorePort> = Box::new(
-            crate::adapters::draft_store::FileDraftStore::new(home.path()),
-        );
-        Drafter::open(store, repo(), pr, now()).0
+    fn drafts(home: &crate::test_support::TempHome) -> Drafts {
+        Drafts::new(
+            Box::new(crate::adapters::draft_store::FileDraftStore::new(
+                home.path(),
+            )),
+            repo(),
+        )
     }
 
-    fn store() -> (Box<dyn DraftStorePort>, crate::test_support::TempHome) {
-        let home = temp_home();
-        let store: Box<dyn DraftStorePort> = Box::new(
-            crate::adapters::draft_store::FileDraftStore::new(home.path()),
+    fn staged(number: u64) -> Draft {
+        let mut draft = Draft::new(number, now());
+        draft.set_decision(Some(Decision::RequestChanges), now());
+        draft.set_body("One thing to fix.", now());
+        draft.add(
+            DraftComment::new("src/a.rs", Side::New, 31, Some(28), "this rounds up")
+                .expect("valid"),
+            now(),
         );
-        (store, home)
+        draft
     }
 
     /// A forge that records what it was asked to publish.
@@ -413,198 +260,46 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_is_saved_as_it_is_made() {
-        let (store, home) = store();
-        let (mut drafter, warning) = Drafter::open(store, repo(), 141, now());
-        assert!(warning.is_none());
-        assert!(drafter.draft().is_empty());
-
-        drafter
-            .stage("src/a.rs", Side::New, 31, None, "why?", now())
-            .expect("staged");
-        let path = home
-            .path()
-            .join("drafts/github.com/acme/service/pr-141.json");
-        assert!(
-            path.exists(),
-            "the draft is on disk before anything is sent"
-        );
-        let written = crate::domain::draft::Draft::from_json(
-            &std::fs::read_to_string(&path).expect("readable"),
-        )
-        .expect("a draft");
-        assert_eq!(written.comments.len(), 1);
-
-        // Removing one saves again.
-        drafter.remove(1, now()).expect("removed");
-        let written = crate::domain::draft::Draft::from_json(
-            &std::fs::read_to_string(&path).expect("readable"),
-        )
-        .expect("a draft");
-        assert!(written.comments.is_empty());
-    }
-
-    #[test]
-    fn a_refused_comment_never_reaches_the_draft() {
-        let (store, home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        assert_eq!(
-            drafter
-                .stage("src/a.rs", Side::New, 1, None, "   ", now())
-                .unwrap_err(),
-            DraftError::EmptyBody
-        );
-        assert_eq!(
-            drafter
-                .stage("src/a.rs", Side::New, 10, Some(20), "why?", now())
-                .unwrap_err(),
-            DraftError::BadRange { start: 20, end: 10 }
-        );
-        assert!(drafter.draft().is_empty());
-        assert!(
-            !home
-                .path()
-                .join("drafts/github.com/acme/service/pr-141.json")
-                .exists(),
-            "a refused comment does not even create the file"
-        );
-    }
-
-    #[test]
-    fn a_reopened_draft_is_the_one_that_was_staged() {
+    fn a_pull_request_with_no_draft_gets_an_empty_one() {
         let home = temp_home();
-        let mut drafter = open_at(&home, 141);
-        drafter
-            .stage("src/a.rs", Side::New, 31, Some(28), "this rounds up", now())
-            .expect("staged");
-        drafter.set_decision(Some(Decision::RequestChanges), now());
-        drafter.set_body("One thing to fix.", now());
-        let staged = drafter.draft().clone();
-        drop(drafter);
-
-        let reopened = open_at(&home, 141);
-        assert_eq!(reopened.draft(), &staged, "a restart is not a lost review");
-        assert!(
-            open_at(&home, 142).draft().is_empty(),
-            "and a different pull request has a draft of its own"
-        );
+        let (draft, warning) = drafts(&home).load(141, now());
+        assert_eq!(draft.pr, 141);
+        assert!(draft.is_empty());
+        assert!(warning.is_none(), "nothing to warn about");
+        assert!(drafts(&home).list().expect("listable").is_empty());
     }
 
     #[test]
-    fn publishing_sends_one_review_and_clears_the_draft() {
-        let (store, home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        drafter
-            .stage("src/a.rs", Side::New, 31, None, "why?", now())
-            .expect("staged");
-        drafter.set_decision(Some(Decision::RequestChanges), now());
-        let forge = RecordingForge::default();
-
-        let posted = drafter
-            .publish(&forge, now(), &Cancel::new())
-            .expect("sent");
-        assert_eq!(posted.id, Some(7));
-        assert!(!posted.dry_run);
-        assert_eq!(forge.submitted.lock().unwrap().len(), 1, "one review");
-        assert!(drafter.draft().is_empty(), "the draft is cleared");
-        assert!(
-            !home
-                .path()
-                .join("drafts/github.com/acme/service/pr-141.json")
-                .exists(),
-            "and so is the file"
-        );
+    fn a_saved_draft_comes_back() {
+        let home = temp_home();
+        let service = drafts(&home);
+        service.save(&staged(141)).expect("writable");
+        let (draft, warning) = service.load(141, now());
+        assert!(warning.is_none());
+        assert_eq!(draft, staged(141));
+        assert_eq!(service.list().expect("listable").len(), 1);
     }
 
     #[test]
-    fn a_failed_publish_keeps_everything() {
-        let (store, home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        drafter
-            .stage("src/a.rs", Side::New, 31, None, "why?", now())
-            .expect("staged");
-        drafter.set_decision(Some(Decision::RequestChanges), now());
-        let forge = RecordingForge {
-            refuse: Mutex::new(Some("your token is not allowed".to_owned())),
-            ..RecordingForge::default()
-        };
-
-        let error = drafter
-            .publish(&forge, now(), &Cancel::new())
-            .expect_err("refused");
-        assert!(error.is_forge());
-        assert_eq!(error.command(), Some("gh api"));
-        assert_eq!(
-            drafter.draft().comments.len(),
-            1,
-            "the comment is still here"
-        );
-        let path = home
-            .path()
-            .join("drafts/github.com/acme/service/pr-141.json");
-        let written = crate::domain::draft::Draft::from_json(
-            &std::fs::read_to_string(&path).expect("still on disk"),
-        )
-        .expect("a draft");
-        assert_eq!(written.comments.len(), 1);
-        assert_eq!(written.decision, Some(Decision::RequestChanges));
-    }
-
-    #[test]
-    fn a_dry_run_sends_nothing_and_keeps_the_draft() {
-        let (store, home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        drafter
-            .stage("src/a.rs", Side::New, 31, None, "why?", now())
-            .expect("staged");
-        let forge = RecordingForge {
-            dry_run: true,
-            ..RecordingForge::default()
-        };
-
-        let posted = drafter
-            .publish(&forge, now(), &Cancel::new())
-            .expect("recorded");
-        assert!(posted.dry_run);
-        assert_eq!(
-            drafter.draft().comments.len(),
-            1,
-            "nothing was sent, so nothing is cleared"
-        );
-        assert!(
-            home.path()
-                .join("drafts/github.com/acme/service/pr-141.json")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn an_empty_draft_is_refused_before_the_forge_is_asked() {
-        let (store, _home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        let forge = RecordingForge::default();
-        let error = drafter
-            .publish(&forge, now(), &Cancel::new())
-            .expect_err("refused");
-        assert!(matches!(error, PublishError::Refused(_)));
-        assert!(!error.is_forge());
-        assert!(
-            forge.submitted.lock().unwrap().is_empty(),
-            "nothing was sent"
-        );
+    fn saving_nothing_removes_rather_than_keeps_an_empty_document() {
+        // `:draft clear` and "I removed the last comment" both end here, and neither
+        // should leave a file that `:draft list` has to filter out.
+        let home = temp_home();
+        let service = drafts(&home);
+        service.save(&staged(141)).expect("writable");
+        service.save(&Draft::new(141, now())).expect("removable");
+        assert!(service.list().expect("listable").is_empty());
+        assert_eq!(service.load(141, now()).0, Draft::new(141, now()));
     }
 
     #[test]
     fn a_draft_that_cannot_be_read_is_reported_without_losing_the_file() {
         let home = temp_home();
         home.write("drafts/github.com/acme/service/pr-141.json", "{ oops");
-        let store: Box<dyn DraftStorePort> = Box::new(
-            crate::adapters::draft_store::FileDraftStore::new(home.path()),
-        );
-        let (drafter, warning) = Drafter::open(store, repo(), 141, now());
-        let warning = warning.expect("the unreadable draft is reported");
+        let (draft, warning) = drafts(&home).load(141, now());
+        let warning = warning.expect("reported");
         assert!(warning.contains("not a usable draft"), "{warning}");
-        assert!(drafter.draft().is_empty(), "and the app still opens");
+        assert!(draft.is_empty(), "and the app still opens");
         assert!(
             home.path()
                 .join("drafts/github.com/acme/service/pr-141.json")
@@ -614,47 +309,69 @@ mod tests {
     }
 
     #[test]
-    fn discarding_removes_the_file_as_well_as_the_draft() {
-        let (store, home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        drafter
-            .stage("src/a.rs", Side::New, 31, None, "why?", now())
-            .expect("staged");
-        drafter.discard(now()).expect("discarded");
-        assert!(drafter.draft().is_empty());
-        assert!(
-            !home
-                .path()
-                .join("drafts/github.com/acme/service/pr-141.json")
-                .exists()
-        );
+    fn publishing_sends_exactly_one_review() {
+        let home = temp_home();
+        let forge = RecordingForge::default();
+        let posted = drafts(&home)
+            .publish(&forge, &staged(141), &Cancel::new())
+            .expect("sent");
+        assert_eq!(posted.id, Some(7));
+        assert!(!posted.dry_run);
+        assert_eq!(forge.submitted.lock().unwrap().len(), 1, "one review");
     }
 
     #[test]
-    fn the_head_is_remembered_but_does_not_write_a_file_by_itself() {
-        let (store, home) = store();
-        let (mut drafter, _) = Drafter::open(store, repo(), 141, now());
-        drafter.anchor_to("abc123");
-        assert_eq!(drafter.draft().head_sha.as_deref(), Some("abc123"));
-        assert!(
-            !home
-                .path()
-                .join("drafts/github.com/acme/service/pr-141.json")
-                .exists(),
-            "opening a pull request must not fill the drafts directory"
+    fn a_refused_publish_leaves_the_draft_alone() {
+        let home = temp_home();
+        let service = drafts(&home);
+        let draft = staged(141);
+        service.save(&draft).expect("writable");
+        let forge = RecordingForge {
+            refuse: Mutex::new(Some("your token is not allowed".to_owned())),
+            ..RecordingForge::default()
+        };
+
+        let error = service
+            .publish(&forge, &draft, &Cancel::new())
+            .expect_err("refused");
+        assert!(error.is_forge());
+        assert_eq!(error.command(), Some("gh api"));
+        assert_eq!(service.load(141, now()).0, draft, "still stageable");
+    }
+
+    #[test]
+    fn an_empty_draft_never_reaches_the_forge() {
+        let home = temp_home();
+        let forge = RecordingForge::default();
+        let error = drafts(&home)
+            .publish(&forge, &Draft::new(141, now()), &Cancel::new())
+            .expect_err("refused");
+        assert!(matches!(error, PublishError::Refused(_)));
+        assert!(!error.is_forge());
+        assert!(forge.submitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dry_run_is_reported_as_one() {
+        let home = temp_home();
+        let forge = RecordingForge {
+            dry_run: true,
+            ..RecordingForge::default()
+        };
+        let posted = drafts(&home)
+            .publish(&forge, &staged(141), &Cancel::new())
+            .expect("recorded");
+        assert!(posted.dry_run, "the caller must not clear the draft");
+    }
+
+    #[test]
+    fn a_draft_from_a_newer_build_is_reported_rather_than_read() {
+        let home = temp_home();
+        home.write(
+            "drafts/github.com/acme/service/pr-141.json",
+            r#"{"version": 99, "pr": 141, "updated_at": "2023-11-14T22:13:20Z"}"#,
         );
-        // The head reaches disk with the next real edit.
-        drafter
-            .stage("src/a.rs", Side::New, 1, None, "why?", now())
-            .expect("staged");
-        let written = crate::domain::draft::Draft::from_json(
-            &std::fs::read_to_string(
-                home.path()
-                    .join("drafts/github.com/acme/service/pr-141.json"),
-            )
-            .expect("readable"),
-        )
-        .expect("a draft");
-        assert_eq!(written.head_sha.as_deref(), Some("abc123"));
+        let (_, warning) = drafts(&home).load(141, now());
+        assert!(warning.expect("reported").contains("newer version"));
     }
 }
