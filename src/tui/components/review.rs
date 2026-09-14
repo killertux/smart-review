@@ -547,6 +547,7 @@ index 1a2b3c4..5d6e7f8 100644
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let startup = crate::Startup::load(&cli).unwrap();
         let mut app = App::new(startup).unwrap();

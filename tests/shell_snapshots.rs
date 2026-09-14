@@ -80,6 +80,7 @@ fn build(home: &Path) -> App {
         home: Some(home.to_path_buf()),
         log_level: None,
         check: false,
+        dry_run: false,
     };
     let startup = Startup::load(&cli).expect("bootstrap");
     let mut app = App::new(startup).expect("build the app");

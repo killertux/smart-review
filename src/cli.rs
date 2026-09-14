@@ -44,4 +44,9 @@ pub struct Cli {
     /// Print an environment report and exit: 0 ready, 1 degraded, 2 unusable (FR-9.3).
     #[arg(long)]
     pub check: bool,
+
+    /// Record every mutating call instead of running it, and write them to
+    /// `logs/dry-run.log` (FR-6.5).
+    #[arg(long)]
+    pub dry_run: bool,
 }

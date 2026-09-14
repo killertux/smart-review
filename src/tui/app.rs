@@ -752,6 +752,16 @@ pub struct App {
     chat_bundle_for: Option<(u64, String)>,
     /// Where chat sessions are kept (FR-5.1).
     pub(crate) chat_store: std::sync::Arc<dyn crate::ports::ChatStorePort>,
+    /// The review draft and everything the review actions own (FR-6.1–FR-6.3).
+    pub(crate) drafts: crate::tui::drafts::DraftState,
+    /// Where drafts are kept between runs (FR-6.1).
+    pub(crate) draft_store: std::sync::Arc<dyn crate::ports::DraftStorePort>,
+    /// The draft service, once the repository is known (FR-6.1).
+    pub(crate) draft_service: Option<crate::application::drafts::Drafts>,
+    /// Whether mutating calls are recorded rather than run (FR-6.5).
+    pub(crate) dry_run: bool,
+    /// The calls a dry run recorded, written out by the loop (FR-6.5).
+    pub(crate) dry_run_ledger: Option<crate::adapters::process::DryRunLedger>,
     /// The job id of the newest detection request.
     pub(crate) environment_job: u64,
     /// The job id of the newest list request, so a superseded answer is dropped.
@@ -818,6 +828,9 @@ impl App {
             workspace_port,
             analysis,
             chat: chat_store,
+            drafts: draft_store,
+            dry_run,
+            dry_run_ledger,
             ..
         } = startup;
 
@@ -864,6 +877,11 @@ impl App {
             chat_bundle: None,
             chat_bundle_for: None,
             chat_store,
+            drafts: crate::tui::drafts::DraftState::default(),
+            draft_store,
+            draft_service: None,
+            dry_run,
+            dry_run_ledger: Some(dry_run_ledger),
             environment_job: 0,
             list_job: 0,
             count_job: 0,
@@ -1443,6 +1461,37 @@ impl App {
     /// was streaming and gone the moment the app restarted.
     pub(crate) fn stop_chat(&mut self) {
         self.chat.stop();
+    }
+
+    /// The commit the open diff is at, for anchoring comments to it (FR-6.3).
+    #[must_use]
+    pub fn open_head_sha(&self) -> Option<&str> {
+        self.detail
+            .as_ref()
+            .map(|detail| detail.summary.head_sha.as_str())
+    }
+
+    /// Whether mutating calls are recorded instead of run (FR-6.5).
+    #[must_use]
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// The review draft, as the interface holds it (FR-6.1).
+    #[must_use]
+    pub fn drafts(&self) -> &crate::tui::drafts::DraftState {
+        &self.drafts
+    }
+
+    /// Binds the draft service to a repository (FR-6.1).
+    ///
+    /// Called when detection resolves which repository is being read: the store is
+    /// keyed by it, so there is nothing to bind before then.
+    pub fn bind_drafts(&mut self, repo: &crate::domain::repo::RepoId) {
+        self.draft_service = Some(crate::application::drafts::Drafts::new(
+            std::sync::Arc::clone(&self.draft_store),
+            repo.clone(),
+        ));
     }
 
     /// Takes the gathered bundle when it is for the commit on screen (FR-4.6).
@@ -4235,6 +4284,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let startup = Startup::load(&cli).unwrap();
         let mut app = App::new(startup).unwrap();
@@ -4387,6 +4437,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let startup = Startup::load(&cli).unwrap();
         let mut app = App::new(startup).unwrap();
@@ -4688,6 +4739,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let startup = Startup::load(&cli).unwrap();
         let mut app = App::new(startup).unwrap();
@@ -5718,6 +5770,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let mut fresh = App::new(Startup::load(&cli).unwrap()).unwrap();
         fresh.open_review(

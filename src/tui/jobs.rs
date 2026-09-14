@@ -1763,6 +1763,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let mut startup = crate::Startup::load(&cli).unwrap();
         // The report probes git and gh; pointing it at a binary that cannot exist

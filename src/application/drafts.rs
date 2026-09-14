@@ -29,14 +29,14 @@ use crate::ports::{Cancel, DraftStoreError, DraftStorePort, ReviewPosted};
 /// inside every state transition, including the ones that run on a keypress.
 #[derive(Debug)]
 pub struct Drafts {
-    store: Box<dyn DraftStorePort>,
+    store: std::sync::Arc<dyn DraftStorePort>,
     repo: RepoId,
 }
 
 impl Drafts {
     /// Binds the service to a store and a repository.
     #[must_use]
-    pub fn new(store: Box<dyn DraftStorePort>, repo: RepoId) -> Self {
+    pub fn new(store: std::sync::Arc<dyn DraftStorePort>, repo: RepoId) -> Self {
         Self { store, repo }
     }
 
@@ -157,7 +157,7 @@ mod tests {
 
     fn drafts(home: &crate::test_support::TempHome) -> Drafts {
         Drafts::new(
-            Box::new(crate::adapters::draft_store::FileDraftStore::new(
+            std::sync::Arc::new(crate::adapters::draft_store::FileDraftStore::new(
                 home.path(),
             )),
             repo(),

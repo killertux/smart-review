@@ -7,6 +7,7 @@ pub mod analysis;
 pub mod chat;
 pub mod command_line;
 pub mod doctor;
+pub mod drafts;
 pub mod filter_bar;
 pub mod header;
 pub mod help;

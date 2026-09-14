@@ -427,6 +427,7 @@ mod tests {
             home: Some(dir.path().to_path_buf()),
             log_level: None,
             check: false,
+            dry_run: false,
         };
         let startup = crate::Startup::load(&cli).unwrap();
         (dir, App::new(startup).unwrap())

@@ -16,6 +16,7 @@ pub mod chat;
 pub mod clipboard;
 pub mod components;
 pub mod diff_view;
+pub mod drafts;
 pub mod event;
 pub mod input;
 pub mod jobs;

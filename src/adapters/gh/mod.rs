@@ -57,6 +57,7 @@ pub struct GhCliForge {
 #[derive(Debug, Clone)]
 pub struct GhForgeFactory {
     program: PathBuf,
+    runner: ProcessRunner,
 }
 
 impl GhForgeFactory {
@@ -65,13 +66,24 @@ impl GhForgeFactory {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            runner: ProcessRunner::new(),
         }
+    }
+
+    /// Uses a prepared runner, which is how `--dry-run` reaches every forge the
+    /// application builds (FR-6.5).
+    #[must_use]
+    pub fn with_runner(mut self, runner: ProcessRunner) -> Self {
+        self.runner = runner;
+        self
     }
 }
 
 impl ForgeFactory for GhForgeFactory {
     fn forge(&self, repo: &RepoId) -> std::sync::Arc<dyn ForgePort> {
-        std::sync::Arc::new(GhCliForge::new(&self.program, repo.clone()))
+        std::sync::Arc::new(
+            GhCliForge::new(&self.program, repo.clone()).with_runner(self.runner.clone()),
+        )
     }
 }
 
