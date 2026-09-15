@@ -271,14 +271,18 @@ impl<'a> Analyst<'a> {
                 // A failed repair attempt still leaves the first answer to show, with
                 // the first failure's reason: the user has text to read either way,
                 // which is what FR-4.1 asks for.
-                let Ok(second) = self.ask(request, &system, &repair, cancel, progress) else {
-                    usage.mark_unknown();
-                    return Ok(AnalysisRun::Unparsed(Box::new(Unparsed {
-                        raw: previous,
-                        reason: failure.reason,
-                        repaired: true,
-                        usage: usage.reported(),
-                    })));
+                let second = match self.ask(request, &system, &repair, cancel, progress) {
+                    Ok(second) => second,
+                    Err(LlmError::Cancelled) => return Ok(AnalysisRun::Cancelled),
+                    Err(_) => {
+                        usage.mark_unknown();
+                        return Ok(AnalysisRun::Unparsed(Box::new(Unparsed {
+                            raw: previous,
+                            reason: failure.reason,
+                            repaired: true,
+                            usage: usage.reported(),
+                        })));
+                    }
                 };
                 usage.record(second.usage);
                 match self.normalize(
@@ -431,47 +435,53 @@ struct Answer {
 }
 
 /// Usage across intentionally executed analysis attempts.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct UsageTotal {
-    known: Option<TokenUsage>,
+    known: TokenUsage,
+    has_known: bool,
     complete: bool,
+}
+
+impl Default for UsageTotal {
+    fn default() -> Self {
+        Self {
+            known: TokenUsage::default(),
+            has_known: false,
+            complete: true,
+        }
+    }
 }
 
 impl UsageTotal {
     fn record(&mut self, usage: Option<TokenUsage>) {
-        match (self.known.as_mut(), usage) {
-            (None, Some(usage)) if !self.complete => {
-                self.known = Some(usage);
-                self.complete = true;
-            }
-            (Some(total), Some(usage)) if self.complete => total.add(usage),
-            _ => {
-                self.known = None;
-                self.complete = false;
-            }
+        if let Some(usage) = usage {
+            self.known.add(usage);
+            self.has_known = true;
+        } else {
+            self.complete = false;
         }
     }
 
     /// A failed request may have consumed tokens without returning accounting.
     fn mark_unknown(&mut self) {
-        self.known = None;
         self.complete = false;
     }
 
     fn reported(self) -> Option<TokenUsage> {
-        self.complete.then_some(self.known).flatten()
+        self.has_known.then_some(self.known)
     }
 }
 
-/// Copies complete port usage into the document's persisted shape.
+/// Copies all reported usage into the document's persisted shape, marking partial totals.
 fn analysis_usage(usage: UsageTotal) -> AnalysisUsage {
+    let complete = usage.complete;
     usage
         .reported()
         .map_or_else(AnalysisUsage::default, |usage| AnalysisUsage {
             prompt: usage.prompt,
             completion: usage.completion,
             reasoning: usage.reasoning,
-            complete: true,
+            complete,
         })
 }
 
@@ -1346,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_02_a_missing_repair_usage_makes_the_aggregate_unknown() {
+    fn ir_02_missing_usage_keeps_the_known_total_but_marks_it_partial() {
         let mut usage = UsageTotal::default();
         usage.record(Some(TokenUsage {
             prompt: 10,
@@ -1356,8 +1366,90 @@ mod tests {
         }));
         usage.record(None);
 
-        assert!(usage.known.is_none());
+        assert_eq!(usage.known.prompt, 10);
+        assert_eq!(usage.known.completion, 20);
         assert!(!usage.complete);
-        assert!(!analysis_usage(usage).complete);
+        assert_eq!(
+            analysis_usage(usage),
+            AnalysisUsage {
+                complete: false,
+                prompt: 10,
+                completion: 20,
+                reasoning: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ir_02_known_usage_after_an_omission_stays_partial() {
+        let mut usage = UsageTotal::default();
+        usage.record(None);
+        usage.record(Some(TokenUsage {
+            prompt: 10,
+            completion: 20,
+            total: 30,
+            reasoning: None,
+        }));
+
+        assert!(!usage.complete);
+        assert_eq!(usage.reported().map(|usage| usage.total), Some(30));
+    }
+
+    #[test]
+    fn ir_02_cancelling_during_repair_stays_cancelled() {
+        #[derive(Debug, Default)]
+        struct RepairCancellation {
+            calls: Mutex<u8>,
+        }
+
+        impl LlmPort for RepairCancellation {
+            fn complete(
+                &self,
+                _request: &ChatRequest,
+                _cancel: &Cancel,
+            ) -> Result<crate::ports::llm::ChatOutcome, LlmError> {
+                Err(LlmError::Request {
+                    provider: "test".to_owned(),
+                    reason: "streaming only".to_owned(),
+                })
+            }
+
+            fn stream(
+                &self,
+                _request: &ChatRequest,
+                _cancel: &Cancel,
+                on_delta: &mut DeltaHandler<'_>,
+            ) -> Result<crate::ports::llm::ChatOutcome, LlmError> {
+                let mut calls = self.calls.lock().expect("lock");
+                *calls = calls.saturating_add(1);
+                if *calls == 2 {
+                    return Err(LlmError::Cancelled);
+                }
+                let text = "not JSON".to_owned();
+                on_delta(&text);
+                Ok(crate::ports::llm::ChatOutcome {
+                    text,
+                    usage: None,
+                    thinking: None,
+                })
+            }
+        }
+
+        let workspace = workspace(&[("src/money.rs", "fn money() {}")]);
+        let cache = FakeCache::default();
+        let llm = RepairCancellation::default();
+        let clock = FakeClock::new(1_767_225_600);
+        let repo = repo();
+        let analyst = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+        let request = request();
+        let cancel = Cancel::new();
+        let (bundle, _) = analyst.gather(&request, &cancel);
+        let mut progress = |_| {};
+
+        let outcome = analyst
+            .run(&request, &bundle, &cancel, &mut progress)
+            .expect("cancellation is a run outcome");
+
+        assert!(matches!(outcome, AnalysisRun::Cancelled));
     }
 }

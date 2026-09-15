@@ -371,15 +371,16 @@ impl StreamingCapabilities {
 
     fn for_route(route: &Route) -> Self {
         match route {
-            Route::Native(NativeBackend::OpenAI | NativeBackend::Google)
-            | Route::Passthrough { .. } => Self::STRUCTURED,
-            Route::Native(NativeBackend::Anthropic | NativeBackend::Xai) => Self::STRINGS,
             Route::Native(
-                NativeBackend::OpenRouter
-                | NativeBackend::DeepSeek
+                NativeBackend::OpenAI
+                | NativeBackend::Google
+                | NativeBackend::OpenRouter
                 | NativeBackend::Groq
                 | NativeBackend::Mistral,
-            ) => Self::NONE,
+            )
+            | Route::Passthrough { .. } => Self::STRUCTURED,
+            Route::Native(NativeBackend::Anthropic | NativeBackend::Xai) => Self::STRINGS,
+            Route::Native(NativeBackend::DeepSeek) => Self::NONE,
         }
     }
 }
@@ -573,19 +574,11 @@ impl LlmPort for LlmCrate {
     /// FR-5.2, FR-5.4).
     ///
     /// The pinned crate implements a different subset of streaming for each backend —
-    /// structured deltas for `OpenAI`, `Google` and `Azure`; text-only deltas for `Anthropic`,
-    /// `Ollama` and `xAI`; nothing at all for `DeepSeek`, `Groq`, `Mistral` and `OpenRouter` (the
-    /// measurements are in REQUIREMENTS Appendix B). Asking every provider for the
-    /// structured stream and reporting what comes back is how a `DeepSeek` user got
-    /// "Structured streaming not supported for this provider" instead of an answer, so
-    /// the ways of asking are tried in order of what they give up:
-    ///
-    /// 1. **structured stream** on the routed provider — text as it arrives, with usage;
-    /// 2. **string stream** on the same provider — text as it arrives, no usage;
-    /// 3. **structured stream through the `OpenAI`-compatible passthrough**, when the
-    ///    catalog gave a base URL for a native backend that has no streaming of its own
-    ///    (`DeepSeek`, `OpenRouter`), which gets the deltas *and* the usage back;
-    /// 4. **one request, no streaming** — the answer arrives whole, with usage.
+    /// structured deltas for `OpenAI`, `Google`, `Azure`, `Groq`, `Mistral` and `OpenRouter`;
+    /// text-only deltas for `Anthropic`, `Ollama` and `xAI`; and neither for `DeepSeek` (the
+    /// measurements are in REQUIREMENTS Appendix B). Locally recorded capability metadata picks
+    /// the one supported method before dispatching; only `DeepSeek` reaches the passthrough or a
+    /// plain request.
     ///
     /// Route capability metadata selects one stream method. A path that emits text, is
     /// cancelled, or fails with any provider/transport error ends the request: absence of
@@ -1065,6 +1058,19 @@ mod tests {
     /// route, only at the providers it is handed.
     fn cascade_request() -> ChatRequest {
         request("deepseek", "deepseek-v4-pro")
+    }
+
+    #[test]
+    fn ir_02_openai_compatible_native_routes_use_structured_streaming() {
+        for backend in [
+            NativeBackend::OpenRouter,
+            NativeBackend::Groq,
+            NativeBackend::Mistral,
+        ] {
+            let capabilities = StreamingCapabilities::for_route(&Route::Native(backend));
+            assert!(capabilities.structured, "{backend:?}");
+            assert!(!capabilities.strings, "{backend:?}");
+        }
     }
 
     fn drain(

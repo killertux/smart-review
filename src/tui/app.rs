@@ -2788,16 +2788,7 @@ impl App {
                     stored_at: self.now_unix_secs,
                 };
                 self.adopt_analysis(stored);
-                let usage = ready.usage.map_or_else(
-                    || " · usage unknown".to_owned(),
-                    |usage| {
-                        let reasoning = usage
-                            .reasoning
-                            .map(|tokens| format!(", {tokens} reasoning"))
-                            .unwrap_or_default();
-                        format!(" · {} in/{}{reasoning} out", usage.prompt, usage.completion)
-                    },
-                );
+                let usage = Self::analysis_usage_label(&ready.analysis.token_usage);
                 self.notice(
                     NoticeLevel::Info,
                     format!(
@@ -2838,6 +2829,23 @@ impl App {
                 );
             }
         }
+    }
+
+    fn analysis_usage_label(usage: &crate::domain::analysis::AnalysisUsage) -> String {
+        let reasoning = usage
+            .reasoning
+            .map(|tokens| format!(", {tokens} reasoning"))
+            .unwrap_or_default();
+        if usage.complete {
+            return format!(" · {} in/{}{reasoning} out", usage.prompt, usage.completion);
+        }
+        if usage.prompt == 0 && usage.completion == 0 && usage.reasoning.is_none() {
+            return " · usage unknown".to_owned();
+        }
+        format!(
+            " · partial usage: {} in/{}{reasoning} out",
+            usage.prompt, usage.completion
+        )
     }
 
     /// Takes a document as the current analysis and re-orders the review (FR-4.2).
