@@ -1,8 +1,8 @@
 //! Persisted state and disposable caches (FR-8.5).
 //!
 //! `state.toml` holds only small, user-meaningful values. Everything under
-//! `cache/` is disposable, so deleting it never loses a draft or a chat
-//! (FR-8.5).
+//! `cache/` is disposable. Drafts, chats and manual review-order overrides live in
+//! dedicated durable locations, so deleting cache cannot lose them (FR-8.5, IR-06).
 
 use std::path::{Path, PathBuf};
 

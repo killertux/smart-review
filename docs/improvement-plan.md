@@ -113,8 +113,8 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | [Open — PR #12](https://github.com/killertux/smart-review/pull/12) |
 | [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Implemented |
 | [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | [Merged — PR #14](https://github.com/killertux/smart-review/pull/14) |
-| [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | In progress on `ir-05-review-session` |
-| [IR-06](#ir-06-make-user-storage-atomic-durable-and-recoverable) | P1 foundation | Atomic writes, durable chat, recoverable indexes | IR-05 | L | Not started |
+| [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | [Merged — PR #15](https://github.com/killertux/smart-review/pull/15) |
+| [IR-06](#ir-06-make-user-storage-atomic-durable-and-recoverable) | P1 foundation | Atomic writes, durable chat, recoverable indexes | IR-05 | L | [Open — PR #16](https://github.com/killertux/smart-review/pull/16) |
 | [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | Not started |
 | [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | Not started |
 | [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | Not started |
@@ -708,7 +708,7 @@ update does not make successfully saved user content undiscoverable.
 5. [ ] Use existing platform/std facilities where supported by the MSRV. If the chosen
    interprocess-lock strategy requires a dependency, stop for the required approval.
    Detect/report a conflict instead of silently overwriting if safe merging is absent.
-6. [ ] Move chat and manual review-order overrides into durable app-owned directories.
+6. [x] Move chat and manual review-order overrides into durable app-owned directories.
    Reserve durable locations for review markers and mutation records used by later PRs.
 7. [ ] Implement idempotent migration from legacy cache locations: read/validate, write
    new location, verify, then mark migrated. Retain old data on failure. Re-running

@@ -8,9 +8,9 @@
 //!   file is atomic enough for a log *if* the process is the only writer and the
 //!   record is one line; a document rewritten through a temporary file and a rename is
 //!   atomic whatever happens, and a session is small enough to rewrite.
-//! - **`cache/` is disposable, but the conversation is the user's own words**
-//!   (FR-8.5). It lives under `cache/` because that is where per-pull-request data
-//!   goes, and it is written carefully because losing it is still a failure.
+//! - **A conversation is the user's own words, not cache** (FR-8.5). It lives under
+//!   the app-owned durable `chats/` directory and is written carefully because losing
+//!   it is still a failure.
 //!
 //! The port is per `(repo, pull request)`: that scope is what `:chat list` lists, what
 //! DEC-9's cap applies to, and what the UI can name.
@@ -52,6 +52,10 @@ pub enum ChatStoreError {
         /// The limit, as a readable size.
         limit: String,
     },
+
+    /// Another application instance is changing this pull request's chat documents.
+    #[error("another smart-review instance is updating this chat; wait for it to finish and retry")]
+    Conflict,
 }
 
 /// The sessions belonging to one pull request.
@@ -86,7 +90,8 @@ pub trait ChatStorePort: fmt::Debug + Send + Sync {
     /// # Errors
     ///
     /// Returns [`ChatStoreError::Full`] when the session would pass DEC-9's per-session
-    /// cap, and [`ChatStoreError::Io`] when it cannot be written.
+    /// cap, [`ChatStoreError::Conflict`] when another instance owns the document lock,
+    /// and [`ChatStoreError::Io`] when it cannot be written.
     fn put(&self, session: &Session) -> Result<(), ChatStoreError>;
 
     /// Removes a session.

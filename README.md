@@ -182,7 +182,9 @@ Everything the application owns goes under `$SMART_REVIEW_HOME`
   credentials.toml   API keys entered in the TUI, mode 0600 (M2)
   themes/*.toml      your themes; each inherits from `base`
   state.toml         remembered theme and last session
-  cache/             disposable: PR lists, diffs, analyses and their plans, chats
+  cache/             disposable: PR lists, diffs and analyses
+  chats/             persistent conversations — not disposable
+  reviews/           persistent manual review-order preferences and records
   drafts/            staged reviews, one file per pull request — not disposable
   worktrees/         per-pull-request checkouts owned by the app (M2)
   exports/dry-run/   private exact payloads retained only when you request a dry run

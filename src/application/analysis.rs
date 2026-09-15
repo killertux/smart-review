@@ -697,9 +697,9 @@ mod tests {
             &self,
             _repo: &RepoId,
             _pr: u64,
-            _plan: &crate::domain::plan::Plan,
-        ) -> Result<(), AnalysisCacheError> {
-            Ok(())
+            plan: &crate::domain::plan::Plan,
+        ) -> Result<crate::domain::plan::Plan, AnalysisCacheError> {
+            Ok(plan.clone())
         }
     }
 
@@ -1223,9 +1223,9 @@ mod tests {
                 &self,
                 _: &RepoId,
                 _: u64,
-                _: &crate::domain::plan::Plan,
-            ) -> Result<(), AnalysisCacheError> {
-                Ok(())
+                plan: &crate::domain::plan::Plan,
+            ) -> Result<crate::domain::plan::Plan, AnalysisCacheError> {
+                Ok(plan.clone())
             }
         }
 

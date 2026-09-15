@@ -148,6 +148,12 @@ pub enum AnalysisCacheError {
         /// What was wrong.
         reason: String,
     },
+
+    /// Another application instance has changed this durable review plan.
+    #[error(
+        "another smart-review instance changed this review order; reopen it before editing again"
+    )]
+    Conflict,
 }
 
 /// Where analyses and their review-plan overrides are kept.
@@ -189,8 +195,11 @@ pub trait AnalysisCachePort: fmt::Debug + Send + Sync {
     ///
     /// # Errors
     ///
-    /// As [`AnalysisCachePort::put`].
-    fn put_plan(&self, repo: &RepoId, pr: u64, plan: &Plan) -> Result<(), AnalysisCacheError>;
+    /// Returns the saved plan, including its next durable revision.
+    ///
+    /// As [`AnalysisCachePort::put`]. Returns [`AnalysisCacheError::Conflict`] when
+    /// another app instance has changed the plan since the caller read it.
+    fn put_plan(&self, repo: &RepoId, pr: u64, plan: &Plan) -> Result<Plan, AnalysisCacheError>;
 }
 
 #[cfg(test)]

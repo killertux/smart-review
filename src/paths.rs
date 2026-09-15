@@ -125,6 +125,18 @@ impl Home {
         self.cache().join("analysis")
     }
 
+    /// Directory for durable review preferences and records (IR-06).
+    #[must_use]
+    pub fn reviews(&self) -> PathBuf {
+        self.root.join("reviews")
+    }
+
+    /// Directory for persistent chat sessions (IR-06).
+    #[must_use]
+    pub fn chats(&self) -> PathBuf {
+        self.root.join("chats")
+    }
+
     /// Directory holding chat transcripts written by `:chat export` (FR-5.1).
     ///
     /// Next to the logs rather than under `cache/`: a transcript the user asked for is
@@ -178,6 +190,8 @@ impl Home {
             self.themes(),
             self.cache(),
             self.drafts(),
+            self.chats(),
+            self.reviews(),
             self.exports(),
             self.worktrees(),
             self.logs(),
@@ -212,7 +226,9 @@ impl Home {
              - `credentials.toml` — API keys entered in the TUI (mode 0600).\n\
              - `state.toml` — window, theme and recently opened state.\n\
              - `themes/` — your own themes; each file inherits from `base`.\n\
-             - `cache/` — disposable: PR lists, details, analyses and chats.\n\
+             - `cache/` — disposable: PR lists, details and analyses.\n\
+             - `chats/` — persistent conversations; not disposable.\n\
+             - `reviews/` — persistent review-order preferences and operation records.\n\
              - `drafts/` — staged reviews you have not published; not disposable.\n\
              - `exports/` — requested transcripts and private dry-run payloads.\n\
              - `worktrees/` — per-pull-request checkouts owned by the app.\n\
@@ -342,7 +358,14 @@ mod tests {
         let home = Home::resolve(Some(dir.path())).unwrap();
         home.ensure().unwrap();
 
-        for path in [home.themes(), home.cache(), home.worktrees(), home.logs()] {
+        for path in [
+            home.themes(),
+            home.cache(),
+            home.chats(),
+            home.reviews(),
+            home.worktrees(),
+            home.logs(),
+        ] {
             assert!(path.is_dir(), "{} should exist", path.display());
         }
 
@@ -362,7 +385,14 @@ mod tests {
         // Directories the app creates are private. An existing root that the
         // user pointed us at is only reported on, never chmodded behind their
         // back (it could be a shared directory).
-        for created in [home.themes(), home.cache(), home.worktrees(), home.logs()] {
+        for created in [
+            home.themes(),
+            home.cache(),
+            home.chats(),
+            home.reviews(),
+            home.worktrees(),
+            home.logs(),
+        ] {
             let mode = std::fs::metadata(&created).unwrap().permissions().mode();
             assert_eq!(
                 mode & 0o777,
