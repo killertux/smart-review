@@ -1,6 +1,6 @@
 //! Chat sessions on disk (FR-5.1, DEC-9).
 //!
-//! Layout: `<home>/cache/chat/<host>/<owner>/<name>/pr-<N>/<id>.json` for the
+//! Layout: `<home>/chats/<host>/<owner>/<name>/pr-<N>/<id>.json` for the
 //! conversation, and `index.json` beside it for the list. The index is a convenience,
 //! never a source of truth: it is rebuilt from the sessions whenever it is missing or
 //! unreadable, because a cache that cannot be trusted to describe itself is a cache
@@ -20,11 +20,16 @@ use crate::ports::chat::{ChatStoreError, ChatStorePort};
 
 /// The file the list is kept in.
 const INDEX_FILE: &str = "index.json";
+/// Serializes document/index replacements for one pull request across app instances.
+const LOCK_FILE: &str = ".chat.lock";
+/// Records that every validated legacy session has a durable copy.
+const MIGRATION_FILE: &str = ".migrated-from-cache-v1";
 
 /// Sessions under a directory.
 #[derive(Debug, Clone)]
 pub struct FileChatStore {
     root: PathBuf,
+    legacy_root: PathBuf,
 }
 
 /// The index document.
@@ -39,11 +44,12 @@ struct Index {
 }
 
 impl FileChatStore {
-    /// A store rooted at `<home>/cache/chat`.
+    /// A store rooted at `<home>/chats`.
     #[must_use]
-    pub fn new(cache_root: impl AsRef<Path>) -> Self {
+    pub fn new(home: impl AsRef<Path>) -> Self {
         Self {
-            root: cache_root.as_ref().join("chat"),
+            root: home.as_ref().join("chats"),
+            legacy_root: home.as_ref().join("cache/chat"),
         }
     }
 
@@ -56,6 +62,18 @@ impl FileChatStore {
         path.join(format!("pr-{pr}"))
     }
 
+    fn legacy_pr_dir(&self, repo: &RepoId, pr: u64) -> PathBuf {
+        let mut path = self.legacy_root.clone();
+        for part in repo.key().split('/') {
+            path.push(part);
+        }
+        path.join(format!("pr-{pr}"))
+    }
+
+    fn migration_path(&self, repo: &RepoId, pr: u64) -> PathBuf {
+        self.pr_dir(repo, pr).join(MIGRATION_FILE)
+    }
+
     /// The file holding one session.
     fn session_path(&self, repo: &RepoId, pr: u64, id: &str) -> PathBuf {
         self.pr_dir(repo, pr).join(format!("{}.json", sanitise(id)))
@@ -64,6 +82,143 @@ impl FileChatStore {
     /// The index file for one pull request.
     fn index_path(&self, repo: &RepoId, pr: u64) -> PathBuf {
         self.pr_dir(repo, pr).join(INDEX_FILE)
+    }
+
+    fn lock(&self, repo: &RepoId, pr: u64) -> Result<DocumentLock, ChatStoreError> {
+        let path = self.pr_dir(repo, pr).join(LOCK_FILE);
+        if let Some(parent) = path.parent() {
+            crate::adapters::fs::create_private_parents(parent).map_err(|error| {
+                ChatStoreError::Io {
+                    action: "create the chat directory".to_owned(),
+                    path: parent.display().to_string(),
+                    cause: error.to_string(),
+                }
+            })?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .map_err(|error| ChatStoreError::Io {
+                            action: "restrict the chat lock".to_owned(),
+                            path: path.display().to_string(),
+                            cause: error.to_string(),
+                        })?;
+                }
+                Ok(DocumentLock { path })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(ChatStoreError::Conflict)
+            }
+            Err(error) => Err(ChatStoreError::Io {
+                action: "lock the chat document".to_owned(),
+                path: path.display().to_string(),
+                cause: error.to_string(),
+            }),
+        }
+    }
+
+    /// Copies validated legacy sessions before reading the durable location (IR-06).
+    /// The legacy files remain in place so an interrupted migration can retry safely.
+    fn migrate_legacy(&self, repo: &RepoId, pr: u64) -> Result<(), ChatStoreError> {
+        if self.migration_path(repo, pr).exists() {
+            return Ok(());
+        }
+        let legacy = self.legacy_pr_dir(repo, pr);
+        let entries = match std::fs::read_dir(&legacy) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ChatStoreError::Io {
+                    action: "read legacy chat sessions".to_owned(),
+                    path: legacy.display().to_string(),
+                    cause: error.to_string(),
+                });
+            }
+        };
+        let mut complete = true;
+        for entry in entries.flatten() {
+            let source = entry.path();
+            if source.extension().and_then(std::ffi::OsStr::to_str) != Some("json")
+                || source.file_name().and_then(std::ffi::OsStr::to_str) == Some(INDEX_FILE)
+            {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&source) {
+                Ok(text) => text,
+                Err(error) => {
+                    logging::log(
+                        Level::Warn,
+                        format!("chat: cannot migrate {}: {error}", source.display()),
+                    );
+                    complete = false;
+                    continue;
+                }
+            };
+            let session = match serde_json::from_str::<Session>(&text) {
+                Ok(session) => session,
+                Err(error) => {
+                    logging::log(
+                        Level::Warn,
+                        format!(
+                            "chat: retaining unreadable legacy session {}: {error}",
+                            source.display()
+                        ),
+                    );
+                    complete = false;
+                    continue;
+                }
+            };
+            if session.repo != repo.key() || session.pr != pr {
+                logging::log(
+                    Level::Warn,
+                    format!(
+                        "chat: retaining misplaced legacy session {}",
+                        source.display()
+                    ),
+                );
+                complete = false;
+                continue;
+            }
+            let destination = self.session_path(repo, pr, &session.id);
+            if destination.exists() {
+                continue;
+            }
+            let body =
+                serde_json::to_string_pretty(&session).map_err(|error| ChatStoreError::Io {
+                    action: "serialise a migrated chat session".to_owned(),
+                    path: destination.display().to_string(),
+                    cause: error.to_string(),
+                })?;
+            write_atomic(&destination, &body).map_err(|error| ChatStoreError::Io {
+                action: "migrate a chat session".to_owned(),
+                path: destination.display().to_string(),
+                cause: error.to_string(),
+            })?;
+            let copied = std::fs::read_to_string(&destination)
+                .ok()
+                .and_then(|body| serde_json::from_str::<Session>(&body).ok());
+            if copied.as_ref() != Some(&session) {
+                return Err(ChatStoreError::Io {
+                    action: "verify a migrated chat session".to_owned(),
+                    path: destination.display().to_string(),
+                    cause: "the copied document did not validate".to_owned(),
+                });
+            }
+        }
+        if complete {
+            let marker = self.migration_path(repo, pr);
+            write_atomic(&marker, "migrated").map_err(|error| ChatStoreError::Io {
+                action: "mark chat migration complete".to_owned(),
+                path: marker.display().to_string(),
+                cause: error.to_string(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Reads the index, or rebuilds it from the sessions on disk.
@@ -181,10 +336,12 @@ fn sanitise(id: &str) -> String {
 
 impl ChatStorePort for FileChatStore {
     fn list(&self, repo: &RepoId, pr: u64) -> Result<Vec<SessionMeta>, ChatStoreError> {
+        self.migrate_legacy(repo, pr)?;
         Ok(self.index(repo, pr))
     }
 
     fn load(&self, repo: &RepoId, pr: u64, id: &str) -> Result<Option<Session>, ChatStoreError> {
+        self.migrate_legacy(repo, pr)?;
         let path = self.session_path(repo, pr, id);
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Ok(None);
@@ -198,6 +355,7 @@ impl ChatStorePort for FileChatStore {
     }
 
     fn latest(&self, repo: &RepoId, pr: u64) -> Result<Option<Session>, ChatStoreError> {
+        self.migrate_legacy(repo, pr)?;
         let Some(newest) = self.index(repo, pr).into_iter().next() else {
             return Ok(None);
         };
@@ -214,6 +372,8 @@ impl ChatStorePort for FileChatStore {
             });
         }
         let repo = repo_of(session)?;
+        let _lock = self.lock(&repo, session.pr)?;
+        self.migrate_legacy(&repo, session.pr)?;
         let path = self.session_path(&repo, session.pr, &session.id);
         let text = serde_json::to_string_pretty(session).map_err(|error| ChatStoreError::Io {
             action: "serialise the session".to_owned(),
@@ -229,6 +389,8 @@ impl ChatStorePort for FileChatStore {
     }
 
     fn remove(&self, repo: &RepoId, pr: u64, id: &str) -> Result<(), ChatStoreError> {
+        let _lock = self.lock(repo, pr)?;
+        self.migrate_legacy(repo, pr)?;
         let path = self.session_path(repo, pr, id);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|error| ChatStoreError::Io {
@@ -253,6 +415,7 @@ impl ChatStorePort for FileChatStore {
     }
 
     fn prune(&self, repo: &RepoId, pr: u64) -> Result<Pruned, ChatStoreError> {
+        self.migrate_legacy(repo, pr)?;
         let metas = self.index(repo, pr);
         let doomed = sessions_to_prune(metas.clone(), MAX_SESSIONS_PER_PR);
         let mut removed = Vec::new();
@@ -277,6 +440,17 @@ impl ChatStorePort for FileChatStore {
             removed,
             over_bytes: false,
         })
+    }
+}
+
+/// Removes the operation-owned lock on every ordinary return path.
+struct DocumentLock {
+    path: PathBuf,
+}
+
+impl Drop for DocumentLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -309,7 +483,7 @@ mod tests {
 
     fn store() -> (FileChatStore, crate::test_support::TempHome) {
         let home = temp_home();
-        let store = FileChatStore::new(home.path().join("cache"));
+        let store = FileChatStore::new(home.path());
         (store, home)
     }
 
@@ -372,7 +546,7 @@ mod tests {
         // …and it was written back, because the rebuild is what a cache is for.
         assert!(
             home.path()
-                .join("cache/chat/github.com/acme/service/pr-141/index.json")
+                .join("chats/github.com/acme/service/pr-141/index.json")
                 .exists()
         );
     }
@@ -543,5 +717,57 @@ mod tests {
         let json = serde_json::to_string(&message).expect("serialises");
         assert!(json.contains("\"user\""), "{json}");
         assert_eq!(message.role, Role::User);
+    }
+
+    #[test]
+    fn ir_06_migrates_legacy_sessions_before_cache_is_removed() {
+        let (store, home) = store();
+        let legacy = home
+            .path()
+            .join("cache/chat/github.com/acme/service/pr-141/1-0.json");
+        std::fs::create_dir_all(legacy.parent().expect("parent")).expect("creates");
+        std::fs::write(
+            &legacy,
+            serde_json::to_string(&session("1-0", 10)).expect("serialises"),
+        )
+        .expect("writes");
+
+        assert_eq!(store.list(&repo(), 141).expect("migrates").len(), 1);
+        std::fs::remove_dir_all(home.path().join("cache")).expect("removes cache");
+        assert!(store.latest(&repo(), 141).expect("reads").is_some());
+    }
+
+    #[test]
+    fn ir_06_reports_another_instances_chat_write_conflict() {
+        let (store, _home) = store();
+        let lock = store.lock(&repo(), 141).expect("acquires first lock");
+        let error = store
+            .put(&session("1-0", 10))
+            .expect_err("reports conflict");
+        assert_eq!(error, ChatStoreError::Conflict);
+        drop(lock);
+        store
+            .put(&session("1-0", 10))
+            .expect("retries after lock release");
+    }
+
+    #[test]
+    fn ir_06_legacy_sessions_are_not_reimported_after_a_removal() {
+        let (store, home) = store();
+        let legacy = home
+            .path()
+            .join("cache/chat/github.com/acme/service/pr-141/1-0.json");
+        std::fs::create_dir_all(legacy.parent().expect("parent")).expect("creates");
+        std::fs::write(
+            &legacy,
+            serde_json::to_string(&session("1-0", 10)).expect("serialises"),
+        )
+        .expect("writes");
+
+        store
+            .remove(&repo(), 141, "1-0")
+            .expect("migrates then removes");
+        assert!(store.list(&repo(), 141).expect("lists").is_empty());
+        assert!(store.migration_path(&repo(), 141).exists());
     }
 }

@@ -32,6 +32,7 @@ const PLAN_FILE: &str = "plan.json";
 #[derive(Debug, Clone)]
 pub struct DiskAnalysisCache {
     root: PathBuf,
+    plan_root: PathBuf,
 }
 
 /// The envelope written to disk: the question, the answer, and the raw text.
@@ -108,7 +109,20 @@ impl DiskAnalysisCache {
     /// Binds the cache to a directory, created on demand.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            plan_root: root.clone(),
+            root,
+        }
+    }
+
+    /// Separates durable manual review-plan overrides from disposable analyses (IR-06).
+    #[must_use]
+    pub fn with_review_root(root: impl Into<PathBuf>, review_root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            plan_root: review_root.into(),
+        }
     }
 
     /// Where the cache lives, for `:doctor`.
@@ -119,13 +133,77 @@ impl DiskAnalysisCache {
 
     /// The directory holding one pull request's analyses.
     fn pr_dir(&self, repo: &RepoId, pr: u64) -> PathBuf {
-        self.root
-            .join(repo.host())
-            .join(repo.owner())
-            .join(repo.name())
-            .join(format!("pr-{pr}"))
+        pr_dir(&self.root, repo, pr)
     }
 
+    fn plan_dir(&self, repo: &RepoId, pr: u64) -> PathBuf {
+        pr_dir(&self.plan_root, repo, pr)
+    }
+
+    fn plan_path(&self, repo: &RepoId, pr: u64) -> PathBuf {
+        self.plan_dir(repo, pr).join(PLAN_FILE)
+    }
+
+    /// Copies a valid legacy override before cache eviction can discard it (IR-06).
+    fn migrate_plan(&self, repo: &RepoId, pr: u64) -> Result<(), AnalysisCacheError> {
+        let destination = self.plan_path(repo, pr);
+        if destination.exists() || self.plan_root == self.root {
+            return Ok(());
+        }
+        let source = self.pr_dir(repo, pr).join(PLAN_FILE);
+        let text = match std::fs::read_to_string(&source) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AnalysisCacheError::Io {
+                    action: "read the legacy review plan".to_owned(),
+                    path: source.display().to_string(),
+                    cause: error.to_string(),
+                });
+            }
+        };
+        let plan: Plan = match serde_json::from_str(&text) {
+            Ok(plan) => plan,
+            Err(error) => {
+                logging::log(
+                    Level::Warn,
+                    format!(
+                        "retaining unreadable legacy review plan {}: {error}",
+                        source.display()
+                    ),
+                );
+                return Ok(());
+            }
+        };
+        let body = serde_json::to_string(&plan).map_err(|error| AnalysisCacheError::Io {
+            action: "serialise a migrated review plan".to_owned(),
+            path: destination.display().to_string(),
+            cause: error.to_string(),
+        })?;
+        Self::write(&destination, &body)?;
+        if std::fs::read_to_string(&destination)
+            .ok()
+            .and_then(|body| serde_json::from_str::<Plan>(&body).ok())
+            .is_none()
+        {
+            return Err(AnalysisCacheError::Io {
+                action: "verify a migrated review plan".to_owned(),
+                path: destination.display().to_string(),
+                cause: "the copied document did not validate".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn pr_dir(root: &Path, repo: &RepoId, pr: u64) -> PathBuf {
+    root.join(repo.host())
+        .join(repo.owner())
+        .join(repo.name())
+        .join(format!("pr-{pr}"))
+}
+
+impl DiskAnalysisCache {
     /// The path a key is stored at.
     ///
     /// The repository and pull request decide the directory; the digest decides the
@@ -280,7 +358,8 @@ impl AnalysisCachePort for DiskAnalysisCache {
     }
 
     fn plan(&self, repo: &RepoId, pr: u64) -> Result<Option<Plan>, AnalysisCacheError> {
-        let path = self.pr_dir(repo, pr).join(PLAN_FILE);
+        self.migrate_plan(repo, pr)?;
+        let path = self.plan_path(repo, pr);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -311,7 +390,8 @@ impl AnalysisCachePort for DiskAnalysisCache {
     }
 
     fn put_plan(&self, repo: &RepoId, pr: u64, plan: &Plan) -> Result<(), AnalysisCacheError> {
-        let path = self.pr_dir(repo, pr).join(PLAN_FILE);
+        self.migrate_plan(repo, pr)?;
+        let path = self.plan_path(repo, pr);
         let body = serde_json::to_string(plan).map_err(|error| AnalysisCacheError::Io {
             action: "serialise the review plan for".to_owned(),
             path: path.display().to_string(),
@@ -545,6 +625,28 @@ mod tests {
         assert!(
             cache.plan(&repo(), 141).expect("reads").is_none(),
             "the analysis is still usable without its overrides"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ir_06_migrates_manual_plan_before_cache_is_removed() {
+        let (_legacy_cache, root) = cache();
+        let legacy = DiskAnalysisCache::new(root.join("cache/analysis"));
+        let durable =
+            DiskAnalysisCache::with_review_root(root.join("cache/analysis"), root.join("reviews"));
+        let plan = Plan::heuristic("abc123", &["src/a.rs".to_owned()]);
+        legacy
+            .put_plan(&repo(), 141, &plan)
+            .expect("writes legacy plan");
+
+        assert_eq!(durable.plan(&repo(), 141).expect("migrates"), Some(plan));
+        std::fs::remove_dir_all(root.join("cache")).expect("removes cache");
+        assert!(
+            durable
+                .plan(&repo(), 141)
+                .expect("uses durable plan")
+                .is_some()
         );
         let _ = std::fs::remove_dir_all(root);
     }

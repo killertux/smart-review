@@ -182,12 +182,13 @@ impl Ports {
                 Arc::clone(&clock),
             )),
             llm: Arc::new(LlmCrate::new()),
-            analysis: Arc::new(crate::adapters::analysis_cache::DiskAnalysisCache::new(
-                home.analysis_cache(),
-            )),
-            chat: Arc::new(crate::adapters::chat_store::FileChatStore::new(
-                home.cache(),
-            )),
+            analysis: Arc::new(
+                crate::adapters::analysis_cache::DiskAnalysisCache::with_review_root(
+                    home.analysis_cache(),
+                    home.reviews(),
+                ),
+            ),
+            chat: Arc::new(crate::adapters::chat_store::FileChatStore::new(home.root())),
             drafts: Arc::new(crate::adapters::draft_store::FileDraftStore::new(
                 home.root(),
             )),

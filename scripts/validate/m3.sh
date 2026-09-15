@@ -497,13 +497,13 @@ if shown "$FRAMES" "\[general\]"; then
 else
   ok "the [general] marker is not shown as text"
 fi
-CHAT_DIR="$HOME_MAIN/cache/chat/github.com/acme/service/pr-141"
+CHAT_DIR="$HOME_MAIN/chats/github.com/acme/service/pr-141"
 FILES="$(find "$CHAT_DIR" -name '*.json' 2>/dev/null | grep -vc index.json)"
 if [ "$FILES" = "1" ]; then
   ok "the conversation is stored under the pull request"
 else
   bad "expected one conversation file, found $FILES"
-  find "$HOME_MAIN/cache/chat" 2>/dev/null | head -8
+  find "$HOME_MAIN/chats" 2>/dev/null | head -8
 fi
 if grep -q '"role": *"user"' "$CHAT_DIR"/*.json 2>/dev/null; then
   ok "the question itself is part of the stored conversation"
@@ -633,12 +633,12 @@ else
   bad "the conversation did not survive"
   printf '%s\n' "$SCREEN" | tail -12
 fi
-SESSIONS="$(find "$HOME_MAIN/cache/chat" -name '*.json' 2>/dev/null | grep -vc index.json)"
+SESSIONS="$(find "$HOME_MAIN/chats" -name '*.json' 2>/dev/null | grep -vc index.json)"
 if [ "$SESSIONS" = "1" ]; then
   ok "one conversation was stored, under the pull request"
 else
   bad "expected one stored conversation, found $SESSIONS"
-  find "$HOME_MAIN/cache/chat" 2>/dev/null | head -8
+  find "$HOME_MAIN/chats" 2>/dev/null | head -8
 fi
 if [ -f "$CHAT_DIR/index.json" ]; then
   ok "the list is stored beside it"

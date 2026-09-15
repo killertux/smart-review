@@ -383,7 +383,10 @@ Root: `$SMART_REVIEW_HOME` if set, else `~/.smart-review`.
     repos/<host>_<owner>_<name>/prs.json
     repos/<host>_<owner>_<name>/pr-<N>/detail.json
     repos/<host>_<owner>_<name>/pr-<N>/analysis-<head_sha>.json
-    repos/<host>_<owner>_<name>/pr-<N>/chat-<session>.json
+  chats/
+    <host>/<owner>/<name>/pr-<N>/<session>.json
+  reviews/
+    <host>/<owner>/<name>/pr-<N>/plan.json
 drafts/<host>/<owner>/<name>/pr-<N>.json
   worktrees/<owner>-<repo>/pr-<N>/
   logs/smart-review.log       # rotated, max 5 files × 2 MiB
@@ -489,7 +492,7 @@ Acceptance criteria:
 - [ ] Themes can be selected by file stem and hot-reloaded with `:theme reload`.
 
 **FR-8.5 State & cache** — MUST — M0/M1
-`state.toml` holds only small, user-meaningful state: last repo/PR, layout and pane sizes, current theme, sort/filter defaults, per-PR manual review-order overrides, seen/visited markers, session ids. Cached network payloads live under `cache/` and MUST be treated as disposable (deleting `cache/` never loses a draft or chat).
+`state.toml` holds only small, user-meaningful state: last repo/PR, layout and pane sizes, current theme, sort/filter defaults, seen/visited markers and session ids. Cached network payloads live under `cache/` and MUST be treated as disposable. Durable chats live under `chats/`; manual review-order overrides live under `reviews/`; deleting `cache/` never loses a draft, chat or manual override.
 
 **FR-8.6 Config robustness** — MUST — M0
 Unknown keys are preserved (not rewritten away) and reported as warnings; unusable values produce a message naming the file, the key and the expected type (TOML syntax errors also carry the line and column) and fall back to the default for that key, so the app still starts. A config file is never silently rewritten.

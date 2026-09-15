@@ -2,14 +2,20 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{self, Loaded};
 use crate::error::Result;
 use crate::ports::{ConfigStore, StateStore};
 use crate::state::{self, AppState};
 
-/// Writes `contents` to `path` through a temporary file and an atomic rename, so
-/// a crash can never leave a half-written file behind (NFR-4.1).
+/// Writes `contents` to `path` through an exclusive, synchronised sibling and an
+/// atomic rename (NFR-4.1).
+///
+/// This protects readers from a process crash between writing and publishing. On Unix
+/// the containing directory is also synchronised after the rename, so the rename is
+/// durable once this function succeeds. No filesystem API can promise that a physical
+/// device has survived power loss beyond the guarantees its filesystem provides.
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     write_atomic_with_mode(path, contents, None)
 }
@@ -24,32 +30,85 @@ pub(crate) fn write_atomic_with_mode(
     contents: &str,
     mode: Option<u32>,
 ) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = temporary_path(path);
-    {
-        let mut file = std::fs::File::create(&temporary)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a document path needs a parent",
+        )
+    })?;
+    create_private_parents(parent)?;
+    let temporary = unique_temporary_path(path);
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let destination_mode = std::fs::metadata(path)
+                .ok()
+                .map(|metadata| metadata.permissions().mode() & 0o777);
+            let effective_mode = mode.or(destination_mode).unwrap_or(0o600);
+            options.mode(effective_mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut file = options.open(&temporary)?;
         #[cfg(unix)]
         if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
-        #[cfg(not(unix))]
-        let _ = mode;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        // This operation created the unique name, so it can never remove another
+        // writer's in-progress replacement.
+        let _ = std::fs::remove_file(&temporary);
     }
-    std::fs::rename(&temporary, path)
+    result
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
+fn unique_temporary_path(path: &Path) -> PathBuf {
+    static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let mut name = path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    name.push(".tmp");
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".tmp-{}-{sequence}", std::process::id()));
     path.with_file_name(name)
+}
+
+pub(crate) fn create_private_parents(parent: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no existing parent directory")
+        })?;
+    }
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    for directory in missing {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// `config.toml` on disk (FR-8.2).
@@ -113,7 +172,12 @@ mod tests {
         write_atomic(&path, "first").unwrap();
         write_atomic(&path, "second").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
-        assert!(!temporary_path(&path).exists());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-"))
+        );
     }
 
     #[test]
@@ -183,5 +247,31 @@ mod tests {
             0o600,
             "the secret must never be world readable"
         );
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_never_publish_interleaved_bytes() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = temp_home();
+        let path = dir.path().join("shared.json");
+        let start = Arc::new(Barrier::new(3));
+        let writers: Vec<_> = ["a".repeat(32_768), "b".repeat(32_768)]
+            .into_iter()
+            .map(|contents| {
+                let start = Arc::clone(&start);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    write_atomic(&path, &contents)
+                })
+            })
+            .collect();
+        start.wait();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let published = std::fs::read_to_string(path).unwrap();
+        assert!(published == "a".repeat(32_768) || published == "b".repeat(32_768));
     }
 }
