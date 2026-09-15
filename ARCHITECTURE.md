@@ -80,7 +80,9 @@ fake) or a real alternative. Empty abstractions are not written "for later".
 
 `WorkspacePort` also evaluates repository ignore rules for context assembly. That
 repository-aware check stays outside `domain`; the resulting path decisions are passed
-to the pure bundle builder and govern both diff hunks and full file bodies (IR-01).
+to the pure bundle builder and govern full and reduced diff hunks, full file bodies and
+later user additions. The adapter evaluates old paths against base-revision ignore rules
+and new paths against head-revision rules (IR-01).
 
 ## 4. Data flow
 

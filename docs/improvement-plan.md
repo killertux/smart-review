@@ -349,6 +349,8 @@ full review/reply/LLM request bodies.
 - Modified/deleted `.env`; `.env` renamed to an innocuous filename and the reverse.
 - Denied nested credential path, binary content, and an oversize file.
 - A tracked path matching ignore rules, including nested patterns/negation behavior.
+- A tracked old path ignored only at the base revision after the head removes the rule.
+- A reduced-budget final payload and a renamed destination added with `:context add`.
 - A permitted source file remains present; filtering does not silently drop the rest
   of the diff or all context.
 - The inspector's file inclusion agrees with the exact fake-provider request.
@@ -368,9 +370,11 @@ an “excluded” row whose content still appears in any request or ordinary log
 contracts (`m4`, `m5`). The final PR description must include exact fixture commands.
 
 **Local verification (2026-09-14):** `cargo fmt --all`, Clippy with all targets,
-features and warnings denied, and `cargo test --all-features` passed (997 unit tests and
+features and warnings denied, and `cargo test --all-features` passed (1002 unit tests and
 11 snapshots). Validators passed: `m2b` 35/35, `m3` 59/59, `m4` 23/23 and `m5` 32/32.
-No live provider, network request or GitHub mutation was used.
+Final-wire regressions cover reduced-budget and user-added-rename payloads, and a real
+Git fixture covers base-only ignore rules. No live provider, network request or GitHub
+mutation was used.
 
 **Out of scope:** replacing the provider SDK or implementing a generic secret scanner.
 

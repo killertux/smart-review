@@ -82,12 +82,9 @@ pub fn gather(
     cancel: &Cancel,
 ) -> Gathered {
     let paths = candidate_paths(source);
-    let (ignored, ignore_error) = ignored_paths(workspace, source.checkout(), &paths, cancel);
-    let eligibility = Eligibility {
-        ignored: &ignored,
-        error: ignore_error.as_deref(),
-        policy: source.policy(),
-    };
+    let ignores = revision_ignores(workspace, source.checkout(), &paths, cancel);
+    let eligibility = ignores.eligibility(source.policy());
+    let head_eligibility = eligibility.head;
     let ChangedContent {
         files,
         mut decisions,
@@ -99,18 +96,13 @@ pub fn gather(
         None => (Vec::new(), None),
     };
 
-    let mut notes = Vec::new();
+    let mut notes = ignores.notes();
     if source.checkout().is_none() {
         notes.push(
             "no local workspace: the changed files' contents are not in the bundle. \
              `:workspace` or the review screen's local diff creates one"
                 .to_owned(),
         );
-    }
-    if let Some(error) = &ignore_error {
-        notes.push(format!(
-            "repository ignore rules could not be checked ({error}); affected content was not sent"
-        ));
     }
     for missing in &skipped {
         notes.push(format!("could not read {missing}"));
@@ -133,7 +125,7 @@ pub fn gather(
     let metadata = crate::application::analysis::render_metadata(source.detail());
     let commits = crate::application::analysis::render_commits(source.detail());
     for (label, bytes) in &conventions {
-        decisions.push(decide_path(label, Some(bytes), eligibility));
+        decisions.push(decide_path(label, Some(bytes), head_eligibility));
     }
     let inputs = BundleInputs {
         metadata: &metadata,
@@ -154,7 +146,7 @@ pub fn gather(
     append_added_files(
         workspace,
         source,
-        eligibility,
+        head_eligibility,
         cancel,
         &mut bundle,
         &mut notes,
@@ -180,6 +172,52 @@ struct Eligibility<'a> {
     policy: &'a BundlePolicy,
 }
 
+#[derive(Clone, Copy)]
+struct RevisionEligibility<'a> {
+    base: Eligibility<'a>,
+    head: Eligibility<'a>,
+}
+
+#[derive(Default)]
+struct RevisionIgnores {
+    base: BTreeSet<String>,
+    head: BTreeSet<String>,
+    base_error: Option<String>,
+    head_error: Option<String>,
+}
+
+impl RevisionIgnores {
+    fn eligibility<'a>(&'a self, policy: &'a BundlePolicy) -> RevisionEligibility<'a> {
+        RevisionEligibility {
+            base: Eligibility {
+                ignored: &self.base,
+                error: self.base_error.as_deref(),
+                policy,
+            },
+            head: Eligibility {
+                ignored: &self.head,
+                error: self.head_error.as_deref(),
+                policy,
+            },
+        }
+    }
+
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some(error) = &self.base_error {
+            notes.push(format!(
+                "repository ignore rules at the base revision could not be checked ({error}); affected content was not sent"
+            ));
+        }
+        if let Some(error) = &self.head_error {
+            notes.push(format!(
+                "repository ignore rules at the head revision could not be checked ({error}); affected content was not sent"
+            ));
+        }
+        notes
+    }
+}
+
 struct ChangedContent {
     files: Vec<(String, Vec<u8>)>,
     decisions: Vec<PathDecision>,
@@ -190,7 +228,6 @@ struct ChangedContent {
 struct ClassificationContext<'a> {
     workspace: &'a dyn WorkspacePort,
     checkout: &'a Checkout,
-    eligibility: Eligibility<'a>,
     cancel: &'a Cancel,
 }
 
@@ -198,7 +235,7 @@ fn changed_content(
     workspace: &dyn WorkspacePort,
     source: &dyn ContextSource,
     paths: &[String],
-    eligibility: Eligibility<'_>,
+    eligibility: RevisionEligibility<'_>,
     cancel: &Cancel,
 ) -> ChangedContent {
     let mut content = ChangedContent {
@@ -218,7 +255,6 @@ fn changed_content(
     let classification = ClassificationContext {
         workspace,
         checkout,
-        eligibility,
         cancel,
     };
     if let Some(patch) = source.patch() {
@@ -226,6 +262,7 @@ fn changed_content(
             if let Some(path) = &file.old_path {
                 classify_representation(
                     classification,
+                    eligibility.base,
                     &path.to_string(),
                     &checkout.base_sha,
                     &mut content.decisions,
@@ -236,6 +273,7 @@ fn changed_content(
                 let path = path.to_string();
                 let bytes = classify_representation(
                     classification,
+                    eligibility.head,
                     &path,
                     &checkout.head_sha,
                     &mut content.decisions,
@@ -250,6 +288,7 @@ fn changed_content(
         for path in source.changed_paths() {
             let bytes = classify_representation(
                 classification,
+                eligibility.head,
                 &path,
                 &checkout.head_sha,
                 &mut content.decisions,
@@ -309,15 +348,47 @@ fn candidate_paths(source: &dyn ContextSource) -> Vec<String> {
 fn ignored_paths(
     workspace: &dyn WorkspacePort,
     checkout: Option<&Checkout>,
+    revision: Option<&str>,
     paths: &[String],
     cancel: &Cancel,
 ) -> (BTreeSet<String>, Option<String>) {
-    let Some(checkout) = checkout else {
+    let (Some(checkout), Some(revision)) = (checkout, revision) else {
         return (BTreeSet::new(), None);
     };
-    match workspace.ignored_paths(&checkout.path, paths, cancel) {
+    match workspace.ignored_paths(&checkout.path, revision, paths, cancel) {
         Ok(paths) => (paths.into_iter().collect(), None),
         Err(error) => (BTreeSet::new(), Some(error.to_string())),
+    }
+}
+
+fn revision_ignores(
+    workspace: &dyn WorkspacePort,
+    checkout: Option<&Checkout>,
+    paths: &[String],
+    cancel: &Cancel,
+) -> RevisionIgnores {
+    let Some(checkout) = checkout else {
+        return RevisionIgnores::default();
+    };
+    let (base, base_error) = ignored_paths(
+        workspace,
+        Some(checkout),
+        Some(&checkout.base_sha),
+        paths,
+        cancel,
+    );
+    let (head, head_error) = ignored_paths(
+        workspace,
+        Some(checkout),
+        Some(&checkout.head_sha),
+        paths,
+        cancel,
+    );
+    RevisionIgnores {
+        base,
+        head,
+        base_error,
+        head_error,
     }
 }
 
@@ -326,16 +397,17 @@ fn ignored_paths(
 /// not copied to a provider merely because their size/type could not be checked.
 fn classify_representation(
     context: ClassificationContext<'_>,
+    eligibility: Eligibility<'_>,
     path: &str,
     revision: &str,
     decisions: &mut Vec<PathDecision>,
     skipped: &mut Vec<String>,
 ) -> Option<Vec<u8>> {
-    if context.eligibility.error.is_some()
-        || context.eligibility.ignored.contains(path)
+    if eligibility.error.is_some()
+        || eligibility.ignored.contains(path)
         || crate::domain::context::is_secret_path(path)
     {
-        decisions.push(decide_path(path, None, context.eligibility));
+        decisions.push(decide_path(path, None, eligibility));
         return None;
     }
     match context
@@ -343,7 +415,7 @@ fn classify_representation(
         .read_file(&context.checkout.path, revision, path, context.cancel)
     {
         Ok(bytes) => {
-            decisions.push(decide_path(path, Some(&bytes), context.eligibility));
+            decisions.push(decide_path(path, Some(&bytes), eligibility));
             Some(bytes)
         }
         Err(error) => {

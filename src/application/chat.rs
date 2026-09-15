@@ -711,6 +711,63 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_the_final_request_reuses_a_rename_decision_for_a_user_added_file() {
+        let mut workspace = workspace();
+        workspace.files.insert(
+            "base123:.env".to_owned(),
+            b"RENAMED_USER_FILE_OLD_SECRET".to_vec(),
+        );
+        workspace.files.insert(
+            "abc123:docs/design.md".to_owned(),
+            b"RENAMED_USER_FILE_NEW_SECRET".to_vec(),
+        );
+        let llm = FakeLlm::answering(&["ok"]);
+        let clock = crate::test_support::FakeClock::new(1_000);
+        let repo = repo();
+        let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
+        let cancel = Cancel::new();
+        let mut spec = spec();
+        spec.patch = Some(Box::new(crate::domain::diff::parse_patch(
+            "diff --git a/.env b/docs/design.md\n\
+             similarity index 90%\n\
+             rename from .env\n\
+             rename to docs/design.md\n\
+             --- a/.env\n\
+             +++ b/docs/design.md\n\
+             @@ -1 +1 @@\n\
+             -RENAMED_USER_FILE_OLD_SECRET\n\
+             +RENAMED_USER_FILE_NEW_SECRET\n",
+        )));
+        spec.added = vec!["docs/design.md".to_owned()];
+        let bundle = chatter.gather(&spec, &cancel);
+        let mut progress = |_: Progress| {};
+        chatter
+            .ask(
+                &spec,
+                &session(),
+                &bundle,
+                "is this safe?",
+                &cancel,
+                &mut progress,
+            )
+            .expect("the fake provider answers");
+
+        let prompts = llm.prompts.lock().expect("lock");
+        let sent = prompts[0]
+            .0
+            .as_deref()
+            .expect("chat sends context in the system prompt");
+        assert!(!sent.contains("RENAMED_USER_FILE_OLD_SECRET"), "{sent}");
+        assert!(!sent.contains("RENAMED_USER_FILE_NEW_SECRET"), "{sent}");
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| { line.contains("docs/design.md") && line.contains("credential") })
+        );
+    }
+
+    #[test]
     fn fr_4_6_ignored_conventions_and_user_additions_are_not_sent() {
         let mut workspace = workspace();
         workspace.files.insert(

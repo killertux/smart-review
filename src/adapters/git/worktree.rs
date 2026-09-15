@@ -818,7 +818,12 @@ mod tests {
         ];
 
         let ignored = git
-            .ignored_paths(&fixture.clone, &candidates, &Cancel::new())
+            .ignored_paths(
+                &fixture.clone,
+                &fixture.head_sha(),
+                &candidates,
+                &Cancel::new(),
+            )
             .expect("ignore rules are evaluated");
 
         assert!(ignored.contains(&"tracked.log".to_owned()), "{ignored:?}");
@@ -831,6 +836,35 @@ mod tests {
             "{ignored:?}"
         );
         assert!(!ignored.contains(&"src/lib.rs".to_owned()), "{ignored:?}");
+    }
+
+    #[test]
+    fn fr_4_6_ignore_rules_are_evaluated_at_the_represented_revision() {
+        let fixture = GitFixture::new();
+        fixture.commit(".gitignore", "tracked.log\n", "ignore the tracked fixture");
+        std::fs::write(
+            fixture.clone.join("tracked.log"),
+            "BASE_ONLY_IGNORE_SENTINEL",
+        )
+        .expect("writes tracked fixture");
+        fixture.git(&["add", "-f", "--", "tracked.log"]);
+        fixture.git(&["commit", "--quiet", "-m", "track ignored fixture"]);
+        let base = fixture.head_sha();
+        fixture.git(&["rm", "--quiet", ".gitignore"]);
+        fixture.git(&["commit", "--quiet", "-m", "remove ignore rule"]);
+        let head = fixture.head_sha();
+        let git = adapter(&fixture, &fixture.path().join("worktrees"));
+        let candidates = vec!["tracked.log".to_owned()];
+
+        let ignored_at_base = git
+            .ignored_paths(&fixture.clone, &base, &candidates, &Cancel::new())
+            .expect("base ignore rules are evaluated");
+        let ignored_at_head = git
+            .ignored_paths(&fixture.clone, &head, &candidates, &Cancel::new())
+            .expect("head ignore rules are evaluated");
+
+        assert_eq!(ignored_at_base, candidates);
+        assert!(ignored_at_head.is_empty(), "{ignored_at_head:?}");
     }
 
     #[test]

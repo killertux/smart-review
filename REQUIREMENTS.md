@@ -241,7 +241,8 @@ Acceptance criteria:
 *Implementation note (IR-01):* one path decision governs every representation of a
 changed file: full bodies and diff hunks, including deleted content and both names of a
 rename. Tracked paths are still checked against repository ignore rules (`git
-check-ignore --no-index`). If eligibility or file bytes cannot be checked, source
+check-ignore --no-index`), using the base revision's rules for old paths and the head
+revision's rules for new paths. If eligibility or file bytes cannot be checked, source
 content is fail-closed and `:context` states why. This is a pathname/file policy, not a
 generic secret scanner: PR metadata, commit messages and the user's own question are
 ordinary prose and are shown in the pre-send context rather than heuristically edited.

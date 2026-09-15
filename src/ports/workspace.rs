@@ -209,7 +209,7 @@ pub trait WorkspacePort: std::fmt::Debug + Send + Sync {
         cancel: &Cancel,
     ) -> Result<Vec<String>, WorkspaceError>;
 
-    /// Returns the supplied paths matched by repository ignore rules.
+    /// Returns the supplied paths matched by repository ignore rules at `rev`.
     ///
     /// This deliberately includes tracked paths: a committed credential remains
     /// excluded when `.gitignore` also names it (FR-4.6).
@@ -220,6 +220,7 @@ pub trait WorkspacePort: std::fmt::Debug + Send + Sync {
     fn ignored_paths(
         &self,
         repo: &std::path::Path,
+        rev: &str,
         paths: &[String],
         cancel: &Cancel,
     ) -> Result<Vec<String>, WorkspaceError>;

@@ -346,6 +346,9 @@ pub struct Bundle {
     pub segments: Vec<Segment>,
     /// The estimated tokens of [`Bundle::text`].
     pub estimated_tokens: usize,
+    /// Completed repository path decisions, retained so a later `:context add` reuses
+    /// the same rename-wide decision as the diff and changed-file body.
+    path_decisions: Vec<PathDecision>,
 }
 
 impl Bundle {
@@ -377,7 +380,11 @@ impl Bundle {
         decision: Option<PathDecision>,
     ) {
         let used = self.text.len();
-        let decisions = decision.into_iter().collect::<Vec<_>>();
+        let mut decisions = std::mem::take(&mut self.path_decisions);
+        decisions.push(decision.unwrap_or_else(|| PathDecision {
+            path: path.to_owned(),
+            disposition: disposition(path, bytes, policy),
+        }));
         let mut builder = Builder {
             policy,
             text: std::mem::take(&mut self.text),
@@ -389,6 +396,7 @@ impl Bundle {
         self.text = builder.text;
         self.segments = builder.segments;
         self.estimated_tokens = estimate_tokens(self.text.len());
+        self.path_decisions = decisions;
     }
 
     /// How many segments are actually in the bundle.
@@ -645,7 +653,11 @@ impl<'a> Builder<'a> {
 
         // Step two of the truncation order: keep the changed lines and just enough
         // context to read them.
-        let reduced = render_patch(patch, Some(self.policy.reduced_context_lines));
+        let reduced = render_patch_filtered(
+            patch,
+            Some(self.policy.reduced_context_lines),
+            self.decisions,
+        );
         if reduced.len() <= self.remaining() {
             let detail = format!(
                 "context reduced to {} line(s) per hunk to fit the budget",
@@ -698,6 +710,7 @@ impl<'a> Builder<'a> {
             text: self.text,
             segments: self.segments,
             estimated_tokens,
+            path_decisions: self.decisions.to_vec(),
         }
     }
 }
@@ -1081,6 +1094,49 @@ mod tests {
         assert!(!bundle.text.contains("OVERSIZE_NEW_SENTINEL"));
         assert!(bundle.inspection().iter().any(|line| {
             line.contains("generated.txt") && line.contains("diff content excluded")
+        }));
+    }
+
+    #[test]
+    fn fr_4_6_reduced_diff_reuses_the_original_path_decisions() {
+        let mut text = String::from(
+            "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n\
+             -REDUCED_OLD_SECRET_SENTINEL\n+REDUCED_NEW_SECRET_SENTINEL\n\
+             diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n\
+             @@ -1,200 +1,200 @@\n",
+        );
+        for index in 0..99 {
+            let _ = writeln!(text, " context before {index}");
+        }
+        text.push_str("-fn old() {}\n+fn reduced_allowed_sentinel() {}\n");
+        for index in 0..99 {
+            let _ = writeln!(text, " context after {index}");
+        }
+        let patch = parse_patch(&text);
+        let policy = BundlePolicy {
+            max_context_tokens: 200,
+            max_file_bytes: 1024,
+            reduced_context_lines: 1,
+        };
+
+        let bundle = build(
+            &BundleInputs {
+                diff: Some(&patch),
+                ..BundleInputs::default()
+            },
+            &policy,
+        );
+
+        assert!(!bundle.text.contains("REDUCED_OLD_SECRET_SENTINEL"));
+        assert!(!bundle.text.contains("REDUCED_NEW_SECRET_SENTINEL"));
+        assert!(bundle.text.contains("reduced_allowed_sentinel"));
+        assert!(bundle.segments.iter().any(|segment| {
+            segment.kind == SegmentKind::Diff
+                && segment.truncated
+                && segment
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("context reduced"))
         }));
     }
 

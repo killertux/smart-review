@@ -570,6 +570,7 @@ mod tests {
     use crate::ports::analysis::{AnalysisCacheError, StoredAnalysis};
     use crate::test_support::{FakeClock, FakeLlm, sample_detail};
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -909,6 +910,50 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_the_reduced_final_provider_request_preserves_exclusions() {
+        let mut patch_text = String::from(
+            "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n\
+             -REDUCED_PROVIDER_OLD_SECRET\n+REDUCED_PROVIDER_NEW_SECRET\n\
+             diff --git a/src/money.rs b/src/money.rs\n--- a/src/money.rs\n+++ b/src/money.rs\n\
+             @@ -1,300 +1,300 @@\n",
+        );
+        for index in 0..149 {
+            let _ = writeln!(patch_text, " context before {index}");
+        }
+        patch_text.push_str("-fn old() {}\n+fn reduced_provider_allowed() {}\n");
+        for index in 0..149 {
+            let _ = writeln!(patch_text, " context after {index}");
+        }
+        let mut request = request();
+        request.patch = Some(Box::new(crate::domain::diff::parse_patch(&patch_text)));
+        request.policy.max_context_tokens = 1_000;
+        let workspace = workspace(&[
+            (".env", "REDUCED_PROVIDER_NEW_SECRET"),
+            ("src/money.rs", "fn reduced_provider_allowed() {}"),
+        ]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+        let cancel = Cancel::new();
+        let (bundle, _) = use_case.gather(&request, &cancel);
+        let mut handler = |_: Progress| {};
+        use_case
+            .run(&request, &bundle, &cancel, &mut handler)
+            .expect("the fake provider answers");
+
+        assert!(bundle.segments.iter().any(|segment| {
+            segment.kind == crate::domain::context::SegmentKind::Diff && segment.truncated
+        }));
+        let prompts = llm.prompts.lock().expect("lock");
+        let sent = &prompts[0].1;
+        assert!(!sent.contains("REDUCED_PROVIDER_OLD_SECRET"), "{sent}");
+        assert!(!sent.contains("REDUCED_PROVIDER_NEW_SECRET"), "{sent}");
+        assert!(sent.contains("reduced_provider_allowed"), "{sent}");
+    }
+
+    #[test]
     fn fr_4_6_a_tracked_ignored_path_is_absent_from_bundle_and_inventory() {
         let request = request();
         let mut workspace = workspace(&[("src/money.rs", "IGNORED_TRACKED_SENTINEL")]);
@@ -928,6 +973,38 @@ mod tests {
                 .inspection()
                 .iter()
                 .any(|line| { line.contains("src/money.rs") && line.contains("ignore rules") })
+        );
+    }
+
+    #[test]
+    fn fr_4_6_a_base_only_ignore_rule_excludes_deleted_content() {
+        let mut request = request();
+        request.patch = Some(Box::new(crate::domain::diff::parse_patch(
+            "diff --git a/tracked.log b/tracked.log\n\
+             deleted file mode 100644\n\
+             --- a/tracked.log\n\
+             +++ /dev/null\n\
+             @@ -1 +0,0 @@\n\
+             -BASE_ONLY_IGNORED_SENTINEL\n",
+        )));
+        let mut workspace = workspace(&[("tracked.log", "BASE_ONLY_IGNORED_SENTINEL")]);
+        workspace
+            .ignored_at
+            .insert("base123".to_owned(), vec!["tracked.log".to_owned()]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+
+        let (bundle, _) = use_case.gather(&request, &Cancel::new());
+
+        assert!(!bundle.text.contains("BASE_ONLY_IGNORED_SENTINEL"));
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| { line.contains("tracked.log") && line.contains("ignore rules") })
         );
     }
 
