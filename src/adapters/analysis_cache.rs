@@ -125,6 +125,32 @@ impl DiskAnalysisCache {
         }
     }
 
+    /// Migrates every legacy manual review plan before `cache/` is disposable (IR-06).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a valid legacy plan cannot be safely copied or conflicts
+    /// with an existing durable plan.
+    pub fn migrate_all(&self) -> Result<(), AnalysisCacheError> {
+        if self.plan_root == self.root {
+            return Ok(());
+        }
+        for path in files_named(&self.root, PLAN_FILE) {
+            let Some((repo, pr)) = subject_from_legacy_plan_path(&self.root, &path) else {
+                logging::log(
+                    Level::Warn,
+                    format!(
+                        "retaining legacy review plan at unexpected path {}",
+                        path.display()
+                    ),
+                );
+                continue;
+            };
+            self.migrate_plan(&repo, pr)?;
+        }
+        Ok(())
+    }
+
     /// Where the cache lives, for `:doctor`.
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -147,7 +173,7 @@ impl DiskAnalysisCache {
     /// Copies a valid legacy override before cache eviction can discard it (IR-06).
     fn migrate_plan(&self, repo: &RepoId, pr: u64) -> Result<(), AnalysisCacheError> {
         let destination = self.plan_path(repo, pr);
-        if destination.exists() || self.plan_root == self.root {
+        if self.plan_root == self.root {
             return Ok(());
         }
         let source = self.pr_dir(repo, pr).join(PLAN_FILE);
@@ -175,6 +201,19 @@ impl DiskAnalysisCache {
                 return Ok(());
             }
         };
+        if let Ok(destination_text) = std::fs::read_to_string(&destination)
+            && let Ok(existing) = serde_json::from_str::<Plan>(&destination_text)
+        {
+            if existing == plan {
+                return Ok(());
+            }
+            return Err(AnalysisCacheError::Io {
+                action: "reconcile conflicting review plans".to_owned(),
+                path: destination.display().to_string(),
+                cause: "the durable and legacy plans differ; retain both and choose one manually"
+                    .to_owned(),
+            });
+        }
         let body = serde_json::to_string(&plan).map_err(|error| AnalysisCacheError::Io {
             action: "serialise a migrated review plan".to_owned(),
             path: destination.display().to_string(),
@@ -201,6 +240,43 @@ fn pr_dir(root: &Path, repo: &RepoId, pr: u64) -> PathBuf {
         .join(repo.owner())
         .join(repo.name())
         .join(format!("pr-{pr}"))
+}
+
+fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_named(&path, name));
+        } else if path.file_name().and_then(std::ffi::OsStr::to_str) == Some(name) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn subject_from_legacy_plan_path(root: &Path, path: &Path) -> Option<(RepoId, u64)> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = relative.components();
+    let host = parts.next()?.as_os_str().to_str()?;
+    let owner = parts.next()?.as_os_str().to_str()?;
+    let name = parts.next()?.as_os_str().to_str()?;
+    let pr = parts
+        .next()?
+        .as_os_str()
+        .to_str()?
+        .strip_prefix("pr-")?
+        .parse()
+        .ok()?;
+    if parts.next()?.as_os_str() != std::ffi::OsStr::new(PLAN_FILE) || parts.next().is_some() {
+        return None;
+    }
+    RepoId::parse(&format!("{host}/{owner}/{name}"))
+        .ok()
+        .map(|repo| (repo, pr))
 }
 
 impl DiskAnalysisCache {
@@ -647,6 +723,44 @@ mod tests {
                 .plan(&repo(), 141)
                 .expect("uses durable plan")
                 .is_some()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ir_06_migration_replaces_a_malformed_durable_plan_with_valid_legacy_data() {
+        let (_cache, root) = cache();
+        let legacy = DiskAnalysisCache::new(root.join("cache/analysis"));
+        let durable =
+            DiskAnalysisCache::with_review_root(root.join("cache/analysis"), root.join("reviews"));
+        let plan = Plan::heuristic("abc123", &["src/a.rs".to_owned()]);
+        legacy
+            .put_plan(&repo(), 141, &plan)
+            .expect("writes legacy plan");
+        let destination = durable.plan_path(&repo(), 141);
+        std::fs::create_dir_all(destination.parent().expect("parent")).expect("creates");
+        std::fs::write(&destination, "not json").expect("writes interrupted destination");
+
+        assert_eq!(durable.plan(&repo(), 141).expect("recovers"), Some(plan));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ir_06_startup_migration_covers_unopened_legacy_plans() {
+        let (_cache, root) = cache();
+        let legacy = DiskAnalysisCache::new(root.join("cache/analysis"));
+        let durable =
+            DiskAnalysisCache::with_review_root(root.join("cache/analysis"), root.join("reviews"));
+        let plan = Plan::heuristic("abc123", &["src/a.rs".to_owned()]);
+        legacy
+            .put_plan(&repo(), 141, &plan)
+            .expect("writes legacy plan");
+
+        durable.migrate_all().expect("migrates all plans");
+        std::fs::remove_dir_all(root.join("cache")).expect("removes cache");
+        assert_eq!(
+            durable.plan(&repo(), 141).expect("reads durable plan"),
+            Some(plan)
         );
         let _ = std::fs::remove_dir_all(root);
     }

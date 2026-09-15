@@ -90,8 +90,7 @@ pub struct Startup {
     pub llm: Arc<dyn LlmPort>,
     /// Where analyses and their review-plan overrides are kept (FR-4.3).
     pub analysis: Arc<dyn crate::ports::AnalysisCachePort>,
-    /// Where chat sessions are kept (FR-5.1). Disposable, like everything else under
-    /// `cache/`, but written carefully: the conversation is the user's own words.
+    /// Where durable chat sessions are kept (FR-5.1, FR-8.5).
     pub chat: Arc<dyn crate::ports::ChatStorePort>,
     /// Where review drafts are kept (FR-6.1). Deliberately *not* under `cache/`: a
     /// draft cannot be fetched again.
@@ -142,7 +141,7 @@ impl Ports {
         config: &crate::config::Config,
         path: Option<std::path::PathBuf>,
         dry_run: bool,
-    ) -> Self {
+    ) -> (Self, Vec<String>) {
         let workspace_root = home.worktrees();
         // The dry-run gate is built once and cloned into every adapter: one gate, one
         // promise, and one list of calls to hand to the user (FR-6.5).
@@ -168,35 +167,47 @@ impl Ports {
         let workspace_port = Arc::clone(&workspace);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let cache: Arc<dyn CacheStore> = Arc::new(DiskCache::new(home.cache()));
-        Self {
-            probe: Arc::new(GhCliProbe::new(config.forge.gh_path.clone())),
-            forge_factory: Arc::new(
-                GhForgeFactory::new(config.forge.gh_path.clone()).with_runner(runner()),
-            ),
-            secret_store: Arc::new(FileSecrets::new(home.credentials(), Arc::new(RealEnv))),
-            catalog: Arc::new(ModelsDevCatalog::new(
-                config.catalog.url.clone(),
-                home.catalog_cache(),
-                u64::from(config.catalog.ttl_hours) * 3600,
-                Arc::new(ReqwestFetcher::new()),
-                Arc::clone(&clock),
-            )),
-            llm: Arc::new(LlmCrate::new()),
-            analysis: Arc::new(
-                crate::adapters::analysis_cache::DiskAnalysisCache::with_review_root(
-                    home.analysis_cache(),
-                    home.reviews(),
-                ),
-            ),
-            chat: Arc::new(crate::adapters::chat_store::FileChatStore::new(home.root())),
-            drafts: Arc::new(crate::adapters::draft_store::FileDraftStore::new(
-                home.root(),
-            )),
-            dry_run_ledger: ledger,
-            workspace,
-            workspace_port,
-            cache,
+        let analysis_store = crate::adapters::analysis_cache::DiskAnalysisCache::with_review_root(
+            home.analysis_cache(),
+            home.reviews(),
+        );
+        let chat_store = crate::adapters::chat_store::FileChatStore::new(home.root());
+        let mut warnings = Vec::new();
+        if let Err(error) = chat_store.migrate_all() {
+            warnings.push(format!("chat migration: {error}; retain cache/ and retry"));
         }
+        if let Err(error) = analysis_store.migrate_all() {
+            warnings.push(format!(
+                "review-plan migration: {error}; retain cache/ and retry"
+            ));
+        }
+        (
+            Self {
+                probe: Arc::new(GhCliProbe::new(config.forge.gh_path.clone())),
+                forge_factory: Arc::new(
+                    GhForgeFactory::new(config.forge.gh_path.clone()).with_runner(runner()),
+                ),
+                secret_store: Arc::new(FileSecrets::new(home.credentials(), Arc::new(RealEnv))),
+                catalog: Arc::new(ModelsDevCatalog::new(
+                    config.catalog.url.clone(),
+                    home.catalog_cache(),
+                    u64::from(config.catalog.ttl_hours) * 3600,
+                    Arc::new(ReqwestFetcher::new()),
+                    Arc::clone(&clock),
+                )),
+                llm: Arc::new(LlmCrate::new()),
+                analysis: Arc::new(analysis_store),
+                chat: Arc::new(chat_store),
+                drafts: Arc::new(crate::adapters::draft_store::FileDraftStore::new(
+                    home.root(),
+                )),
+                dry_run_ledger: ledger,
+                workspace,
+                workspace_port,
+                cache,
+            },
+            warnings,
+        )
     }
 }
 
@@ -300,7 +311,9 @@ impl Startup {
         let keymap = keymap::load(&home, &loaded.config.ui, &mut warnings)?;
 
         let dry_run = cli.dry_run || loaded.config.forge.dry_run;
-        let ports = Ports::build(&home, &loaded.config, cli.path.clone(), dry_run);
+        let (ports, storage_warnings) =
+            Ports::build(&home, &loaded.config, cli.path.clone(), dry_run);
+        warnings.extend(storage_warnings);
 
         Ok(Self {
             home,
@@ -375,6 +388,44 @@ mod tests {
         assert!(startup.home.cache().is_dir());
         assert!(startup.home.logs().is_dir());
         assert!(startup.home.root().join("README.md").is_file());
+    }
+
+    #[test]
+    fn ir_06_startup_migrates_every_legacy_durable_document_before_cache_eviction() {
+        let dir = temp_home();
+        let repo = crate::domain::repo::RepoId::parse("github.com/acme/service").expect("repo");
+        let session = crate::domain::chat::Session::new(
+            "1-0",
+            repo.key(),
+            141,
+            "head",
+            "provider/model",
+            None,
+            10,
+        );
+        dir.write(
+            "cache/chat/github.com/acme/service/pr-141/1-0.json",
+            &serde_json::to_string(&session).expect("serialises"),
+        );
+        let plan = crate::domain::plan::Plan::heuristic("head", &["src/a.rs".to_owned()]);
+        dir.write(
+            "cache/analysis/github.com/acme/service/pr-141/plan.json",
+            &serde_json::to_string(&plan).expect("serialises"),
+        );
+
+        let startup = Startup::load(&cli_for(dir.path())).expect("starts and migrates");
+        std::fs::remove_dir_all(startup.home.cache()).expect("removes only cache");
+        assert!(
+            startup
+                .chat
+                .latest(&repo, 141)
+                .expect("durable chat")
+                .is_some()
+        );
+        assert_eq!(
+            startup.analysis.plan(&repo, 141).expect("durable plan"),
+            Some(plan)
+        );
     }
 
     #[test]
