@@ -470,7 +470,7 @@ make_home "$HOME_REPAIR"
 # "repairing", and the quit that follows cuts the run off before the retry lands. The
 # prose is "I looked at the diff…"; the analysis it is replaced by has an intent line.
 SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' \
-  'money\.rs~Nothing has been sent yet~Finance reported a rounding drift~needed a second attempt' \
+  'money\.rs~Nothing has been sent yet~Finance reported a rounding drift' \
   "$TMP/repair.log")"
 if shown "$TMP/repair.log" "Finance reported a rounding drift"; then
   ok "prose was repaired into a usable analysis"
@@ -484,7 +484,11 @@ if [ "${REPAIRS:-0}" -ge 1 ]; then
 else
   bad "the retry did not explain the failure"
 fi
-if shown "$TMP/repair.log" "needed a second attempt|after a retry"; then
+# A lazy streaming adapter may complete the repair before the terminal captures another
+# frame. The status notice is emitted by the same reducer transition and is retained in
+# the app log, so inspect that durable UI record rather than requiring an unnecessary
+# second provider request to keep the popup open (IR-02).
+if grep -q "analysed #141.*(after a retry)" "$HOME_REPAIR/logs/smart-review.log"; then
   ok "the interface says a retry happened"
 else
   bad "the interface did not mention the retry"
