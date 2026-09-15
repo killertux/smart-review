@@ -112,8 +112,8 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | [Open — PR #11](https://github.com/killertux/smart-review/pull/11) |
 | [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | [Open — PR #12](https://github.com/killertux/smart-review/pull/12) |
 | [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Implemented |
-| [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | In progress on `ir-04-draft-anchors-composers` |
-| [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | Not started |
+| [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | [Merged — PR #14](https://github.com/killertux/smart-review/pull/14) |
+| [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | In progress on `ir-05-review-session` |
 | [IR-06](#ir-06-make-user-storage-atomic-durable-and-recoverable) | P1 foundation | Atomic writes, durable chat, recoverable indexes | IR-05 | L | Not started |
 | [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | Not started |
 | [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | Not started |
@@ -534,7 +534,7 @@ request was used.
 
 **Priority:** P1. **Findings:** F10, F13.\
 **Requirements:** FR-6.1–6.3, NFR-3.4, NFR-4.1. **Depends on:** none.
-**Status:** in progress on `ir-04-draft-anchors-composers`.
+**Status:** merged in [PR #14](https://github.com/killertux/smart-review/pull/14).
 
 ### Delivered outcome
 

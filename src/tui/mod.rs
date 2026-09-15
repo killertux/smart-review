@@ -247,6 +247,9 @@ fn edit_composer(app: &mut App, terminal: &mut terminal::TerminalGuard, body: &s
 ///
 /// This is the only function in `tui` that touches the outside world, which is what
 /// lets [`App::render`] stay pure and keeps the loop responsive (NFR-1.2).
+// The exhaustive effect dispatcher is intentionally co-located so adding an effect
+// cannot leave its IO boundary or ownership policy implicit.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn apply(
     effect: Effect,
     app: &mut App,
@@ -281,7 +284,18 @@ pub(crate) fn apply(
         | Effect::RunDoctor => {
             let context = app.doctor_request();
             if let Some(job) = jobs::job_for(&effect, &app.list, context, &app.drafts.draft) {
-                let id = runner.submit(job);
+                if let Effect::OpenPullRequest(number) = &effect {
+                    app.enter_review_session(*number);
+                }
+                let owner = match effect {
+                    Effect::OpenPullRequest(_)
+                    | Effect::PublishDraft
+                    | Effect::PostReply { .. }
+                    | Effect::PostConversation { .. }
+                    | Effect::ResolveThread { .. } => review_job_owner(app),
+                    _ => jobs::JobOwner::Global,
+                };
+                let id = runner.submit_owned(owner, job);
                 app.record_job(&effect, id);
             }
         }
@@ -418,7 +432,7 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
         },
         _ => Job::Patch { number, head_sha },
     };
-    let id = runner.submit(job);
+    let id = runner.submit_owned(review_job_owner(app), job);
     app.patch_job = id;
     app.diff_loading = true;
     // The second step of the same wait: fetching a large diff is the slow half.
@@ -440,6 +454,13 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
     }
 }
 
+/// Associates PR-scoped work with the review visit that requested it (IR-05).
+fn review_job_owner(app: &App) -> jobs::JobOwner {
+    app.review_session()
+        .cloned()
+        .map_or(jobs::JobOwner::Global, jobs::JobOwner::Review)
+}
+
 /// Handles the effects that read, gather or run an analysis (FR-4.1, FR-4.3, FR-4.6).
 ///
 /// Returns whether the effect belonged to this group, so `apply` stays exhaustive.
@@ -456,7 +477,10 @@ fn apply_analysis_effect(
                 // the cache, and asking it with half a key would be a bug.
                 return true;
             };
-            let id = runner.submit(jobs::Job::LoadAnalysis { key: Box::new(key) });
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::LoadAnalysis { key: Box::new(key) },
+            );
             app.record_stored_job(id);
         }
 
@@ -473,10 +497,13 @@ fn apply_analysis_effect(
                 return true;
             };
             app.panel.state = app::AnalysisState::Gathering;
-            let id = runner.submit(jobs::Job::GatherContext {
-                request: Box::new(request),
-                intent: *intent,
-            });
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::GatherContext {
+                    request: Box::new(request),
+                    intent: *intent,
+                },
+            );
             app.record_context_job(id);
         }
 
@@ -496,10 +523,13 @@ fn apply_analysis_effect(
                 return true;
             };
             app.begin_analysis();
-            let id = runner.submit(jobs::Job::RunAnalysis {
-                request: Box::new(request),
-                bundle: Box::new(bundle),
-            });
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::RunAnalysis {
+                    request: Box::new(request),
+                    bundle: Box::new(bundle),
+                },
+            );
             app.record_analysis_job(id);
         }
 
@@ -544,7 +574,10 @@ fn apply_chat_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> 
             let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
                 return true;
             };
-            let id = runner.submit(jobs::Job::LoadChat { pr, open: None });
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::LoadChat { pr, open: None },
+            );
             app.record_chat_load(id);
         }
 
@@ -558,10 +591,13 @@ fn apply_chat_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> 
             let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
                 return true;
             };
-            let job = runner.submit(jobs::Job::LoadChat {
-                pr,
-                open: Some(id.clone()),
-            });
+            let job = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::LoadChat {
+                    pr,
+                    open: Some(id.clone()),
+                },
+            );
             app.record_chat_load(job);
         }
 
@@ -680,14 +716,17 @@ fn ask_chat(app: &mut App, runner: &mut JobRunner, retry: bool) {
     // to differ.
     if let Some(bundle) = app.take_chat_bundle() {
         app.begin_chat_answer(&question, session.clone());
-        let id = runner.submit(jobs::Job::AskChat {
-            request: Box::new(jobs::ChatAsk {
-                spec,
-                session: Box::new(session),
-                question,
-                bundle: Box::new(bundle),
-            }),
-        });
+        let id = runner.submit_owned(
+            review_job_owner(app),
+            jobs::Job::AskChat {
+                request: Box::new(jobs::ChatAsk {
+                    spec,
+                    session: Box::new(session),
+                    question,
+                    bundle: Box::new(bundle),
+                }),
+            },
+        );
         app.record_chat_job(id);
         return;
     }
@@ -697,11 +736,14 @@ fn ask_chat(app: &mut App, runner: &mut JobRunner, retry: bool) {
     if !app.analysis_opt_in_recorded() {
         app.await_chat_confirmation();
     }
-    let id = runner.submit(jobs::Job::GatherChat {
-        spec: Box::new(spec),
-        session: Box::new(session),
-        question,
-    });
+    let id = runner.submit_owned(
+        review_job_owner(app),
+        jobs::Job::GatherChat {
+            spec: Box::new(spec),
+            session: Box::new(session),
+            question,
+        },
+    );
     app.record_chat_load(id);
 }
 
@@ -741,9 +783,12 @@ fn apply_model_effect(
                 .and_then(|environment| environment.remote.clone())
                 .unwrap_or_else(|| "origin".to_owned());
             let request = workspace_request(&repo, &remote, detail, *number);
-            let id = runner.submit(jobs::Job::Workspace {
-                request: Box::new(request),
-            });
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::Workspace {
+                    request: Box::new(request),
+                },
+            );
             app.record_workspace_job(id);
         }
 
