@@ -110,7 +110,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | PR | Priority | Title / delivered outcome | Hard dependencies | Size | Status |
 |---|---|---|---|---|---|
 | [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | [Open — PR #11](https://github.com/killertux/smart-review/pull/11) |
-| [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | Implemented locally |
+| [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | [Open — PR #12](https://github.com/killertux/smart-review/pull/12) |
 | [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Not started |
 | [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | Not started |
 | [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | Not started |
@@ -384,7 +384,8 @@ mutation was used.
 
 **Priority:** P1. **Findings:** F15.\
 **Requirements:** FR-4.4, FR-5.2, FR-5.4. **Depends on:** none.
-**Status:** implemented and locally verified on `ir-02-streaming-attempt-policy`.
+**Status:** implemented and locally verified on `ir-02-streaming-attempt-policy`;
+[PR #12](https://github.com/killertux/smart-review/pull/12) is open for review.
 
 ### Delivered outcome
 
