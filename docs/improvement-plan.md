@@ -109,7 +109,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 
 | PR | Priority | Title / delivered outcome | Hard dependencies | Size | Status |
 |---|---|---|---|---|---|
-| [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | In progress — locally verified |
+| [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | [Open — PR #11](https://github.com/killertux/smart-review/pull/11) |
 | [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | Not started |
 | [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Not started |
 | [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | Not started |
@@ -299,7 +299,7 @@ path. Cache formats can be invalidated; user-authored documents need a migration
 **Requirements:** FR-4.6, FR-6.5, FR-9.2, NFR-3.1–3.3.\
 **Depends on:** none.\
 **Status:** implemented and locally verified on `ir-01-outbound-content-policy`;
-pull request pending.
+[PR #11](https://github.com/killertux/smart-review/pull/11) is open for review.
 
 ### Delivered outcome
 
