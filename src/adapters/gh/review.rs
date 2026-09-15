@@ -18,8 +18,6 @@
 //!   the translation does not know is passed through unchanged rather than replaced
 //!   with something vaguer (FR-9.1).
 
-use std::path::PathBuf;
-
 use crate::adapters::gh::GhCliForge;
 use crate::adapters::process::CommandSpec;
 use crate::domain::draft::{Draft, DraftComment};
@@ -154,26 +152,6 @@ fn first_line(text: &str) -> String {
     first.to_owned()
 }
 
-/// Where the JSON payload is written for `--input`.
-///
-/// In the temporary directory rather than the state directory: it exists for one
-/// command, and a body that mentions a security problem is not something to leave in
-/// `~/.smart-review` (§7.4's reasoning about secrets, applied to prose).
-///
-/// The name carries a counter because the pid alone is not enough: two reviews
-/// published in one session (or two tests publishing in parallel) would share a name,
-/// and the atomic-write dance around it — write `.tmp`, rename — would have one of
-/// them rename the other's file away. That is not hypothetical; it is how this
-/// function first failed.
-fn payload_path(number: u64) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "smart-review-review-{}-{number}-{unique}.json",
-        std::process::id()
-    ))
-}
-
 impl GhCliForge {
     /// Posts the draft as one review (FR-6.3).
     ///
@@ -207,19 +185,32 @@ impl GhCliForge {
         let decision = draft.effective_decision();
         let number_arg = number.to_string();
         let flag = format!("--{}", decision.gh_flag());
-        let mut args: Vec<&str> = vec!["pr", "review", &number_arg, &flag];
-        if let Some(body) = draft.body.as_deref().filter(|body| !body.trim().is_empty()) {
-            args.push("--body");
-            args.push(body);
+        let mut spec = self.spec(&["pr", "review", &number_arg, &flag]).mutating();
+        let body_path = draft
+            .body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())
+            .map(|body| {
+                let path = self.payload_path("review-body", number, "txt");
+                crate::adapters::fs::write_atomic_with_mode(&path, body, Some(0o600))
+                    .map(|()| path.clone())
+                    .map_err(|error| crate::Error::io("write the review body", path, error))
+            })
+            .transpose()?;
+        if let Some(path) = &body_path {
+            spec = spec.arg("--body-file").arg(path);
         }
-        let spec = self.spec(&args).mutating();
 
-        let Some(output) = self.mutate(&spec, cancel)? else {
+        let output = self.mutate(&spec, cancel);
+        if output.as_ref().is_ok_and(Option::is_some) || output.is_err() {
+            remove_payload(body_path.as_deref());
+        }
+        let Some(output) = output? else {
             return Ok(dry_run());
         };
         if !output.success() {
             return Err(crate::Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 translate_refusal(&output.stderr, number),
             ));
         }
@@ -239,7 +230,7 @@ impl GhCliForge {
         let payload = review_payload(draft);
         let text = serde_json::to_string_pretty(&payload)
             .map_err(|error| crate::Error::forge("review", error.to_string()))?;
-        let path = payload_path(number);
+        let path = self.payload_path("review", number, "json");
         // Written even during a dry run, and deliberately: the recorded command says
         // `--input <path>`, and a command a person cannot run by hand is not the
         // command that would have run (FR-6.5).
@@ -257,13 +248,16 @@ impl GhCliForge {
             .arg(&path)
             .mutating();
 
-        let Some(output) = self.mutate(&spec, cancel)? else {
+        let output = self.mutate(&spec, cancel);
+        if output.as_ref().is_ok_and(Option::is_some) || output.is_err() {
+            remove_payload(Some(&path));
+        }
+        let Some(output) = output? else {
             return Ok(dry_run());
         };
-        let _ = std::fs::remove_file(&path);
         if !output.success() {
             return Err(crate::Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 translate_refusal(&output.stderr, number),
             ));
         }
@@ -277,6 +271,12 @@ impl GhCliForge {
                 .map(str::to_owned),
             dry_run: false,
         })
+    }
+}
+
+fn remove_payload(path: Option<&std::path::Path>) {
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -453,8 +453,12 @@ mod tests {
 
     #[test]
     fn the_payload_path_is_per_pull_request() {
-        let one = payload_path(1);
-        let two = payload_path(2);
+        let forge = GhCliForge::new(
+            "gh",
+            crate::domain::repo::RepoId::parse("acme/service").expect("valid repository"),
+        );
+        let one = forge.payload_path("review", 1, "json");
+        let two = forge.payload_path("review", 2, "json");
         assert_ne!(one, two);
         assert!(one.to_string_lossy().contains("-1-"), "{}", one.display());
         assert!(

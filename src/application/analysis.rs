@@ -669,6 +669,7 @@ mod tests {
             checkout: Some(Checkout {
                 path: std::path::PathBuf::from("/tmp/ws"),
                 head_sha: "abc123".to_owned(),
+                base_sha: "base123".to_owned(),
             }),
             policy: BundlePolicy::default(),
         }
@@ -687,6 +688,9 @@ mod tests {
             workspace
                 .files
                 .insert(format!("abc123:{path}"), body.as_bytes().to_vec());
+            workspace
+                .files
+                .insert(format!("base123:{path}"), body.as_bytes().to_vec());
         }
         workspace
     }
@@ -859,6 +863,75 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_the_final_fake_provider_request_excludes_secret_diff_content() {
+        let mut request = request();
+        request.patch = Some(Box::new(crate::domain::diff::parse_patch(
+            "diff --git a/.env b/.env\n\
+             --- a/.env\n\
+             +++ b/.env\n\
+             @@ -1 +1 @@\n\
+             -PROTECTED_OLD_SENTINEL=one\n\
+             +PROTECTED_NEW_SENTINEL=two\n\
+             diff --git a/src/money.rs b/src/money.rs\n\
+             --- a/src/money.rs\n\
+             +++ b/src/money.rs\n\
+             @@ -1 +1 @@\n\
+             -fn old() {}\n\
+             +fn allowed_source_sentinel() {}\n",
+        )));
+        let workspace = workspace(&[
+            (".env", "PROTECTED_NEW_SENTINEL=two"),
+            ("src/money.rs", "fn allowed_source_sentinel() {}"),
+        ]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+        let cancel = Cancel::new();
+        let (bundle, _) = use_case.gather(&request, &cancel);
+        let mut handler = |_: Progress| {};
+        use_case
+            .run(&request, &bundle, &cancel, &mut handler)
+            .expect("the fake provider answers");
+
+        let prompts = llm.prompts.lock().expect("lock");
+        let sent = &prompts[0].1;
+        assert!(!sent.contains("PROTECTED_OLD_SENTINEL"), "{sent}");
+        assert!(!sent.contains("PROTECTED_NEW_SENTINEL"), "{sent}");
+        assert!(sent.contains("allowed_source_sentinel"), "{sent}");
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| line.contains("✗ .env"))
+        );
+    }
+
+    #[test]
+    fn fr_4_6_a_tracked_ignored_path_is_absent_from_bundle_and_inventory() {
+        let request = request();
+        let mut workspace = workspace(&[("src/money.rs", "IGNORED_TRACKED_SENTINEL")]);
+        workspace.ignored.push("src/money.rs".to_owned());
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+
+        let (bundle, _) = use_case.gather(&request, &Cancel::new());
+
+        assert!(!bundle.text.contains("IGNORED_TRACKED_SENTINEL"));
+        assert!(!bundle.text.contains("-old"), "the ignored diff is absent");
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| { line.contains("src/money.rs") && line.contains("ignore rules") })
+        );
+    }
+
+    #[test]
     fn without_a_workspace_the_bundle_says_so_instead_of_pretending() {
         let mut request = request();
         request.checkout = None;
@@ -904,8 +977,12 @@ mod tests {
             "{:?}",
             bundle.segments
         );
-        // The diff is still there even when no file body could be read.
-        assert!(bundle.text.contains("-old"));
+        // Unknown bytes are fail-closed: without reading them the app cannot verify
+        // the size/binary policy that also governs their diff representation.
+        assert!(!bundle.text.contains("-old"));
+        assert!(bundle.inspection().iter().any(|line| {
+            line.contains("src/money.rs") && line.contains("diff content excluded")
+        }));
     }
 
     #[test]

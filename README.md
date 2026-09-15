@@ -106,9 +106,12 @@ leaves the draft exactly where it was and says what GitHub said, in words. Threa
 are already on the pull request are drawn under the lines they are about: `r` writes a
 reply, and `<leader>pt` resolves or reopens the whole thread after confirmation. The PR
 conversation is available through `<leader>pc`; `<leader>pw` writes a top-level comment
-through GitHub's issue-comment endpoint. `--dry-run` (or `[forge] dry_run = true`) records every command that would change
+through GitHub's issue-comment endpoint. Review and reply prose is passed to `gh` in a
+private payload file rather than copied into process arguments or ordinary logs.
+`--dry-run` (or `[forge] dry_run = true`) records every command that would change
 something — publishing, `:workspace clean` — in `logs/dry-run.log` and runs none of
-them.
+them. Exact review/reply payloads requested by a dry run remain as mode-0600 artifacts
+under `exports/dry-run/`, so the recorded commands are replayable.
 
 Opening a pull request also materialises it as a managed git worktree under
 `~/.smart-review/worktrees/`, so the diff can be produced locally: the context and
@@ -132,10 +135,14 @@ repository shows what would be sent — the estimate, and the list of files, inc
 and not — and sends nothing until you press it again. The answer streams into a panel,
 and the file tree reorders to the plan it returned; `o` reads the same files in path
 order, `J`/`K` move a group, and `:plan move <file> <group>` pins a file, with your
-order saved beside the analysis. A `.env`, a binary and a file over `max_file_bytes`
-are replaced by a note, the changed files' contents come from the worktree at the
-pull request's commit, and `:context` lists everything that would be sent — the
-analysis is cached per commit, model and thinking setting, so re-opening it costs
+order saved beside the analysis. A `.env`, credential-like path, ignored path, binary
+or file over `max_file_bytes` cannot contribute content through either its full body or
+its diff. Both old and new names of a rename are checked; `:context` lists the actual
+filtered payload and explains exclusions. If repository eligibility cannot be checked,
+source content is not sent. This path policy does not claim to scan arbitrary prose in
+the PR description or the user's question. Changed-file contents come from the worktree
+at the pull request's exact commits, and the analysis is cached per commit, model and
+thinking setting, so re-opening it costs
 nothing. If the model answers with prose instead of JSON it is asked once more with
 the reason, and if it still does not, the text is shown rather than swallowed
 (`:analyze raw`).
@@ -178,6 +185,7 @@ Everything the application owns goes under `$SMART_REVIEW_HOME`
   cache/             disposable: PR lists, diffs, analyses and their plans, chats
   drafts/            staged reviews, one file per pull request — not disposable
   worktrees/         per-pull-request checkouts owned by the app (M2)
+  exports/dry-run/   private exact payloads retained only when you request a dry run
   logs/              rotated logs; never contains secrets
 ```
 

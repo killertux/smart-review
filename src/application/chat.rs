@@ -495,6 +495,7 @@ mod tests {
             checkout: Some(context::Checkout {
                 path: std::path::PathBuf::from("/tmp/ws"),
                 head_sha: "abc123".to_owned(),
+                base_sha: "base123".to_owned(),
             }),
             policy: BundlePolicy::default(),
             added: Vec::new(),
@@ -512,6 +513,9 @@ mod tests {
         workspace
             .files
             .insert("abc123:src/money.rs".to_owned(), b"fn money() {}".to_vec());
+        workspace
+            .files
+            .insert("base123:src/money.rs".to_owned(), b"fn money() {}".to_vec());
         workspace
             .files
             .insert("abc123:docs/design.md".to_owned(), b"# design".to_vec());
@@ -707,6 +711,37 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_ignored_conventions_and_user_additions_are_not_sent() {
+        let mut workspace = workspace();
+        workspace.files.insert(
+            "abc123:AGENTS.md".to_owned(),
+            b"IGNORED_CONVENTION_SENTINEL".to_vec(),
+        );
+        workspace.ignored = vec!["AGENTS.md".to_owned(), "docs/design.md".to_owned()];
+        let llm = FakeLlm::answering(&["ok"]);
+        let clock = crate::test_support::FakeClock::new(1_000);
+        let repo = repo();
+        let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
+        let mut spec = spec();
+        spec.added = vec!["docs/design.md".to_owned()];
+
+        let bundle = chatter.gather(&spec, &Cancel::new());
+
+        assert!(!bundle.text.contains("IGNORED_CONVENTION_SENTINEL"));
+        assert!(!bundle.text.contains("# design"));
+        for path in ["AGENTS.md", "docs/design.md"] {
+            assert!(
+                bundle
+                    .inspection()
+                    .iter()
+                    .any(|line| { line.contains(path) && line.contains("ignore rules") }),
+                "{path} should be listed as excluded: {:?}",
+                bundle.segments
+            );
+        }
+    }
+
+    #[test]
     fn a_file_the_user_added_that_cannot_be_read_is_reported_not_hidden() {
         let workspace = workspace();
         let llm = FakeLlm::answering(&["ok"]);
@@ -854,8 +889,9 @@ mod tests {
 
     #[test]
     fn the_workspace_is_where_the_context_is_read_from() {
-        // A pull request without a checkout still produces a bundle: it is the diff
-        // and the metadata, with a note saying why the files are not in it.
+        // A pull request without a checkout still produces metadata and an explicit
+        // note. Source content is fail-closed because ignore/size policy cannot be
+        // verified without repository access.
         let workspace = workspace();
         let llm = FakeLlm::answering(&["ok"]);
         let clock = crate::test_support::FakeClock::new(1_000);
@@ -865,7 +901,10 @@ mod tests {
         let mut spec = spec();
         spec.checkout = None;
         let bundle = chatter.gather(&spec, &cancel);
-        assert!(bundle.text.contains("src/money.rs"), "the diff is there");
+        assert!(
+            !bundle.text.contains("fn cents"),
+            "source content is not sent"
+        );
         assert!(
             bundle.segments.iter().any(|segment| segment
                 .detail

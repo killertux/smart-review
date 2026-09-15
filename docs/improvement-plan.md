@@ -109,7 +109,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 
 | PR | Priority | Title / delivered outcome | Hard dependencies | Size | Status |
 |---|---|---|---|---|---|
-| [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | Not started |
+| [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | In progress — locally verified |
 | [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | Not started |
 | [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Not started |
 | [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | Not started |
@@ -297,7 +297,9 @@ path. Cache formats can be invalidated; user-authored documents need a migration
 
 **Priority:** P1. **Findings:** F01; request-body logging follow-up.\
 **Requirements:** FR-4.6, FR-6.5, FR-9.2, NFR-3.1–3.3.\
-**Depends on:** none.
+**Depends on:** none.\
+**Status:** implemented and locally verified on `ir-01-outbound-content-policy`;
+pull request pending.
 
 ### Delivered outcome
 
@@ -316,29 +318,29 @@ full review/reply/LLM request bodies.
 
 ### Implementation steps
 
-1. [ ] Add a failing final-payload regression using synthetic sentinels in a changed
+1. [x] Add a failing final-payload regression using synthetic sentinels in a changed
    `.env`, including both removed and added lines. Assert against what the fake LLM
    receives, not just `Disposition::Omit` or a segment flag.
-2. [ ] Define one exclusion decision per input path/representation. Evaluate both old
+2. [x] Define one exclusion decision per input path/representation. Evaluate both old
    and new paths for a rename so renaming a secret file does not bypass the policy.
-3. [ ] Apply the policy before rendering diff content. Keep a non-content placeholder
+3. [x] Apply the policy before rendering diff content. Keep a non-content placeholder
    that explains why the file is absent when appropriate; never include the excluded
    hunk text in the placeholder or diagnostics.
-4. [ ] Cover deleted files, binary changes, full bodies, convention files and user-added
+4. [x] Cover deleted files, binary changes, full bodies, convention files and user-added
    paths. Make oversize behavior consistent with the documented per-file policy.
-5. [ ] Correct the `.gitignore` assumption: being tracked does not prove a path is not
+5. [x] Correct the `.gitignore` assumption: being tracked does not prove a path is not
    matched by ignore rules. Obtain eligibility through the workspace boundary, with
    tests for tracked ignored files and nested rules. Do not add filesystem/process IO
    to the domain layer.
-6. [ ] Derive included/excluded inventory entries from the actual filtered bundle.
+6. [x] Derive included/excluded inventory entries from the actual filtered bundle.
    Avoid a separate list that merely repeats the user's intended policy.
-7. [ ] Classify command arguments/payloads for logging. Log program, operation, subject,
+7. [x] Classify command arguments/payloads for logging. Log program, operation, subject,
    job ID and outcome; exclude body/key fields. Use existing payload-file/stdin
    facilities for review and reply content where possible.
-8. [ ] Keep exact user-requested dry-run payloads as private, app-owned artifacts when
+8. [x] Keep exact user-requested dry-run payloads as private, app-owned artifacts when
    necessary for replay. Ordinary logs should reference their path rather than copy
    their contents. Continue honoring dry-run for every remote write.
-9. [ ] Update the context/privacy and logging documentation to describe actual rules
+9. [x] Update the context/privacy and logging documentation to describe actual rules
    and their limits, including the distinction between path filtering and arbitrary
    prose supplied by a user.
 
@@ -364,6 +366,11 @@ an “excluded” row whose content still appears in any request or ordinary log
 
 **Gates:** shared gates plus context/LLM contracts (`m2b`, `m3`) and affected posting
 contracts (`m4`, `m5`). The final PR description must include exact fixture commands.
+
+**Local verification (2026-09-14):** `cargo fmt --all`, Clippy with all targets,
+features and warnings denied, and `cargo test --all-features` passed (997 unit tests and
+11 snapshots). Validators passed: `m2b` 35/35, `m3` 59/59, `m4` 23/23 and `m5` 32/32.
+No live provider, network request or GitHub mutation was used.
 
 **Out of scope:** replacing the provider SDK or implementing a generic secret scanner.
 

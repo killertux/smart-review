@@ -139,7 +139,13 @@ case "$1:$2" in
       *issues/*/comments*)
         case "$*" in
           *POST*)
-            body=$(printf '%s\n' "$@" | sed -n 's/^body=//p' | head -1)
+            body=$(python3 - "$@" <<'PY'
+import json, sys
+args = sys.argv[1:]
+path = args[args.index("--input") + 1]
+print(json.load(open(path))["body"], end="")
+PY
+)
             printf '%s' "$body" >"$here/conversation-posted.txt"
             if [ "$(cat "$here/fail_conversation" 2>/dev/null)" = "1" ]; then
               printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
@@ -152,7 +158,13 @@ case "$1:$2" in
         ;;
       # A reply, which is the comment route with the comment it answers in the path.
       *pulls/*/comments/*/replies*)
-        body=$(printf '%s\n' "$@" | sed -n 's/^body=//p' | head -1)
+        body=$(python3 - "$@" <<'PY'
+import json, sys
+args = sys.argv[1:]
+path = args[args.index("--input") + 1]
+print(json.load(open(path))["body"], end="")
+PY
+)
         printf '%s' "$body" >"$here/reply-posted.txt"
         if [ "$(cat "$here/fail_reply" 2>/dev/null)" = "1" ]; then
           printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2

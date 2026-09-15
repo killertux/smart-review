@@ -85,6 +85,32 @@ pub enum Disposition {
     },
 }
 
+/// The content decision already made for one repository path.
+///
+/// The application layer supplies decisions that need repository knowledge (notably
+/// `.gitignore`). The domain then applies the same decision to every representation of
+/// that path: old/new rename names, diff hunks and full file bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathDecision {
+    /// The repository-relative path.
+    pub path: String,
+    /// Whether its content may be sent.
+    pub disposition: Disposition,
+}
+
+impl PathDecision {
+    /// Records a path that repository policy excludes.
+    #[must_use]
+    pub fn omitted(path: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            disposition: Disposition::Omit {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
 impl Disposition {
     /// Whether the content is sent.
     #[must_use]
@@ -307,6 +333,8 @@ pub struct BundleInputs<'a> {
     pub diff: Option<&'a Patch>,
     /// Each changed file's content at head, in diff order, as `(path, bytes)`.
     pub files: Vec<(&'a str, &'a [u8])>,
+    /// Decisions made with repository knowledge, applied to every representation.
+    pub decisions: Vec<PathDecision>,
 }
 
 /// A built bundle: the text that will be sent, plus the account of what went into it.
@@ -336,12 +364,26 @@ impl Bundle {
     /// truncation order, so a file the user asked for is dropped only when everything
     /// already decided filled the budget.
     pub fn push_user_file(&mut self, path: &str, bytes: &[u8], policy: &BundlePolicy) {
+        self.push_user_file_with_decision(path, bytes, policy, None);
+    }
+
+    /// Appends a user-added file using the repository eligibility decision made while
+    /// gathering it.
+    pub fn push_user_file_with_decision(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        policy: &BundlePolicy,
+        decision: Option<PathDecision>,
+    ) {
         let used = self.text.len();
+        let decisions = decision.into_iter().collect::<Vec<_>>();
         let mut builder = Builder {
             policy,
             text: std::mem::take(&mut self.text),
             segments: std::mem::take(&mut self.segments),
             used,
+            decisions: &decisions,
         };
         builder.push_optional_file(SegmentKind::UserFile, path, bytes);
         self.text = builder.text;
@@ -389,7 +431,8 @@ impl Bundle {
 /// than in the middle of it.
 #[must_use]
 pub fn build(inputs: &BundleInputs<'_>, policy: &BundlePolicy) -> Bundle {
-    let mut builder = Builder::new(policy);
+    let decisions = complete_decisions(inputs, policy);
+    let mut builder = Builder::new(policy, &decisions);
 
     builder.push_text(SegmentKind::Metadata, "pull request", inputs.metadata);
     builder.push_text(SegmentKind::Commits, "commits", inputs.commits);
@@ -398,10 +441,10 @@ pub fn build(inputs: &BundleInputs<'_>, policy: &BundlePolicy) -> Bundle {
     }
 
     // The diff is reduced rather than dropped, and only truncated as a last resort.
-    let diff_text = inputs
-        .diff
-        .map(|patch| render_patch(patch, None))
-        .unwrap_or_default();
+    let diff_text = inputs.diff.map_or_else(String::new, |patch| {
+        builder.record_excluded_patch_files(patch);
+        render_patch_filtered(patch, None, &decisions)
+    });
     let file_count = inputs.diff.map_or(0, |patch| patch.files.len());
     builder.reserve_diff(&diff_text, file_count);
     builder.push_diff(inputs.diff, &diff_text);
@@ -413,21 +456,88 @@ pub fn build(inputs: &BundleInputs<'_>, policy: &BundlePolicy) -> Bundle {
     builder.finish()
 }
 
+/// Adds path-only decisions for patch names the application did not classify. This is
+/// what protects remote-only patches and direct domain callers: obvious credential
+/// names are denied even when no repository checkout was available.
+fn complete_decisions(inputs: &BundleInputs<'_>, policy: &BundlePolicy) -> Vec<PathDecision> {
+    let mut decisions = inputs.decisions.clone();
+    let Some(patch) = inputs.diff else {
+        return decisions;
+    };
+    for path in patch.files.iter().flat_map(|file| {
+        file.old_path
+            .iter()
+            .chain(file.new_path.iter())
+            .map(ToString::to_string)
+    }) {
+        if !decisions.iter().any(|decision| decision.path == path) {
+            decisions.push(PathDecision {
+                disposition: disposition(&path, &[], policy),
+                path,
+            });
+        }
+    }
+    // A patch file is one content unit. If either side of a rename/copy is excluded,
+    // carry that decision to both names so the safe new filename cannot re-introduce
+    // the same bytes through the full-file section.
+    for file in &patch.files {
+        let strict = file
+            .old_path
+            .iter()
+            .chain(file.new_path.iter())
+            .filter_map(|path| decision_for(&path.to_string(), &decisions))
+            .max_by_key(|disposition| disposition_rank(disposition))
+            .cloned();
+        if let Some(disposition) = strict {
+            for path in file.old_path.iter().chain(file.new_path.iter()) {
+                decisions.push(PathDecision {
+                    path: path.to_string(),
+                    disposition: disposition.clone(),
+                });
+            }
+        }
+    }
+    decisions
+}
+
 /// Collects the segments while watching the budget.
 struct Builder<'a> {
     policy: &'a BundlePolicy,
     text: String,
     segments: Vec<Segment>,
     used: usize,
+    decisions: &'a [PathDecision],
 }
 
 impl<'a> Builder<'a> {
-    fn new(policy: &'a BundlePolicy) -> Self {
+    fn new(policy: &'a BundlePolicy, decisions: &'a [PathDecision]) -> Self {
         Self {
             policy,
             text: String::new(),
             segments: Vec::new(),
             used: 0,
+            decisions,
+        }
+    }
+
+    /// Records patch files whose content is absent from the final payload. These rows
+    /// are derived from the same decisions used by the renderer, so the inspector
+    /// cannot claim that a file was excluded while its hunks were sent.
+    fn record_excluded_patch_files(&mut self, patch: &Patch) {
+        for file in &patch.files {
+            let Some(disposition) = file_disposition(file, self.decisions) else {
+                continue;
+            };
+            if let Some(reason) = disposition.reason() {
+                self.segments.push(Segment {
+                    kind: SegmentKind::File,
+                    label: file.display_path(),
+                    bytes: 0,
+                    included: false,
+                    truncated: false,
+                    detail: Some(format!("diff content excluded: {reason}")),
+                });
+            }
         }
     }
 
@@ -455,7 +565,10 @@ impl<'a> Builder<'a> {
 
     /// Appends a file, honouring the per-file rules and the budget.
     fn push_optional_file(&mut self, kind: SegmentKind, label: &str, bytes: &[u8]) {
-        match disposition(label, bytes, self.policy) {
+        let disposition = decision_for(label, self.decisions)
+            .cloned()
+            .unwrap_or_else(|| disposition(label, bytes, self.policy));
+        match disposition {
             Disposition::Omit { reason } => {
                 self.segments.push(Segment {
                     kind,
@@ -609,8 +722,20 @@ fn truncate_bytes(text: &str, allowed: usize) -> (String, bool) {
 /// is a smaller request rather than a different one.
 #[must_use]
 pub fn render_patch(patch: &Patch, keep_context: Option<u32>) -> String {
+    render_patch_filtered(patch, keep_context, &[])
+}
+
+/// Renders only patch content allowed by the supplied path decisions.
+fn render_patch_filtered(
+    patch: &Patch,
+    keep_context: Option<u32>,
+    decisions: &[PathDecision],
+) -> String {
     let mut out = String::new();
     for file in &patch.files {
+        if file_disposition(file, decisions).is_some() {
+            continue;
+        }
         let _ = writeln!(out, "### {} {}", file.status.marker(), file.display_path());
         if let Some(placeholder) = file.placeholder() {
             let _ = writeln!(out, "({placeholder})");
@@ -674,6 +799,36 @@ pub fn render_patch(patch: &Patch, keep_context: Option<u32>) -> String {
     out
 }
 
+/// The strictest decision for a patch file. A rename is allowed only when both its old
+/// and new names are allowed, preventing a secret rename from laundering its hunks.
+fn file_disposition<'a>(
+    file: &crate::domain::diff::FileDiff,
+    decisions: &'a [PathDecision],
+) -> Option<&'a Disposition> {
+    file.old_path
+        .iter()
+        .chain(file.new_path.iter())
+        .filter_map(|path| decision_for(&path.to_string(), decisions))
+        .find(|decision| !decision.is_included())
+}
+
+fn decision_for<'a>(path: &str, decisions: &'a [PathDecision]) -> Option<&'a Disposition> {
+    decisions
+        .iter()
+        .filter(|decision| decision.path == path)
+        .map(|decision| &decision.disposition)
+        .filter(|disposition| !disposition.is_included())
+        .max_by_key(|disposition| disposition_rank(disposition))
+}
+
+fn disposition_rank(disposition: &Disposition) -> u8 {
+    match disposition {
+        Disposition::Include => 0,
+        Disposition::Placeholder { .. } => 1,
+        Disposition::Omit { .. } => 2,
+    }
+}
+
 /// A byte count a person reads at a glance.
 #[must_use]
 pub fn human_bytes(bytes: u64) -> String {
@@ -730,6 +885,7 @@ mod tests {
             conventions: vec![("AGENTS.md", b"Use thiserror." as &[u8])],
             diff: Some(&patch),
             files: vec![("src/money.rs", b"fn money() {}" as &[u8])],
+            decisions: Vec::new(),
         };
         let bundle = build_with(&inputs);
         let positions: Vec<usize> = [
@@ -768,6 +924,7 @@ mod tests {
                 (".ssh/config", b"Host *" as &[u8]),
                 ("src/main.rs", b"fn main() {}" as &[u8]),
             ],
+            decisions: Vec::new(),
         };
         let bundle = build_with(&inputs);
         assert!(!bundle.text.contains("hunter2"));
@@ -799,6 +956,132 @@ mod tests {
                 "{segment:?}"
             );
         }
+    }
+
+    #[test]
+    fn fr_4_6_excludes_secret_content_from_the_final_diff_payload() {
+        let patch = parse_patch(
+            "diff --git a/.env b/.env\n\
+             --- a/.env\n\
+             +++ b/.env\n\
+             @@ -1 +1 @@\n\
+             -OLD_SECRET_SENTINEL=one\n\
+             +NEW_SECRET_SENTINEL=two\n\
+             diff --git a/src/main.rs b/src/main.rs\n\
+             --- a/src/main.rs\n\
+             +++ b/src/main.rs\n\
+             @@ -1 +1 @@\n\
+             -fn old() {}\n\
+             +fn allowed_source_sentinel() {}\n",
+        );
+        let inputs = BundleInputs {
+            diff: Some(&patch),
+            files: vec![
+                (".env", b"NEW_SECRET_SENTINEL=two" as &[u8]),
+                ("src/main.rs", b"fn allowed_source_sentinel() {}" as &[u8]),
+            ],
+            ..BundleInputs::default()
+        };
+
+        let bundle = build_with(&inputs);
+
+        assert!(
+            !bundle.text.contains("OLD_SECRET_SENTINEL"),
+            "{}",
+            bundle.text
+        );
+        assert!(
+            !bundle.text.contains("NEW_SECRET_SENTINEL"),
+            "{}",
+            bundle.text
+        );
+        assert!(
+            bundle.text.contains("allowed_source_sentinel"),
+            "{}",
+            bundle.text
+        );
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| line.contains("✗ .env"))
+        );
+    }
+
+    #[test]
+    fn fr_4_6_checks_both_names_of_a_secret_rename() {
+        for (old, new) in [(".env", "config.txt"), ("config.txt", ".env.local")] {
+            let text = format!(
+                "diff --git a/{old} b/{new}\n\
+                 similarity index 90%\n\
+                 rename from {old}\n\
+                 rename to {new}\n\
+                 --- a/{old}\n\
+                 +++ b/{new}\n\
+                 @@ -1 +1 @@\n\
+                 -RENAMED_SECRET_OLD\n\
+                 +RENAMED_SECRET_NEW\n"
+            );
+            let patch = parse_patch(&text);
+            let bundle = build_with(&BundleInputs {
+                diff: Some(&patch),
+                files: vec![(new, b"RENAMED_SECRET_NEW" as &[u8])],
+                ..BundleInputs::default()
+            });
+            assert!(!bundle.text.contains("RENAMED_SECRET"), "{}", bundle.text);
+        }
+    }
+
+    #[test]
+    fn fr_4_6_excludes_a_deleted_secret_from_the_diff() {
+        let patch = parse_patch(
+            "diff --git a/.env.production b/.env.production\n\
+             deleted file mode 100644\n\
+             --- a/.env.production\n\
+             +++ /dev/null\n\
+             @@ -1 +0,0 @@\n\
+             -DELETED_SECRET_SENTINEL=one\n",
+        );
+        let bundle = build_with(&BundleInputs {
+            diff: Some(&patch),
+            ..BundleInputs::default()
+        });
+        assert!(!bundle.text.contains("DELETED_SECRET_SENTINEL"));
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| line.contains("✗ .env.production"))
+        );
+    }
+
+    #[test]
+    fn fr_4_6_applies_an_oversize_decision_to_diff_and_file_content() {
+        let patch = parse_patch(
+            "diff --git a/generated.txt b/generated.txt\n\
+             --- a/generated.txt\n\
+             +++ b/generated.txt\n\
+             @@ -1 +1 @@\n\
+             -OVERSIZE_OLD_SENTINEL\n\
+             +OVERSIZE_NEW_SENTINEL\n",
+        );
+        let body = b"OVERSIZE_NEW_SENTINEL";
+        let bundle = build_with(&BundleInputs {
+            diff: Some(&patch),
+            files: vec![("generated.txt", body.as_slice())],
+            decisions: vec![PathDecision {
+                path: "generated.txt".to_owned(),
+                disposition: Disposition::Placeholder {
+                    reason: "over the per-file limit".to_owned(),
+                },
+            }],
+            ..BundleInputs::default()
+        });
+        assert!(!bundle.text.contains("OVERSIZE_OLD_SENTINEL"));
+        assert!(!bundle.text.contains("OVERSIZE_NEW_SENTINEL"));
+        assert!(bundle.inspection().iter().any(|line| {
+            line.contains("generated.txt") && line.contains("diff content excluded")
+        }));
     }
 
     #[test]
@@ -854,6 +1137,7 @@ mod tests {
             conventions: Vec::new(),
             diff: None,
             files: vec![("a.rs", small.as_slice()), ("b.rs", large.as_slice())],
+            decisions: Vec::new(),
         };
         let bundle = build(&inputs, &policy);
         assert!(bundle.text.contains(&"a".repeat(100)));
@@ -966,6 +1250,7 @@ mod tests {
                 (".env", b"S" as &[u8]),
                 ("src/main.rs", b"fn main() {}" as &[u8]),
             ],
+            decisions: Vec::new(),
         };
         let bundle = build_with(&inputs);
         let lines = bundle.inspection();

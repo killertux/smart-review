@@ -94,7 +94,7 @@ impl GhCliForge {
                 .errors
                 .first()
                 .map_or_else(|| "no data".to_owned(), |error| error.message.clone());
-            return Err(crate::Error::forge(spec.render(), reason));
+            return Err(crate::Error::forge(spec.diagnostic(), reason));
         };
         Ok(data
             .repository
@@ -154,17 +154,13 @@ impl GhCliForge {
         body: &str,
         cancel: &Cancel,
     ) -> crate::Result<CommentPosted> {
-        let spec = CommandSpec::new(self.program.clone())
-            .args(["api", "-X", "POST"])
-            .arg(format!(
-                "repos/{}/{}/pulls/{number}/comments/{comment_id}/replies",
-                self.repo.owner(),
-                self.repo.name()
-            ))
-            .arg("-f")
-            .arg(format!("body={body}"))
-            .mutating();
-        self.posted(&spec, number, cancel)
+        self.post_body(
+            &format!("pulls/{number}/comments/{comment_id}/replies"),
+            "reply",
+            number,
+            body,
+            cancel,
+        )
     }
 
     /// Comments on the pull request's conversation (FR-6.4, DEC-16).
@@ -181,12 +177,13 @@ impl GhCliForge {
         body: &str,
         cancel: &Cancel,
     ) -> crate::Result<CommentPosted> {
-        let spec = self
-            .api_spec(&format!("issues/{number}/comments"))
-            .args(["-X", "POST", "-f"])
-            .arg(format!("body={body}"))
-            .mutating();
-        self.posted(&spec, number, cancel)
+        self.post_body(
+            &format!("issues/{number}/comments"),
+            "conversation-comment",
+            number,
+            body,
+            cancel,
+        )
     }
 
     /// Resolves or unresolves a thread (FR-6.4).
@@ -210,7 +207,7 @@ impl GhCliForge {
         };
         if !output.success() {
             return Err(crate::Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 crate::adapters::gh::review::translate_refusal(&output.stderr, 0),
             ));
         }
@@ -220,7 +217,10 @@ impl GhCliForge {
         let answer: GraphQlAnswer<serde_json::Value> =
             serde_json::from_str(&output.stdout).unwrap_or_default();
         if let Some(error) = answer.errors.first() {
-            return Err(crate::Error::forge(spec.render(), error.message.clone()));
+            return Err(crate::Error::forge(
+                spec.diagnostic(),
+                error.message.clone(),
+            ));
         }
         Ok(())
     }
@@ -253,7 +253,7 @@ impl GhCliForge {
         };
         if !output.success() {
             return Err(crate::Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 crate::adapters::gh::review::translate_refusal(&output.stderr, number),
             ));
         }
@@ -267,6 +267,35 @@ impl GhCliForge {
                 .map(str::to_owned),
             dry_run: false,
         })
+    }
+
+    /// Posts user prose from a private JSON file, never from argv. The exact file is
+    /// retained only for a dry run, where the recorded command is explicitly meant to
+    /// be replayable; ordinary success and failure remove it.
+    fn post_body(
+        &self,
+        endpoint: &str,
+        kind: &str,
+        number: u64,
+        body: &str,
+        cancel: &Cancel,
+    ) -> crate::Result<CommentPosted> {
+        let text = serde_json::to_string_pretty(&serde_json::json!({ "body": body }))
+            .map_err(|error| crate::Error::forge(kind, error.to_string()))?;
+        let path = self.payload_path(kind, number, "json");
+        crate::adapters::fs::write_atomic_with_mode(&path, &text, Some(0o600))
+            .map_err(|error| crate::Error::io("write the comment payload", path.clone(), error))?;
+        let spec = self
+            .api_spec(endpoint)
+            .args(["-X", "POST"])
+            .arg("--input")
+            .arg(&path)
+            .mutating();
+        let result = self.posted(&spec, number, cancel);
+        if result.as_ref().is_ok_and(|posted| !posted.dry_run) || result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result
     }
 }
 

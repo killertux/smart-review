@@ -265,6 +265,38 @@ impl WorkspacePort for GitCli {
             .collect())
     }
 
+    fn ignored_paths(
+        &self,
+        repo: &Path,
+        paths: &[String],
+        cancel: &Cancel,
+    ) -> std::result::Result<Vec<String>, WorkspaceError> {
+        // `--no-index` is essential: without it git suppresses tracked files from
+        // `check-ignore`, which would make committing a secret disable the guardrail.
+        // One quiet call per path avoids parsing git's quoted pathname output. IR-17
+        // owns batching this IO after measuring it; correctness comes first here.
+        let mut ignored = Vec::new();
+        for path in paths {
+            let command = CommandSpec::new(&self.program)
+                .args(["check-ignore", "--quiet", "--no-index", "--"])
+                .arg(path)
+                .current_dir(repo);
+            let output = self
+                .runner
+                .run(&command, cancel)
+                .map_err(ProcessError::into_workspace)?;
+            if output.success() {
+                ignored.push(path.clone());
+            } else if output.code() != Some(1) {
+                return Err(WorkspaceError::Failed(format!(
+                    "could not evaluate repository ignore rules: {}",
+                    output.stderr_tail()
+                )));
+            }
+        }
+        Ok(ignored)
+    }
+
     fn list(&self) -> std::result::Result<Vec<WorkspaceEntry>, WorkspaceError> {
         self.list_workspaces()
     }

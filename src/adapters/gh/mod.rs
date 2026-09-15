@@ -124,6 +124,24 @@ impl GhCliForge {
         &self.repo
     }
 
+    /// A unique private file for prose/JSON passed to `gh` by path rather than argv.
+    /// Dry-run payloads live under the configured app home so the recorded command
+    /// remains replayable; ordinary one-shot payloads use the system temporary area.
+    fn payload_path(&self, stem: &str, number: u64, extension: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(path) = self
+            .runner
+            .dry_run_artifact_path(&format!("{stem}-pr-{number}"), extension)
+        {
+            return path;
+        }
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "smart-review-{stem}-{}-{number}-{unique}.{extension}",
+            std::process::id()
+        ))
+    }
+
     /// A `gh pr` command for this repository.
     ///
     /// `--repo` is appended to every one of them, so the current directory can
@@ -153,7 +171,7 @@ impl GhCliForge {
         let text = self.text(spec, cancel)?;
         serde_json::from_str(&text).map_err(|error| {
             Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 format!("could not read the response: {error}"),
             )
         })
@@ -174,7 +192,7 @@ impl GhCliForge {
                 Ok(page) => items.extend(page),
                 Err(error) => {
                     return Err(Error::forge(
-                        spec.render(),
+                        spec.diagnostic(),
                         format!("could not read the response: {error}"),
                     ));
                 }
@@ -185,10 +203,10 @@ impl GhCliForge {
 
     /// Runs a command and returns its stdout.
     fn text(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<String> {
-        logging::log(Level::Debug, format!("running {}", spec.render()));
+        logging::log(Level::Debug, format!("running {}", spec.diagnostic()));
         let output = self.runner.run(spec, cancel).map_err(|error| {
             Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 match error {
                     crate::adapters::process::ProcessError::NotFound { .. } => {
                         "the GitHub CLI was not found; install it from https://cli.github.com"
@@ -201,7 +219,7 @@ impl GhCliForge {
 
         if !output.success() {
             return Err(Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 format!(
                     "exit {}: {}",
                     output
@@ -214,7 +232,10 @@ impl GhCliForge {
         if output.stdout_truncated {
             logging::log(
                 Level::Warn,
-                format!("{} produced more output than was captured", spec.render()),
+                format!(
+                    "{} produced more output than was captured",
+                    spec.diagnostic()
+                ),
             );
         }
         Ok(output.stdout)
@@ -227,10 +248,10 @@ impl GhCliForge {
     /// call in this adapter goes through here, so there is one place where the
     /// dry-run promise is kept rather than one per feature.
     fn mutate(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<Option<Output>> {
-        logging::log(Level::Debug, format!("running {}", spec.render()));
+        logging::log(Level::Debug, format!("running {}", spec.diagnostic()));
         let output = self.runner.run(spec, cancel).map_err(|error| {
             Error::forge(
-                spec.render(),
+                spec.diagnostic(),
                 match error {
                     crate::adapters::process::ProcessError::NotFound { .. } => {
                         "the GitHub CLI was not found; install it from https://cli.github.com"
@@ -327,13 +348,13 @@ impl ForgePort for GhCliForge {
                 .first()
                 .and_then(|error| error.message.clone())
                 .unwrap_or_else(|| "unknown GraphQL error".to_owned());
-            return Err(Error::forge(spec.render(), message));
+            return Err(Error::forge(spec.diagnostic(), message));
         }
         response
             .data
             .and_then(|data| data.search)
             .and_then(|search| search.issue_count)
-            .ok_or_else(|| Error::forge(spec.render(), "the response carried no count"))
+            .ok_or_else(|| Error::forge(spec.diagnostic(), "the response carried no count"))
     }
 
     fn get_pull_request(&self, number: u64, cancel: &Cancel) -> Result<PullRequestDetail> {
@@ -515,7 +536,7 @@ mod tests {
             // way to check the wire rather than the code that built it.
             let _ = writeln!(
                 script,
-                "prev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = \"--input\" ] && [ -f \"$arg\" ]; then\n    cp \"$arg\" \"{captured}\"\n  fi\n  prev=\"$arg\"\ndone",
+                "prev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = \"--input\" ] || [ \"$prev\" = \"--body-file\" ]; then\n    if [ -f \"$arg\" ]; then cp \"$arg\" \"{captured}\"; fi\n  fi\n  prev=\"$arg\"\ndone",
                 captured = dir.path().join("input.json").display()
             );
             // The keys are matched against `$1:$2` rather than `$*`: a `case`
@@ -573,6 +594,11 @@ mod tests {
                 .expect("the fake kept a copy of --input");
             serde_json::from_str(&text).expect("valid JSON")
         }
+
+        fn input_text(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("input.json"))
+                .expect("the fake kept a copy of the payload file")
+        }
     }
 
     const LIST: &str = include_str!("../../../tests/fixtures/gh/pr-list.json");
@@ -616,20 +642,15 @@ mod tests {
             .expect("published");
 
         assert!(!posted.dry_run);
-        assert_eq!(
-            fake.last_call(),
-            vec![
-                "pr",
-                "review",
-                "141",
-                "--request-changes",
-                "--body",
-                "One thing to fix.",
-                "--repo",
-                "acme/service",
-            ],
-            "the body is one argv element, never interpolated into a shell"
+        let call = fake.last_call();
+        assert_eq!(&call[..4], ["pr", "review", "141", "--request-changes"]);
+        assert!(
+            call.windows(2)
+                .any(|pair| pair[0] == "--repo" && pair[1] == "acme/service")
         );
+        assert!(call.windows(2).any(|pair| pair[0] == "--body-file"));
+        assert!(!call.iter().any(|arg| arg.contains("One thing to fix")));
+        assert_eq!(fake.input_text(), "One thing to fix.");
     }
 
     #[test]
@@ -743,13 +764,10 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_goes_to_the_reply_route_with_the_body_as_one_argument() {
-        let fake = FakeGh::scripted(&[("-X", r#"{"id":7,"html_url":"https://example.test/c/7"}"#)]);
+    fn a_reply_goes_to_the_reply_route_with_a_private_json_payload() {
+        let fake =
+            FakeGh::scripted(&[("api", r#"{"id":7,"html_url":"https://example.test/c/7"}"#)]);
         let forge = fake.forge("acme/service");
-        // Quotes and a backslash, but no newline: the fake records one argument per
-        // line, so a newline inside an argument is not something it can show back.
-        // Newlines in a body are covered by the review payload's own test, which
-        // reads the JSON that was sent rather than the argv.
         let body = "agreed \"fixed\" in 9f2c1ab, and C:\\path too";
         let posted = forge
             .reply_to_review_comment(141, 1001, body, &Cancel::new())
@@ -765,12 +783,8 @@ mod tests {
             call.contains(&"repos/acme/service/pulls/141/comments/1001/replies".to_owned()),
             "{call:?}"
         );
-        // One argv element, quotes and newline and all: a body is prose, and the only
-        // thing standing between it and a shell is that it is never a string.
-        assert!(
-            call.iter().any(|arg| arg == &format!("body={body}")),
-            "{call:?}"
-        );
+        assert!(!call.iter().any(|arg| arg.contains(body)), "{call:?}");
+        assert_eq!(fake.input()["body"], body);
     }
 
     #[test]
@@ -786,10 +800,8 @@ mod tests {
             call.contains(&"repos/acme/service/issues/141/comments".to_owned()),
             "a pull request is an issue, and its conversation is the issue's comments: {call:?}"
         );
-        assert!(
-            call.iter().any(|arg| arg == "body=thanks, looking now"),
-            "{call:?}"
-        );
+        assert!(!call.iter().any(|arg| arg.contains("thanks, looking now")));
+        assert_eq!(fake.input()["body"], "thanks, looking now");
     }
 
     #[test]
@@ -874,8 +886,10 @@ mod tests {
     #[test]
     fn posting_anything_during_a_dry_run_reaches_nothing() {
         let fake = FakeGh::scripted(&[("-X", "{}"), ("graphql", "{}")]);
-        let runner =
-            ProcessRunner::new().with_dry_run(crate::adapters::process::DryRunLedger::new());
+        let artifacts = fake.dir.path().join("exports/dry-run");
+        let runner = ProcessRunner::new().with_dry_run(
+            crate::adapters::process::DryRunLedger::in_directory(&artifacts),
+        );
         let ledger = runner.dry_run_ledger().expect("a ledger").clone();
         let forge = fake.forge("acme/service").with_runner(runner);
 
@@ -912,6 +926,27 @@ mod tests {
             "{}",
             commands[2]
         );
+        assert!(
+            commands[..2]
+                .iter()
+                .all(|command| !command.contains("hello")),
+            "ordinary command records contain paths, not bodies: {commands:#?}"
+        );
+        let payloads = std::fs::read_dir(&artifacts)
+            .expect("the app-owned artifact directory exists")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("payload entries are readable");
+        assert_eq!(payloads.len(), 2);
+        for payload in payloads {
+            let text = std::fs::read_to_string(payload.path()).expect("payload is readable");
+            assert!(text.contains("hello"), "the explicit artifact is exact");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = payload.metadata().expect("metadata").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} is private", payload.path().display());
+            }
+        }
     }
 
     #[test]

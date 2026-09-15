@@ -134,7 +134,7 @@ cat >"$REPO/clone/README.md" <<'EOF'
 Install with cargo. This README must not reach the provider: AGENTS.md wins.
 EOF
 cat >"$REPO/clone/.env" <<'EOF'
-FINANCE_API_KEY=super-secret-value-that-must-never-be-sent
+FINANCE_API_KEY=old-secret-diff-sentinel-that-must-never-be-sent
 EOF
 mkdir -p "$REPO/clone/src/domain" "$REPO/clone/tests"
 cat >"$REPO/clone/src/domain/money.rs" <<'EOF'
@@ -162,6 +162,9 @@ git -C "$REPO/clone" commit --quiet -m "initial"
 git -C "$REPO/clone" push --quiet origin main
 
 git -C "$REPO/clone" checkout --quiet -b work
+cat >"$REPO/clone/.env" <<'EOF'
+FINANCE_API_KEY=new-secret-diff-sentinel-that-must-never-be-sent
+EOF
 cat >"$REPO/clone/src/domain/money.rs" <<'EOF'
 pub fn round(cents: i64) -> i64 {
     (cents + 5) / 10 * 10
@@ -376,7 +379,10 @@ for name, passed in checks:
     print(("  PASS  " if passed else "  FAIL  ") + name)
     failed += 0 if passed else 1
 # The privacy rule is its own check, and its own sentence.
-secrets = [s for s in ("super-secret-value-that-must-never-be-sent",) if s in blob]
+secrets = [s for s in (
+    "old-secret-diff-sentinel-that-must-never-be-sent",
+    "new-secret-diff-sentinel-that-must-never-be-sent",
+) if s in blob]
 if secrets:
     print("  FAIL  a committed .env value reached the provider")
     failed += 1

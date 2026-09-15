@@ -792,6 +792,48 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_ignore_rules_include_tracked_files_and_respect_nested_negation() {
+        let fixture = GitFixture::new();
+        fixture.commit(
+            ".gitignore",
+            "tracked.log\nsecrets/**\n!secrets/public.txt\n",
+            "add ignore rules",
+        );
+        std::fs::create_dir_all(fixture.clone.join("secrets")).expect("creates nested directory");
+        std::fs::write(fixture.clone.join("tracked.log"), "tracked but ignored")
+            .expect("writes ignored file");
+        std::fs::write(fixture.clone.join("secrets/private.txt"), "private")
+            .expect("writes private file");
+        std::fs::write(fixture.clone.join("secrets/public.txt"), "public")
+            .expect("writes negated file");
+        fixture.git(&["add", "-f", "--", "tracked.log", "secrets/private.txt"]);
+        fixture.git(&["add", "--", "secrets/public.txt"]);
+        fixture.git(&["commit", "--quiet", "-m", "track fixture files"]);
+        let git = adapter(&fixture, &fixture.path().join("worktrees"));
+        let candidates = vec![
+            "tracked.log".to_owned(),
+            "secrets/private.txt".to_owned(),
+            "secrets/public.txt".to_owned(),
+            "src/lib.rs".to_owned(),
+        ];
+
+        let ignored = git
+            .ignored_paths(&fixture.clone, &candidates, &Cancel::new())
+            .expect("ignore rules are evaluated");
+
+        assert!(ignored.contains(&"tracked.log".to_owned()), "{ignored:?}");
+        assert!(
+            ignored.contains(&"secrets/private.txt".to_owned()),
+            "{ignored:?}"
+        );
+        assert!(
+            !ignored.contains(&"secrets/public.txt".to_owned()),
+            "{ignored:?}"
+        );
+        assert!(!ignored.contains(&"src/lib.rs".to_owned()), "{ignored:?}");
+    }
+
+    #[test]
     fn managed_worktrees_are_listed_and_removed() {
         let (fixture, _base, head) = fixture();
         let root = fixture.path().join("worktrees");

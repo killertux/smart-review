@@ -87,4 +87,20 @@ records its path in `logs/smart-review.log` for recovery.
 
 Set `[forge].dry_run = true` or start with `--dry-run` to record mutating GitHub and
 workspace commands in `logs/dry-run.log` without running them. Reads still run so the
-preview describes the real PR.
+preview describes the real PR. Review/reply bodies are never copied into argv or the
+ordinary diagnostic log. A dry run that needs a body writes an exact private (`0600`)
+payload under `exports/dry-run/`; the command log references that path so it can be
+inspected or replayed deliberately.
+
+## Context privacy
+
+The same eligibility decision applies to a changed file's full contents and its diff,
+including deleted lines and both old/new names of a rename. Credential-like names,
+paths matched by repository ignore rules (even when tracked), binary files and files
+over `llm.max_file_bytes` contribute no source content. `:context` is generated from
+the filtered payload and explains each exclusion. When the repository rules or file
+bytes cannot be checked, source content is not sent.
+
+This is a file/path boundary, not a generic secret scanner. Pull-request descriptions,
+commit messages and questions are user-visible prose included in the pre-send preview;
+smart-review does not guess which substrings in that prose are secrets.
