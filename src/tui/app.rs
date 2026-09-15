@@ -1454,17 +1454,15 @@ impl App {
                 .catalog
                 .model(&resolved.provider, &resolved.model)
         });
-        let output_limit = model.and_then(crate::domain::model::CatalogModel::output_limit);
-        let mut chat = crate::application::models::analysis_chat(resolved, secret, output_limit);
+        let mut chat = crate::application::models::analysis_chat(resolved, secret);
         // A chat answer is read as it arrives and is usually shorter than an analysis of
         // the same pull request, so the long analysis timeout would only hold a dead
         // connection open.
         chat.timeout_secs = CHAT_TIMEOUT_SECS;
         let policy = crate::domain::context::BundlePolicy {
-            max_context_tokens: crate::application::models::context_budget(
-                model.and_then(crate::domain::model::CatalogModel::context_limit),
-                self.config.llm.max_context_tokens,
-                chat.max_tokens,
+            max_context_tokens: crate::application::models::context_budget_after_framing(
+                &resolved.settings,
+                crate::application::chat::system_prompt("").len(),
             ),
             max_file_bytes: self.config.llm.max_file_bytes,
             ..crate::domain::context::BundlePolicy::default()
@@ -1484,6 +1482,7 @@ impl App {
                 .map(|view| Box::new(view.patch.clone())),
             checkout: self.checkout(),
             policy,
+            input_budget_tokens: resolved.settings.input_tokens,
             added: self.chat.added.clone(),
             cost: model.and_then(|model| model.cost.clone()),
         };
@@ -2436,7 +2435,7 @@ impl App {
         // The confirmation is where the estimate is shown, because it is the only place
         // the size of the request is known before something is paid for (FR-4.6).
         if self.chat.is_confirming() {
-            self.show_chat_estimate(&session);
+            self.show_chat_estimate(&session, &question);
             return None;
         }
         // Already agreed: the question goes now, with the bundle that was just gathered.
@@ -2446,14 +2445,14 @@ impl App {
 
     /// Shows what a question would send, and asks for the key press that agrees to it
     /// (FR-4.6).
-    fn show_chat_estimate(&mut self, session: &crate::domain::chat::Session) {
+    fn show_chat_estimate(&mut self, session: &crate::domain::chat::Session, question: &str) {
         let Some((spec, _)) = self.chat_request() else {
             return;
         };
         let Some(bundle) = self.chat_bundle.as_deref() else {
             return;
         };
-        let estimate = crate::application::chat::estimate_of(&spec, session, bundle);
+        let estimate = crate::application::chat::estimate_of(&spec, session, bundle, question);
         let summary = bundle.summary();
         self.chat.set_estimate(estimate);
         self.chat.open = true;
@@ -3051,31 +3050,12 @@ impl App {
             .get(&resolved.provider, resolved.env_var.as_deref())
             .ok()
             .flatten()?;
-        // The output cap comes from the catalog when it declares one (FR-4.7).
-        let output_limit = self
-            .catalog
-            .as_ref()
-            .and_then(|state| {
-                state
-                    .load
-                    .catalog
-                    .model(&resolved.provider, &resolved.model)
-            })
-            .and_then(crate::domain::model::CatalogModel::output_limit);
-        let chat = crate::application::models::analysis_chat(resolved, secret, output_limit);
+        let chat = crate::application::models::analysis_chat(resolved, secret);
         let policy = BundlePolicy {
-            max_context_tokens: crate::application::models::context_budget(
-                self.catalog
-                    .as_ref()
-                    .and_then(|state| {
-                        state
-                            .load
-                            .catalog
-                            .model(&resolved.provider, &resolved.model)
-                    })
-                    .and_then(crate::domain::model::CatalogModel::context_limit),
-                self.config.llm.max_context_tokens,
-                chat.max_tokens,
+            max_context_tokens: crate::application::models::context_budget_after_framing(
+                &resolved.settings,
+                crate::domain::analysis::system_prompt(None).len()
+                    + crate::domain::analysis::user_prompt("").len(),
             ),
             max_file_bytes: self.config.llm.max_file_bytes,
             ..BundlePolicy::default()
@@ -3090,6 +3070,7 @@ impl App {
                 .map(|view| Box::new(view.patch.clone())),
             checkout: self.checkout(),
             policy,
+            input_budget_tokens: resolved.settings.input_tokens,
         })
     }
 
@@ -4517,11 +4498,19 @@ impl App {
     #[must_use]
     pub fn picker_selection(&self) -> Option<ModelSelection> {
         let picker = self.picker.as_ref()?;
+        let provider = picker.provider()?.to_owned();
+        let model = picker.model()?.to_owned();
+        let existing = self
+            .config
+            .llm
+            .active
+            .as_ref()
+            .filter(|active| active.provider == provider && active.model == model);
         Some(ModelSelection {
-            provider: picker.provider()?.to_owned(),
-            model: picker.model()?.to_owned(),
-            temperature: None,
-            max_tokens: None,
+            provider,
+            model,
+            temperature: existing.and_then(|active| active.temperature),
+            max_tokens: existing.and_then(|active| active.max_tokens),
             reasoning: picker.thinking().cloned(),
         })
     }
@@ -4640,28 +4629,34 @@ impl App {
             // `Esc` walks back a step, and closes the picker from the first step:
             // that is "back out without changing anything" (FR-4.5).
             KeyCode::Esc => close = !picker.step_back(),
-            KeyCode::Enter => match picker.advance() {
-                // Nothing to do for either: the picker has already moved, or has put
-                // the reason on screen itself.
-                model_picker::PickerStep::Moved | model_picker::PickerStep::Refused(_) => {}
-                model_picker::PickerStep::KeyTyped { provider, key } => {
-                    effect = Effect::SaveKey { provider, key };
-                }
-                model_picker::PickerStep::Commit {
-                    provider,
-                    model,
-                    thinking,
-                } => {
-                    let selection = ModelSelection {
+            KeyCode::Enter => {
+                match picker.advance() {
+                    // Nothing to do for either: the picker has already moved, or has put
+                    // the reason on screen itself.
+                    model_picker::PickerStep::Moved | model_picker::PickerStep::Refused(_) => {}
+                    model_picker::PickerStep::KeyTyped { provider, key } => {
+                        effect = Effect::SaveKey { provider, key };
+                    }
+                    model_picker::PickerStep::Commit {
                         provider,
                         model,
-                        temperature: None,
-                        max_tokens: None,
-                        reasoning: thinking,
-                    };
-                    effect = Effect::SaveSelection(Box::new(selection));
+                        thinking,
+                    } => {
+                        let existing =
+                            self.config.llm.active.as_ref().filter(|active| {
+                                active.provider == provider && active.model == model
+                            });
+                        let selection = ModelSelection {
+                            provider,
+                            model,
+                            temperature: existing.and_then(|active| active.temperature),
+                            max_tokens: existing.and_then(|active| active.max_tokens),
+                            reasoning: thinking,
+                        };
+                        effect = Effect::SaveSelection(Box::new(selection));
+                    }
                 }
-            },
+            }
             KeyCode::Up => picker.move_cursor(-1),
             KeyCode::Down => picker.move_cursor(1),
             KeyCode::Char('p') if combo.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4711,10 +4706,11 @@ impl App {
             self.model_problem = None;
             return;
         };
-        match crate::application::models::resolve_selection(
+        match crate::application::models::resolve_selection_with_input(
             &state.load.catalog,
             &selection,
             self.secret_store.as_ref(),
+            self.config.llm.max_context_tokens,
         ) {
             Ok(resolved) => {
                 for warning in &resolved.warnings {
@@ -6294,6 +6290,16 @@ mod tests {
             env_source: None,
             from_file: true,
             thinking: None,
+            settings: crate::application::models::EffectiveRequestSettings {
+                configured_temperature: None,
+                temperature: None,
+                max_tokens: None,
+                configured_max_tokens: None,
+                catalog_output_tokens: None,
+                input_tokens: 100_000,
+                configured_input_tokens: 100_000,
+                model_window: None,
+            },
             warnings: Vec::new(),
         });
         let store = std::sync::Arc::new(FakeChatStore::default());

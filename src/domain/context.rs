@@ -558,12 +558,26 @@ impl<'a> Builder<'a> {
         if body.trim().is_empty() {
             return;
         }
-        let allowed = self.remaining();
+        let prefix = format!("## {label}\n");
+        let suffix = "\n\n";
+        let framing = prefix.len() + suffix.len();
+        if self.remaining() < framing {
+            self.segments.push(Segment {
+                kind,
+                label: label.to_owned(),
+                bytes: 0,
+                included: false,
+                truncated: false,
+                detail: Some("elided: the context budget has no room for its heading".to_owned()),
+            });
+            return;
+        }
+        let allowed = self.remaining() - framing;
         let (body, truncated) = truncate_bytes(body, allowed);
         let detail = truncated
             .then(|| format!("truncated at {allowed} bytes: the context budget was reached"));
         self.append(
-            &format!("## {label}\n{body}\n\n"),
+            &format!("{prefix}{body}{suffix}"),
             kind,
             label,
             truncated,
@@ -589,7 +603,7 @@ impl<'a> Builder<'a> {
             }
             Disposition::Placeholder { reason } => {
                 let body = format!("## {label} ({reason})\n");
-                self.append(&body, kind, label, false, Some(reason));
+                self.push_complete_block(&body, kind, label, Some(reason));
             }
             Disposition::Include => {
                 let Some(text) = std::str::from_utf8(bytes).ok() else {
@@ -598,13 +612,14 @@ impl<'a> Builder<'a> {
                     // total rather than making the caller handle it.
                     let reason = "binary file".to_owned();
                     let body = format!("## {label} ({reason})\n");
-                    self.append(&body, kind, label, false, Some(reason));
+                    self.push_complete_block(&body, kind, label, Some(reason));
                     return;
                 };
                 // A file that does not fit whole is left out rather than cut in half:
                 // half a function invites a confident wrong answer, and the segment
                 // list says the file was elided so the user can widen the budget.
-                let cost = text.len();
+                let body = format!("## {label}\n{text}\n\n");
+                let cost = body.len();
                 if cost > self.remaining() {
                     self.segments.push(Segment {
                         kind,
@@ -620,7 +635,6 @@ impl<'a> Builder<'a> {
                     });
                     return;
                 }
-                let body = format!("## {label}\n{text}\n\n");
                 self.append(&body, kind, label, false, None);
             }
         }
@@ -645,8 +659,8 @@ impl<'a> Builder<'a> {
         if full.trim().is_empty() {
             return;
         }
-        if full.len() <= self.remaining() {
-            let body = format!("## diff\n{full}\n");
+        let body = format!("## diff\n{full}\n");
+        if body.len() <= self.remaining() {
             self.append(&body, SegmentKind::Diff, "diff", false, None);
             return;
         }
@@ -658,29 +672,68 @@ impl<'a> Builder<'a> {
             Some(self.policy.reduced_context_lines),
             self.decisions,
         );
-        if reduced.len() <= self.remaining() {
+        let body = format!("## diff (context reduced)\n{reduced}\n");
+        if body.len() <= self.remaining() {
             let detail = format!(
                 "context reduced to {} line(s) per hunk to fit the budget",
                 self.policy.reduced_context_lines
             );
-            let body = format!("## diff (context reduced)\n{reduced}\n");
             self.append(&body, SegmentKind::Diff, "diff", true, Some(detail));
             return;
         }
 
         // Step three: truncate, and say where.
-        let allowed = self.remaining();
+        let prefix = "## diff (truncated)\n";
+        if self.remaining() < prefix.len() {
+            self.segments.push(Segment {
+                kind: SegmentKind::Diff,
+                label: "diff".to_owned(),
+                bytes: 0,
+                included: false,
+                truncated: false,
+                detail: Some(
+                    "elided: the context budget has no room for the diff heading".to_owned(),
+                ),
+            });
+            return;
+        }
+        let allowed = self.remaining().saturating_sub(prefix.len());
         let (body, _) = truncate_bytes(&reduced, allowed);
         let detail = format!(
             "truncated at {allowed} bytes after reducing context; the rest of the diff was not sent"
         );
         self.append(
-            &format!("## diff (truncated)\n{body}"),
+            &format!("{prefix}{body}"),
             SegmentKind::Diff,
             "diff",
             true,
             Some(detail),
         );
+    }
+
+    /// Adds a pre-rendered block only when its complete serialized form fits.
+    fn push_complete_block(
+        &mut self,
+        body: &str,
+        kind: SegmentKind,
+        label: &str,
+        detail: Option<String>,
+    ) {
+        if body.len() <= self.remaining() {
+            self.append(body, kind, label, false, detail);
+        } else {
+            self.segments.push(Segment {
+                kind,
+                label: label.to_owned(),
+                bytes: 0,
+                included: false,
+                truncated: false,
+                detail: Some(
+                    "elided: the complete placeholder does not fit in the context budget"
+                        .to_owned(),
+                ),
+            });
+        }
     }
 
     /// Adds the text and its segment.
@@ -887,6 +940,30 @@ mod tests {
 
     fn build_with(inputs: &BundleInputs<'_>) -> Bundle {
         build(inputs, &policy())
+    }
+
+    #[test]
+    fn ir_03_serialized_bundle_never_exceeds_its_exact_byte_budget() {
+        let policy = BundlePolicy {
+            max_context_tokens: 5,
+            max_file_bytes: 1024,
+            reduced_context_lines: 0,
+        };
+        let inputs = BundleInputs {
+            metadata: "éééééééééééééééééééé",
+            conventions: vec![("a/very/long/path/to/a/binary.bin", b"\0" as &[u8])],
+            ..BundleInputs::default()
+        };
+
+        let bundle = build(&inputs, &policy);
+
+        assert!(
+            bundle.bytes() <= policy.max_bytes(),
+            "{} > {}",
+            bundle.bytes(),
+            policy.max_bytes()
+        );
+        assert!(bundle.text.is_char_boundary(bundle.text.len()));
     }
 
     #[test]

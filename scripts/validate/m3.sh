@@ -317,10 +317,6 @@ max_file_bytes = ${MAX_FILE_BYTES:-262144}
 [llm.active]
 provider = "fake"
 model = "fake-analysis-1"
-
-[llm.active.reasoning]
-type = "toggle"
-value = true
 EOF
 }
 

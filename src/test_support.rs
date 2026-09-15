@@ -666,6 +666,16 @@ pub(crate) fn resolved_model() -> crate::application::models::ResolvedSelection 
         env_source: None,
         from_file: true,
         thinking: None,
+        settings: crate::application::models::EffectiveRequestSettings {
+            configured_temperature: None,
+            temperature: None,
+            max_tokens: None,
+            configured_max_tokens: None,
+            catalog_output_tokens: None,
+            input_tokens: 100_000,
+            configured_input_tokens: 100_000,
+            model_window: None,
+        },
         warnings: Vec::new(),
     }
 }

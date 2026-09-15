@@ -78,6 +78,8 @@ pub struct AnalysisRequest {
     pub checkout: Option<Checkout>,
     /// The bundle budget (FR-4.6).
     pub policy: BundlePolicy,
+    /// Full input allowance, distinct from the source bundle's reduced allowance.
+    pub input_budget_tokens: u32,
 }
 
 impl AnalysisRequest {
@@ -234,6 +236,7 @@ impl<'a> Analyst<'a> {
             .map(|segment| segment.label.clone());
         let system = system_prompt(conventions.as_deref());
         let prompt = user_prompt(&bundle.text);
+        validate_input_budget(request, &system, &prompt)?;
         let index = request
             .patch
             .as_deref()
@@ -264,13 +267,14 @@ impl<'a> Analyst<'a> {
         let (normalized, repaired, raw) = match attempt {
             Ok(normalized) => (normalized, false, first.text),
             Err(failure) => {
-                // One repair pass, with the reason and the previous answer (FR-4.1).
-                progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let previous = first.text.clone();
                 let repair = repair_prompt(&previous, &failure);
-                // A failed repair attempt still leaves the first answer to show, with
-                // the first failure's reason: the user has text to read either way,
-                // which is what FR-4.1 asks for.
+                if let Some(run) =
+                    rejected_repair(request, &system, &repair, &previous, &failure, usage)
+                {
+                    return Ok(run);
+                }
+                progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let second = match self.ask(request, &system, &repair, cancel, progress) {
                     Ok(second) => second,
                     Err(LlmError::Cancelled) => return Ok(AnalysisRun::Cancelled),
@@ -426,6 +430,48 @@ impl<'a> Analyst<'a> {
                 && entry.key.prompt_version == key.prompt_version
         }))
     }
+}
+
+/// Refuses a final serialized request that cannot fit the selected input allowance.
+fn validate_input_budget(
+    request: &AnalysisRequest,
+    system: &str,
+    prompt: &str,
+) -> Result<(), LlmError> {
+    let bytes = crate::ports::llm::estimated_input_bytes(Some(system), &[], prompt);
+    if bytes
+        <= (request.input_budget_tokens as usize)
+            .saturating_mul(crate::domain::context::BYTES_PER_TOKEN)
+    {
+        return Ok(());
+    }
+    Err(LlmError::Request {
+        provider: request.chat.provider.clone(),
+        reason: "the analysis prompt exceeds the configured input limit; widen the limit or reduce :context".to_owned(),
+    })
+}
+
+fn rejected_repair(
+    request: &AnalysisRequest,
+    system: &str,
+    repair: &str,
+    previous: &str,
+    failure: &ParseFailure,
+    usage: UsageTotal,
+) -> Option<AnalysisRun> {
+    validate_input_budget(request, system, repair)
+        .err()
+        .map(|_| {
+            AnalysisRun::Unparsed(Box::new(Unparsed {
+                raw: previous.to_owned(),
+                reason: format!(
+                    "{} (the repair prompt exceeded the input limit)",
+                    failure.reason
+                ),
+                repaired: true,
+                usage: usage.reported(),
+            }))
+        })
 }
 
 /// One provider answer.
@@ -706,6 +752,7 @@ mod tests {
                 base_sha: "base123".to_owned(),
             }),
             policy: BundlePolicy::default(),
+            input_budget_tokens: 100_000,
         }
     }
 

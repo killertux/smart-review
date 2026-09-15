@@ -21,6 +21,25 @@ use crate::domain::model::{Route, ThinkingRequest};
 use crate::ports::Cancel;
 use crate::ports::secret::ApiKey;
 
+/// Approximate JSON/role framing added for each provider message.
+pub const MESSAGE_FRAMING_BYTES: usize = 16;
+
+/// Estimates the bytes sent after the adapter has assigned roles and message wrappers.
+#[must_use]
+pub fn estimated_input_bytes(
+    system: Option<&str>,
+    history: &[(crate::domain::chat::Role, String)],
+    prompt: &str,
+) -> usize {
+    system.map_or(0, |text| text.len() + MESSAGE_FRAMING_BYTES)
+        + history
+            .iter()
+            .map(|(_, text)| text.len() + MESSAGE_FRAMING_BYTES)
+            .sum::<usize>()
+        + prompt.len()
+        + MESSAGE_FRAMING_BYTES
+}
+
 /// Where to send a request, and what to send.
 #[derive(Clone)]
 pub struct ChatRequest {

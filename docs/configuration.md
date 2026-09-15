@@ -50,6 +50,13 @@ level = "info"             # error | warn | info | debug | trace
 # path = "/absolute/path/to/smart-review.log"
 ```
 
+`max_context_tokens` is a hard input ceiling. The catalog can reduce it for a smaller
+model window after reserving output tokens, but it never increases it. The complete
+prompt framing and chat history are accounted for; `:context` identifies omitted
+material. `max_tokens` is sent to supported providers and capped by catalog output
+metadata. A configured `temperature` or `reasoning` setting that the selected model
+does not support prevents selection rather than being silently ignored.
+
 ## Model selection
 
 There is deliberately no provider/model default. Pick one in the TUI with

@@ -227,8 +227,72 @@ pub struct ResolvedSelection {
     pub from_file: bool,
     /// Thinking setting to send, already mapped (FR-4.8).
     pub thinking: Option<crate::domain::model::ThinkingRequest>,
+    /// Settings actually applied to every analysis and chat request.
+    pub settings: EffectiveRequestSettings,
     /// Problems that do not stop the selection being used.
     pub warnings: Vec<String>,
+}
+
+/// The model settings after user configuration and catalog capacity have both been applied.
+///
+/// A user limit is a ceiling, never a hint that catalog metadata may increase. Catalog metadata
+/// can only reduce it (FR-4.5–FR-4.8, FR-5.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveRequestSettings {
+    /// User-configured temperature, before capability validation.
+    pub configured_temperature: Option<f32>,
+    /// Sampling temperature, when the selected model explicitly supports it.
+    pub temperature: Option<f32>,
+    /// Maximum completion tokens requested from the provider.
+    pub max_tokens: Option<u32>,
+    /// User-configured output ceiling, before catalog capping.
+    pub configured_max_tokens: Option<u32>,
+    /// Catalog output cap, when published.
+    pub catalog_output_tokens: Option<u32>,
+    /// The input window left after reserving the requested output.
+    pub input_tokens: u32,
+    /// User-configured input ceiling.
+    pub configured_input_tokens: u32,
+    /// The catalog's combined context window, when known.
+    pub model_window: Option<u32>,
+}
+
+impl EffectiveRequestSettings {
+    /// Computes settings without allowing catalog metadata to raise a configured ceiling.
+    #[must_use]
+    pub fn for_model(
+        model: &CatalogModel,
+        selection: &ModelSelection,
+        configured_input: u32,
+    ) -> Self {
+        let max_tokens = match (selection.max_tokens, model.output_limit()) {
+            (Some(configured), Some(catalog)) => Some(configured.min(catalog)),
+            (Some(configured), None) => Some(configured),
+            (None, Some(catalog)) => Some(catalog.min(DEFAULT_MAX_TOKENS)),
+            (None, None) => Some(
+                model
+                    .context_limit()
+                    .map_or(DEFAULT_OUTPUT_RESERVE, |window| {
+                        window.min(DEFAULT_OUTPUT_RESERVE)
+                    }),
+            ),
+        };
+        let input_tokens = model.context_limit().map_or(configured_input, |window| {
+            window
+                .saturating_sub(max_tokens.unwrap_or_default())
+                .min(configured_input)
+        });
+        Self {
+            temperature: selection.temperature,
+            configured_temperature: selection.temperature,
+            max_tokens,
+            configured_max_tokens: selection.max_tokens,
+            catalog_output_tokens: model.output_limit(),
+            input_tokens,
+            configured_input_tokens: configured_input,
+            model_window: model.context_limit(),
+        }
+    }
 }
 
 impl ResolvedSelection {
@@ -289,6 +353,10 @@ pub enum SelectionError {
     #[error("{0}")]
     Thinking(String),
 
+    /// The model does not accept the configured temperature.
+    #[error("{0}")]
+    Temperature(String),
+
     /// The provider has no key (FR-4.5).
     #[error("no API key is stored for {0}")]
     MissingKey(String),
@@ -311,6 +379,20 @@ pub fn resolve_selection(
     selection: &ModelSelection,
     secrets: &dyn SecretStore,
 ) -> Result<ResolvedSelection, SelectionError> {
+    resolve_selection_with_input(catalog, selection, secrets, 100_000)
+}
+
+/// Resolves a selection using the configured input ceiling.
+///
+/// # Errors
+///
+/// As [`resolve_selection`].
+pub fn resolve_selection_with_input(
+    catalog: &Catalog,
+    selection: &ModelSelection,
+    secrets: &dyn SecretStore,
+    configured_input: u32,
+) -> Result<ResolvedSelection, SelectionError> {
     let provider = catalog
         .provider(&selection.provider)
         .ok_or_else(|| SelectionError::UnknownProvider(selection.provider.clone()))?;
@@ -326,20 +408,21 @@ pub fn resolve_selection(
         .route()
         .ok_or_else(|| SelectionError::Unreachable(selection.provider.clone()))?;
 
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let thinking = match &selection.reasoning {
         None => None,
-        Some(setting) => match setting.request(model) {
-            Ok(mapped) => Some(mapped),
-            Err(error) => {
-                // Stored settings can go stale when the model changes its declared
-                // options; that is a warning with the selection still usable, not a
-                // reason to refuse the model.
-                warnings.push(format!("{error}; thinking is off"));
-                None
-            }
-        },
+        Some(setting) => Some(
+            setting
+                .request(model)
+                .map_err(|error| SelectionError::Thinking(error.to_string()))?,
+        ),
     };
+    if selection.temperature.is_some() && !model.temperature {
+        return Err(SelectionError::Temperature(format!(
+            "{} does not support temperature; remove it in :model",
+            model.label()
+        )));
+    }
 
     let env_var = provider.env_var().map(str::to_owned);
     let status = secrets
@@ -348,16 +431,7 @@ pub fn resolve_selection(
     let Some(key) = status else {
         return Err(SelectionError::MissingKey(selection.provider.clone()));
     };
-    if let Some(max_tokens) = selection.max_tokens
-        && let Some(limit) = model.output_limit()
-        && max_tokens > limit
-    {
-        warnings.push(format!(
-            "max_tokens {max_tokens} is above {}'s output limit of {limit}",
-            provider.label()
-        ));
-    }
-
+    let settings = EffectiveRequestSettings::for_model(model, selection, configured_input);
     Ok(ResolvedSelection {
         provider: provider.id.clone(),
         model: model.id.clone(),
@@ -370,6 +444,7 @@ pub fn resolve_selection(
         }),
         from_file: !key.source().is_environment(),
         thinking,
+        settings,
         warnings,
     })
 }
@@ -406,11 +481,7 @@ pub fn connection_check(resolved: &ResolvedSelection, key: ApiKey) -> ChatReques
 /// wants as much room as the catalog allows and sends the thinking settings the user
 /// chose (FR-4.8).
 #[must_use]
-pub fn analysis_chat(
-    resolved: &ResolvedSelection,
-    key: ApiKey,
-    output_limit: Option<u32>,
-) -> ChatRequest {
+pub fn analysis_chat(resolved: &ResolvedSelection, key: ApiKey) -> ChatRequest {
     let mut request = ChatRequest::new(
         resolved.provider.clone(),
         resolved.model.clone(),
@@ -420,9 +491,8 @@ pub fn analysis_chat(
     );
     request.base_url.clone_from(&resolved.base_url);
     request.thinking.clone_from(&resolved.thinking);
-    // The output cap comes from the catalog when it declares one: asking for more
-    // than a model can produce is a truncation, not a bigger answer (FR-4.7).
-    request.max_tokens = output_limit.map(|limit| limit.min(DEFAULT_MAX_TOKENS));
+    request.max_tokens = resolved.settings.max_tokens;
+    request.temperature = resolved.settings.temperature;
     request.timeout_secs = ANALYSIS_TIMEOUT_SECS;
     request
 }
@@ -435,21 +505,19 @@ pub fn analysis_chat(
 /// the whole window leaves the model nothing to answer with, which reads to the user as
 /// truncation rather than as a full context.
 #[must_use]
-pub fn context_budget(
-    catalog_limit: Option<u32>,
-    configured: u32,
-    output_reserved: Option<u32>,
-) -> u32 {
-    /// The least context worth sending: below this the bundle is not an analysis of
-    /// anything in particular, and a smaller request would be a worse answer rather
-    /// than a cheaper one.
-    const FLOOR: u32 = 4_096;
-    /// What is held back for the answer when the caller does not say.
-    const DEFAULT_RESERVE: u32 = 8_192;
+pub fn context_budget(settings: &EffectiveRequestSettings) -> u32 {
+    settings.input_tokens
+}
 
-    let base = catalog_limit.unwrap_or(configured).max(FLOOR);
-    let reserve = output_reserved.unwrap_or(DEFAULT_RESERVE).min(base / 2);
-    base.saturating_sub(reserve).max(FLOOR)
+/// Leaves room for prompt framing which is outside the source bundle itself.
+#[must_use]
+pub fn context_budget_after_framing(
+    settings: &EffectiveRequestSettings,
+    framing_bytes: usize,
+) -> u32 {
+    settings.input_tokens.saturating_sub(
+        u32::try_from(crate::domain::context::estimate_tokens(framing_bytes)).unwrap_or(u32::MAX),
+    )
 }
 
 /// How long an analysis may take before it is given up on.
@@ -461,6 +529,8 @@ pub const ANALYSIS_TIMEOUT_SECS: u64 = 600;
 
 /// The most tokens an analysis is allowed to ask for.
 const DEFAULT_MAX_TOKENS: u32 = 32_768;
+/// Reserved and requested when the catalog does not publish an output limit.
+const DEFAULT_OUTPUT_RESERVE: u32 = 8_192;
 
 /// What is known about the key for one provider (FR-4.5, NFR-3.1).
 ///
@@ -801,32 +871,86 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_thinking_setting_that_no_longer_maps_is_a_warning_not_a_refusal() {
+    fn ir_03_an_unsupported_stored_thinking_setting_refuses_selection() {
         let catalog = catalog();
         let secrets = FakeSecrets::with_key("deepseek", "sk");
         let mut stored = selection("deepseek", "deepseek-v4-pro");
         stored.reasoning = Some(Thinking::Effort {
             value: "max".to_owned(),
         });
-        let resolved = resolve_selection(&catalog, &stored, &secrets).expect("still usable");
-        assert!(resolved.thinking.is_none(), "thinking is off");
-        assert_eq!(resolved.thinking_label(), "off");
-        assert_eq!(resolved.warnings.len(), 1);
-        assert!(resolved.warnings[0].contains("cannot send effort `max`"));
+        let error = resolve_selection(&catalog, &stored, &secrets).expect_err("not downgraded");
+        assert!(matches!(error, SelectionError::Thinking(_)), "{error:?}");
     }
 
     #[test]
-    fn a_max_tokens_above_the_models_limit_warns() {
+    fn ir_03_catalog_output_cap_reduces_the_effective_request() {
         let catalog = catalog();
         let secrets = FakeSecrets::with_key("deepseek", "sk");
         let mut stored = selection("deepseek", "deepseek-v4-pro");
         stored.max_tokens = Some(500_000);
         let resolved = resolve_selection(&catalog, &stored, &secrets).expect("usable");
-        assert!(
-            resolved.warnings.iter().any(|w| w.contains("output limit")),
-            "{:?}",
-            resolved.warnings
+        assert_eq!(
+            resolved.settings.max_tokens,
+            catalog
+                .model("deepseek", "deepseek-v4-pro")
+                .and_then(CatalogModel::output_limit)
         );
+    }
+
+    #[test]
+    fn ir_03_a_catalog_window_never_raises_the_user_input_ceiling() {
+        let model = CatalogModel {
+            limit: crate::domain::model::Limit {
+                context: Some(1_000_000),
+                output: Some(4_096),
+            },
+            ..CatalogModel::default()
+        };
+        let stored = selection("provider", "model");
+
+        let settings = EffectiveRequestSettings::for_model(&model, &stored, 100_000);
+
+        assert_eq!(settings.input_tokens, 100_000);
+        assert_eq!(settings.max_tokens, Some(4_096));
+    }
+
+    #[test]
+    fn ir_03_user_output_reaches_the_request_until_the_catalog_caps_it() {
+        let mut model = CatalogModel::default();
+        model.limit.output = Some(8_192);
+        let mut stored = selection("provider", "model");
+        stored.max_tokens = Some(4_096);
+        assert_eq!(
+            EffectiveRequestSettings::for_model(&model, &stored, 100_000).max_tokens,
+            Some(4_096)
+        );
+        stored.max_tokens = Some(16_384);
+        assert_eq!(
+            EffectiveRequestSettings::for_model(&model, &stored, 100_000).max_tokens,
+            Some(8_192)
+        );
+    }
+
+    #[test]
+    fn ir_03_temperature_is_sent_when_supported_and_refused_when_not() {
+        let supported = CatalogModel {
+            temperature: true,
+            ..CatalogModel::default()
+        };
+        let mut stored = selection("provider", "model");
+        stored.temperature = Some(0.2);
+        assert_eq!(
+            EffectiveRequestSettings::for_model(&supported, &stored, 100_000).temperature,
+            Some(0.2)
+        );
+
+        let catalog = Catalog::from_json(
+            r#"{"provider":{"api":"https://provider.test/v1","models":{"model":{"id":"model","temperature":false}}}}"#,
+        )
+        .expect("catalog");
+        let error = resolve_selection(&catalog, &stored, &FakeSecrets::with_key("provider", "key"))
+            .expect_err("unsupported temperature is refused");
+        assert!(matches!(error, SelectionError::Temperature(_)), "{error:?}");
     }
 
     #[test]

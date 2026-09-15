@@ -1199,12 +1199,20 @@ fn model_command(app: &mut App, argument: &str) -> Effect {
                 app.notice(
                     NoticeLevel::Info,
                     format!(
-                        "{} · {} · base {} · key from {} · thinking {}",
+                        "{} · {} · base {} · key from {} · thinking {} · input effective {}/configured {}/window {} · output effective {}/configured {}/catalog {} · temperature effective {}/configured {}",
                         resolved.label(),
                         resolved.route_label(),
                         resolved.base_url.as_deref().unwrap_or("provider default"),
                         source,
-                        resolved.thinking_label()
+                        resolved.thinking_label(),
+                        resolved.settings.input_tokens,
+                        resolved.settings.configured_input_tokens,
+                        resolved.settings.model_window.map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.max_tokens.map_or_else(|| "provider default".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.configured_max_tokens.map_or_else(|| "provider default".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.catalog_output_tokens.map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.temperature.map_or_else(|| "provider default".to_owned(), |value| value.to_string()),
+                        resolved.settings.configured_temperature.map_or_else(|| "provider default".to_owned(), |value| value.to_string())
                     ),
                 );
             } else {
@@ -1537,6 +1545,35 @@ fn set_option(app: &mut App, spec: &str) -> Effect {
             }
             Err(error) => {
                 app.command_error(error.to_string());
+                Effect::None
+            }
+        },
+        "llm.max_context_tokens" => {
+            if let Ok(tokens) = value.parse::<u32>() {
+                app.config.llm.max_context_tokens = tokens;
+                app.resolve_active_model();
+                app.notice(
+                    NoticeLevel::Info,
+                    format!("llm.max_context_tokens = {tokens}"),
+                );
+                Effect::None
+            } else {
+                app.command_error(format!("`{value}` is not a token limit"));
+                Effect::None
+            }
+        }
+        "llm.max_tokens" => match value.parse::<u32>() {
+            Ok(tokens) if tokens > 0 => {
+                let Some(mut selection) = app.config.llm.active.clone() else {
+                    app.command_error("select a model before setting llm.max_tokens");
+                    return Effect::None;
+                };
+                selection.max_tokens = Some(tokens);
+                app.set_active_selection(selection.clone());
+                Effect::SaveSelection(Box::new(selection))
+            }
+            _ => {
+                app.command_error(format!("`{value}` is not a positive output token limit"));
                 Effect::None
             }
         },

@@ -211,6 +211,14 @@ impl ModelSelection {
         if self.model.trim().is_empty() {
             return Err("`model` is empty".to_owned());
         }
+        if let Some(temperature) = self.temperature
+            && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+        {
+            return Err("`temperature` must be a finite number from 0 to 2".to_owned());
+        }
+        if self.max_tokens == Some(0) {
+            return Err("`max_tokens` must be greater than zero when configured".to_owned());
+        }
         Ok(())
     }
 }
