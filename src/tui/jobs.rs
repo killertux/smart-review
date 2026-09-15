@@ -433,6 +433,8 @@ pub enum Outcome {
 pub struct Progress {
     /// Which job this is about.
     pub job: u64,
+    /// The review session that requested this update, when it is PR-scoped (IR-05).
+    pub owner: JobOwner,
     /// What it wants to say.
     pub update: ProgressUpdate,
 }
@@ -1131,6 +1133,7 @@ impl JobRunner {
                 let sink = ProgressSink {
                     sender: &progress_sender,
                     job: id,
+                    owner: worker_owner.clone(),
                 };
                 let body =
                     std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel, &sink));
@@ -1185,6 +1188,7 @@ impl JobRunner {
 struct ProgressSink<'a> {
     sender: &'a Sender<Progress>,
     job: u64,
+    owner: JobOwner,
 }
 
 impl ProgressSink<'_> {
@@ -1194,6 +1198,7 @@ impl ProgressSink<'_> {
     fn send(&self, update: ProgressUpdate) {
         let _ = self.sender.send(Progress {
             job: self.job,
+            owner: self.owner.clone(),
             update,
         });
     }

@@ -449,7 +449,7 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
     // Ask for the worktree in the background while the diff is being read, but only
     // once per pull request: this handler runs again for every context or whitespace
     // change (FR-3.1).
-    if app.workspace.is_none() && app.workspace_job == 0 && app.wants_workspace() {
+    if !app.workspace_ready() && app.workspace_job == 0 && app.wants_workspace() {
         pending_effects.push(Effect::EnsureWorkspace(number));
     }
 }
