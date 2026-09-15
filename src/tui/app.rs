@@ -846,6 +846,8 @@ pub struct App {
     pub(crate) workspace: Option<Workspace>,
     /// The job id of the worktree being built (FR-3.1).
     pub(crate) workspace_job: u64,
+    /// The head revision for which workspace materialisation was last attempted (IR-05).
+    workspace_attempted_head: Option<String>,
     /// Why the shown diff came from the cache, when it did (DEC-14).
     pub(crate) diff_offline: Option<String>,
     /// The analysis panel's state (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
@@ -991,6 +993,7 @@ impl App {
             diff_source: DiffSource::Forge,
             workspace: None,
             workspace_job: 0,
+            workspace_attempted_head: None,
             diff_offline: None,
             panel: PanelState::default(),
             chat: crate::tui::chat::ChatState::default(),
@@ -1218,6 +1221,7 @@ impl App {
         self.diff_source = DiffSource::Forge;
         self.workspace = None;
         self.workspace_job = 0;
+        self.workspace_attempted_head = None;
         self.detail_job = 0;
         self.patch_job = 0;
         self.panel = PanelState::default();
@@ -1378,7 +1382,20 @@ impl App {
             }
             Outcome::Workspace(workspace) if job == self.workspace_job => {
                 self.workspace_job = 0;
-                self.workspace = Some(*workspace);
+                let workspace = *workspace;
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| workspace.head_sha != detail.summary.head_sha)
+                {
+                    self.workspace = None;
+                    self.notice(
+                        NoticeLevel::Warn,
+                        "the pull request moved while its workspace was being prepared; using the remote diff",
+                    );
+                    return None;
+                }
+                self.workspace = Some(workspace);
                 // The diff was read from the forge a moment ago; now that the code is
                 // on disk, the same diff is read locally so the context and whitespace
                 // toggles mean something (FR-3.2).
@@ -1574,6 +1591,9 @@ impl App {
         crate::domain::chat::Session,
     )> {
         let detail = self.detail.as_ref()?;
+        if !self.applied_view_matches_detail() {
+            return None;
+        }
         let resolved = self.active_model.as_ref()?;
         let secret = self
             .secret_store
@@ -2757,10 +2777,18 @@ impl App {
             return;
         };
         let crate::tui::jobs::ChatAnswered { run, session, .. } = *answered;
+        let is_current = self.chat.job == job;
         let was_cancelled = self.cancelled_chat_job == job;
-        self.chat.job = 0;
-        self.cancelled_chat_job = 0;
-        self.chat.pending = None;
+        if !is_current && !was_cancelled {
+            return;
+        }
+        if is_current {
+            self.chat.job = 0;
+            self.chat.pending = None;
+        }
+        if was_cancelled {
+            self.cancelled_chat_job = 0;
+        }
 
         // A superseded answer is dropped, which is what makes `Esc` and a second
         // question safe to press in either order.
@@ -2796,8 +2824,10 @@ impl App {
         // The input was cleared when the question was taken, not here: a user who types
         // the next question while the answer is arriving must not lose it to the answer
         // landing.
-        self.chat.stream.clear();
-        self.chat.scroll = 0;
+        if is_current {
+            self.chat.stream.clear();
+            self.chat.scroll = 0;
+        }
     }
 
     /// Writes the open conversation to the store (FR-5.1).
@@ -3281,6 +3311,9 @@ impl App {
     #[must_use]
     pub fn analysis_request(&self) -> Option<crate::application::analysis::AnalysisRequest> {
         let detail = self.detail.as_ref()?;
+        if !self.applied_view_matches_detail() {
+            return None;
+        }
         let key = self.analysis_key()?;
         let resolved = self.active_model.as_ref()?;
         let secret = self
@@ -3635,6 +3668,7 @@ impl App {
         // revision-derived views and in-flight reads do not.
         self.workspace = None;
         self.workspace_job = 0;
+        self.workspace_attempted_head = None;
         self.patch_job = 0;
         self.panel = PanelState::default();
         self.chat_bundle = None;
@@ -3814,6 +3848,8 @@ impl App {
         self.list.loading = false;
         self.list.counting = false;
         self.diff_loading = false;
+        self.detail_job = 0;
+        self.patch_job = 0;
         self.notice(NoticeLevel::Info, "cancelled");
     }
 
@@ -4680,6 +4716,7 @@ impl App {
     /// Records the job id of the worktree being built (FR-3.1).
     pub(crate) fn record_workspace_job(&mut self, job: u64) {
         self.workspace_job = job;
+        self.workspace_attempted_head = self.open_head_sha().map(ToOwned::to_owned);
     }
 
     /// Records the job id of the connection check (FR-4.5).
@@ -4836,6 +4873,21 @@ impl App {
             (Some(workspace), Some(detail)) => workspace.head_sha == detail.summary.head_sha,
             _ => false,
         }
+    }
+
+    /// Whether the visible patch was produced for the detail revision being requested.
+    #[must_use]
+    fn applied_view_matches_detail(&self) -> bool {
+        matches!(
+            (&self.review, &self.detail),
+            (Some(view), Some(detail)) if view.head_sha.as_deref() == Some(detail.summary.head_sha.as_str())
+        )
+    }
+
+    /// Whether this head still needs one workspace materialisation attempt (IR-05).
+    #[must_use]
+    pub(crate) fn needs_workspace_attempt(&self) -> bool {
+        self.workspace_attempted_head.as_deref() != self.open_head_sha()
     }
 
     /// The request that asks the provider whether the active model works (FR-4.5).
