@@ -2020,6 +2020,7 @@ mod tests {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(7);
         app.apply_progress(crate::tui::jobs::Progress {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 6,
             update: crate::tui::jobs::ProgressUpdate::Analysis(
                 crate::application::analysis::Progress::Delta("old".to_owned()),
@@ -2030,6 +2031,7 @@ mod tests {
             "a superseded run is dropped"
         );
         app.apply_progress(crate::tui::jobs::Progress {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 7,
             update: crate::tui::jobs::ProgressUpdate::Analysis(
                 crate::application::analysis::Progress::Delta("new".to_owned()),
@@ -2052,6 +2054,7 @@ mod tests {
             crate::application::analysis::Progress::Delta("REPAIRED_SENTINEL".to_owned()),
         ] {
             app.apply_progress(crate::tui::jobs::Progress {
+                owner: crate::tui::jobs::JobOwner::Global,
                 job: 7,
                 update: crate::tui::jobs::ProgressUpdate::Analysis(update),
             });

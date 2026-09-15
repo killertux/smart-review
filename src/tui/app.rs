@@ -603,6 +603,25 @@ pub struct Opening {
     started_at: u64,
 }
 
+/// The pull request and lifecycle generation that own the review surface (IR-05).
+///
+/// A PR number alone is not an identity: it is meaningful only within a repository,
+/// and re-opening the same PR after navigation must not accept work from the previous
+/// visit. The generation therefore changes whenever the review subject changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSession {
+    /// Repository containing the pull request.
+    pub subject_repo: crate::domain::repo::RepoId,
+    /// Pull request number inside [`Self::subject_repo`].
+    pub subject_pr: u64,
+    /// Head revision known when this session's work was requested.
+    pub head_sha: Option<String>,
+    /// Merge-base revision, explicitly absent in remote-only mode.
+    pub base_sha: Option<String>,
+    /// Monotonic lifetime token for this visit to the review screen.
+    pub generation: u64,
+}
+
 /// The two steps of opening a pull request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpeningStage {
@@ -785,6 +804,10 @@ pub struct App {
     pub(crate) environment_running: bool,
     /// The pull request list (FR-2.1).
     pub(crate) list: PrListState,
+    /// The identity that owns every PR-scoped field below (IR-05).
+    review_session: Option<ReviewSession>,
+    /// Source for review-session generations; it is never reset while the app runs.
+    next_review_generation: u64,
     /// The detail of the open pull request (FR-2.4).
     pub(crate) detail: Option<PullRequestDetail>,
     /// The review view, present when a pull request is open (FR-3.3).
@@ -823,6 +846,8 @@ pub struct App {
     pub(crate) workspace: Option<Workspace>,
     /// The job id of the worktree being built (FR-3.1).
     pub(crate) workspace_job: u64,
+    /// The head revision for which workspace materialisation was last attempted (IR-05).
+    workspace_attempted_head: Option<String>,
     /// Why the shown diff came from the cache, when it did (DEC-14).
     pub(crate) diff_offline: Option<String>,
     /// The analysis panel's state (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
@@ -833,6 +858,9 @@ pub struct App {
     chat_bundle: Option<Box<crate::domain::context::Bundle>>,
     /// Which pull request and commit the bundle was gathered for (FR-4.6).
     chat_bundle_for: Option<(u64, String)>,
+    /// A cancelled chat may still deliver its explicit partial terminal result, but it
+    /// must no longer accept progress or an already-queued success (IR-05).
+    cancelled_chat_job: u64,
     /// Where chat sessions are kept (FR-5.1).
     pub(crate) chat_store: std::sync::Arc<dyn crate::ports::ChatStorePort>,
     /// The review draft and everything the review actions own (FR-6.1–FR-6.3).
@@ -947,6 +975,8 @@ impl App {
             environment_error: None,
             environment_running: true,
             list,
+            review_session: None,
+            next_review_generation: 1,
             detail: None,
             review: None,
             opening: None,
@@ -963,11 +993,13 @@ impl App {
             diff_source: DiffSource::Forge,
             workspace: None,
             workspace_job: 0,
+            workspace_attempted_head: None,
             diff_offline: None,
             panel: PanelState::default(),
             chat: crate::tui::chat::ChatState::default(),
             chat_bundle: None,
             chat_bundle_for: None,
+            cancelled_chat_job: 0,
             chat_store,
             drafts: crate::tui::drafts::DraftState::default(),
             discussion: crate::tui::discussion::DiscussionState::default(),
@@ -1105,6 +1137,7 @@ impl App {
     /// out of whatever the user had moved on to. With two panes that was invisible;
     /// with a compose box it silently turned a typed question into key bindings.
     pub fn open_review(&mut self, detail: PullRequestDetail, view: DiffView) {
+        self.enter_review_session(detail.summary.number);
         let opening = self.review.is_none();
         let mut view = view;
         if view.head_sha.is_none() {
@@ -1127,15 +1160,98 @@ impl App {
         self.stop_opening();
     }
 
+    /// Returns the review identity currently allowed to own PR-scoped state (IR-05).
+    #[must_use]
+    pub fn review_session(&self) -> Option<&ReviewSession> {
+        self.review_session.as_ref()
+    }
+
+    /// Enters `number` as a new review subject, atomically detaching every value that
+    /// belonged to another pull request. Refreshing the same subject intentionally keeps
+    /// the draft, composer, cursor and panel state intact.
+    pub(crate) fn enter_review_session(&mut self, number: u64) {
+        let Some(repo) = self
+            .environment
+            .as_ref()
+            .map(|environment| environment.repo.clone())
+        else {
+            return;
+        };
+        if self
+            .review_session
+            .as_ref()
+            .is_some_and(|session| session.subject_repo == repo && session.subject_pr == number)
+        {
+            return;
+        }
+
+        // Some deterministic render tests construct the initial review before they
+        // install an environment. Once the environment is available, backfill its
+        // session without treating the already-visible same subject as a switch.
+        let already_showing_subject = self.review.is_some()
+            && (self.review_session.is_none()
+                || self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.summary.number == number));
+        if !already_showing_subject {
+            self.detach_review_session();
+        }
+        self.review_session = Some(ReviewSession {
+            subject_repo: repo,
+            subject_pr: number,
+            head_sha: None,
+            base_sha: None,
+            generation: self.next_review_generation,
+        });
+        self.next_review_generation = self.next_review_generation.saturating_add(1);
+    }
+
+    /// Removes PR-scoped state without touching global preferences or durable stores.
+    ///
+    /// Pending remote mutations are deliberately not cancelled or forgotten here: they
+    /// retain the snapshot they were submitted with and IR-07 will reconcile them.
+    fn detach_review_session(&mut self) {
+        self.review_session = None;
+        self.detail = None;
+        self.review = None;
+        self.opening = None;
+        self.diff_loading = false;
+        self.diff_offline = None;
+        self.diff_source = DiffSource::Forge;
+        self.workspace = None;
+        self.workspace_job = 0;
+        self.workspace_attempted_head = None;
+        self.detail_job = 0;
+        self.patch_job = 0;
+        self.panel = PanelState::default();
+        self.chat = crate::tui::chat::ChatState::default();
+        self.chat_bundle = None;
+        self.chat_bundle_for = None;
+        self.cancelled_chat_job = 0;
+        self.drafts.close();
+        self.discussion = crate::tui::discussion::DiscussionState::default();
+        self.confirmation = None;
+        if matches!(
+            self.overlay,
+            Overlay::Analysis
+                | Overlay::Context
+                | Overlay::RawAnswer
+                | Overlay::Draft
+                | Overlay::Publish
+                | Overlay::Confirm
+                | Overlay::Conversation
+        ) {
+            self.overlay = Overlay::None;
+        }
+    }
+
     /// Closes the review screen and returns to the list (FR-3.4).
     pub fn close_review(&mut self) -> bool {
         if self.review.is_none() {
             return false;
         }
-        self.review = None;
-        self.detail = None;
-        self.diff_offline = None;
-        self.diff_loading = false;
+        self.detach_review_session();
         self.focus = Pane::PullRequests;
         true
     }
@@ -1170,6 +1286,7 @@ impl App {
                 self.list.counting = true;
             }
             Effect::OpenPullRequest(number) => {
+                self.enter_review_session(*number);
                 self.detail_job = id;
                 self.diff_loading = true;
                 // The indicator appears on the key press rather than when the first
@@ -1209,7 +1326,15 @@ impl App {
     /// places.
     #[allow(clippy::too_many_lines)]
     pub fn apply_completion(&mut self, completion: jobs::Completion) -> Option<Effect> {
-        let Completion { job, outcome } = completion;
+        let Completion {
+            job,
+            owner,
+            outcome,
+        } = completion;
+        if matches!(owner, jobs::JobOwner::Review(ref session) if self.review_session.as_ref() != Some(session))
+        {
+            return None;
+        }
 
         match outcome {
             Outcome::Environment(environment) if job == self.environment_job => {
@@ -1256,7 +1381,21 @@ impl App {
                 None
             }
             Outcome::Workspace(workspace) if job == self.workspace_job => {
-                self.workspace = Some(*workspace);
+                self.workspace_job = 0;
+                let workspace = *workspace;
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| workspace.head_sha != detail.summary.head_sha)
+                {
+                    self.workspace = None;
+                    self.notice(
+                        NoticeLevel::Warn,
+                        "the pull request moved while its workspace was being prepared; using the remote diff",
+                    );
+                    return None;
+                }
+                self.workspace = Some(workspace);
                 // The diff was read from the forge a moment ago; now that the code is
                 // on disk, the same diff is read locally so the context and whitespace
                 // toggles mean something (FR-3.2).
@@ -1303,7 +1442,9 @@ impl App {
             Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
-                if job == self.chat.load_job || job == self.chat.job =>
+                if job == self.chat.load_job
+                    || job == self.chat.job
+                    || job == self.cancelled_chat_job =>
             {
                 self.apply_chat_outcome(job, outcome)
             }
@@ -1450,6 +1591,9 @@ impl App {
         crate::domain::chat::Session,
     )> {
         let detail = self.detail.as_ref()?;
+        if !self.applied_view_matches_detail() {
+            return None;
+        }
         let resolved = self.active_model.as_ref()?;
         let secret = self
             .secret_store
@@ -1598,6 +1742,9 @@ impl App {
     /// be stored. Clearing the id here is what made the partial answer visible while it
     /// was streaming and gone the moment the app restarted.
     pub(crate) fn stop_chat(&mut self) {
+        self.cancelled_chat_job = self.chat.job;
+        self.chat.job = 0;
+        self.chat.load_job = 0;
         self.chat.stop();
     }
 
@@ -2588,8 +2735,8 @@ impl App {
                 self.apply_chat_loaded(outcome);
                 None
             }
-            Outcome::ChatAnswered(_) if job == self.chat.job => {
-                self.apply_chat_answer(outcome);
+            Outcome::ChatAnswered(_) if job == self.chat.job || job == self.cancelled_chat_job => {
+                self.apply_chat_answer(job, outcome);
                 None
             }
             Outcome::ChatGathered { .. } if job == self.chat.load_job => {
@@ -2625,13 +2772,23 @@ impl App {
     }
 
     /// Appends an answer to the conversation it belongs to (FR-5.1, FR-5.2).
-    fn apply_chat_answer(&mut self, outcome: jobs::Outcome) {
+    fn apply_chat_answer(&mut self, job: u64, outcome: jobs::Outcome) {
         let jobs::Outcome::ChatAnswered(answered) = outcome else {
             return;
         };
         let crate::tui::jobs::ChatAnswered { run, session, .. } = *answered;
-        self.chat.job = 0;
-        self.chat.pending = None;
+        let is_current = self.chat.job == job;
+        let was_cancelled = self.cancelled_chat_job == job;
+        if !is_current && !was_cancelled {
+            return;
+        }
+        if is_current {
+            self.chat.job = 0;
+            self.chat.pending = None;
+        }
+        if was_cancelled {
+            self.cancelled_chat_job = 0;
+        }
 
         // A superseded answer is dropped, which is what makes `Esc` and a second
         // question safe to press in either order.
@@ -2643,6 +2800,9 @@ impl App {
         }
         match run {
             crate::application::chat::ChatRun::Answered(answer) => {
+                if was_cancelled {
+                    return;
+                }
                 current.messages.push(answer.message);
                 current.updated_at = self.now_unix_secs;
                 self.chat.status = crate::tui::chat::ChatStatus::Idle;
@@ -2664,8 +2824,10 @@ impl App {
         // The input was cleared when the question was taken, not here: a user who types
         // the next question while the answer is arriving must not lose it to the answer
         // landing.
-        self.chat.stream.clear();
-        self.chat.scroll = 0;
+        if is_current {
+            self.chat.stream.clear();
+            self.chat.scroll = 0;
+        }
     }
 
     /// Writes the open conversation to the store (FR-5.1).
@@ -3073,6 +3235,10 @@ impl App {
     /// started a different question, is discarded by job id rather than by hoping the
     /// timing works out.
     pub fn apply_progress(&mut self, progress: jobs::Progress) {
+        if matches!(progress.owner, jobs::JobOwner::Review(ref session) if self.review_session.as_ref() != Some(session))
+        {
+            return;
+        }
         if progress.job == self.chat.job {
             if let jobs::ProgressUpdate::Chat(update) = progress.update {
                 self.apply_chat_progress(update);
@@ -3145,6 +3311,9 @@ impl App {
     #[must_use]
     pub fn analysis_request(&self) -> Option<crate::application::analysis::AnalysisRequest> {
         let detail = self.detail.as_ref()?;
+        if !self.applied_view_matches_detail() {
+            return None;
+        }
         let key = self.analysis_key()?;
         let resolved = self.active_model.as_ref()?;
         let secret = self
@@ -3229,6 +3398,9 @@ impl App {
 
     /// Gives up on a run, keeping whatever text arrived (FR-4.4).
     pub(crate) fn cancelled_analysis(&mut self) {
+        self.panel.job = 0;
+        self.panel.context_job = 0;
+        self.panel.stored_job = 0;
         if self.panel.state.is_running() {
             self.panel.state = AnalysisState::Cancelled;
         }
@@ -3459,6 +3631,7 @@ impl App {
     fn apply_detail(&mut self, outcome: FetchOutcome<PullRequestDetail>) {
         self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
         let detail = outcome.into_value();
+        self.update_review_revision(&detail);
         self.notice(
             NoticeLevel::Info,
             format!(
@@ -3469,6 +3642,44 @@ impl App {
             ),
         );
         self.detail = Some(detail);
+    }
+
+    /// Advances the session when a refresh resolves a different PR revision (IR-05).
+    fn update_review_revision(&mut self, detail: &PullRequestDetail) {
+        let Some(session) = self.review_session.as_mut() else {
+            return;
+        };
+        let head_changed = session
+            .head_sha
+            .as_ref()
+            .is_some_and(|head| head != &detail.summary.head_sha);
+        let base_changed = session.base_sha != detail.base_sha
+            && (session.base_sha.is_some() || detail.base_sha.is_some());
+        if !head_changed && !base_changed {
+            session.head_sha = Some(detail.summary.head_sha.clone());
+            session.base_sha.clone_from(&detail.base_sha);
+            return;
+        }
+        session.head_sha = Some(detail.summary.head_sha.clone());
+        session.base_sha.clone_from(&detail.base_sha);
+        session.generation = self.next_review_generation;
+        self.next_review_generation = self.next_review_generation.saturating_add(1);
+        // Drafts and their composer intentionally survive a same-subject refresh; all
+        // revision-derived views and in-flight reads do not.
+        self.workspace = None;
+        self.workspace_job = 0;
+        self.workspace_attempted_head = None;
+        self.patch_job = 0;
+        self.panel = PanelState::default();
+        self.chat_bundle = None;
+        self.chat_bundle_for = None;
+        self.chat.load_job = 0;
+        self.chat.job = 0;
+        self.cancelled_chat_job = 0;
+        if self.chat.status.is_running() {
+            self.chat.status = crate::tui::chat::ChatStatus::Idle;
+            self.chat.stream.clear();
+        }
     }
 
     /// Adopts a freshly fetched catalog and re-resolves the configured model
@@ -3637,6 +3848,8 @@ impl App {
         self.list.loading = false;
         self.list.counting = false;
         self.diff_loading = false;
+        self.detail_job = 0;
+        self.patch_job = 0;
         self.notice(NoticeLevel::Info, "cancelled");
     }
 
@@ -4503,6 +4716,7 @@ impl App {
     /// Records the job id of the worktree being built (FR-3.1).
     pub(crate) fn record_workspace_job(&mut self, job: u64) {
         self.workspace_job = job;
+        self.workspace_attempted_head = self.open_head_sha().map(ToOwned::to_owned);
     }
 
     /// Records the job id of the connection check (FR-4.5).
@@ -4659,6 +4873,21 @@ impl App {
             (Some(workspace), Some(detail)) => workspace.head_sha == detail.summary.head_sha,
             _ => false,
         }
+    }
+
+    /// Whether the visible patch was produced for the detail revision being requested.
+    #[must_use]
+    fn applied_view_matches_detail(&self) -> bool {
+        matches!(
+            (&self.review, &self.detail),
+            (Some(view), Some(detail)) if view.head_sha.as_deref() == Some(detail.summary.head_sha.as_str())
+        )
+    }
+
+    /// Whether this head still needs one workspace materialisation attempt (IR-05).
+    #[must_use]
+    pub(crate) fn needs_workspace_attempt(&self) -> bool {
+        self.workspace_attempted_head.as_deref() != self.open_head_sha()
     }
 
     /// The request that asks the provider whether the active model works (FR-4.5).
@@ -6515,6 +6744,7 @@ mod tests {
         app.chat.job = job;
 
         let effect = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::Failed(
                 "the provider refused: model not found".to_owned(),
@@ -6548,6 +6778,7 @@ mod tests {
         app.record_analysis_job(job);
 
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::Failed(
                 "Structured streaming not supported for this provider".to_owned(),
@@ -6569,6 +6800,7 @@ mod tests {
         let job = 24;
         app.panel.context_job = job;
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::Failed("the worktree is gone".to_owned()),
         });
@@ -6591,6 +6823,7 @@ mod tests {
         let job = 23;
         app.record_chat_load(job);
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::Failed("the worktree is gone".to_owned()),
         });
@@ -6613,6 +6846,7 @@ mod tests {
             "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-a\n+b\n",
         );
         let effect = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: app.patch_job,
             outcome: crate::tui::jobs::Outcome::Patch {
                 outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
@@ -6652,6 +6886,118 @@ mod tests {
         ));
         app.open_review(crate::test_support::sample_detail(), DiffView::new(patch));
         (dir, app)
+    }
+
+    #[test]
+    fn ir_05_entering_another_pr_detaches_every_pr_scoped_surface() {
+        let (_dir, mut app) = draft_app();
+        app.environment = Some(crate::test_support::environment());
+        app.enter_review_session(141);
+        app.drafts
+            .open(crate::domain::draft::Draft::new(141, app.now()), None);
+        app.chat.open();
+        app.chat.input.insert_str("writing about A");
+        app.panel.state = AnalysisState::Gathering;
+        app.workspace = Some(crate::ports::workspace::Workspace {
+            path: std::path::PathBuf::from("/tmp/a"),
+            head_sha: "a-head".to_owned(),
+            base_sha: "a-base".to_owned(),
+            reused: false,
+        });
+
+        app.record_job(&Effect::OpenPullRequest(142), 42);
+
+        let session = app.review_session().expect("B session");
+        assert_eq!(session.subject_pr, 142);
+        assert!(app.detail.is_none());
+        assert!(app.review.is_none());
+        assert!(app.workspace.is_none());
+        assert!(!app.drafts.open);
+        assert!(app.chat.session.is_none());
+        assert!(app.chat.input.is_empty());
+        assert_eq!(app.panel.state, AnalysisState::Idle);
+        assert_eq!(app.detail_job, 42);
+    }
+
+    #[test]
+    fn ir_05_a_completion_from_an_older_review_session_is_discarded() {
+        let (_dir, mut app) = draft_app();
+        app.environment = Some(crate::test_support::environment());
+        app.enter_review_session(141);
+        let older = app.review_session().cloned().expect("A session");
+        app.enter_review_session(142);
+        app.detail_job = 7;
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            job: 7,
+            owner: crate::tui::jobs::JobOwner::Review(older),
+            outcome: crate::tui::jobs::Outcome::Detail(Box::new(
+                crate::application::prs::FetchOutcome::Fresh(crate::test_support::sample_detail()),
+            )),
+        });
+
+        assert_eq!(effect, None);
+        assert!(app.detail.is_none(), "A detail cannot start B's diff load");
+        assert_eq!(
+            app.review_session().map(|session| session.subject_pr),
+            Some(142)
+        );
+    }
+
+    #[test]
+    fn ir_05_a_new_revision_invalidates_the_previous_sessions_work() {
+        let (_dir, mut app) = draft_app();
+        app.environment = Some(crate::test_support::environment());
+        app.enter_review_session(141);
+        let mut h1 = crate::test_support::sample_detail();
+        h1.summary.head_sha = "h1".to_owned();
+        h1.base_sha = Some("base-1".to_owned());
+        app.apply_detail(crate::application::prs::FetchOutcome::Fresh(h1));
+        let generation = app.review_session().expect("H1 session").generation;
+        app.panel.job = 7;
+        app.patch_job = 8;
+        app.workspace_job = 9;
+        app.workspace = Some(crate::ports::workspace::Workspace {
+            path: std::path::PathBuf::from("/tmp/h1"),
+            base_sha: "base-1".to_owned(),
+            head_sha: "h1".to_owned(),
+            reused: false,
+        });
+
+        let mut h2 = crate::test_support::sample_detail();
+        h2.summary.head_sha = "h2".to_owned();
+        h2.base_sha = Some("base-2".to_owned());
+        app.apply_detail(crate::application::prs::FetchOutcome::Fresh(h2));
+
+        assert!(
+            app.review_session()
+                .is_some_and(|session| session.generation > generation)
+        );
+        assert!(app.workspace.is_none());
+        assert_eq!(app.workspace_job, 0);
+        assert_eq!(app.patch_job, 0);
+        assert_eq!(app.panel.job, 0);
+    }
+
+    #[test]
+    fn ir_05_cancelled_analysis_rejects_queued_progress() {
+        let (_dir, mut app) = draft_app();
+        app.panel.job = 7;
+        app.panel.state = AnalysisState::Running {
+            stage: "asking".to_owned(),
+        };
+        app.cancelled_analysis();
+
+        app.apply_progress(crate::tui::jobs::Progress {
+            job: 7,
+            owner: crate::tui::jobs::JobOwner::Global,
+            update: crate::tui::jobs::ProgressUpdate::Analysis(
+                crate::application::analysis::Progress::Delta("late".to_owned()),
+            ),
+        });
+
+        assert_eq!(app.panel.state, AnalysisState::Cancelled);
+        assert!(app.panel.stream.text().is_empty());
     }
 
     #[test]
@@ -6750,6 +7096,7 @@ mod tests {
         );
 
         let effect = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: app.patch_job,
             outcome: crate::tui::jobs::Outcome::Patch {
                 outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
@@ -7057,6 +7404,7 @@ mod tests {
         assert_eq!(app.drafts().post_job, job);
 
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::Failed(
                 "your token is not allowed to comment".to_owned(),
@@ -7101,6 +7449,7 @@ mod tests {
         );
 
         let effect = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::CommentPosted(Box::new(
                 crate::ports::CommentPosted {
@@ -7149,6 +7498,7 @@ mod tests {
         );
 
         let effect = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::CommentPosted(Box::new(
                 crate::ports::CommentPosted {
@@ -7186,6 +7536,7 @@ mod tests {
         app.record_job(&effect, job);
         assert_eq!(app.discussion().job, job);
         let some = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::ThreadResolved {
                 thread_id: "PRRT_1".to_owned(),
@@ -7243,6 +7594,7 @@ mod tests {
         let job = 45;
         app.record_job(&effect, job);
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job,
             outcome: crate::tui::jobs::Outcome::Failed(
                 "Could not resolve to a node with the global id of 'PRRT_1'".to_owned(),
@@ -7345,6 +7697,7 @@ mod tests {
         );
         let session = app.chat_request().expect("a request").1;
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 42,
             outcome: crate::tui::jobs::Outcome::ChatGathered {
                 bundle: Box::new(bundle),
@@ -7397,6 +7750,7 @@ mod tests {
             crate::domain::chat::Message::assistant("half an ans", 1_000, None, Vec::new());
         partial.partial = true;
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 12,
             outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
                 crate::tui::jobs::ChatAnswered {
@@ -7454,6 +7808,7 @@ mod tests {
             crate::domain::chat::Message::assistant("half an ans", 1_000, None, Vec::new());
         partial.partial = true;
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 7,
             outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
                 crate::tui::jobs::ChatAnswered {
@@ -7499,6 +7854,7 @@ mod tests {
         app.chat.job = 9;
         app.chat.input.set_text("a question typed while waiting");
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 9,
             outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
                 crate::tui::jobs::ChatAnswered {
@@ -7553,6 +7909,7 @@ mod tests {
         ));
         app.chat.job = 3;
         app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
             job: 3,
             outcome: crate::tui::jobs::Outcome::ChatAnswered(Box::new(
                 crate::tui::jobs::ChatAnswered {

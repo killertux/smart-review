@@ -354,6 +354,7 @@ impl DraftState {
         self.post = None;
         self.selection = None;
         self.status = DraftStatus::Idle;
+        self.job = 0;
         self.post_job = 0;
         self.cursor = 1;
         self.scroll = 0;
@@ -372,6 +373,7 @@ impl DraftState {
         self.post = None;
         self.selection = None;
         self.status = DraftStatus::Idle;
+        self.job = 0;
         self.post_job = 0;
         self.cursor = 1;
         self.scroll = 0;

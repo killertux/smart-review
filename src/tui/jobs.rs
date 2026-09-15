@@ -43,6 +43,7 @@ use crate::ports::workspace::{
 };
 use crate::ports::{Cancel, Clock};
 use crate::tui::app::Effect;
+use crate::tui::app::ReviewSession;
 use crate::tui::list_view::PrListState;
 
 /// How many progress messages are handed to the interface in one poll. Anything
@@ -432,6 +433,8 @@ pub enum Outcome {
 pub struct Progress {
     /// Which job this is about.
     pub job: u64,
+    /// The review session that requested this update, when it is PR-scoped (IR-05).
+    pub owner: JobOwner,
     /// What it wants to say.
     pub update: ProgressUpdate,
 }
@@ -468,8 +471,20 @@ pub struct ChatAnswered {
 pub struct Completion {
     /// Which job this is the answer to.
     pub job: u64,
+    /// The review session that requested this work, when it is PR-scoped (IR-05).
+    pub owner: JobOwner,
     /// What it produced.
     pub outcome: Outcome,
+}
+
+/// The state allowed to consume a background result (IR-05).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum JobOwner {
+    /// Application-wide work such as environment detection or the model catalog.
+    #[default]
+    Global,
+    /// Work derived from one visit to one pull request.
+    Review(ReviewSession),
 }
 
 /// The ports one repository's jobs need (ARCH-2).
@@ -910,7 +925,7 @@ pub struct JobRunner {
     /// What the command line asked for.
     request: DetectRequest,
     /// Jobs waiting for a free slot.
-    queue: VecDeque<(u64, Job)>,
+    queue: VecDeque<(u64, JobOwner, Job)>,
     /// Jobs that are running.
     running: Vec<Running>,
     /// The next job id.
@@ -995,13 +1010,18 @@ impl JobRunner {
     /// job is cancelled, which for a process job means its child is killed rather than
     /// left to finish into a result nobody will read.
     pub fn submit(&mut self, job: Job) -> u64 {
+        self.submit_owned(JobOwner::Global, job)
+    }
+
+    /// Schedules work owned by a review session.
+    pub fn submit_owned(&mut self, owner: JobOwner, job: Job) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let slot = job.slot();
 
         self.cancel_slot(slot);
-        self.queue.retain(|(_, queued)| queued.slot() != slot);
-        self.queue.push_back((id, job));
+        self.queue.retain(|(_, _, queued)| queued.slot() != slot);
+        self.queue.push_back((id, owner, job));
         self.pump();
         id
     }
@@ -1027,13 +1047,13 @@ impl JobRunner {
     #[must_use]
     pub fn is_busy_in(&self, slot: Slot) -> bool {
         self.running.iter().any(|running| running.slot == slot)
-            || self.queue.iter().any(|(_, job)| job.slot() == slot)
+            || self.queue.iter().any(|(_, _, job)| job.slot() == slot)
     }
 
     /// Cancels every job in a slot, for `Esc` on the screen that owns it.
     pub fn cancel(&mut self, slot: Slot) {
         self.cancel_slot(slot);
-        self.queue.retain(|(_, queued)| queued.slot() != slot);
+        self.queue.retain(|(_, _, queued)| queued.slot() != slot);
     }
 
     /// Starts queued jobs while there is room, and collects finished ones.
@@ -1070,15 +1090,15 @@ impl JobRunner {
     /// Starts as many queued jobs as there is room for.
     fn pump(&mut self) {
         while self.running.len() < MAX_IN_FLIGHT {
-            let Some((id, job)) = self.queue.pop_front() else {
+            let Some((id, owner, job)) = self.queue.pop_front() else {
                 return;
             };
-            self.start(id, job);
+            self.start(id, owner, job);
         }
     }
 
     /// Runs one job on a worker thread.
-    fn start(&mut self, id: u64, job: Job) {
+    fn start(&mut self, id: u64, owner: JobOwner, job: Job) {
         let slot = job.slot();
         // Every job gets a flag; a report simply never blocks long enough for it to
         // matter, and giving one class of job no handle would mean a special case in
@@ -1093,6 +1113,7 @@ impl JobRunner {
         let catalog = Arc::clone(&self.catalog);
         let llm = Arc::clone(&self.llm);
         let request = self.request.clone();
+        let worker_owner = owner.clone();
 
         let spawned = std::thread::Builder::new()
             .name(format!("smart-review-job-{id}"))
@@ -1112,6 +1133,7 @@ impl JobRunner {
                 let sink = ProgressSink {
                     sender: &progress_sender,
                     job: id,
+                    owner: worker_owner.clone(),
                 };
                 let body =
                     std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel, &sink));
@@ -1134,7 +1156,11 @@ impl JobRunner {
                     outcome
                 };
 
-                let _ = sender.send(Completion { job: id, outcome });
+                let _ = sender.send(Completion {
+                    job: id,
+                    owner: worker_owner,
+                    outcome,
+                });
             });
 
         match spawned {
@@ -1150,6 +1176,7 @@ impl JobRunner {
                 );
                 let _ = self.sender.send(Completion {
                     job: id,
+                    owner,
                     outcome: Outcome::Failed(format!("could not start a worker thread: {error}")),
                 });
             }
@@ -1161,6 +1188,7 @@ impl JobRunner {
 struct ProgressSink<'a> {
     sender: &'a Sender<Progress>,
     job: u64,
+    owner: JobOwner,
 }
 
 impl ProgressSink<'_> {
@@ -1170,6 +1198,7 @@ impl ProgressSink<'_> {
     fn send(&self, update: ProgressUpdate) {
         let _ = self.sender.send(Progress {
             job: self.job,
+            owner: self.owner.clone(),
             update,
         });
     }
