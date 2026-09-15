@@ -989,7 +989,7 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 
 ### B.3 Budgeting
 - Token estimation: `ceil(bytes / 4)` is acceptable until a real tokenizer is approved as a dependency.
-- `limit.context` from the catalog (FR-4.7) is preferred over a fixed `max_context_tokens` when the active model declares one.
+- `max_context_tokens` is the user's input ceiling. A catalog `limit.context` may only lower that ceiling after the effective output reservation; it never raises it. The complete serialized system prompt, question and replayed history fit that input allowance, while headings, separators and placeholders count against the source-bundle allowance. `max_tokens` is sent when configured and is capped by catalog `limit.output`; unsupported temperature or thinking settings refuse the selection rather than silently changing it.
 
 ## Appendix C — Manual E2E checklist (run at each milestone)
 

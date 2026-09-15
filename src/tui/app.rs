@@ -1454,17 +1454,15 @@ impl App {
                 .catalog
                 .model(&resolved.provider, &resolved.model)
         });
-        let output_limit = model.and_then(crate::domain::model::CatalogModel::output_limit);
-        let mut chat = crate::application::models::analysis_chat(resolved, secret, output_limit);
+        let mut chat = crate::application::models::analysis_chat(resolved, secret);
         // A chat answer is read as it arrives and is usually shorter than an analysis of
         // the same pull request, so the long analysis timeout would only hold a dead
         // connection open.
         chat.timeout_secs = CHAT_TIMEOUT_SECS;
         let policy = crate::domain::context::BundlePolicy {
-            max_context_tokens: crate::application::models::context_budget(
-                model.and_then(crate::domain::model::CatalogModel::context_limit),
-                self.config.llm.max_context_tokens,
-                chat.max_tokens,
+            max_context_tokens: crate::application::models::context_budget_after_framing(
+                &resolved.settings,
+                crate::application::chat::system_prompt("").len(),
             ),
             max_file_bytes: self.config.llm.max_file_bytes,
             ..crate::domain::context::BundlePolicy::default()
@@ -3051,31 +3049,12 @@ impl App {
             .get(&resolved.provider, resolved.env_var.as_deref())
             .ok()
             .flatten()?;
-        // The output cap comes from the catalog when it declares one (FR-4.7).
-        let output_limit = self
-            .catalog
-            .as_ref()
-            .and_then(|state| {
-                state
-                    .load
-                    .catalog
-                    .model(&resolved.provider, &resolved.model)
-            })
-            .and_then(crate::domain::model::CatalogModel::output_limit);
-        let chat = crate::application::models::analysis_chat(resolved, secret, output_limit);
+        let chat = crate::application::models::analysis_chat(resolved, secret);
         let policy = BundlePolicy {
-            max_context_tokens: crate::application::models::context_budget(
-                self.catalog
-                    .as_ref()
-                    .and_then(|state| {
-                        state
-                            .load
-                            .catalog
-                            .model(&resolved.provider, &resolved.model)
-                    })
-                    .and_then(crate::domain::model::CatalogModel::context_limit),
-                self.config.llm.max_context_tokens,
-                chat.max_tokens,
+            max_context_tokens: crate::application::models::context_budget_after_framing(
+                &resolved.settings,
+                crate::domain::analysis::system_prompt(None).len()
+                    + crate::domain::analysis::user_prompt("").len(),
             ),
             max_file_bytes: self.config.llm.max_file_bytes,
             ..BundlePolicy::default()
@@ -4711,10 +4690,11 @@ impl App {
             self.model_problem = None;
             return;
         };
-        match crate::application::models::resolve_selection(
+        match crate::application::models::resolve_selection_with_input(
             &state.load.catalog,
             &selection,
             self.secret_store.as_ref(),
+            self.config.llm.max_context_tokens,
         ) {
             Ok(resolved) => {
                 for warning in &resolved.warnings {
@@ -6294,6 +6274,12 @@ mod tests {
             env_source: None,
             from_file: true,
             thinking: None,
+            settings: crate::application::models::EffectiveRequestSettings {
+                temperature: None,
+                max_tokens: None,
+                input_tokens: 100_000,
+                model_window: None,
+            },
             warnings: Vec::new(),
         });
         let store = std::sync::Arc::new(FakeChatStore::default());

@@ -1199,12 +1199,15 @@ fn model_command(app: &mut App, argument: &str) -> Effect {
                 app.notice(
                     NoticeLevel::Info,
                     format!(
-                        "{} · {} · base {} · key from {} · thinking {}",
+                        "{} · {} · base {} · key from {} · thinking {} · input {} · output {} · temperature {}",
                         resolved.label(),
                         resolved.route_label(),
                         resolved.base_url.as_deref().unwrap_or("provider default"),
                         source,
-                        resolved.thinking_label()
+                        resolved.thinking_label(),
+                        resolved.settings.input_tokens,
+                        resolved.settings.max_tokens.map_or_else(|| "provider default".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.temperature.map_or_else(|| "provider default".to_owned(), |value| value.to_string())
                     ),
                 );
             } else {
