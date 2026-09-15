@@ -200,8 +200,11 @@ impl LlmCrate {
     /// speak `/chat/completions`, so the same question can be asked the
     /// `OpenAI`-compatible way and streamed. The native backend is still tried first, so
     /// a crate that grows streaming is preferred the day it is pinned.
-    fn candidates(request: &ChatRequest) -> Result<Vec<Box<dyn ChatProvider>>, LlmError> {
-        let mut candidates = vec![Self::provider(request)?];
+    fn candidates(request: &ChatRequest) -> Result<Vec<Candidate>, LlmError> {
+        let mut candidates = vec![Candidate::new(
+            Self::provider(request)?,
+            StreamingCapabilities::for_route(&request.route),
+        )];
         if matches!(request.route, Route::Native(_))
             && let Some(url) = request
                 .base_url
@@ -209,7 +212,7 @@ impl LlmCrate {
                 .filter(|url| !url.trim().is_empty())
             && let Ok(provider) = passthrough(request, url)
         {
-            candidates.push(provider);
+            candidates.push(Candidate::new(provider, StreamingCapabilities::STRUCTURED));
         }
         Ok(candidates)
     }
@@ -225,7 +228,6 @@ impl LlmCrate {
         cancel: &Cancel,
         on_delta: &mut DeltaHandler<'_>,
     ) -> Attempt {
-        let mut emitted = false;
         let outcome = block_on(async {
             let mut stream = provider.chat_stream_struct(messages).await?;
             let mut text = String::new();
@@ -242,7 +244,6 @@ impl LlmCrate {
                     if let Some(content) = choice.delta.content
                         && !content.is_empty()
                     {
-                        emitted = true;
                         text.push_str(&content);
                         on_delta(&content);
                     }
@@ -262,7 +263,7 @@ impl LlmCrate {
         if cancel.is_cancelled() {
             Attempt::Failed(Failure::plain(LlmError::Cancelled))
         } else {
-            Attempt::from(outcome, &request.provider, emitted)
+            Attempt::from(outcome, &request.provider)
         }
     }
 
@@ -279,7 +280,6 @@ impl LlmCrate {
         cancel: &Cancel,
         on_delta: &mut DeltaHandler<'_>,
     ) -> Attempt {
-        let mut emitted = false;
         let outcome = block_on(async {
             let mut stream = provider.chat_stream(messages).await?;
             let mut text = String::new();
@@ -289,7 +289,6 @@ impl LlmCrate {
                 }
                 let delta = item?;
                 if !delta.is_empty() {
-                    emitted = true;
                     text.push_str(&delta);
                     on_delta(&delta);
                 }
@@ -303,7 +302,7 @@ impl LlmCrate {
         if cancel.is_cancelled() {
             Attempt::Failed(Failure::plain(LlmError::Cancelled))
         } else {
-            Attempt::from(outcome, &request.provider, emitted)
+            Attempt::from(outcome, &request.provider)
         }
     }
 
@@ -336,10 +335,66 @@ impl LlmCrate {
                 })
             }),
             &request.provider,
-            false,
         ) {
             Attempt::Done(outcome) => Ok(*outcome),
             Attempt::Failed(failure) => Err(failure),
+        }
+    }
+}
+
+/// The stream methods the pinned crate implements for a routed provider.
+///
+/// This is deliberately local capability metadata, rather than an inference from an
+/// upstream error. `LLMError::Generic` may describe a dispatched provider failure, so it
+/// can never prove a retry is free (IR-02).
+#[derive(Debug, Clone, Copy)]
+struct StreamingCapabilities {
+    structured: bool,
+    strings: bool,
+}
+
+impl StreamingCapabilities {
+    const STRUCTURED: Self = Self {
+        structured: true,
+        strings: false,
+    };
+
+    const STRINGS: Self = Self {
+        structured: false,
+        strings: true,
+    };
+
+    const NONE: Self = Self {
+        structured: false,
+        strings: false,
+    };
+
+    fn for_route(route: &Route) -> Self {
+        match route {
+            Route::Native(NativeBackend::OpenAI | NativeBackend::Google)
+            | Route::Passthrough { .. } => Self::STRUCTURED,
+            Route::Native(NativeBackend::Anthropic | NativeBackend::Xai) => Self::STRINGS,
+            Route::Native(
+                NativeBackend::OpenRouter
+                | NativeBackend::DeepSeek
+                | NativeBackend::Groq
+                | NativeBackend::Mistral,
+            ) => Self::NONE,
+        }
+    }
+}
+
+/// One provider route and the methods this build can invoke on it.
+struct Candidate {
+    provider: Box<dyn ChatProvider>,
+    capabilities: StreamingCapabilities,
+}
+
+impl Candidate {
+    fn new(provider: Box<dyn ChatProvider>, capabilities: StreamingCapabilities) -> Self {
+        Self {
+            provider,
+            capabilities,
         }
     }
 }
@@ -349,62 +404,28 @@ fn cancelled() -> llm::error::LLMError {
     llm::error::LLMError::Generic("the caller cancelled the request".to_owned())
 }
 
-/// Keeps the more informative of two failures: anything beats a capability absence, and
-/// otherwise the first stands, because it is about the route the user chose.
-fn choose(reported: Option<Failure>, next: Failure) -> Failure {
-    match reported {
-        Some(current) if current.unsupported && !next.unsupported => next,
-        Some(current) => current,
-        None => next,
-    }
-}
-
 impl Failure {
-    /// A failure that emitted nothing and is not a capability absence.
+    /// A locally constructed failure.
     fn plain(error: LlmError) -> Self {
-        Self {
-            error,
-            emitted: false,
-            unsupported: false,
-        }
-    }
-
-    /// Whether this failure proves that no request reached the provider and another
-    /// delivery method may be attempted safely.
-    ///
-    /// The crate uses `LLMError::Generic` for its default unimplemented trait methods.
-    /// That typed signal is distinct from a provider rejection, timeout, transport error
-    /// or cancellation, each of which may have reached a billable endpoint even before a
-    /// text delta arrived (IR-02).
-    fn permits_fallback(&self) -> bool {
-        !self.emitted && self.unsupported
+        Self { error }
     }
 }
 
 /// What one way of asking did (FR-4.4, FR-5.2).
 ///
-/// Only a typed capability absence permits another method: no emitted text does not show
-/// that a provider/transport failure was free. An attempt that emitted text, was
-/// cancelled, or failed ambiguously is the end of the request (IR-02).
+/// Capability metadata chooses the first method to call. Any actual call failure ends the
+/// request, because no error response proves that a dispatched request was free (IR-02).
 enum Attempt {
     /// The answer arrived.
     Done(Box<ChatOutcome>),
-    /// The request was made and failed, with or without text first.
+    /// The request was made and failed.
     Failed(Failure),
 }
 
 /// A failed attempt.
-///
-/// Whether the crate's typed catch-all reported an unimplemented capability. The
-/// fallback decision is based on this type, never an error message that a provider or
-/// crate release could reword.
 struct Failure {
     /// What to tell the user if nothing else works.
     error: LlmError,
-    /// Whether any text arrived before the failure.
-    emitted: bool,
-    /// Whether this is a capability absence rather than something the provider said.
-    unsupported: bool,
 }
 
 impl Attempt {
@@ -418,22 +439,17 @@ impl Attempt {
             crate::adapters::http::RuntimeError,
         >,
         provider: &str,
-        emitted: bool,
     ) -> Self {
         match outcome {
             Ok(Ok(outcome)) => Self::Done(Box::new(outcome)),
             Ok(Err(error)) => Self::Failed(Failure {
-                unsupported: matches!(error, llm::error::LLMError::Generic(_)),
                 error: translate(provider, &error),
-                emitted,
             }),
             Err(error) => Self::Failed(Failure {
                 error: LlmError::Transport {
                     provider: provider.to_owned(),
                     reason: error.to_string(),
                 },
-                emitted,
-                unsupported: false,
             }),
         }
     }
@@ -571,10 +587,9 @@ impl LlmPort for LlmCrate {
     ///    (`DeepSeek`, `OpenRouter`), which gets the deltas *and* the usage back;
     /// 4. **one request, no streaming** — the answer arrives whole, with usage.
     ///
-    /// Only the crate's typed "method unsupported" result advances the cascade. A path
-    /// that emits text, is cancelled, or fails with a provider/transport error ends the
-    /// request: absence of a delta does not prove the request was not dispatched or billed.
-    /// What is reported when no supported path works is the most informative failure.
+    /// Route capability metadata selects one stream method. A path that emits text, is
+    /// cancelled, or fails with any provider/transport error ends the request: absence of
+    /// a delta does not prove the request was not dispatched or billed.
     fn stream(
         &self,
         request: &ChatRequest,
@@ -594,53 +609,61 @@ impl LlmPort for LlmCrate {
 impl LlmCrate {
     /// Tries each way of asking, in order (FR-4.4, FR-5.2).
     fn ask_streaming(
-        candidates: &[Box<dyn ChatProvider>],
+        candidates: &[Candidate],
         request: &ChatRequest,
         cancel: &Cancel,
         on_delta: &mut DeltaHandler<'_>,
     ) -> Result<ChatOutcome, LlmError> {
         let messages = Self::messages(request);
-        let mut reported: Option<Failure> = None;
-
-        for (candidate, provider) in candidates.iter().enumerate() {
-            match Self::stream_structured(&**provider, request, &messages, cancel, on_delta) {
-                Attempt::Done(outcome) => {
-                    log_stream_success(request, candidate, "structured stream");
-                    return Ok(*outcome);
+        let mut attempts = 0_u32;
+        for provider in candidates {
+            if provider.capabilities.structured {
+                attempts = attempts.saturating_add(1);
+                match Self::stream_structured(
+                    &*provider.provider,
+                    request,
+                    &messages,
+                    cancel,
+                    on_delta,
+                ) {
+                    Attempt::Done(outcome) => {
+                        log_stream_success(request, attempts, "structured stream");
+                        return Ok(*outcome);
+                    }
+                    Attempt::Failed(failure) => return Err(failure.error),
                 }
-                Attempt::Failed(failure) if !failure.permits_fallback() => {
-                    return Err(failure.error);
-                }
-                Attempt::Failed(failure) => reported = Some(choose(reported, failure)),
             }
 
-            // This invocation is deliberately after the structured outcome is known.
-            // Constructing both attempts in an array eagerly sent both requests even
-            // when the first had already succeeded (IR-02).
-            match Self::stream_strings(&**provider, request, &messages, cancel, on_delta) {
-                Attempt::Done(outcome) => {
-                    log_stream_success(request, candidate, "string stream");
-                    return Ok(*outcome);
+            if provider.capabilities.strings {
+                attempts = attempts.saturating_add(1);
+                match Self::stream_strings(
+                    &*provider.provider,
+                    request,
+                    &messages,
+                    cancel,
+                    on_delta,
+                ) {
+                    Attempt::Done(outcome) => {
+                        log_stream_success(request, attempts, "string stream");
+                        return Ok(*outcome);
+                    }
+                    Attempt::Failed(failure) => return Err(failure.error),
                 }
-                Attempt::Failed(failure) if !failure.permits_fallback() => {
-                    return Err(failure.error);
-                }
-                Attempt::Failed(failure) => reported = Some(choose(reported, failure)),
             }
         }
 
         // Nothing streamed. Every provider implements a plain request, so this is not a
         // last resort so much as the answer for a provider the crate cannot stream at
         // all (Groq, Mistral).
-        if let Some((candidate, provider)) = candidates.iter().enumerate().next() {
-            match Self::ask_once(&**provider, request, &messages, cancel) {
+        if let Some(provider) = candidates.first() {
+            attempts = attempts.saturating_add(1);
+            match Self::ask_once(&*provider.provider, request, &messages, cancel) {
                 Ok(outcome) => {
                     logging::log(
                         Level::Debug,
                         format!(
                             "{} attempt {} answered without streaming",
-                            request.provider,
-                            candidate + 1
+                            request.provider, attempts
                         ),
                     );
                     return Ok(outcome);
@@ -657,24 +680,20 @@ impl LlmCrate {
         // either answers or errors — but an error is the right shape for it: the lints
         // here refuse `unreachable!()` and a panic in a job thread is worse than a
         // sentence the user can read.
-        Err(reported.map_or_else(
-            || LlmError::Request {
-                provider: request.provider.clone(),
-                reason: "no way to ask this provider produced an answer".to_owned(),
-            },
-            |failure| failure.error,
-        ))
+        Err(LlmError::Request {
+            provider: request.provider.clone(),
+            reason: "no way to ask this provider produced an answer".to_owned(),
+        })
     }
 }
 
 /// Records which attempt produced the accepted stream without logging request content.
-fn log_stream_success(request: &ChatRequest, candidate: usize, path: &str) {
+fn log_stream_success(request: &ChatRequest, attempt: u32, path: &str) {
     logging::log(
         Level::Debug,
         format!(
-            "{} attempt {} answered with the {path} path",
-            request.provider,
-            candidate + 1
+            "{} attempt {attempt} answered with the {path} path",
+            request.provider
         ),
     );
 }
@@ -886,6 +905,7 @@ mod tests {
     /// not tried" becomes an assertion.
     struct Stub {
         structured: Option<Result<Vec<String>, &'static str>>,
+        structured_generic: bool,
         strings: Option<Result<Vec<String>, &'static str>>,
         chat: Result<String, &'static str>,
         structured_calls: std::sync::atomic::AtomicUsize,
@@ -897,6 +917,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 structured: None,
+                structured_generic: false,
                 strings: None,
                 chat: Err("this provider was not asked to answer in one piece"),
                 structured_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -1009,6 +1030,9 @@ mod tests {
                         .collect();
                     Ok(Box::pin(futures::stream::iter(chunks)))
                 }
+                Some(Err(reason)) if self.structured_generic => {
+                    Err(llm::error::LLMError::Generic((*reason).to_owned()))
+                }
                 Some(Err(reason)) => Err(llm::error::LLMError::ProviderError((*reason).to_owned())),
             }
         }
@@ -1044,7 +1068,7 @@ mod tests {
     }
 
     fn drain(
-        candidates: &[Box<dyn ChatProvider>],
+        candidates: &[Candidate],
         request: &ChatRequest,
     ) -> (Result<ChatOutcome, LlmError>, Vec<String>) {
         let mut deltas: Vec<String> = Vec::new();
@@ -1054,12 +1078,22 @@ mod tests {
         (outcome, deltas)
     }
 
+    fn candidate(
+        provider: impl ChatProvider + 'static,
+        capabilities: StreamingCapabilities,
+    ) -> Candidate {
+        Candidate::new(Box::new(provider), capabilities)
+    }
+
     #[test]
     fn a_provider_with_no_streaming_answers_in_one_request() {
         // The DeepSeek case: the crate's native backend implements neither stream, so
         // before the cascade the app asked for the structured one and reported the
         // crate's refusal as the failure. The answer is what the user wanted.
-        let stub = Box::new(Stub::answer("the whole answer"));
+        let stub = candidate(
+            Stub::answer("the whole answer"),
+            StreamingCapabilities::NONE,
+        );
         let (outcome, deltas) = drain(&[stub], &cascade_request());
         let outcome = outcome.expect("answered");
         assert_eq!(outcome.text, "the whole answer");
@@ -1071,11 +1105,14 @@ mod tests {
 
     #[test]
     fn a_provider_with_only_a_string_stream_still_streams() {
-        let stub = Box::new(Stub {
-            strings: Some(Ok(vec!["half ".to_owned(), "an answer".to_owned()])),
-            chat: Ok("unused".to_owned()),
-            ..Stub::default()
-        });
+        let stub = candidate(
+            Stub {
+                strings: Some(Ok(vec!["half ".to_owned(), "an answer".to_owned()])),
+                chat: Ok("unused".to_owned()),
+                ..Stub::default()
+            },
+            StreamingCapabilities::STRINGS,
+        );
         let (outcome, deltas) = drain(&[stub], &cascade_request());
         let outcome = outcome.expect("streamed");
         assert_eq!(outcome.text, "half an answer");
@@ -1094,7 +1131,10 @@ mod tests {
             ..Stub::default()
         });
         let (outcome, deltas) = drain(
-            &[Box::new(NativeHandle(provider.clone()))],
+            &[candidate(
+                NativeHandle(provider.clone()),
+                StreamingCapabilities::STRUCTURED,
+            )],
             &cascade_request(),
         );
 
@@ -1133,7 +1173,10 @@ mod tests {
             ..Stub::default()
         });
         let (outcome, deltas) = drain(
-            &[Box::new(NativeHandle(provider.clone()))],
+            &[candidate(
+                NativeHandle(provider.clone()),
+                StreamingCapabilities::STRINGS,
+            )],
             &cascade_request(),
         );
 
@@ -1143,7 +1186,7 @@ mod tests {
             provider
                 .structured_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
         assert_eq!(
             provider
@@ -1163,7 +1206,10 @@ mod tests {
     fn ir_02_two_unsupported_streams_make_one_plain_request() {
         let provider = std::sync::Arc::new(Stub::answer("PLAIN_SENTINEL"));
         let (outcome, deltas) = drain(
-            &[Box::new(NativeHandle(provider.clone()))],
+            &[candidate(
+                NativeHandle(provider.clone()),
+                StreamingCapabilities::NONE,
+            )],
             &cascade_request(),
         );
 
@@ -1173,13 +1219,13 @@ mod tests {
             provider
                 .structured_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
         assert_eq!(
             provider
                 .string_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-            1
+            0
         );
         assert_eq!(
             provider
@@ -1195,8 +1241,10 @@ mod tests {
         // OpenAI-compatible one can, and the answer therefore arrives in pieces.
         let native = std::sync::Arc::new(Stub::breaking());
         let compatible = Stub::streaming(&["streamed ", "through chat/completions"]);
-        let candidates: Vec<Box<dyn ChatProvider>> =
-            vec![Box::new(NativeHandle(native.clone())), Box::new(compatible)];
+        let candidates = vec![
+            candidate(NativeHandle(native.clone()), StreamingCapabilities::NONE),
+            candidate(compatible, StreamingCapabilities::STRUCTURED),
+        ];
         let (outcome, deltas) = drain(&candidates, &cascade_request());
         let outcome = outcome.expect("answered");
         assert_eq!(outcome.text, "streamed through chat/completions");
@@ -1214,7 +1262,13 @@ mod tests {
         // it twice, so a partial answer is the end of the request (ARCH-5) — and that
         // holds even though this provider *could* answer a plain request.
         let provider = std::sync::Arc::new(MidStreamFailure::default());
-        let (outcome, deltas) = drain(&[Box::new(Handle(provider.clone()))], &cascade_request());
+        let (outcome, deltas) = drain(
+            &[candidate(
+                Handle(provider.clone()),
+                StreamingCapabilities::STRUCTURED,
+            )],
+            &cascade_request(),
+        );
         let error = outcome.expect_err("the failure is reported");
         assert!(error.to_string().contains("connection reset"), "{error}");
         assert_eq!(deltas, vec!["the first token".to_owned()]);
@@ -1237,7 +1291,10 @@ mod tests {
             ..Stub::default()
         });
         let (outcome, deltas) = drain(
-            &[Box::new(NativeHandle(provider.clone()))],
+            &[candidate(
+                NativeHandle(provider.clone()),
+                StreamingCapabilities::STRUCTURED,
+            )],
             &cascade_request(),
         );
         assert!(matches!(outcome, Err(LlmError::Auth { .. })));
@@ -1264,7 +1321,10 @@ mod tests {
             chat: Ok("PLAIN_SENTINEL".to_owned()),
             ..Stub::default()
         });
-        let candidates: Vec<Box<dyn ChatProvider>> = vec![Box::new(NativeHandle(provider.clone()))];
+        let candidates = vec![candidate(
+            NativeHandle(provider.clone()),
+            StreamingCapabilities::STRUCTURED,
+        )];
         let cancel = Cancel::new();
         let mut deltas = Vec::new();
         let mut sink = |delta: &str| {
@@ -1438,52 +1498,38 @@ mod tests {
     }
 
     #[test]
-    fn what_is_reported_is_the_most_informative_failure() {
-        // The real DeepSeek run: the native backend has no streaming (the crate's
-        // catch-all), the passthrough and the plain request both reached the provider and
-        // were told the key was invalid. Reporting the *first* failure told the user
-        // "Structured streaming not supported for this provider" — a sentence about a
-        // method the app does not even call — instead of "your key is invalid".
-        let refusal = llm::error::LLMError::Generic(
-            "Structured streaming not supported for this provider".to_owned(),
-        );
-        let auth = llm::error::LLMError::AuthError(
-            "Authentication Fails, Your api key: ****pose is invalid".to_owned(),
-        );
-        let first = Attempt::from(Ok(Err(refusal)), "deepseek", false);
-        let Attempt::Failed(first) = first else {
-            panic!("a failure")
-        };
-        let second = Attempt::from(Ok(Err(auth)), "deepseek", false);
-        let Attempt::Failed(second) = second else {
-            panic!("a failure")
-        };
-        assert!(first.unsupported, "the catch-all is marked as such");
-        assert!(!second.unsupported, "the provider's own words are not");
-        let chosen = choose(Some(first), second);
-        let message = chosen.error.to_string();
-        assert!(message.contains("Authentication Fails"), "{message}");
-        assert!(!message.contains("not supported"), "{message}");
-    }
-
-    #[test]
-    fn a_catch_all_does_not_displace_the_first_real_failure() {
-        // The other direction: once a substantive failure is in hand, a later catch-all
-        // (from the next way of asking) does not replace it.
-        let real = Failure::plain(LlmError::Transport {
-            provider: "deepseek".to_owned(),
-            reason: "connection refused".to_owned(),
+    fn ir_02_a_generic_rate_limit_error_does_not_start_a_follow_up_request() {
+        let provider = std::sync::Arc::new(Stub {
+            structured: Some(Err("rate limited")),
+            structured_generic: true,
+            strings: Some(Ok(vec!["STRING_SENTINEL".to_owned()])),
+            chat: Ok("PLAIN_SENTINEL".to_owned()),
+            ..Stub::default()
         });
-        let unsupported = Failure {
-            error: LlmError::Request {
-                provider: "deepseek".to_owned(),
-                reason: "Generic error: not supported".to_owned(),
-            },
-            emitted: false,
-            unsupported: true,
-        };
-        let chosen = choose(Some(real), unsupported);
-        assert!(chosen.error.to_string().contains("connection refused"));
+        let (outcome, _) = drain(
+            &[candidate(
+                NativeHandle(provider.clone()),
+                StreamingCapabilities {
+                    structured: true,
+                    strings: true,
+                },
+            )],
+            &cascade_request(),
+        );
+
+        assert!(matches!(outcome, Err(LlmError::Request { .. })));
+        assert_eq!(
+            provider
+                .string_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            provider
+                .chat_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     #[test]

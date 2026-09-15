@@ -2788,16 +2788,16 @@ impl App {
                     stored_at: self.now_unix_secs,
                 };
                 self.adopt_analysis(stored);
-                let usage = ready
-                    .usage
-                    .map(|usage| {
+                let usage = ready.usage.map_or_else(
+                    || " · usage unknown".to_owned(),
+                    |usage| {
                         let reasoning = usage
                             .reasoning
                             .map(|tokens| format!(", {tokens} reasoning"))
                             .unwrap_or_default();
                         format!(" · {} in/{}{reasoning} out", usage.prompt, usage.completion)
-                    })
-                    .unwrap_or_default();
+                    },
+                );
                 self.notice(
                     NoticeLevel::Info,
                     format!(
@@ -2977,6 +2977,10 @@ impl App {
             return;
         };
         match update {
+            crate::application::analysis::Progress::Reset(stage) => {
+                self.panel.stream.clear();
+                self.panel.state = AnalysisState::Running { stage };
+            }
             crate::application::analysis::Progress::Stage(stage) => {
                 self.panel.state = if self.panel.stream.text().is_empty() {
                     AnalysisState::Running { stage }
@@ -3315,6 +3319,15 @@ impl App {
         Some(crate::application::analysis::PanelModel::of(
             &stored.analysis,
         ))
+    }
+
+    #[cfg(test)]
+    /// The accepted raw provider answer, retained with the stored analysis.
+    pub(crate) fn stored_analysis_raw(&self) -> Option<&str> {
+        self.panel
+            .analysis
+            .as_ref()
+            .map(|stored| stored.raw.as_str())
     }
 
     /// The provenance line: which model, which prompt version, how old (FR-4.3).

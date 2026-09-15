@@ -50,6 +50,9 @@ pub enum AnalysisIntent {
 pub enum Progress {
     /// What the job is doing now, for the status line.
     Stage(String),
+    /// Starts an intentionally separate provider attempt, replacing the previous
+    /// attempt's preview rather than concatenating independent answers (IR-02).
+    Reset(String),
     /// Model text as it arrived.
     Delta(String),
 }
@@ -236,10 +239,10 @@ impl<'a> Analyst<'a> {
             .as_deref()
             .map_or_else(PathIndex::default, PathIndex::from_patch);
 
-        let mut usage = None;
+        let mut usage = UsageTotal::default();
         progress(Progress::Stage(format!("asking {}", request.chat.model)));
         let first = self.ask(request, &system, &prompt, cancel, progress)?;
-        add_usage(&mut usage, first.usage);
+        usage.record(first.usage);
 
         if cancel.is_cancelled() {
             return Ok(AnalysisRun::Cancelled);
@@ -262,21 +265,22 @@ impl<'a> Analyst<'a> {
             Ok(normalized) => (normalized, false, first.text),
             Err(failure) => {
                 // One repair pass, with the reason and the previous answer (FR-4.1).
-                progress(Progress::Stage(format!("repairing: {}", failure.reason)));
+                progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let previous = first.text.clone();
                 let repair = repair_prompt(&previous, &failure);
                 // A failed repair attempt still leaves the first answer to show, with
                 // the first failure's reason: the user has text to read either way,
                 // which is what FR-4.1 asks for.
                 let Ok(second) = self.ask(request, &system, &repair, cancel, progress) else {
+                    usage.mark_unknown();
                     return Ok(AnalysisRun::Unparsed(Box::new(Unparsed {
                         raw: previous,
                         reason: failure.reason,
                         repaired: true,
-                        usage,
+                        usage: usage.reported(),
                     })));
                 };
-                add_usage(&mut usage, second.usage);
+                usage.record(second.usage);
                 match self.normalize(
                     &second.text,
                     &index,
@@ -294,7 +298,7 @@ impl<'a> Analyst<'a> {
                                 failure.reason, second_failure.reason
                             ),
                             repaired: true,
-                            usage,
+                            usage: usage.reported(),
                         })));
                     }
                 }
@@ -326,7 +330,7 @@ impl<'a> Analyst<'a> {
             analysis: Box::new(normalized.analysis),
             warnings,
             repaired,
-            usage,
+            usage: usage.reported(),
         })))
     }
 
@@ -349,7 +353,7 @@ impl<'a> Analyst<'a> {
         index: &PathIndex,
         model_label: &str,
         request: &AnalysisRequest,
-        usage: Option<TokenUsage>,
+        usage: UsageTotal,
         created_at: &str,
     ) -> Result<Normalized, ParseFailure> {
         normalize(
@@ -426,30 +430,49 @@ struct Answer {
     usage: Option<TokenUsage>,
 }
 
-/// Adds the second attempt's usage to the first, so the numbers are the whole cost.
-fn add_usage(total: &mut Option<TokenUsage>, extra: Option<TokenUsage>) {
-    match (total.as_mut(), extra) {
-        (Some(total), Some(extra)) => {
-            total.prompt = total.prompt.saturating_add(extra.prompt);
-            total.completion = total.completion.saturating_add(extra.completion);
-            total.total = total.total.saturating_add(extra.total);
-            total.reasoning = match (total.reasoning, extra.reasoning) {
-                (Some(left), Some(right)) => Some(left.saturating_add(right)),
-                (left, right) => left.or(right),
-            };
+/// Usage across intentionally executed analysis attempts.
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageTotal {
+    known: Option<TokenUsage>,
+    complete: bool,
+}
+
+impl UsageTotal {
+    fn record(&mut self, usage: Option<TokenUsage>) {
+        match (self.known.as_mut(), usage) {
+            (None, Some(usage)) if !self.complete => {
+                self.known = Some(usage);
+                self.complete = true;
+            }
+            (Some(total), Some(usage)) if self.complete => total.add(usage),
+            _ => {
+                self.known = None;
+                self.complete = false;
+            }
         }
-        (None, Some(extra)) => *total = Some(extra),
-        _ => {}
+    }
+
+    /// A failed request may have consumed tokens without returning accounting.
+    fn mark_unknown(&mut self) {
+        self.known = None;
+        self.complete = false;
+    }
+
+    fn reported(self) -> Option<TokenUsage> {
+        self.complete.then_some(self.known).flatten()
     }
 }
 
-/// Copies the port's usage into the document's shape.
-fn analysis_usage(usage: Option<TokenUsage>) -> AnalysisUsage {
-    usage.map_or_else(AnalysisUsage::default, |usage| AnalysisUsage {
-        prompt: usage.prompt,
-        completion: usage.completion,
-        reasoning: usage.reasoning,
-    })
+/// Copies complete port usage into the document's persisted shape.
+fn analysis_usage(usage: UsageTotal) -> AnalysisUsage {
+    usage
+        .reported()
+        .map_or_else(AnalysisUsage::default, |usage| AnalysisUsage {
+            prompt: usage.prompt,
+            completion: usage.completion,
+            reasoning: usage.reasoning,
+            complete: true,
+        })
 }
 
 /// Keeps the raw text bounded, saying so when it was cut (FR-4.1).
@@ -774,7 +797,7 @@ mod tests {
         let progress = progress.into_inner().expect("lock");
         assert!(
             progress.iter().any(
-                |update| matches!(update, Progress::Stage(stage) if stage.starts_with("repairing"))
+                |update| matches!(update, Progress::Reset(stage) if stage.starts_with("repairing"))
             ),
             "{progress:?}"
         );
@@ -1314,10 +1337,27 @@ mod tests {
         assert_eq!(
             ready.analysis.token_usage,
             AnalysisUsage {
+                complete: true,
                 prompt: 10,
                 completion: 20,
                 reasoning: Some(5)
             }
         );
+    }
+
+    #[test]
+    fn ir_02_a_missing_repair_usage_makes_the_aggregate_unknown() {
+        let mut usage = UsageTotal::default();
+        usage.record(Some(TokenUsage {
+            prompt: 10,
+            completion: 20,
+            total: 30,
+            reasoning: None,
+        }));
+        usage.record(None);
+
+        assert!(usage.known.is_none());
+        assert!(!usage.complete);
+        assert!(!analysis_usage(usage).complete);
     }
 }

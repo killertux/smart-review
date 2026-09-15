@@ -372,6 +372,7 @@ mod tests {
             head_sha: head_sha.to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             token_usage: AnalysisUsage {
+                complete: true,
                 prompt: 100,
                 completion: 200,
                 reasoning: Some(50),

@@ -441,10 +441,12 @@ that changes to content from an unrequested attempt.
 **Gates:** shared gates, targeted adapter tests, `m2b` and `m3` contracts.
 
 **Local verification (2026-09-15):** `cargo fmt --all`, Clippy with all targets,
-features and warnings denied, and `cargo test --all-features` passed (1006 unit tests and
-11 snapshots). Validators passed: `m2b` 35/35 and `m3` 59/59. The M2b repair fixture
-now checks its durable retry notice instead of relying on duplicate streaming requests to
-keep a transient popup on screen. No live provider or network request was used.
+features and warnings denied, and `cargo test --all-features` passed (1007 unit tests and
+11 snapshots). Validators passed: `m2b` 35/35 and `m3` 59/59. Regressions cover a generic
+rate-limit failure without a follow-up request, reset repair previews/raw answers, unknown
+aggregate usage, and monotonic diagnostic attempts. The M2b repair fixture now checks its
+durable retry notice instead of relying on duplicate streaming requests to keep a transient
+popup on screen. No live provider or network request was used.
 
 ---
 

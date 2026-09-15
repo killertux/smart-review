@@ -117,6 +117,10 @@ pub struct FileNote {
 /// the domain's to keep stable, and the adapter's numbers are copied into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AnalysisUsage {
+    /// Whether every executed attempt reported usage. A false value means the numeric
+    /// fields must not be read as a complete cost (IR-02).
+    #[serde(default)]
+    pub complete: bool,
     /// Prompt tokens.
     #[serde(default)]
     pub prompt: u32,
