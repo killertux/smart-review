@@ -924,6 +924,12 @@ fn drain_effects(
 fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
     match effect {
         Effect::LoadDraft => {
+            // A refresh can leave a previously queued load behind. The in-memory draft
+            // is now the user's document, so a late disk result must not replace edits
+            // or an active composer for the same review.
+            if app.drafts.open {
+                return;
+            }
             let Some(service) = app.draft_service.as_ref() else {
                 return;
             };
@@ -931,11 +937,7 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
                 return;
             };
             let (draft, warning) = service.load(number, app.now());
-            let head = app.open_head_sha().map(str::to_owned);
             app.drafts.open(draft, warning);
-            if let Some(head) = head {
-                app.drafts.anchor_to(&head);
-            }
         }
         Effect::SaveDraft => {
             let Some(service) = app.draft_service.as_ref() else {

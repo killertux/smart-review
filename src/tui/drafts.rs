@@ -515,9 +515,13 @@ impl DraftState {
         self.dirty = true;
     }
 
-    /// Remembers the commit the comments are written against (FR-6.3).
+    /// Remembers the commit the first comment is written against (FR-6.3).
+    ///
+    /// An existing anchor is historical user data, not a cache of the current view.
+    /// Replacing it would make old line coordinates look like they belonged to a newer
+    /// commit, so only an unanchored draft may acquire a head here.
     pub fn anchor_to(&mut self, head_sha: &str) {
-        if self.draft.head_sha.as_deref() == Some(head_sha) || head_sha.is_empty() {
+        if self.draft.head_sha.is_some() || head_sha.is_empty() {
             return;
         }
         self.draft.head_sha = Some(head_sha.to_owned());
@@ -879,5 +883,18 @@ mod tests {
         state.dirty = false;
         state.anchor_to("abc123");
         assert!(!state.dirty, "the same head is not a change");
+    }
+
+    #[test]
+    fn an_existing_anchor_is_never_relabelled_as_a_newer_head() {
+        let mut state = fresh();
+        state.anchor_to("h1");
+        state.dirty = false;
+
+        state.anchor_to("h2");
+
+        assert_eq!(state.draft.head_sha.as_deref(), Some("h1"));
+        assert!(!state.dirty, "a refresh did not rewrite the document");
+        assert!(state.drifted(Some("h2")));
     }
 }

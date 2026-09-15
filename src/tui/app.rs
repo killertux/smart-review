@@ -1681,6 +1681,13 @@ impl App {
 
     /// Opens the composer on the line under the cursor (FR-6.2).
     pub(crate) fn start_comment(&mut self) -> Effect {
+        if self.draft_drifted() {
+            self.notice(
+                NoticeLevel::Warn,
+                "the pull request moved since this draft was anchored; recreate its comments before adding another",
+            );
+            return Effect::None;
+        }
         let Some(anchor) = self.current_anchor() else {
             self.notice(
                 NoticeLevel::Warn,
@@ -1981,8 +1988,20 @@ impl App {
 
     /// Stages what the composer holds, and says what happened (FR-6.1, FR-6.2).
     pub(crate) fn stage_comment(&mut self) -> Effect {
+        if self.draft_drifted() {
+            if let Some(composer) = self.drafts.composer.as_mut() {
+                composer.refusal = Some(
+                    "the pull request moved since this draft was anchored; recreate its comments before staging another"
+                        .to_owned(),
+                );
+            }
+            return Effect::None;
+        }
         match self.drafts.stage(self.now()) {
             Ok(()) => {
+                if let Some(head) = self.open_head_sha().map(str::to_owned) {
+                    self.drafts.anchor_to(&head);
+                }
                 self.mode = Mode::Normal;
                 let count = self.drafts.draft.comments.len();
                 self.notice(
@@ -2254,6 +2273,13 @@ impl App {
         if self.drafts.status.is_publishing() {
             return Effect::None;
         }
+        if self.draft_drifted() {
+            self.notice(
+                NoticeLevel::Warn,
+                "the pull request moved since this draft was anchored; re-check and recreate its comments before publishing",
+            );
+            return Effect::None;
+        }
         match self.drafts.open_modal() {
             Ok(()) => {
                 self.open_overlay(Overlay::Publish);
@@ -2295,14 +2321,15 @@ impl App {
         if !self.drafts.open || self.drafts.status.is_publishing() {
             return Effect::None;
         }
+        if self.draft_drifted() {
+            self.notice(
+                NoticeLevel::Warn,
+                "the pull request moved since this draft was anchored; re-check and recreate its comments before publishing",
+            );
+            return Effect::None;
+        }
         self.drafts.armed = false;
         self.drafts.status = crate::tui::drafts::DraftStatus::Publishing;
-        // The anchor is recorded before the send, so the review says which revision
-        // its line numbers belong to even if the pull request moves while it is in
-        // flight (FR-6.3).
-        if let Some(head) = self.open_head_sha().map(str::to_owned) {
-            self.drafts.anchor_to(&head);
-        }
         Effect::PublishDraft
     }
 
@@ -3452,6 +3479,9 @@ impl App {
             self.config.review.ignore_whitespace,
         );
         let files = view.patch.stats();
+        let load_draft = self.detail.as_ref().is_some_and(|detail| {
+            !self.drafts.open || self.drafts.draft.pr != detail.summary.number
+        });
         match self.detail.take() {
             Some(detail) => self.open_review(detail, view),
             None => self.set_review(view),
@@ -3465,9 +3495,14 @@ impl App {
                 self.list.status_label()
             ),
         );
-        // The review screen is up, so this is where the draft is read: opening a pull
-        // request is the question "was I in the middle of reviewing this?" (FR-6.1).
-        Effect::LoadDraft
+        // A patch can arrive more than once for one review (remote, then local, then a
+        // display refresh). Loading is an entry operation, not a diff-refresh operation:
+        // otherwise it destroys the active composer and overwrites in-memory writing.
+        if load_draft {
+            Effect::LoadDraft
+        } else {
+            Effect::None
+        }
     }
 
     /// Notes that a pull request is being opened, which the indicator shows.
@@ -6597,7 +6632,116 @@ mod tests {
         assert_eq!(effect, Effect::SaveDraft, "staging asks the loop to write");
         assert_eq!(app.mode(), Mode::Normal);
         assert_eq!(app.drafts().draft.comments.len(), 1);
+        assert_eq!(
+            app.drafts().draft.head_sha,
+            app.open_head_sha().map(str::to_owned),
+            "the first staged line records the revision that supplied its coordinates"
+        );
         assert!(app.drafts().dirty, "and the loop is what clears this");
+    }
+
+    #[test]
+    fn ir_04_a_local_patch_refresh_keeps_the_active_comment_composer() {
+        let (_dir, mut app) = draft_app();
+        app.drafts
+            .open(crate::domain::draft::Draft::new(141, app.now()), None);
+        press(&mut app, "}");
+        press(&mut app, "jjjj");
+        press(&mut app, "c");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("composer")
+            .input
+            .insert_str("keep this exact sentence");
+        let anchor = app
+            .drafts
+            .composer
+            .as_ref()
+            .and_then(crate::tui::drafts::Composer::anchor)
+            .cloned()
+            .expect("anchor");
+        app.diff_loading = true;
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/domain/money.rs b/src/domain/money.rs\n--- a/src/domain/money.rs\n+++ b/src/domain/money.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            job: app.patch_job,
+            outcome: crate::tui::jobs::Outcome::Patch {
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
+                source: crate::domain::diff::DiffSource::Worktree,
+            },
+        });
+
+        assert_eq!(
+            effect,
+            Some(Effect::None),
+            "a same-review refresh does not reload disk state"
+        );
+        let composer = app.drafts.composer.as_ref().expect("writing survives");
+        assert_eq!(composer.input.text(), "keep this exact sentence");
+        assert_eq!(composer.anchor(), Some(&anchor));
+        assert_eq!(app.mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn ir_04_a_drifted_draft_cannot_be_published_against_a_new_head() {
+        let (_dir, mut app) = draft_app();
+        let mut draft = crate::domain::draft::Draft::new(141, app.now());
+        draft.head_sha = Some("h1".to_owned());
+        draft.add(
+            crate::domain::draft::DraftComment::new(
+                "src/domain/money.rs",
+                crate::domain::draft::Side::New,
+                2,
+                None,
+                "keep the old coordinates",
+            )
+            .expect("comment"),
+            app.now(),
+        );
+        app.drafts.open(draft, None);
+        app.detail.as_mut().expect("detail").summary.head_sha = "h2".to_owned();
+
+        assert_eq!(app.open_publish(), Effect::None);
+        assert!(!app.drafts.modal);
+        assert_eq!(app.drafts.draft.head_sha.as_deref(), Some("h1"));
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("recreate")),
+            "the refusal says what to do"
+        );
+    }
+
+    #[test]
+    fn ir_04_a_drifted_draft_cannot_mix_new_comments_with_its_old_anchor() {
+        let (_dir, mut app) = draft_app();
+        let mut draft = crate::domain::draft::Draft::new(141, app.now());
+        draft.head_sha = Some("h1".to_owned());
+        draft.add(
+            crate::domain::draft::DraftComment::new(
+                "src/domain/money.rs",
+                crate::domain::draft::Side::New,
+                2,
+                None,
+                "old coordinate",
+            )
+            .expect("comment"),
+            app.now(),
+        );
+        app.drafts.open(draft, None);
+        app.detail.as_mut().expect("detail").summary.head_sha = "h2".to_owned();
+        press(&mut app, "}");
+        press(&mut app, "jjjj");
+
+        assert_eq!(app.start_comment(), Effect::None);
+        assert!(!app.draft_is_composing());
+        assert_eq!(app.drafts.draft.comments.len(), 1);
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("recreate"))
+        );
     }
 
     /// An app with a diff open whose discussion has one comment in it (FR-6.4).

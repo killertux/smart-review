@@ -237,7 +237,7 @@ fn panel_lines(app: &App, drafts: &DraftState, width: u16) -> Vec<Line<'static>>
         // Anchors are line numbers: a force-push makes them quietly mean something
         // else, which is precisely the accident this line prevents (FR-6.3).
         lines.push(Line::from(Span::styled(
-            " ! the diff has moved since these were written: re-check the line numbers".to_owned(),
+            " ! the diff has moved since these were written: recreate their anchors before publishing".to_owned(),
             theme.style(element::NOTICE_WARN),
         )));
     }

@@ -474,6 +474,9 @@ impl Draft {
         self.comments.clear();
         self.decision = None;
         self.body = None;
+        // With no staged line coordinates left, this is a new draft. Keeping the old
+        // revision would incorrectly make its first new comment look drifted.
+        self.head_sha = None;
         self.updated_at = now;
     }
 
@@ -859,10 +862,12 @@ mod tests {
         draft.add(comment("src/a.rs", 1, "why?"), now());
         draft.set_decision(Some(Decision::Approve), now());
         draft.set_body("nice", now());
+        draft.head_sha = Some("h1".to_owned());
         draft.clear(now());
         assert_eq!(draft.pr, 141);
         assert!(draft.is_empty());
         assert_eq!(draft.decision, None);
+        assert_eq!(draft.head_sha, None, "the next comment gets a fresh anchor");
     }
 
     #[test]
