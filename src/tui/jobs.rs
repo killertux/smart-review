@@ -345,6 +345,8 @@ pub enum Outcome {
         outcome: Box<FetchOutcome<Patch>>,
         /// Where it was read from (FR-3.2).
         source: DiffSource,
+        /// The revision the patch job requested.
+        head_sha: String,
     },
     /// The environment report.
     Checks(Vec<Check>),
@@ -590,6 +592,7 @@ impl Executor {
                 Ok(outcome) => Outcome::Patch {
                     outcome: Box::new(outcome),
                     source: DiffSource::Forge,
+                    head_sha: head_sha.clone(),
                 },
                 Err(error) => Outcome::Failed(error.to_string()),
             },
@@ -740,6 +743,7 @@ impl Executor {
                 return Outcome::Patch {
                     outcome: Box::new(FetchOutcome::Fresh(cached.value)),
                     source: DiffSource::Worktree,
+                    head_sha: head_sha.to_owned(),
                 };
             }
             Ok(_) | Err(_) => {}
@@ -765,6 +769,7 @@ impl Executor {
                 Outcome::Patch {
                     outcome: Box::new(FetchOutcome::Fresh(patch)),
                     source: DiffSource::Worktree,
+                    head_sha: head_sha.to_owned(),
                 }
             }
             // The worktree is gone: the caller falls back to the forge, and
@@ -777,6 +782,7 @@ impl Executor {
                             reason: error.to_string(),
                         }),
                         source: DiffSource::Worktree,
+                        head_sha: head_sha.to_owned(),
                     },
                     _ => Outcome::Failed(error.to_string()),
                 }

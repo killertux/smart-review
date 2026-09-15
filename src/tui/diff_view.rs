@@ -224,6 +224,8 @@ impl DirBuilder {
 /// The diff pane: a patch, the rows it flattens to, the tree, and the cursor.
 #[derive(Debug, Clone)]
 pub struct DiffView {
+    /// The PR head revision this applied patch was read from (IR-04).
+    pub head_sha: Option<String>,
     /// The patch being read.
     pub patch: Patch,
     /// The flattened rows, rebuilt only when the patch or the folds change.
@@ -289,6 +291,7 @@ impl DiffView {
     pub fn new(patch: Patch) -> Self {
         let mut view = Self {
             patch,
+            head_sha: None,
             rows: Vec::new(),
             split_rows: Vec::new(),
             split_index: Vec::new(),
@@ -311,6 +314,32 @@ impl DiffView {
         };
         view.rebuild();
         view
+    }
+
+    /// Records the revision that supplied this applied patch.
+    pub fn set_head_sha(&mut self, head_sha: String) {
+        self.head_sha = Some(head_sha);
+    }
+
+    /// Whether this view still contains every coordinate of an inline anchor.
+    #[must_use]
+    pub fn contains_anchor(&self, anchor: &crate::tui::drafts::Anchor) -> bool {
+        let (start, end) = (anchor.start_line.unwrap_or(anchor.line), anchor.line);
+        (start..=end).all(|line| {
+            self.rows.iter().any(|row| {
+                self.patch
+                    .files
+                    .get(row.file)
+                    .and_then(|file| file.path())
+                    .is_some_and(|path| {
+                        path.as_str() == anchor.path
+                            && match anchor.side {
+                                crate::domain::draft::Side::Old => row.old_line == Some(line),
+                                crate::domain::draft::Side::New => row.new_line == Some(line),
+                            }
+                    })
+            })
+        })
     }
 
     /// Rebuilds the rows and the tree from the current patch and fold state.

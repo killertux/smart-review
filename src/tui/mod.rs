@@ -931,11 +931,7 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
                 return;
             };
             let (draft, warning) = service.load(number, app.now());
-            let head = app.open_head_sha().map(str::to_owned);
-            app.drafts.open(draft, warning);
-            if let Some(head) = head {
-                app.drafts.anchor_to(&head);
-            }
+            app.apply_loaded_draft(number, draft, warning);
         }
         Effect::SaveDraft => {
             let Some(service) = app.draft_service.as_ref() else {
