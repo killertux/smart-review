@@ -177,6 +177,12 @@ pub struct Composer {
     pub input: TextInput,
     /// Why the last attempt to stage it was refused.
     pub refusal: Option<String>,
+    /// The revision that supplied this target's line coordinates.
+    ///
+    /// The diff may refresh while the user is typing. Keeping this separate from the
+    /// draft's first staged anchor prevents old coordinates being relabelled as a new
+    /// head when the composer is eventually staged (IR-04).
+    pub head_sha: Option<String>,
 }
 
 impl Composer {
@@ -187,6 +193,7 @@ impl Composer {
             target,
             input: TextInput::new(),
             refusal: None,
+            head_sha: None,
         }
     }
 
@@ -200,6 +207,11 @@ impl Composer {
     #[must_use]
     pub fn body(&self) -> &str {
         self.input.text().trim_end()
+    }
+
+    /// Captures the revision that supplied this composer's line target.
+    pub fn capture_head(&mut self, head_sha: Option<String>) {
+        self.head_sha = head_sha;
     }
 }
 

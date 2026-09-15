@@ -591,11 +591,11 @@ unchanged line numbers or any lost writing. Do not publish to a real PR for this
 **Gates:** shared gates, draft/composer snapshots, `m4` and `m5` contracts.
 
 **Local verification (2026-09-15):** `cargo fmt --all`, Clippy with all targets,
-features and warnings denied, and `cargo test --all-features` passed (1018 unit tests
+features and warnings denied, and `cargo test --all-features` passed (1020 unit tests
 and 11 snapshots). Validators passed: `m4` 23/23 and `m5` 32/32. Regressions cover
-preserving an H1 anchor at H2, refusing mixed-revision comments and publication, and
-keeping active composer text and its range through a local patch refresh. No live
-GitHub mutation was used.
+preserving an H1 anchor at H2, refusing mixed-revision comments and publication,
+replacing A's draft when entering B, and keeping active composer text and its range
+through a local patch refresh. No live GitHub mutation was used.
 
 ---
 

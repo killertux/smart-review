@@ -1703,6 +1703,10 @@ impl App {
             }
             None => self.drafts.compose(anchor),
         }
+        let head = self.open_head_sha().map(str::to_owned);
+        if let Some(composer) = self.drafts.composer.as_mut() {
+            composer.capture_head(head);
+        }
         self.mode = Mode::Insert;
         self.focus = Pane::Diff;
         Effect::None
@@ -1997,9 +2001,27 @@ impl App {
             }
             return Effect::None;
         }
+        let composer_head = self
+            .drafts
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.head_sha.as_deref());
+        if !matches!(
+            (composer_head, self.open_head_sha()),
+            (Some(composer_head), Some(current_head)) if composer_head == current_head
+        ) {
+            if let Some(composer) = self.drafts.composer.as_mut() {
+                composer.refusal = Some(
+                    "this comment's target is unavailable or no longer on the current revision; recreate it before staging"
+                        .to_owned(),
+                );
+            }
+            return Effect::None;
+        }
+        let composer_head = composer_head.map(ToOwned::to_owned);
         match self.drafts.stage(self.now()) {
             Ok(()) => {
-                if let Some(head) = self.open_head_sha().map(str::to_owned) {
+                if let Some(head) = composer_head {
                     self.drafts.anchor_to(&head);
                 }
                 self.mode = Mode::Normal;
@@ -2382,6 +2404,25 @@ impl App {
                 .as_ref()
                 .map(|detail| detail.summary.head_sha.as_str()),
         )
+    }
+
+    /// Applies a draft read for the review that is still on screen.
+    ///
+    /// A same-subject load that arrives after an edit is ignored, while a different
+    /// subject replaces the old draft coherently. IR-05 will carry the originating
+    /// subject through effects; this guard prevents the known reload-loss schedule.
+    pub(crate) fn apply_loaded_draft(
+        &mut self,
+        number: u64,
+        draft: crate::domain::draft::Draft,
+        warning: Option<String>,
+    ) {
+        if self.detail.as_ref().map(|detail| detail.summary.number) != Some(number)
+            || (self.drafts.open && self.drafts.draft.pr == number)
+        {
+            return;
+        }
+        self.drafts.open(draft, warning);
     }
 
     /// Takes the gathered bundle when it is for the commit on screen (FR-4.6).
@@ -6643,6 +6684,7 @@ mod tests {
     #[test]
     fn ir_04_a_local_patch_refresh_keeps_the_active_comment_composer() {
         let (_dir, mut app) = draft_app();
+        app.detail.as_mut().expect("detail").summary.head_sha = "h1".to_owned();
         app.drafts
             .open(crate::domain::draft::Draft::new(141, app.now()), None);
         press(&mut app, "}");
@@ -6662,6 +6704,7 @@ mod tests {
             .cloned()
             .expect("anchor");
         app.diff_loading = true;
+        app.detail.as_mut().expect("detail").summary.head_sha = "h2".to_owned();
         let patch = crate::domain::diff::parse_patch(
             "diff --git a/src/domain/money.rs b/src/domain/money.rs\n--- a/src/domain/money.rs\n+++ b/src/domain/money.rs\n@@ -1 +1 @@\n-old\n+new\n",
         );
@@ -6682,7 +6725,57 @@ mod tests {
         let composer = app.drafts.composer.as_ref().expect("writing survives");
         assert_eq!(composer.input.text(), "keep this exact sentence");
         assert_eq!(composer.anchor(), Some(&anchor));
+        assert_eq!(composer.head_sha.as_deref(), Some("h1"));
         assert_eq!(app.mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn ir_04_a_stale_composer_keeps_its_text_instead_of_relabelling_old_coordinates() {
+        let (_dir, mut app) = draft_app();
+        app.detail.as_mut().expect("detail").summary.head_sha = "h1".to_owned();
+        press(&mut app, "}");
+        press(&mut app, "jjjj");
+        press(&mut app, "c");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("composer")
+            .input
+            .insert_str("keep this sentence");
+        app.detail.as_mut().expect("detail").summary.head_sha = "h2".to_owned();
+
+        assert_eq!(app.stage_comment(), Effect::None);
+
+        let composer = app.drafts.composer.as_ref().expect("writing survives");
+        assert_eq!(composer.input.text(), "keep this sentence");
+        assert_eq!(composer.head_sha.as_deref(), Some("h1"));
+        assert!(
+            composer
+                .refusal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("recreate"))
+        );
+        assert!(app.drafts.draft.comments.is_empty());
+        assert_eq!(app.drafts.draft.head_sha, None);
+    }
+
+    #[test]
+    fn ir_04_loading_a_new_pr_replaces_the_previous_prs_draft() {
+        let (_dir, mut app) = draft_app();
+        let mut first = crate::domain::draft::Draft::new(141, app.now());
+        first.set_body("draft for A", app.now());
+        app.drafts.open(first, None);
+        let mut detail = crate::test_support::sample_detail();
+        detail.summary.number = 142;
+        detail.summary.head_sha = "h2".to_owned();
+        app.open_review(detail, DiffView::new(crate::domain::diff::parse_patch("")));
+        let mut second = crate::domain::draft::Draft::new(142, app.now());
+        second.set_body("draft for B", app.now());
+
+        app.apply_loaded_draft(142, second, None);
+
+        assert_eq!(app.drafts.draft.pr, 142);
+        assert_eq!(app.drafts.draft.body.as_deref(), Some("draft for B"));
     }
 
     #[test]
