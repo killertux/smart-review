@@ -844,12 +844,12 @@ impl crate::ports::AnalysisCachePort for InMemoryAnalysis {
         repo: &crate::domain::repo::RepoId,
         pr: u64,
         plan: &crate::domain::plan::Plan,
-    ) -> Result<(), crate::ports::AnalysisCacheError> {
+    ) -> Result<crate::domain::plan::Plan, crate::ports::AnalysisCacheError> {
         self.plans
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(format!("{}/pr-{pr}", repo.key()), plan.clone());
-        Ok(())
+        Ok(plan.clone())
     }
 }
 

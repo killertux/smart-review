@@ -207,6 +207,9 @@ const DOC_SUFFIXES: &[&str] = &[".md", ".mdx", ".rst", ".adoc", ".txt"];
 /// The review plan, effective and persisted per pull request (FR-4.2, FR-4.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
+    /// Monotonic durable-document revision used to reject stale cross-process writes.
+    #[serde(default)]
+    pub document_revision: u64,
     /// The head this plan describes. A plan for another head is not applied.
     pub head_sha: String,
     /// Where the grouping came from.
@@ -223,6 +226,7 @@ impl Plan {
     #[must_use]
     pub fn from_analysis(analysis: &Analysis) -> Self {
         Self {
+            document_revision: 0,
             head_sha: analysis.head_sha.clone(),
             source: PlanSource::Analysis,
             groups: analysis.review_plan.clone(),
@@ -277,6 +281,7 @@ impl Plan {
             group.order = u32::try_from(position + 1).unwrap_or(u32::MAX);
         }
         Self {
+            document_revision: 0,
             head_sha: head_sha.to_owned(),
             source: PlanSource::Heuristic,
             groups,

@@ -433,30 +433,24 @@ fn sanitise(id: &str) -> String {
 
 impl ChatStorePort for FileChatStore {
     fn list(&self, repo: &RepoId, pr: u64) -> Result<Vec<SessionMeta>, ChatStoreError> {
+        let _lock = self.lock(repo, pr)?;
         self.migrate_legacy(repo, pr)?;
         Ok(self.index(repo, pr))
     }
 
     fn load(&self, repo: &RepoId, pr: u64, id: &str) -> Result<Option<Session>, ChatStoreError> {
+        let _lock = self.lock(repo, pr)?;
         self.migrate_legacy(repo, pr)?;
-        let path = self.session_path(repo, pr, id);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Ok(None);
-        };
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|error| ChatStoreError::Malformed {
-                path: path.display().to_string(),
-                reason: error.to_string(),
-            })
+        self.load_unlocked(repo, pr, id)
     }
 
     fn latest(&self, repo: &RepoId, pr: u64) -> Result<Option<Session>, ChatStoreError> {
+        let _lock = self.lock(repo, pr)?;
         self.migrate_legacy(repo, pr)?;
         let Some(newest) = self.index(repo, pr).into_iter().next() else {
             return Ok(None);
         };
-        self.load(repo, pr, &newest.id)
+        self.load_unlocked(repo, pr, &newest.id)
     }
 
     fn put(&self, session: &Session) -> Result<(), ChatStoreError> {
@@ -488,6 +482,52 @@ impl ChatStorePort for FileChatStore {
     fn remove(&self, repo: &RepoId, pr: u64, id: &str) -> Result<(), ChatStoreError> {
         let _lock = self.lock(repo, pr)?;
         self.migrate_legacy(repo, pr)?;
+        self.remove_unlocked(repo, pr, id)
+    }
+
+    fn prune(&self, repo: &RepoId, pr: u64) -> Result<Pruned, ChatStoreError> {
+        let _lock = self.lock(repo, pr)?;
+        self.migrate_legacy(repo, pr)?;
+        let metas = self.index(repo, pr);
+        let doomed = sessions_to_prune(metas, MAX_SESSIONS_PER_PR);
+        let mut removed = Vec::new();
+        for id in doomed {
+            self.remove_unlocked(repo, pr, &id)?;
+            removed.push(id);
+        }
+        if !removed.is_empty() {
+            logging::log(
+                Level::Info,
+                format!("chat: pruned {} sessions for PR {pr}", removed.len()),
+            );
+        }
+        Ok(Pruned {
+            removed,
+            over_bytes: false,
+        })
+    }
+}
+
+impl FileChatStore {
+    fn load_unlocked(
+        &self,
+        repo: &RepoId,
+        pr: u64,
+        id: &str,
+    ) -> Result<Option<Session>, ChatStoreError> {
+        let path = self.session_path(repo, pr, id);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|error| ChatStoreError::Malformed {
+                path: path.display().to_string(),
+                reason: error.to_string(),
+            })
+    }
+
+    fn remove_unlocked(&self, repo: &RepoId, pr: u64, id: &str) -> Result<(), ChatStoreError> {
         let path = self.session_path(repo, pr, id);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|error| ChatStoreError::Io {
@@ -508,34 +548,6 @@ impl ChatStorePort for FileChatStore {
             action: "write the chat index".to_owned(),
             path: index_path.display().to_string(),
             cause: error.to_string(),
-        })
-    }
-
-    fn prune(&self, repo: &RepoId, pr: u64) -> Result<Pruned, ChatStoreError> {
-        self.migrate_legacy(repo, pr)?;
-        let metas = self.index(repo, pr);
-        let doomed = sessions_to_prune(metas.clone(), MAX_SESSIONS_PER_PR);
-        let mut removed = Vec::new();
-        for id in doomed {
-            // A session that is already gone is not a failure: the point is that it is
-            // not there.
-            match self.remove(repo, pr, &id) {
-                Ok(()) => removed.push(id),
-                Err(error) => {
-                    logging::log(Level::Warn, format!("chat: could not prune {id}: {error}"));
-                    return Err(error);
-                }
-            }
-        }
-        if !removed.is_empty() {
-            logging::log(
-                Level::Info,
-                format!("chat: pruned {} sessions for PR {pr}", removed.len()),
-            );
-        }
-        Ok(Pruned {
-            removed,
-            over_bytes: false,
         })
     }
 }

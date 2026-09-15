@@ -556,11 +556,12 @@ fn apply_analysis_effect(
             let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
                 return true;
             };
-            if let Err(error) = app.analysis_cache.put_plan(&repo, pr, plan) {
-                app.notice(
+            match app.analysis_cache.put_plan(&repo, pr, plan) {
+                Ok(saved) => app.set_plan(saved),
+                Err(error) => app.notice(
                     app::NoticeLevel::Warn,
                     format!("could not save the review order: {error}"),
-                );
+                ),
             }
         }
 
