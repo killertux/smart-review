@@ -214,7 +214,7 @@ impl Home {
              - `themes/` — your own themes; each file inherits from `base`.\n\
              - `cache/` — disposable: PR lists, details, analyses and chats.\n\
              - `drafts/` — staged reviews you have not published; not disposable.\n\
-             - `exports/` — chat transcripts you asked to keep (`:chat export`).\n\
+             - `exports/` — requested transcripts and private dry-run payloads.\n\
              - `worktrees/` — per-pull-request checkouts owned by the app.\n\
              - `logs/` — rotated logs; never contains secrets.\n\n\
              Root: {}\n",

@@ -146,7 +146,8 @@ impl Ports {
         let workspace_root = home.worktrees();
         // The dry-run gate is built once and cloned into every adapter: one gate, one
         // promise, and one list of calls to hand to the user (FR-6.5).
-        let ledger = crate::adapters::process::DryRunLedger::new();
+        let ledger =
+            crate::adapters::process::DryRunLedger::in_directory(home.exports().join("dry-run"));
         let runner = || {
             let runner = ProcessRunner::new();
             if dry_run {

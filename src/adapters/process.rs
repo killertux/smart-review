@@ -63,6 +63,7 @@ pub struct CommandSpec {
     timeout: Option<Duration>,
     cwd: Option<PathBuf>,
     mutating: bool,
+    sensitive_args: Vec<usize>,
 }
 
 impl CommandSpec {
@@ -74,12 +75,24 @@ impl CommandSpec {
             timeout: None,
             cwd: None,
             mutating: false,
+            sensitive_args: Vec::new(),
         }
     }
 
     /// Appends one argument.
     #[must_use]
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Appends an argument that must never be copied into diagnostics.
+    ///
+    /// The real argv and explicit dry-run record keep the value; ordinary logs and
+    /// errors replace it with `<redacted>` (FR-9.2, NFR-3.1).
+    #[must_use]
+    pub fn sensitive_arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.sensitive_args.push(self.args.len());
         self.args.push(arg.into());
         self
     }
@@ -149,6 +162,25 @@ impl CommandSpec {
     /// invocation never goes through a shell.
     #[must_use]
     pub fn render(&self) -> String {
+        self.render_with(|_, arg| arg.to_string_lossy())
+    }
+
+    /// A command description safe for ordinary logs and errors.
+    #[must_use]
+    pub fn diagnostic(&self) -> String {
+        self.render_with(|index, arg| {
+            if self.sensitive_args.contains(&index) {
+                std::borrow::Cow::Borrowed("<redacted>")
+            } else {
+                arg.to_string_lossy()
+            }
+        })
+    }
+
+    fn render_with<'a>(
+        &'a self,
+        display: impl Fn(usize, &'a std::ffi::OsStr) -> std::borrow::Cow<'a, str>,
+    ) -> String {
         let mut line = String::new();
         if let Some(dir) = &self.cwd {
             line.push_str("cd ");
@@ -156,9 +188,9 @@ impl CommandSpec {
             line.push_str(" && ");
         }
         line.push_str(&quote(&self.program.display().to_string()));
-        for arg in &self.args {
+        for (index, arg) in self.args.iter().enumerate() {
             line.push(' ');
-            line.push_str(&quote(&arg.to_string_lossy()));
+            line.push_str(&quote(&display(index, arg)));
         }
         line
     }
@@ -271,6 +303,7 @@ pub enum ProcessError {
 #[derive(Debug, Clone, Default)]
 pub struct DryRunLedger {
     calls: Arc<Mutex<Vec<String>>>,
+    artifact_dir: Option<Arc<PathBuf>>,
 }
 
 impl DryRunLedger {
@@ -278,6 +311,27 @@ impl DryRunLedger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A ledger whose replay payloads live in a private app-owned directory.
+    #[must_use]
+    pub fn in_directory(path: impl Into<PathBuf>) -> Self {
+        Self {
+            calls: Arc::default(),
+            artifact_dir: Some(Arc::new(path.into())),
+        }
+    }
+
+    /// A unique path for an exact dry-run payload.
+    #[must_use]
+    pub fn artifact_path(&self, stem: &str, extension: &str) -> Option<PathBuf> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = self.artifact_dir.as_ref()?;
+        let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(root.join(format!(
+            "{stem}-{}-{unique}.{extension}",
+            std::process::id()
+        )))
     }
 
     /// Records a call that was *not* run.
@@ -402,6 +456,14 @@ impl ProcessRunner {
         self.dry_run.as_ref()
     }
 
+    /// A private app-owned path for a replayable dry-run payload, when enabled.
+    #[must_use]
+    pub fn dry_run_artifact_path(&self, stem: &str, extension: &str) -> Option<PathBuf> {
+        self.dry_run
+            .as_ref()
+            .and_then(|ledger| ledger.artifact_path(stem, extension))
+    }
+
     /// Runs a command to completion.
     ///
     /// A non-zero exit is *not* an error here: the caller decides whether it
@@ -493,14 +555,14 @@ impl ProcessRunner {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ProcessError::Cancelled {
-                    command: spec.render(),
+                    command: spec.diagnostic(),
                 });
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ProcessError::Timeout {
-                    command: spec.render(),
+                    command: spec.diagnostic(),
                     timeout,
                 });
             }
@@ -533,8 +595,11 @@ impl ProcessRunner {
         if !spec.is_mutating() {
             return None;
         }
-        let command = ledger.record(spec);
-        logging::log(Level::Warn, format!("dry run, not running: {command}"));
+        let _command = ledger.record(spec);
+        logging::log(
+            Level::Warn,
+            format!("dry run, not running: {}", spec.diagnostic()),
+        );
         Some(Output {
             status: ExitStatus::default(),
             stdout: String::new(),
@@ -567,7 +632,7 @@ impl ProcessRunner {
             return Ok(output);
         }
         Err(ProcessError::Failed {
-            command: spec.render(),
+            command: spec.diagnostic(),
             code: output
                 .code()
                 .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
@@ -959,6 +1024,36 @@ mod tests {
         // A title full of shell metacharacters stays one quoted word.
         let hostile = CommandSpec::new("gh").arg("--title").arg("a; rm -rf ~ #");
         assert_eq!(hostile.render(), "gh --title 'a; rm -rf ~ #'");
+    }
+
+    #[test]
+    fn nfr_3_1_sensitive_arguments_are_absent_from_diagnostics_but_keep_exact_argv() {
+        let sentinel = "PRIVATE_REVIEW_BODY_SENTINEL";
+        let spec = CommandSpec::new("gh")
+            .args(["pr", "review", "141", "--body"])
+            .sensitive_arg(sentinel);
+
+        assert!(
+            spec.render().contains(sentinel),
+            "explicit replay stays exact"
+        );
+        assert!(!spec.diagnostic().contains(sentinel));
+        assert!(spec.diagnostic().contains("<redacted>"));
+        assert_eq!(spec.argv().last(), Some(&OsString::from(sentinel)));
+    }
+
+    #[test]
+    fn nfr_3_1_process_failures_use_the_redacted_command() {
+        let sentinel = "PRIVATE_FAILURE_BODY_SENTINEL";
+        let spec = CommandSpec::new("/bin/sh")
+            .args(["-c"])
+            .sensitive_arg("exit 9")
+            .sensitive_arg(sentinel);
+        let output = runner().run(&spec, &Cancel::new()).unwrap();
+        let error = ProcessRunner::require_success(&spec, output).unwrap_err();
+        let message = error.to_string();
+        assert!(!message.contains(sentinel), "{message}");
+        assert!(message.contains("<redacted>"), "{message}");
     }
 
     #[test]

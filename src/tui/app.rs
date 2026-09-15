@@ -3091,6 +3091,7 @@ impl App {
         Some(crate::application::analysis::Checkout {
             path: workspace.path.clone(),
             head_sha: workspace.head_sha.clone(),
+            base_sha: workspace.base_sha.clone(),
         })
     }
 
@@ -6332,6 +6333,7 @@ mod tests {
                 conventions: Vec::new(),
                 diff: None,
                 files: Vec::new(),
+                decisions: Vec::new(),
             },
             &crate::domain::context::BundlePolicy::default(),
         );
@@ -7021,6 +7023,7 @@ mod tests {
                 conventions: Vec::new(),
                 diff: None,
                 files: Vec::new(),
+                decisions: Vec::new(),
             },
             &crate::domain::context::BundlePolicy::default(),
         );

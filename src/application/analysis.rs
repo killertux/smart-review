@@ -570,6 +570,7 @@ mod tests {
     use crate::ports::analysis::{AnalysisCacheError, StoredAnalysis};
     use crate::test_support::{FakeClock, FakeLlm, sample_detail};
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
@@ -669,6 +670,7 @@ mod tests {
             checkout: Some(Checkout {
                 path: std::path::PathBuf::from("/tmp/ws"),
                 head_sha: "abc123".to_owned(),
+                base_sha: "base123".to_owned(),
             }),
             policy: BundlePolicy::default(),
         }
@@ -687,6 +689,9 @@ mod tests {
             workspace
                 .files
                 .insert(format!("abc123:{path}"), body.as_bytes().to_vec());
+            workspace
+                .files
+                .insert(format!("base123:{path}"), body.as_bytes().to_vec());
         }
         workspace
     }
@@ -859,6 +864,151 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_the_final_fake_provider_request_excludes_secret_diff_content() {
+        let mut request = request();
+        request.patch = Some(Box::new(crate::domain::diff::parse_patch(
+            "diff --git a/.env b/.env\n\
+             --- a/.env\n\
+             +++ b/.env\n\
+             @@ -1 +1 @@\n\
+             -PROTECTED_OLD_SENTINEL=one\n\
+             +PROTECTED_NEW_SENTINEL=two\n\
+             diff --git a/src/money.rs b/src/money.rs\n\
+             --- a/src/money.rs\n\
+             +++ b/src/money.rs\n\
+             @@ -1 +1 @@\n\
+             -fn old() {}\n\
+             +fn allowed_source_sentinel() {}\n",
+        )));
+        let workspace = workspace(&[
+            (".env", "PROTECTED_NEW_SENTINEL=two"),
+            ("src/money.rs", "fn allowed_source_sentinel() {}"),
+        ]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+        let cancel = Cancel::new();
+        let (bundle, _) = use_case.gather(&request, &cancel);
+        let mut handler = |_: Progress| {};
+        use_case
+            .run(&request, &bundle, &cancel, &mut handler)
+            .expect("the fake provider answers");
+
+        let prompts = llm.prompts.lock().expect("lock");
+        let sent = &prompts[0].1;
+        assert!(!sent.contains("PROTECTED_OLD_SENTINEL"), "{sent}");
+        assert!(!sent.contains("PROTECTED_NEW_SENTINEL"), "{sent}");
+        assert!(sent.contains("allowed_source_sentinel"), "{sent}");
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| line.contains("✗ .env"))
+        );
+    }
+
+    #[test]
+    fn fr_4_6_the_reduced_final_provider_request_preserves_exclusions() {
+        let mut patch_text = String::from(
+            "diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n\
+             -REDUCED_PROVIDER_OLD_SECRET\n+REDUCED_PROVIDER_NEW_SECRET\n\
+             diff --git a/src/money.rs b/src/money.rs\n--- a/src/money.rs\n+++ b/src/money.rs\n\
+             @@ -1,300 +1,300 @@\n",
+        );
+        for index in 0..149 {
+            let _ = writeln!(patch_text, " context before {index}");
+        }
+        patch_text.push_str("-fn old() {}\n+fn reduced_provider_allowed() {}\n");
+        for index in 0..149 {
+            let _ = writeln!(patch_text, " context after {index}");
+        }
+        let mut request = request();
+        request.patch = Some(Box::new(crate::domain::diff::parse_patch(&patch_text)));
+        request.policy.max_context_tokens = 1_000;
+        let workspace = workspace(&[
+            (".env", "REDUCED_PROVIDER_NEW_SECRET"),
+            ("src/money.rs", "fn reduced_provider_allowed() {}"),
+        ]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+        let cancel = Cancel::new();
+        let (bundle, _) = use_case.gather(&request, &cancel);
+        let mut handler = |_: Progress| {};
+        use_case
+            .run(&request, &bundle, &cancel, &mut handler)
+            .expect("the fake provider answers");
+
+        assert!(bundle.segments.iter().any(|segment| {
+            segment.kind == crate::domain::context::SegmentKind::Diff && segment.truncated
+        }));
+        let prompts = llm.prompts.lock().expect("lock");
+        let sent = &prompts[0].1;
+        assert!(!sent.contains("REDUCED_PROVIDER_OLD_SECRET"), "{sent}");
+        assert!(!sent.contains("REDUCED_PROVIDER_NEW_SECRET"), "{sent}");
+        assert!(sent.contains("reduced_provider_allowed"), "{sent}");
+    }
+
+    #[test]
+    fn fr_4_6_a_tracked_ignored_path_is_absent_from_bundle_and_inventory() {
+        let request = request();
+        let mut workspace = workspace(&[("src/money.rs", "IGNORED_TRACKED_SENTINEL")]);
+        workspace.ignored.push("src/money.rs".to_owned());
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+
+        let (bundle, _) = use_case.gather(&request, &Cancel::new());
+
+        assert!(!bundle.text.contains("IGNORED_TRACKED_SENTINEL"));
+        assert!(!bundle.text.contains("-old"), "the ignored diff is absent");
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| { line.contains("src/money.rs") && line.contains("ignore rules") })
+        );
+    }
+
+    #[test]
+    fn fr_4_6_a_base_only_ignore_rule_excludes_deleted_content() {
+        let mut request = request();
+        request.patch = Some(Box::new(crate::domain::diff::parse_patch(
+            "diff --git a/tracked.log b/tracked.log\n\
+             deleted file mode 100644\n\
+             --- a/tracked.log\n\
+             +++ /dev/null\n\
+             @@ -1 +0,0 @@\n\
+             -BASE_ONLY_IGNORED_SENTINEL\n",
+        )));
+        let mut workspace = workspace(&[("tracked.log", "BASE_ONLY_IGNORED_SENTINEL")]);
+        workspace
+            .ignored_at
+            .insert("base123".to_owned(), vec!["tracked.log".to_owned()]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let use_case = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+
+        let (bundle, _) = use_case.gather(&request, &Cancel::new());
+
+        assert!(!bundle.text.contains("BASE_ONLY_IGNORED_SENTINEL"));
+        assert!(
+            bundle
+                .inspection()
+                .iter()
+                .any(|line| { line.contains("tracked.log") && line.contains("ignore rules") })
+        );
+    }
+
+    #[test]
     fn without_a_workspace_the_bundle_says_so_instead_of_pretending() {
         let mut request = request();
         request.checkout = None;
@@ -904,8 +1054,12 @@ mod tests {
             "{:?}",
             bundle.segments
         );
-        // The diff is still there even when no file body could be read.
-        assert!(bundle.text.contains("-old"));
+        // Unknown bytes are fail-closed: without reading them the app cannot verify
+        // the size/binary policy that also governs their diff representation.
+        assert!(!bundle.text.contains("-old"));
+        assert!(bundle.inspection().iter().any(|line| {
+            line.contains("src/money.rs") && line.contains("diff content excluded")
+        }));
     }
 
     #[test]

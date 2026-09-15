@@ -11,7 +11,12 @@
 //! here knows whether the code came from a worktree or somewhere else — the caller
 //! says where to look.
 
-use crate::domain::context::{Bundle, BundleInputs, BundlePolicy, Segment, SegmentKind, build};
+use std::collections::BTreeSet;
+
+use crate::domain::context::{
+    Bundle, BundleInputs, BundlePolicy, Disposition, PathDecision, Segment, SegmentKind, build,
+    disposition,
+};
 use crate::domain::diff::Patch;
 use crate::domain::pr::PullRequestDetail;
 use crate::ports::Cancel;
@@ -31,6 +36,8 @@ pub struct Checkout {
     pub path: std::path::PathBuf,
     /// The commit to read from.
     pub head_sha: String,
+    /// The merge-base commit used by the review diff.
+    pub base_sha: String,
 }
 
 /// Everything a bundle is gathered from.
@@ -74,27 +81,22 @@ pub fn gather(
     source: &dyn ContextSource,
     cancel: &Cancel,
 ) -> Gathered {
-    let paths = source.changed_paths();
-    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-
-    if let Some(checkout) = source.checkout() {
-        for path in &paths {
-            match workspace.read_file(&checkout.path, &checkout.head_sha, path, cancel) {
-                Ok(bytes) => files.push((path.clone(), bytes)),
-                // A file that cannot be read is not a reason to fail the whole
-                // request: it is one elided file, and the bundle says so.
-                Err(error) => skipped.push(format!("{path}: {error}")),
-            }
-        }
-    }
+    let paths = candidate_paths(source);
+    let ignores = revision_ignores(workspace, source.checkout(), &paths, cancel);
+    let eligibility = ignores.eligibility(source.policy());
+    let head_eligibility = eligibility.head;
+    let ChangedContent {
+        files,
+        mut decisions,
+        skipped,
+    } = changed_content(workspace, source, &paths, eligibility, cancel);
 
     let (conventions, convention_label) = match source.checkout() {
         Some(checkout) => conventions(workspace, checkout, cancel),
         None => (Vec::new(), None),
     };
 
-    let mut notes = Vec::new();
+    let mut notes = ignores.notes();
     if source.checkout().is_none() {
         notes.push(
             "no local workspace: the changed files' contents are not in the bundle. \
@@ -122,6 +124,9 @@ pub fn gather(
 
     let metadata = crate::application::analysis::render_metadata(source.detail());
     let commits = crate::application::analysis::render_commits(source.detail());
+    for (label, bytes) in &conventions {
+        decisions.push(decide_path(label, Some(bytes), head_eligibility));
+    }
     let inputs = BundleInputs {
         metadata: &metadata,
         commits: &commits,
@@ -134,23 +139,18 @@ pub fn gather(
             .iter()
             .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
             .collect(),
+        decisions,
     };
     let mut bundle = build(&inputs, source.policy());
 
-    // The user's own additions, read from the same checkout. A path that cannot be
-    // read is reported exactly like a changed file that could not be read.
-    for path in source.added() {
-        let Some(checkout) = source.checkout() else {
-            notes.push(format!(
-                "could not add {path}: there is no local workspace to read it from"
-            ));
-            continue;
-        };
-        match workspace.read_file(&checkout.path, &checkout.head_sha, path, cancel) {
-            Ok(bytes) => bundle.push_user_file(path, &bytes, source.policy()),
-            Err(error) => notes.push(format!("could not add {path}: {error}")),
-        }
-    }
+    append_added_files(
+        workspace,
+        source,
+        head_eligibility,
+        cancel,
+        &mut bundle,
+        &mut notes,
+    );
 
     for note in notes {
         bundle.segments.push(Segment {
@@ -163,6 +163,292 @@ pub fn gather(
         });
     }
     Gathered { bundle, files }
+}
+
+#[derive(Clone, Copy)]
+struct Eligibility<'a> {
+    ignored: &'a BTreeSet<String>,
+    error: Option<&'a str>,
+    policy: &'a BundlePolicy,
+}
+
+#[derive(Clone, Copy)]
+struct RevisionEligibility<'a> {
+    base: Eligibility<'a>,
+    head: Eligibility<'a>,
+}
+
+#[derive(Default)]
+struct RevisionIgnores {
+    base: BTreeSet<String>,
+    head: BTreeSet<String>,
+    base_error: Option<String>,
+    head_error: Option<String>,
+}
+
+impl RevisionIgnores {
+    fn eligibility<'a>(&'a self, policy: &'a BundlePolicy) -> RevisionEligibility<'a> {
+        RevisionEligibility {
+            base: Eligibility {
+                ignored: &self.base,
+                error: self.base_error.as_deref(),
+                policy,
+            },
+            head: Eligibility {
+                ignored: &self.head,
+                error: self.head_error.as_deref(),
+                policy,
+            },
+        }
+    }
+
+    fn notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some(error) = &self.base_error {
+            notes.push(format!(
+                "repository ignore rules at the base revision could not be checked ({error}); affected content was not sent"
+            ));
+        }
+        if let Some(error) = &self.head_error {
+            notes.push(format!(
+                "repository ignore rules at the head revision could not be checked ({error}); affected content was not sent"
+            ));
+        }
+        notes
+    }
+}
+
+struct ChangedContent {
+    files: Vec<(String, Vec<u8>)>,
+    decisions: Vec<PathDecision>,
+    skipped: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ClassificationContext<'a> {
+    workspace: &'a dyn WorkspacePort,
+    checkout: &'a Checkout,
+    cancel: &'a Cancel,
+}
+
+fn changed_content(
+    workspace: &dyn WorkspacePort,
+    source: &dyn ContextSource,
+    paths: &[String],
+    eligibility: RevisionEligibility<'_>,
+    cancel: &Cancel,
+) -> ChangedContent {
+    let mut content = ChangedContent {
+        files: Vec::new(),
+        decisions: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let Some(checkout) = source.checkout() else {
+        content.decisions.extend(paths.iter().map(|path| {
+            PathDecision::omitted(
+                path,
+                "content eligibility cannot be verified without a local workspace",
+            )
+        }));
+        return content;
+    };
+    let classification = ClassificationContext {
+        workspace,
+        checkout,
+        cancel,
+    };
+    if let Some(patch) = source.patch() {
+        for file in &patch.files {
+            if let Some(path) = &file.old_path {
+                classify_representation(
+                    classification,
+                    eligibility.base,
+                    &path.to_string(),
+                    &checkout.base_sha,
+                    &mut content.decisions,
+                    &mut content.skipped,
+                );
+            }
+            if let Some(path) = &file.new_path {
+                let path = path.to_string();
+                let bytes = classify_representation(
+                    classification,
+                    eligibility.head,
+                    &path,
+                    &checkout.head_sha,
+                    &mut content.decisions,
+                    &mut content.skipped,
+                );
+                if let Some(bytes) = bytes {
+                    content.files.push((path, bytes));
+                }
+            }
+        }
+    } else {
+        for path in source.changed_paths() {
+            let bytes = classify_representation(
+                classification,
+                eligibility.head,
+                &path,
+                &checkout.head_sha,
+                &mut content.decisions,
+                &mut content.skipped,
+            );
+            if let Some(bytes) = bytes {
+                content.files.push((path, bytes));
+            }
+        }
+    }
+    content
+}
+
+fn append_added_files(
+    workspace: &dyn WorkspacePort,
+    source: &dyn ContextSource,
+    eligibility: Eligibility<'_>,
+    cancel: &Cancel,
+    bundle: &mut Bundle,
+    notes: &mut Vec<String>,
+) {
+    for path in source.added() {
+        let Some(checkout) = source.checkout() else {
+            notes.push(format!(
+                "could not add {path}: there is no local workspace to read it from"
+            ));
+            continue;
+        };
+        match workspace.read_file(&checkout.path, &checkout.head_sha, path, cancel) {
+            Ok(bytes) => bundle.push_user_file_with_decision(
+                path,
+                &bytes,
+                source.policy(),
+                Some(decide_path(path, Some(&bytes), eligibility)),
+            ),
+            Err(error) => notes.push(format!("could not add {path}: {error}")),
+        }
+    }
+}
+
+/// Every path whose content could enter the bundle, deduplicated for one ignore check.
+fn candidate_paths(source: &dyn ContextSource) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    if let Some(patch) = source.patch() {
+        for file in &patch.files {
+            paths.extend(file.old_path.iter().map(ToString::to_string));
+            paths.extend(file.new_path.iter().map(ToString::to_string));
+        }
+    } else {
+        paths.extend(source.changed_paths());
+    }
+    paths.extend(CONVENTION_FILES.iter().map(|path| (*path).to_owned()));
+    paths.extend(source.added().iter().cloned());
+    paths.into_iter().collect()
+}
+
+fn ignored_paths(
+    workspace: &dyn WorkspacePort,
+    checkout: Option<&Checkout>,
+    revision: Option<&str>,
+    paths: &[String],
+    cancel: &Cancel,
+) -> (BTreeSet<String>, Option<String>) {
+    let (Some(checkout), Some(revision)) = (checkout, revision) else {
+        return (BTreeSet::new(), None);
+    };
+    match workspace.ignored_paths(&checkout.path, revision, paths, cancel) {
+        Ok(paths) => (paths.into_iter().collect(), None),
+        Err(error) => (BTreeSet::new(), Some(error.to_string())),
+    }
+}
+
+fn revision_ignores(
+    workspace: &dyn WorkspacePort,
+    checkout: Option<&Checkout>,
+    paths: &[String],
+    cancel: &Cancel,
+) -> RevisionIgnores {
+    let Some(checkout) = checkout else {
+        return RevisionIgnores::default();
+    };
+    let (base, base_error) = ignored_paths(
+        workspace,
+        Some(checkout),
+        Some(&checkout.base_sha),
+        paths,
+        cancel,
+    );
+    let (head, head_error) = ignored_paths(
+        workspace,
+        Some(checkout),
+        Some(&checkout.head_sha),
+        paths,
+        cancel,
+    );
+    RevisionIgnores {
+        base,
+        head,
+        base_error,
+        head_error,
+    }
+}
+
+/// Reads and classifies exactly one old/new representation. A read failure is a
+/// fail-closed content decision: the diff still exists locally, but unknown bytes are
+/// not copied to a provider merely because their size/type could not be checked.
+fn classify_representation(
+    context: ClassificationContext<'_>,
+    eligibility: Eligibility<'_>,
+    path: &str,
+    revision: &str,
+    decisions: &mut Vec<PathDecision>,
+    skipped: &mut Vec<String>,
+) -> Option<Vec<u8>> {
+    if eligibility.error.is_some()
+        || eligibility.ignored.contains(path)
+        || crate::domain::context::is_secret_path(path)
+    {
+        decisions.push(decide_path(path, None, eligibility));
+        return None;
+    }
+    match context
+        .workspace
+        .read_file(&context.checkout.path, revision, path, context.cancel)
+    {
+        Ok(bytes) => {
+            decisions.push(decide_path(path, Some(&bytes), eligibility));
+            Some(bytes)
+        }
+        Err(error) => {
+            skipped.push(format!("{path} at {revision}: {error}"));
+            decisions.push(PathDecision::omitted(
+                path,
+                "content could not be read to verify its size and type",
+            ));
+            None
+        }
+    }
+}
+
+fn decide_path(path: &str, bytes: Option<&[u8]>, eligibility: Eligibility<'_>) -> PathDecision {
+    let disposition = if crate::domain::context::is_secret_path(path) {
+        disposition(path, &[], eligibility.policy)
+    } else if eligibility.error.is_some() {
+        Disposition::Omit {
+            reason: "repository ignore eligibility could not be verified".to_owned(),
+        }
+    } else if eligibility.ignored.contains(path) {
+        Disposition::Omit {
+            reason: "this path matches repository ignore rules, so it is never sent".to_owned(),
+        }
+    } else if let Some(bytes) = bytes {
+        disposition(path, bytes, eligibility.policy)
+    } else {
+        Disposition::Include
+    };
+    PathDecision {
+        path: path.to_owned(),
+        disposition,
+    }
 }
 
 /// Reads the first convention file that exists (FR-4.6).

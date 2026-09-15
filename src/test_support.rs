@@ -268,6 +268,10 @@ pub(crate) struct FakeWorkspace {
     pub(crate) files: BTreeMap<String, Vec<u8>>,
     /// The files `list_files` reports.
     pub(crate) tracked: Vec<String>,
+    /// Repository-relative paths matched by ignore rules.
+    pub(crate) ignored: Vec<String>,
+    /// Revision-specific ignore matches, keyed by commit SHA.
+    pub(crate) ignored_at: BTreeMap<String, Vec<String>>,
     /// Worktrees `list` reports.
     pub(crate) entries: Vec<crate::ports::workspace::WorkspaceEntry>,
     /// Calls that were made, for assertions about what the app asked for.
@@ -371,6 +375,27 @@ impl crate::ports::workspace::WorkspacePort for FakeWorkspace {
     ) -> Result<Vec<String>, crate::ports::workspace::WorkspaceError> {
         self.record("list_files");
         Ok(self.tracked.clone())
+    }
+
+    fn ignored_paths(
+        &self,
+        _repo: &Path,
+        rev: &str,
+        paths: &[String],
+        _cancel: &crate::ports::Cancel,
+    ) -> Result<Vec<String>, crate::ports::workspace::WorkspaceError> {
+        self.record("ignored_paths");
+        Ok(paths
+            .iter()
+            .filter(|path| {
+                self.ignored.contains(path)
+                    || self
+                        .ignored_at
+                        .get(rev)
+                        .is_some_and(|ignored| ignored.contains(path))
+            })
+            .cloned()
+            .collect())
     }
 
     fn list(

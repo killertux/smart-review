@@ -792,6 +792,82 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_6_ignore_rules_include_tracked_files_and_respect_nested_negation() {
+        let fixture = GitFixture::new();
+        fixture.commit(
+            ".gitignore",
+            "tracked.log\nsecrets/**\n!secrets/public.txt\n",
+            "add ignore rules",
+        );
+        std::fs::create_dir_all(fixture.clone.join("secrets")).expect("creates nested directory");
+        std::fs::write(fixture.clone.join("tracked.log"), "tracked but ignored")
+            .expect("writes ignored file");
+        std::fs::write(fixture.clone.join("secrets/private.txt"), "private")
+            .expect("writes private file");
+        std::fs::write(fixture.clone.join("secrets/public.txt"), "public")
+            .expect("writes negated file");
+        fixture.git(&["add", "-f", "--", "tracked.log", "secrets/private.txt"]);
+        fixture.git(&["add", "--", "secrets/public.txt"]);
+        fixture.git(&["commit", "--quiet", "-m", "track fixture files"]);
+        let git = adapter(&fixture, &fixture.path().join("worktrees"));
+        let candidates = vec![
+            "tracked.log".to_owned(),
+            "secrets/private.txt".to_owned(),
+            "secrets/public.txt".to_owned(),
+            "src/lib.rs".to_owned(),
+        ];
+
+        let ignored = git
+            .ignored_paths(
+                &fixture.clone,
+                &fixture.head_sha(),
+                &candidates,
+                &Cancel::new(),
+            )
+            .expect("ignore rules are evaluated");
+
+        assert!(ignored.contains(&"tracked.log".to_owned()), "{ignored:?}");
+        assert!(
+            ignored.contains(&"secrets/private.txt".to_owned()),
+            "{ignored:?}"
+        );
+        assert!(
+            !ignored.contains(&"secrets/public.txt".to_owned()),
+            "{ignored:?}"
+        );
+        assert!(!ignored.contains(&"src/lib.rs".to_owned()), "{ignored:?}");
+    }
+
+    #[test]
+    fn fr_4_6_ignore_rules_are_evaluated_at_the_represented_revision() {
+        let fixture = GitFixture::new();
+        fixture.commit(".gitignore", "tracked.log\n", "ignore the tracked fixture");
+        std::fs::write(
+            fixture.clone.join("tracked.log"),
+            "BASE_ONLY_IGNORE_SENTINEL",
+        )
+        .expect("writes tracked fixture");
+        fixture.git(&["add", "-f", "--", "tracked.log"]);
+        fixture.git(&["commit", "--quiet", "-m", "track ignored fixture"]);
+        let base = fixture.head_sha();
+        fixture.git(&["rm", "--quiet", ".gitignore"]);
+        fixture.git(&["commit", "--quiet", "-m", "remove ignore rule"]);
+        let head = fixture.head_sha();
+        let git = adapter(&fixture, &fixture.path().join("worktrees"));
+        let candidates = vec!["tracked.log".to_owned()];
+
+        let ignored_at_base = git
+            .ignored_paths(&fixture.clone, &base, &candidates, &Cancel::new())
+            .expect("base ignore rules are evaluated");
+        let ignored_at_head = git
+            .ignored_paths(&fixture.clone, &head, &candidates, &Cancel::new())
+            .expect("head ignore rules are evaluated");
+
+        assert_eq!(ignored_at_base, candidates);
+        assert!(ignored_at_head.is_empty(), "{ignored_at_head:?}");
+    }
+
+    #[test]
     fn managed_worktrees_are_listed_and_removed() {
         let (fixture, _base, head) = fixture();
         let root = fixture.path().join("worktrees");

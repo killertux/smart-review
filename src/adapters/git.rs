@@ -12,14 +12,33 @@
 mod worktree;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapters::process::{CommandSpec, ProcessError, ProcessRunner};
+use crate::domain::diff::RelPath;
 use crate::logging::{self, Level};
 use crate::ports::Cancel;
 use crate::ports::workspace::{
     DiffRequest, Remote, RepoInfo, Workspace, WorkspaceEntry, WorkspaceError, WorkspacePort,
     WorkspaceRequest,
 };
+
+/// Distinguishes concurrent revision ignore checks in this process.
+static IGNORE_TREE_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A private, app-owned view containing only one revision's `.gitignore` files.
+///
+/// It is not a git worktree and has no repository metadata to clean up. Removing the
+/// directory on drop also covers cancellation and command failures.
+struct TemporaryIgnoreTree {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryIgnoreTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
 
 /// Runs `git` in a directory.
 #[derive(Debug, Clone)]
@@ -113,6 +132,135 @@ impl GitCli {
             Err(error) => Err(WorkspaceError::Failed(error.to_string())),
         }
     }
+
+    /// Materialises only the tracked `.gitignore` files from `rev` into a private
+    /// temporary work tree. `git check-ignore` can then apply Git's own matching
+    /// semantics without consulting the head checkout's rules for an old path.
+    fn ignore_tree(
+        &self,
+        repo: &Path,
+        rev: &str,
+        cancel: &Cancel,
+    ) -> Result<TemporaryIgnoreTree, WorkspaceError> {
+        let root = self.worktrees_root()?.join(".ignore-rules");
+        create_private_dir(&root)?;
+        let id = IGNORE_TREE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!("{}-{id}", std::process::id()));
+        create_private_dir(&path)?;
+        let tree = TemporaryIgnoreTree { path };
+
+        let command = CommandSpec::new(&self.program)
+            .args(["ls-tree", "-r", "-z", rev])
+            .current_dir(repo);
+        let output = self
+            .runner
+            .run(&command, cancel)
+            .map_err(ProcessError::into_workspace)?;
+        if !output.success() {
+            return Err(WorkspaceError::Failed(format!(
+                "could not list ignore rules at {rev}: {}",
+                output.stderr_tail()
+            )));
+        }
+        if output.stdout_truncated {
+            return Err(WorkspaceError::Failed(format!(
+                "could not list ignore rules at {rev}: the repository tree exceeded the output limit"
+            )));
+        }
+
+        for rule_path in ignore_rule_paths(&output.stdout_bytes)? {
+            let object = format!("{rev}:{rule_path}");
+            let command = CommandSpec::new(&self.program)
+                .args(["show", &object])
+                .current_dir(repo);
+            let output = self
+                .runner
+                .run(&command, cancel)
+                .map_err(ProcessError::into_workspace)?;
+            if !output.success() || output.stdout_truncated {
+                return Err(WorkspaceError::Failed(format!(
+                    "could not read ignore rule {rule_path} at {rev}: {}",
+                    output.stderr_tail()
+                )));
+            }
+            let destination = tree.path.join(&rule_path);
+            if let Some(parent) = destination.parent() {
+                create_private_dir(parent)?;
+            }
+            std::fs::write(&destination, output.stdout_bytes).map_err(|error| {
+                WorkspaceError::Failed(format!(
+                    "could not prepare ignore rule {rule_path} at {rev}: {error}"
+                ))
+            })?;
+        }
+        Ok(tree)
+    }
+}
+
+/// Parses `git ls-tree -r -z`, returning regular files named `.gitignore`.
+/// Symlinks are skipped because Git deliberately does not follow them for ignore rules.
+fn ignore_rule_paths(bytes: &[u8]) -> Result<Vec<String>, WorkspaceError> {
+    let mut paths = Vec::new();
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(WorkspaceError::Failed(
+                "could not parse the repository tree while checking ignore rules".to_owned(),
+            ));
+        };
+        let metadata = std::str::from_utf8(&record[..tab]).map_err(|error| {
+            WorkspaceError::Failed(format!(
+                "could not parse repository tree metadata while checking ignore rules: {error}"
+            ))
+        })?;
+        let mut fields = metadata.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        if kind != "blob" || !matches!(mode, "100644" | "100755") {
+            continue;
+        }
+        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|error| {
+            WorkspaceError::Failed(format!(
+                "a non-UTF-8 path prevents repository ignore rules from being checked: {error}"
+            ))
+        })?;
+        if path == ".gitignore" || path.ends_with("/.gitignore") {
+            let path = RelPath::parse(path).ok_or_else(|| {
+                WorkspaceError::Failed(
+                    "an invalid repository path prevents ignore rules from being checked"
+                        .to_owned(),
+                )
+            })?;
+            paths.push(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
+fn create_private_dir(path: &Path) -> Result<(), WorkspaceError> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        WorkspaceError::Failed(format!("could not create {}: {error}", path.display()))
+    })?;
+    set_private_dir_mode(path)
+}
+
+#[cfg(unix)]
+fn set_private_dir_mode(path: &Path) -> Result<(), WorkspaceError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
+        WorkspaceError::Failed(format!(
+            "could not restrict permissions on {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_mode(_path: &Path) -> Result<(), WorkspaceError> {
+    Ok(())
 }
 
 impl GitCli {
@@ -263,6 +411,41 @@ impl WorkspacePort for GitCli {
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
             .collect())
+    }
+
+    fn ignored_paths(
+        &self,
+        repo: &Path,
+        rev: &str,
+        paths: &[String],
+        cancel: &Cancel,
+    ) -> std::result::Result<Vec<String>, WorkspaceError> {
+        // `--no-index` is essential: without it git suppresses tracked files from
+        // `check-ignore`, which would make committing a secret disable the guardrail.
+        // One quiet call per path avoids parsing git's quoted pathname output. IR-17
+        // owns batching this IO after measuring it; correctness comes first here.
+        let tree = self.ignore_tree(repo, rev, cancel)?;
+        let work_tree = format!("--work-tree={}", tree.path.to_string_lossy());
+        let mut ignored = Vec::new();
+        for path in paths {
+            let command = CommandSpec::new(&self.program)
+                .args([&work_tree, "check-ignore", "--quiet", "--no-index", "--"])
+                .arg(path)
+                .current_dir(repo);
+            let output = self
+                .runner
+                .run(&command, cancel)
+                .map_err(ProcessError::into_workspace)?;
+            if output.success() {
+                ignored.push(path.clone());
+            } else if output.code() != Some(1) {
+                return Err(WorkspaceError::Failed(format!(
+                    "could not evaluate repository ignore rules: {}",
+                    output.stderr_tail()
+                )));
+            }
+        }
+        Ok(ignored)
     }
 
     fn list(&self) -> std::result::Result<Vec<WorkspaceEntry>, WorkspaceError> {

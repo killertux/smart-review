@@ -238,6 +238,15 @@ Acceptance criteria:
 - [ ] Total context is capped by `max_context_tokens` (default 100k) with a documented truncation order: per-file elision → diff context reduction → oldest chat turns dropped.
 - [ ] Token/byte estimate is shown before the first send for a given PR, with a one-time opt-in notice per repository.
 
+*Implementation note (IR-01):* one path decision governs every representation of a
+changed file: full bodies and diff hunks, including deleted content and both names of a
+rename. Tracked paths are still checked against repository ignore rules (`git
+check-ignore --no-index`), using the base revision's rules for old paths and the head
+revision's rules for new paths. If eligibility or file bytes cannot be checked, source
+content is fail-closed and `:context` states why. This is a pathname/file policy, not a
+generic secret scanner: PR metadata, commit messages and the user's own question are
+ordinary prose and are shown in the pre-send context rather than heuristically edited.
+
 **FR-4.7 Model catalog** — MUST — M2 — *DEC-6 `[DECIDED]`: catalog sourced from models.dev*
 The provider and model lists MUST be sourced from `https://models.dev/api.json` and cached locally, so the picker is data-driven rather than a hand-maintained list.
 Acceptance criteria:
@@ -492,6 +501,12 @@ No IO/network/parse failure may panic or corrupt the terminal. Errors surface as
 
 **FR-9.2 Logging** — MUST — M0
 Structured logs to `<root>/logs/`, level from `--log-level`/`RUST_LOG`/config. Never log API keys, tokens, full request bodies, or file contents. `:doctor` reports the log path and the last N warnings.
+
+*Implementation note (IR-01):* GitHub review, reply and conversation bodies are passed
+to `gh` through private `0600` payload files, not argv. Ordinary diagnostics identify
+the operation, repository/PR and outcome and may name the payload path, but never copy
+its contents. An explicit dry run retains its exact payload under
+`exports/dry-run/` so the command in `logs/dry-run.log` remains replayable.
 
 **FR-9.3 `smart-review doctor`** — MUST — M1
 Prints a checklist: git version, repo detection, remote detection, `gh` presence/version/auth/scopes, config/keybind/theme parse status, cache and log paths, workspace mode and writability, LLM profiles and key presence (presence only, never the value), terminal and locale info. Exit code 0 = ready, 1 = degraded, 2 = unusable.
