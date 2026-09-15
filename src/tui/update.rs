@@ -1199,15 +1199,20 @@ fn model_command(app: &mut App, argument: &str) -> Effect {
                 app.notice(
                     NoticeLevel::Info,
                     format!(
-                        "{} · {} · base {} · key from {} · thinking {} · input {} · output {} · temperature {}",
+                        "{} · {} · base {} · key from {} · thinking {} · input effective {}/configured {}/window {} · output effective {}/configured {}/catalog {} · temperature effective {}/configured {}",
                         resolved.label(),
                         resolved.route_label(),
                         resolved.base_url.as_deref().unwrap_or("provider default"),
                         source,
                         resolved.thinking_label(),
                         resolved.settings.input_tokens,
+                        resolved.settings.configured_input_tokens,
+                        resolved.settings.model_window.map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string()),
                         resolved.settings.max_tokens.map_or_else(|| "provider default".to_owned(), |tokens| tokens.to_string()),
-                        resolved.settings.temperature.map_or_else(|| "provider default".to_owned(), |value| value.to_string())
+                        resolved.settings.configured_max_tokens.map_or_else(|| "provider default".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.catalog_output_tokens.map_or_else(|| "unknown".to_owned(), |tokens| tokens.to_string()),
+                        resolved.settings.temperature.map_or_else(|| "provider default".to_owned(), |value| value.to_string()),
+                        resolved.settings.configured_temperature.map_or_else(|| "provider default".to_owned(), |value| value.to_string())
                     ),
                 );
             } else {

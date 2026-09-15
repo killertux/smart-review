@@ -1482,6 +1482,7 @@ impl App {
                 .map(|view| Box::new(view.patch.clone())),
             checkout: self.checkout(),
             policy,
+            input_budget_tokens: resolved.settings.input_tokens,
             added: self.chat.added.clone(),
             cost: model.and_then(|model| model.cost.clone()),
         };
@@ -2434,7 +2435,7 @@ impl App {
         // The confirmation is where the estimate is shown, because it is the only place
         // the size of the request is known before something is paid for (FR-4.6).
         if self.chat.is_confirming() {
-            self.show_chat_estimate(&session);
+            self.show_chat_estimate(&session, &question);
             return None;
         }
         // Already agreed: the question goes now, with the bundle that was just gathered.
@@ -2444,14 +2445,14 @@ impl App {
 
     /// Shows what a question would send, and asks for the key press that agrees to it
     /// (FR-4.6).
-    fn show_chat_estimate(&mut self, session: &crate::domain::chat::Session) {
+    fn show_chat_estimate(&mut self, session: &crate::domain::chat::Session, question: &str) {
         let Some((spec, _)) = self.chat_request() else {
             return;
         };
         let Some(bundle) = self.chat_bundle.as_deref() else {
             return;
         };
-        let estimate = crate::application::chat::estimate_of(&spec, session, bundle);
+        let estimate = crate::application::chat::estimate_of(&spec, session, bundle, question);
         let summary = bundle.summary();
         self.chat.set_estimate(estimate);
         self.chat.open = true;
@@ -3069,6 +3070,7 @@ impl App {
                 .map(|view| Box::new(view.patch.clone())),
             checkout: self.checkout(),
             policy,
+            input_budget_tokens: resolved.settings.input_tokens,
         })
     }
 
@@ -4496,11 +4498,19 @@ impl App {
     #[must_use]
     pub fn picker_selection(&self) -> Option<ModelSelection> {
         let picker = self.picker.as_ref()?;
+        let provider = picker.provider()?.to_owned();
+        let model = picker.model()?.to_owned();
+        let existing = self
+            .config
+            .llm
+            .active
+            .as_ref()
+            .filter(|active| active.provider == provider && active.model == model);
         Some(ModelSelection {
-            provider: picker.provider()?.to_owned(),
-            model: picker.model()?.to_owned(),
-            temperature: None,
-            max_tokens: None,
+            provider,
+            model,
+            temperature: existing.and_then(|active| active.temperature),
+            max_tokens: existing.and_then(|active| active.max_tokens),
             reasoning: picker.thinking().cloned(),
         })
     }
@@ -4619,28 +4629,34 @@ impl App {
             // `Esc` walks back a step, and closes the picker from the first step:
             // that is "back out without changing anything" (FR-4.5).
             KeyCode::Esc => close = !picker.step_back(),
-            KeyCode::Enter => match picker.advance() {
-                // Nothing to do for either: the picker has already moved, or has put
-                // the reason on screen itself.
-                model_picker::PickerStep::Moved | model_picker::PickerStep::Refused(_) => {}
-                model_picker::PickerStep::KeyTyped { provider, key } => {
-                    effect = Effect::SaveKey { provider, key };
-                }
-                model_picker::PickerStep::Commit {
-                    provider,
-                    model,
-                    thinking,
-                } => {
-                    let selection = ModelSelection {
+            KeyCode::Enter => {
+                match picker.advance() {
+                    // Nothing to do for either: the picker has already moved, or has put
+                    // the reason on screen itself.
+                    model_picker::PickerStep::Moved | model_picker::PickerStep::Refused(_) => {}
+                    model_picker::PickerStep::KeyTyped { provider, key } => {
+                        effect = Effect::SaveKey { provider, key };
+                    }
+                    model_picker::PickerStep::Commit {
                         provider,
                         model,
-                        temperature: None,
-                        max_tokens: None,
-                        reasoning: thinking,
-                    };
-                    effect = Effect::SaveSelection(Box::new(selection));
+                        thinking,
+                    } => {
+                        let existing =
+                            self.config.llm.active.as_ref().filter(|active| {
+                                active.provider == provider && active.model == model
+                            });
+                        let selection = ModelSelection {
+                            provider,
+                            model,
+                            temperature: existing.and_then(|active| active.temperature),
+                            max_tokens: existing.and_then(|active| active.max_tokens),
+                            reasoning: thinking,
+                        };
+                        effect = Effect::SaveSelection(Box::new(selection));
+                    }
                 }
-            },
+            }
             KeyCode::Up => picker.move_cursor(-1),
             KeyCode::Down => picker.move_cursor(1),
             KeyCode::Char('p') if combo.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -6275,9 +6291,13 @@ mod tests {
             from_file: true,
             thinking: None,
             settings: crate::application::models::EffectiveRequestSettings {
+                configured_temperature: None,
                 temperature: None,
                 max_tokens: None,
+                configured_max_tokens: None,
+                catalog_output_tokens: None,
                 input_tokens: 100_000,
+                configured_input_tokens: 100_000,
                 model_window: None,
             },
             warnings: Vec::new(),

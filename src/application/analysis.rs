@@ -78,6 +78,8 @@ pub struct AnalysisRequest {
     pub checkout: Option<Checkout>,
     /// The bundle budget (FR-4.6).
     pub policy: BundlePolicy,
+    /// Full input allowance, distinct from the source bundle's reduced allowance.
+    pub input_budget_tokens: u32,
 }
 
 impl AnalysisRequest {
@@ -234,6 +236,7 @@ impl<'a> Analyst<'a> {
             .map(|segment| segment.label.clone());
         let system = system_prompt(conventions.as_deref());
         let prompt = user_prompt(&bundle.text);
+        validate_input_budget(request, &system, &prompt)?;
         let index = request
             .patch
             .as_deref()
@@ -268,6 +271,7 @@ impl<'a> Analyst<'a> {
                 progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let previous = first.text.clone();
                 let repair = repair_prompt(&previous, &failure);
+                validate_input_budget(request, &system, &repair)?;
                 // A failed repair attempt still leaves the first answer to show, with
                 // the first failure's reason: the user has text to read either way,
                 // which is what FR-4.1 asks for.
@@ -426,6 +430,25 @@ impl<'a> Analyst<'a> {
                 && entry.key.prompt_version == key.prompt_version
         }))
     }
+}
+
+/// Refuses a final serialized request that cannot fit the selected input allowance.
+fn validate_input_budget(
+    request: &AnalysisRequest,
+    system: &str,
+    prompt: &str,
+) -> Result<(), LlmError> {
+    let bytes = system.len().saturating_add(prompt.len());
+    if bytes
+        <= (request.input_budget_tokens as usize)
+            .saturating_mul(crate::domain::context::BYTES_PER_TOKEN)
+    {
+        return Ok(());
+    }
+    Err(LlmError::Request {
+        provider: request.chat.provider.clone(),
+        reason: "the analysis prompt exceeds the configured input limit; widen the limit or reduce :context".to_owned(),
+    })
 }
 
 /// One provider answer.
@@ -706,6 +729,7 @@ mod tests {
                 base_sha: "base123".to_owned(),
             }),
             policy: BundlePolicy::default(),
+            input_budget_tokens: 100_000,
         }
     }
 

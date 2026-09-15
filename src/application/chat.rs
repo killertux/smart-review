@@ -107,6 +107,8 @@ pub struct ChatSpec {
     pub checkout: Option<context::Checkout>,
     /// The bundle budget (FR-4.6).
     pub policy: BundlePolicy,
+    /// Full input allowance, separate from the source-bundle policy.
+    pub input_budget_tokens: u32,
     /// Files the user added with `:context add` (FR-5.3).
     pub added: Vec<String>,
     /// What the catalog says this model costs, for the per-session estimate (FR-5.4).
@@ -223,7 +225,7 @@ impl<'a> Chatter<'a> {
         progress: &mut ProgressHandler<'_>,
     ) -> Result<ChatRun, LlmError> {
         let system = system_prompt(&bundle.text);
-        if system.len().saturating_add(question.len()) > spec.policy.max_bytes() {
+        if system.len().saturating_add(question.len()) > input_budget_bytes(spec) {
             return Err(LlmError::Request {
                 provider: spec.chat.provider.clone(),
                 reason: "the context and question exceed the configured input limit; reduce :context or shorten the question".to_owned(),
@@ -313,9 +315,7 @@ fn history_plan_that_fits(
     system: &str,
     question: &str,
 ) -> HistoryPlan {
-    let budget_bytes = spec
-        .policy
-        .max_bytes()
+    let budget_bytes = input_budget_bytes(spec)
         .saturating_sub(system.len())
         .saturating_sub(question.len());
     let (messages, dropped) = replayable_history(session, budget_bytes, 0);
@@ -368,11 +368,16 @@ impl Estimate {
 /// returned a bundle and before anything is sent: the estimate is what the user is
 /// shown to agree to, so it goes through the same prompt assembly the request will.
 #[must_use]
-pub fn estimate_of(spec: &ChatSpec, session: &Session, bundle: &Bundle) -> Estimate {
+pub fn estimate_of(
+    spec: &ChatSpec,
+    session: &Session,
+    bundle: &Bundle,
+    question: &str,
+) -> Estimate {
     let system = system_prompt(&bundle.text);
-    let plan = history_plan_that_fits(session, spec, &system, "");
+    let plan = history_plan_that_fits(session, spec, &system, question);
     let history_bytes: usize = plan.messages.iter().map(|message| message.text.len()).sum();
-    let total = system.len() + history_bytes;
+    let total = system.len() + question.len() + history_bytes;
     Estimate {
         context_bytes: bundle.bytes(),
         history_bytes,
@@ -380,6 +385,10 @@ pub fn estimate_of(spec: &ChatSpec, session: &Session, bundle: &Bundle) -> Estim
         estimated_tokens: estimate_tokens(total),
         history: plan,
     }
+}
+
+fn input_budget_bytes(spec: &ChatSpec) -> usize {
+    (spec.input_budget_tokens as usize).saturating_mul(crate::domain::context::BYTES_PER_TOKEN)
 }
 
 /// The byte budget for the conversation, from the bundle's token budget (FR-4.6).
@@ -522,6 +531,7 @@ mod tests {
                 base_sha: "base123".to_owned(),
             }),
             policy: BundlePolicy::default(),
+            input_budget_tokens: 100_000,
             added: Vec::new(),
             cost: None,
         }

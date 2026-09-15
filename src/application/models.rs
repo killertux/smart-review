@@ -239,12 +239,20 @@ pub struct ResolvedSelection {
 /// can only reduce it (FR-4.5–FR-4.8, FR-5.4).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveRequestSettings {
+    /// User-configured temperature, before capability validation.
+    pub configured_temperature: Option<f32>,
     /// Sampling temperature, when the selected model explicitly supports it.
     pub temperature: Option<f32>,
     /// Maximum completion tokens requested from the provider.
     pub max_tokens: Option<u32>,
+    /// User-configured output ceiling, before catalog capping.
+    pub configured_max_tokens: Option<u32>,
+    /// Catalog output cap, when published.
+    pub catalog_output_tokens: Option<u32>,
     /// The input window left after reserving the requested output.
     pub input_tokens: u32,
+    /// User-configured input ceiling.
+    pub configured_input_tokens: u32,
     /// The catalog's combined context window, when known.
     pub model_window: Option<u32>,
 }
@@ -270,8 +278,12 @@ impl EffectiveRequestSettings {
         });
         Self {
             temperature: selection.temperature,
+            configured_temperature: selection.temperature,
             max_tokens,
+            configured_max_tokens: selection.max_tokens,
+            catalog_output_tokens: model.output_limit(),
             input_tokens,
+            configured_input_tokens: configured_input,
             model_window: model.context_limit(),
         }
     }
@@ -390,26 +402,21 @@ pub fn resolve_selection_with_input(
         .route()
         .ok_or_else(|| SelectionError::Unreachable(selection.provider.clone()))?;
 
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let thinking = match &selection.reasoning {
         None => None,
-        Some(setting) => match setting.request(model) {
-            Ok(mapped) => Some(mapped),
-            Err(error) => {
-                warnings.push(format!("{error}; thinking is disabled for this request"));
-                None
-            }
-        },
+        Some(setting) => Some(
+            setting
+                .request(model)
+                .map_err(|error| SelectionError::Thinking(error.to_string()))?,
+        ),
     };
-    let temperature = if selection.temperature.is_some() && !model.temperature {
-        warnings.push(format!(
-            "{} does not support temperature; provider default will be used",
+    if selection.temperature.is_some() && !model.temperature {
+        return Err(SelectionError::Temperature(format!(
+            "{} does not support temperature; remove it in :model",
             model.label()
-        ));
-        None
-    } else {
-        selection.temperature
-    };
+        )));
+    }
 
     let env_var = provider.env_var().map(str::to_owned);
     let status = secrets
@@ -418,8 +425,7 @@ pub fn resolve_selection_with_input(
     let Some(key) = status else {
         return Err(SelectionError::MissingKey(selection.provider.clone()));
     };
-    let mut settings = EffectiveRequestSettings::for_model(model, selection, configured_input);
-    settings.temperature = temperature;
+    let settings = EffectiveRequestSettings::for_model(model, selection, configured_input);
     Ok(ResolvedSelection {
         provider: provider.id.clone(),
         model: model.id.clone(),
@@ -857,23 +863,15 @@ mod tests {
     }
 
     #[test]
-    fn ir_03_an_unsupported_stored_thinking_setting_is_disabled_explicitly() {
+    fn ir_03_an_unsupported_stored_thinking_setting_refuses_selection() {
         let catalog = catalog();
         let secrets = FakeSecrets::with_key("deepseek", "sk");
         let mut stored = selection("deepseek", "deepseek-v4-pro");
         stored.reasoning = Some(Thinking::Effort {
             value: "max".to_owned(),
         });
-        let resolved =
-            resolve_selection(&catalog, &stored, &secrets).expect("selection remains usable");
-        assert!(resolved.thinking.is_none());
-        assert_eq!(resolved.thinking_label(), "off");
-        assert!(
-            resolved
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("disabled"))
-        );
+        let error = resolve_selection(&catalog, &stored, &secrets).expect_err("not downgraded");
+        assert!(matches!(error, SelectionError::Thinking(_)), "{error:?}");
     }
 
     #[test]
@@ -926,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_03_temperature_is_sent_when_supported_and_disclosed_when_not() {
+    fn ir_03_temperature_is_sent_when_supported_and_refused_when_not() {
         let supported = CatalogModel {
             temperature: true,
             ..CatalogModel::default()
@@ -942,16 +940,9 @@ mod tests {
             r#"{"provider":{"api":"https://provider.test/v1","models":{"model":{"id":"model","temperature":false}}}}"#,
         )
         .expect("catalog");
-        let resolved =
-            resolve_selection(&catalog, &stored, &FakeSecrets::with_key("provider", "key"))
-                .expect("the actual provider default is disclosed");
-        assert_eq!(resolved.settings.temperature, None);
-        assert!(
-            resolved
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("provider default"))
-        );
+        let error = resolve_selection(&catalog, &stored, &FakeSecrets::with_key("provider", "key"))
+            .expect_err("unsupported temperature is refused");
+        assert!(matches!(error, SelectionError::Temperature(_)), "{error:?}");
     }
 
     #[test]
