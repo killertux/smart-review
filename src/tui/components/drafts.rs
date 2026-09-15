@@ -552,6 +552,7 @@ mod tests {
             side: crate::domain::draft::Side::Old,
             line: 31,
             start_line: Some(28),
+            head_sha: None,
         }));
         composer.input.insert_str("this whole block");
         let text = flatten(&composer_lines(&composer, &Theme::default(), 100));

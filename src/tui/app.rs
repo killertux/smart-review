@@ -1107,6 +1107,12 @@ impl App {
     pub fn open_review(&mut self, detail: PullRequestDetail, view: DiffView) {
         let opening = self.review.is_none();
         let mut view = view;
+        if view.head_sha.is_none() {
+            // Direct callers (notably deterministic UI tests) may build a view without
+            // the job's revision snapshot. The detail is safe only while opening this
+            // view; later detail refreshes leave an already-applied view unchanged.
+            view.set_head_sha(detail.summary.head_sha.clone());
+        }
         // FR-6.4: what GitHub already says about these lines, drawn under them. Set
         // here rather than in the caller because this is the one place where the detail
         // and the diff are both in hand.
@@ -1240,9 +1246,11 @@ impl App {
                 self.apply_detail(*outcome);
                 Some(Effect::ReloadDiff)
             }
-            Outcome::Patch { outcome, source } if job == self.patch_job => {
-                Some(self.apply_patch(*outcome, source))
-            }
+            Outcome::Patch {
+                outcome,
+                source,
+                head_sha,
+            } if job == self.patch_job => Some(self.apply_patch(*outcome, source, head_sha)),
             Outcome::Catalog(load) if job == self.catalog_job => {
                 self.apply_catalog(*load);
                 None
@@ -1664,17 +1672,22 @@ impl App {
         // A context line exists on both sides; an addition only on the new one and a
         // deletion only on the old one. The side with a number is the side the comment
         // can be anchored to, which is also the side GitHub will check.
+        let head_sha = view.head_sha.clone();
         match (row.new_line, row.old_line) {
-            (Some(line), _) => Some(crate::tui::drafts::Anchor::line(
+            (Some(line), _) => Some(crate::tui::drafts::Anchor {
                 path,
-                crate::domain::draft::Side::New,
+                side: crate::domain::draft::Side::New,
                 line,
-            )),
-            (None, Some(line)) => Some(crate::tui::drafts::Anchor::line(
+                start_line: None,
+                head_sha,
+            }),
+            (None, Some(line)) => Some(crate::tui::drafts::Anchor {
                 path,
-                crate::domain::draft::Side::Old,
+                side: crate::domain::draft::Side::Old,
                 line,
-            )),
+                start_line: None,
+                head_sha,
+            }),
             (None, None) => None,
         }
     }
@@ -1703,7 +1716,12 @@ impl App {
             }
             None => self.drafts.compose(anchor),
         }
-        let head = self.open_head_sha().map(str::to_owned);
+        let head = self
+            .drafts
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.anchor())
+            .and_then(|anchor| anchor.head_sha.clone());
         if let Some(composer) = self.drafts.composer.as_mut() {
             composer.capture_head(head);
         }
@@ -2007,12 +2025,28 @@ impl App {
             .as_ref()
             .and_then(|composer| composer.head_sha.as_deref());
         if !matches!(
-            (composer_head, self.open_head_sha()),
+            (composer_head, self.review.as_ref().and_then(|view| view.head_sha.as_deref())),
             (Some(composer_head), Some(current_head)) if composer_head == current_head
         ) {
             if let Some(composer) = self.drafts.composer.as_mut() {
                 composer.refusal = Some(
                     "this comment's target is unavailable or no longer on the current revision; recreate it before staging"
+                        .to_owned(),
+                );
+            }
+            return Effect::None;
+        }
+        let target_is_visible = self.drafts.composer.as_ref().is_some_and(|composer| {
+            composer.anchor().is_some_and(|anchor| {
+                self.review
+                    .as_ref()
+                    .is_some_and(|view| view.contains_anchor(anchor))
+            })
+        });
+        if !target_is_visible {
+            if let Some(composer) = self.drafts.composer.as_mut() {
+                composer.refusal = Some(
+                    "this comment's target is no longer in the displayed diff; recreate it before staging"
                         .to_owned(),
                 );
             }
@@ -3510,15 +3544,17 @@ impl App {
         &mut self,
         outcome: FetchOutcome<crate::domain::diff::Patch>,
         source: DiffSource,
+        head_sha: String,
     ) -> Effect {
         self.diff_source = source;
         self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
         let patch = outcome.into_value();
-        let view = DiffView::with_options(
+        let mut view = DiffView::with_options(
             patch,
             self.config.review.context_lines,
             self.config.review.ignore_whitespace,
         );
+        view.set_head_sha(head_sha);
         let files = view.patch.stats();
         let load_draft = self.detail.as_ref().is_some_and(|detail| {
             !self.drafts.open || self.drafts.draft.pr != detail.summary.number
@@ -6581,6 +6617,7 @@ mod tests {
             outcome: crate::tui::jobs::Outcome::Patch {
                 outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
                 source: crate::domain::diff::DiffSource::Worktree,
+                head_sha: "head".to_owned(),
             },
         });
         // The effect that comes back is the draft load, and it must not move the focus
@@ -6685,6 +6722,9 @@ mod tests {
     fn ir_04_a_local_patch_refresh_keeps_the_active_comment_composer() {
         let (_dir, mut app) = draft_app();
         app.detail.as_mut().expect("detail").summary.head_sha = "h1".to_owned();
+        app.review_mut()
+            .expect("view")
+            .set_head_sha("h1".to_owned());
         app.drafts
             .open(crate::domain::draft::Draft::new(141, app.now()), None);
         press(&mut app, "}");
@@ -6714,6 +6754,7 @@ mod tests {
             outcome: crate::tui::jobs::Outcome::Patch {
                 outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
                 source: crate::domain::diff::DiffSource::Worktree,
+                head_sha: "h2".to_owned(),
             },
         });
 
@@ -6733,6 +6774,9 @@ mod tests {
     fn ir_04_a_stale_composer_keeps_its_text_instead_of_relabelling_old_coordinates() {
         let (_dir, mut app) = draft_app();
         app.detail.as_mut().expect("detail").summary.head_sha = "h1".to_owned();
+        app.review_mut()
+            .expect("view")
+            .set_head_sha("h1".to_owned());
         press(&mut app, "}");
         press(&mut app, "jjjj");
         press(&mut app, "c");
@@ -6743,6 +6787,14 @@ mod tests {
             .input
             .insert_str("keep this sentence");
         app.detail.as_mut().expect("detail").summary.head_sha = "h2".to_owned();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/domain/money.rs b/src/domain/money.rs\n--- a/src/domain/money.rs\n+++ b/src/domain/money.rs\n@@ -1,3 +1,3 @@\n pub fn round(cents: i64) -> i64 {\n-    cents\n+    (cents + 5) / 10 * 10\n }\n",
+        );
+        let _ = app.apply_patch(
+            crate::application::prs::FetchOutcome::Fresh(patch),
+            crate::domain::diff::DiffSource::Worktree,
+            "h2".to_owned(),
+        );
 
         assert_eq!(app.stage_comment(), Effect::None);
 

@@ -27,6 +27,8 @@ pub struct Anchor {
     pub line: u32,
     /// The first line, for a range.
     pub start_line: Option<u32>,
+    /// The applied diff revision that supplied the coordinates (IR-04).
+    pub head_sha: Option<String>,
 }
 
 impl Anchor {
@@ -38,6 +40,7 @@ impl Anchor {
             side,
             line,
             start_line: None,
+            head_sha: None,
         }
     }
 
@@ -48,7 +51,7 @@ impl Anchor {
     /// can anchor, and refusing it here is a sentence instead of a 422.
     #[must_use]
     pub fn extended_to(&self, other: &Self) -> Option<Self> {
-        if self.path != other.path || self.side != other.side {
+        if self.path != other.path || self.side != other.side || self.head_sha != other.head_sha {
             return None;
         }
         let (start, end) = if self.line <= other.line {
@@ -61,6 +64,7 @@ impl Anchor {
             side: self.side,
             line: end,
             start_line: (start != end).then_some(start),
+            head_sha: self.head_sha.clone(),
         })
     }
 
@@ -433,7 +437,7 @@ impl DraftState {
         let Some(range) = start.extended_to(&end) else {
             let mut composer = Composer::new(Target::Line(end));
             let reason = format!(
-                "a range has to be in one file and on one side — the selection starts at {}",
+                "a range has to stay in one file, on one side and on one displayed revision — the selection starts at {}",
                 start.label()
             );
             composer.refusal = Some(reason.clone());

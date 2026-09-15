@@ -595,7 +595,9 @@ features and warnings denied, and `cargo test --all-features` passed (1020 unit 
 and 11 snapshots). Validators passed: `m4` 23/23 and `m5` 32/32. Regressions cover
 preserving an H1 anchor at H2, refusing mixed-revision comments and publication,
 replacing A's draft when entering B, and keeping active composer text and its range
-through a local patch refresh. No live GitHub mutation was used.
+through a local patch refresh. Composer and range coordinates carry the revision of
+the applied diff job, rather than a newer detail response. No live GitHub mutation was
+used.
 
 ---
 
