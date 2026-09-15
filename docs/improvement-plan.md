@@ -110,7 +110,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | PR | Priority | Title / delivered outcome | Hard dependencies | Size | Status |
 |---|---|---|---|---|---|
 | [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | [Open — PR #11](https://github.com/killertux/smart-review/pull/11) |
-| [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | Not started |
+| [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | [Open — PR #12](https://github.com/killertux/smart-review/pull/12) |
 | [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Not started |
 | [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | Not started |
 | [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | Not started |
@@ -384,6 +384,8 @@ mutation was used.
 
 **Priority:** P1. **Findings:** F15.\
 **Requirements:** FR-4.4, FR-5.2, FR-5.4. **Depends on:** none.
+**Status:** implemented and locally verified on `ir-02-streaming-attempt-policy`;
+[PR #12](https://github.com/killertux/smart-review/pull/12) is open for review.
 
 ### Delivered outcome
 
@@ -399,21 +401,21 @@ the answer. The preview and reported usage belong to the same attempt.
 
 ### Implementation steps
 
-1. [ ] Reproduce the eager array evaluation with a stub that supports both streaming
+1. [x] Reproduce the eager array evaluation with a stub that supports both streaming
    methods and records independent counters and distinct text sentinels.
-2. [ ] Replace eager evaluation with explicit lazy control flow. Inspect the outcome
+2. [x] Replace eager evaluation with explicit lazy control flow. Inspect the outcome
    of one attempt before invoking the next.
-3. [ ] Define which failures allow a fallback: unsupported capability is different
+3. [x] Define which failures allow a fallback: unsupported capability is different
    from auth refusal, rate limiting, a timeout, or lost transport after dispatch.
    An absence of emitted text alone does not prove the provider did no billable work.
-4. [ ] Stop the cascade after success, after any emitted partial answer, and after
+4. [x] Stop the cascade after success, after any emitted partial answer, and after
    cancellation. Preserve the most informative typed error and partial result.
-5. [ ] Track attempt identity in diagnostics and preview updates, without request
+5. [x] Track attempt identity in diagnostics and preview updates, without request
    content. Reset/swap previews deliberately for a legitimate retry; never concatenate
    independent answers as one stream.
-6. [ ] Preserve usage for attempted requests when reported. If usage is unavailable,
+6. [x] Preserve usage for attempted requests when reported. If usage is unavailable,
    label it unknown instead of asserting a zero-cost attempt.
-7. [ ] Review the separate analysis JSON-repair request. It is an explicit second
+7. [x] Review the separate analysis JSON-repair request. It is an explicit second
    attempt, not a streaming fallback; retain its current bounded retry count and make
    combined usage honest.
 
@@ -437,6 +439,15 @@ with a forced partial failure. Failure means an unexpected second request or a p
 that changes to content from an unrequested attempt.
 
 **Gates:** shared gates, targeted adapter tests, `m2b` and `m3` contracts.
+
+**Local verification (2026-09-15):** `cargo fmt --all`, Clippy with all targets,
+features and warnings denied, and `cargo test --all-features` passed (1010 unit tests and
+11 snapshots). Validators passed: `m2b` 35/35 and `m3` 59/59. Regressions cover a generic
+rate-limit failure without a follow-up request, reset repair previews/raw answers, partial
+usage in either attempt order, native OpenAI-compatible streaming, repair cancellation, and
+monotonic diagnostic attempts. The M2b repair fixture now checks its durable retry notice
+instead of relying on duplicate streaming requests to keep a transient popup on screen. No
+live provider or network request was used.
 
 ---
 

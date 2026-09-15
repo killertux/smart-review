@@ -2788,16 +2788,7 @@ impl App {
                     stored_at: self.now_unix_secs,
                 };
                 self.adopt_analysis(stored);
-                let usage = ready
-                    .usage
-                    .map(|usage| {
-                        let reasoning = usage
-                            .reasoning
-                            .map(|tokens| format!(", {tokens} reasoning"))
-                            .unwrap_or_default();
-                        format!(" · {} in/{}{reasoning} out", usage.prompt, usage.completion)
-                    })
-                    .unwrap_or_default();
+                let usage = Self::analysis_usage_label(&ready.analysis.token_usage);
                 self.notice(
                     NoticeLevel::Info,
                     format!(
@@ -2838,6 +2829,23 @@ impl App {
                 );
             }
         }
+    }
+
+    fn analysis_usage_label(usage: &crate::domain::analysis::AnalysisUsage) -> String {
+        let reasoning = usage
+            .reasoning
+            .map(|tokens| format!(", {tokens} reasoning"))
+            .unwrap_or_default();
+        if usage.complete {
+            return format!(" · {} in/{}{reasoning} out", usage.prompt, usage.completion);
+        }
+        if usage.prompt == 0 && usage.completion == 0 && usage.reasoning.is_none() {
+            return " · usage unknown".to_owned();
+        }
+        format!(
+            " · partial usage: {} in/{}{reasoning} out",
+            usage.prompt, usage.completion
+        )
     }
 
     /// Takes a document as the current analysis and re-orders the review (FR-4.2).
@@ -2977,6 +2985,10 @@ impl App {
             return;
         };
         match update {
+            crate::application::analysis::Progress::Reset(stage) => {
+                self.panel.stream.clear();
+                self.panel.state = AnalysisState::Running { stage };
+            }
             crate::application::analysis::Progress::Stage(stage) => {
                 self.panel.state = if self.panel.stream.text().is_empty() {
                     AnalysisState::Running { stage }
@@ -3315,6 +3327,15 @@ impl App {
         Some(crate::application::analysis::PanelModel::of(
             &stored.analysis,
         ))
+    }
+
+    #[cfg(test)]
+    /// The accepted raw provider answer, retained with the stored analysis.
+    pub(crate) fn stored_analysis_raw(&self) -> Option<&str> {
+        self.panel
+            .analysis
+            .as_ref()
+            .map(|stored| stored.raw.as_str())
     }
 
     /// The provenance line: which model, which prompt version, how old (FR-4.3).

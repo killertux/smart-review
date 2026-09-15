@@ -2006,6 +2006,33 @@ mod tests {
     }
 
     #[test]
+    fn ir_02_a_repair_preview_replaces_the_rejected_attempt() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.record_analysis_job(7);
+        for update in [
+            crate::application::analysis::Progress::Delta("REJECTED_SENTINEL".to_owned()),
+            crate::application::analysis::Progress::Reset("repairing".to_owned()),
+            crate::application::analysis::Progress::Delta("REPAIRED_SENTINEL".to_owned()),
+        ] {
+            app.apply_progress(crate::tui::jobs::Progress {
+                job: 7,
+                update: crate::tui::jobs::ProgressUpdate::Analysis(update),
+            });
+        }
+        assert_eq!(app.analysis_stream(), "REPAIRED_SENTINEL");
+
+        app.apply_analysis(crate::application::analysis::AnalysisRun::Ready(Box::new(
+            crate::application::analysis::Analyzed {
+                analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
+                warnings: Vec::new(),
+                repaired: true,
+                usage: None,
+            },
+        )));
+        assert_eq!(app.stored_analysis_raw(), Some("REPAIRED_SENTINEL"));
+    }
+
+    #[test]
     fn a_ready_analysis_orders_the_review_and_fills_the_panel() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(3);
