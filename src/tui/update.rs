@@ -1548,6 +1548,35 @@ fn set_option(app: &mut App, spec: &str) -> Effect {
                 Effect::None
             }
         },
+        "llm.max_context_tokens" => {
+            if let Ok(tokens) = value.parse::<u32>() {
+                app.config.llm.max_context_tokens = tokens;
+                app.resolve_active_model();
+                app.notice(
+                    NoticeLevel::Info,
+                    format!("llm.max_context_tokens = {tokens}"),
+                );
+                Effect::None
+            } else {
+                app.command_error(format!("`{value}` is not a token limit"));
+                Effect::None
+            }
+        }
+        "llm.max_tokens" => match value.parse::<u32>() {
+            Ok(tokens) if tokens > 0 => {
+                let Some(mut selection) = app.config.llm.active.clone() else {
+                    app.command_error("select a model before setting llm.max_tokens");
+                    return Effect::None;
+                };
+                selection.max_tokens = Some(tokens);
+                app.set_active_selection(selection.clone());
+                Effect::SaveSelection(Box::new(selection))
+            }
+            _ => {
+                app.command_error(format!("`{value}` is not a positive output token limit"));
+                Effect::None
+            }
+        },
         _ => {
             app.command_error(format!(
                 "`{key}` cannot be changed at runtime yet; edit {}",

@@ -269,7 +269,13 @@ impl EffectiveRequestSettings {
             (Some(configured), Some(catalog)) => Some(configured.min(catalog)),
             (Some(configured), None) => Some(configured),
             (None, Some(catalog)) => Some(catalog.min(DEFAULT_MAX_TOKENS)),
-            (None, None) => None,
+            (None, None) => Some(
+                model
+                    .context_limit()
+                    .map_or(DEFAULT_OUTPUT_RESERVE, |window| {
+                        window.min(DEFAULT_OUTPUT_RESERVE)
+                    }),
+            ),
         };
         let input_tokens = model.context_limit().map_or(configured_input, |window| {
             window
@@ -523,6 +529,8 @@ pub const ANALYSIS_TIMEOUT_SECS: u64 = 600;
 
 /// The most tokens an analysis is allowed to ask for.
 const DEFAULT_MAX_TOKENS: u32 = 32_768;
+/// Reserved and requested when the catalog does not publish an output limit.
+const DEFAULT_OUTPUT_RESERVE: u32 = 8_192;
 
 /// What is known about the key for one provider (FR-4.5, NFR-3.1).
 ///

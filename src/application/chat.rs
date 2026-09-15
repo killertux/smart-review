@@ -225,7 +225,9 @@ impl<'a> Chatter<'a> {
         progress: &mut ProgressHandler<'_>,
     ) -> Result<ChatRun, LlmError> {
         let system = system_prompt(&bundle.text);
-        if system.len().saturating_add(question.len()) > input_budget_bytes(spec) {
+        if crate::ports::llm::estimated_input_bytes(Some(&system), &[], question)
+            > input_budget_bytes(spec)
+        {
             return Err(LlmError::Request {
                 provider: spec.chat.provider.clone(),
                 reason: "the context and question exceed the configured input limit; reduce :context or shorten the question".to_owned(),
@@ -315,10 +317,27 @@ fn history_plan_that_fits(
     system: &str,
     question: &str,
 ) -> HistoryPlan {
-    let budget_bytes = input_budget_bytes(spec)
-        .saturating_sub(system.len())
-        .saturating_sub(question.len());
-    let (messages, dropped) = replayable_history(session, budget_bytes, 0);
+    let full_budget = input_budget_bytes(spec);
+    let base = crate::ports::llm::estimated_input_bytes(Some(system), &[], question);
+    let budget_bytes = full_budget
+        .saturating_sub(base)
+        .min(full_budget / HISTORY_BUDGET_DIVISOR);
+    let (mut messages, _) = replayable_history(session, budget_bytes, 0);
+    while crate::ports::llm::estimated_input_bytes(
+        Some(system),
+        &messages
+            .iter()
+            .map(|message| (message.role, message.text.clone()))
+            .collect::<Vec<_>>(),
+        question,
+    ) > full_budget
+    {
+        if messages.is_empty() {
+            break;
+        }
+        messages.remove(0);
+    }
+    let dropped = session.messages.len().saturating_sub(messages.len());
     HistoryPlan {
         messages,
         dropped,

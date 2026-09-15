@@ -267,14 +267,14 @@ impl<'a> Analyst<'a> {
         let (normalized, repaired, raw) = match attempt {
             Ok(normalized) => (normalized, false, first.text),
             Err(failure) => {
-                // One repair pass, with the reason and the previous answer (FR-4.1).
-                progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let previous = first.text.clone();
                 let repair = repair_prompt(&previous, &failure);
-                validate_input_budget(request, &system, &repair)?;
-                // A failed repair attempt still leaves the first answer to show, with
-                // the first failure's reason: the user has text to read either way,
-                // which is what FR-4.1 asks for.
+                if let Some(run) =
+                    rejected_repair(request, &system, &repair, &previous, &failure, usage)
+                {
+                    return Ok(run);
+                }
+                progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let second = match self.ask(request, &system, &repair, cancel, progress) {
                     Ok(second) => second,
                     Err(LlmError::Cancelled) => return Ok(AnalysisRun::Cancelled),
@@ -438,7 +438,7 @@ fn validate_input_budget(
     system: &str,
     prompt: &str,
 ) -> Result<(), LlmError> {
-    let bytes = system.len().saturating_add(prompt.len());
+    let bytes = crate::ports::llm::estimated_input_bytes(Some(system), &[], prompt);
     if bytes
         <= (request.input_budget_tokens as usize)
             .saturating_mul(crate::domain::context::BYTES_PER_TOKEN)
@@ -449,6 +449,29 @@ fn validate_input_budget(
         provider: request.chat.provider.clone(),
         reason: "the analysis prompt exceeds the configured input limit; widen the limit or reduce :context".to_owned(),
     })
+}
+
+fn rejected_repair(
+    request: &AnalysisRequest,
+    system: &str,
+    repair: &str,
+    previous: &str,
+    failure: &ParseFailure,
+    usage: UsageTotal,
+) -> Option<AnalysisRun> {
+    validate_input_budget(request, system, repair)
+        .err()
+        .map(|_| {
+            AnalysisRun::Unparsed(Box::new(Unparsed {
+                raw: previous.to_owned(),
+                reason: format!(
+                    "{} (the repair prompt exceeded the input limit)",
+                    failure.reason
+                ),
+                repaired: true,
+                usage: usage.reported(),
+            }))
+        })
 }
 
 /// One provider answer.
