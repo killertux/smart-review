@@ -24,6 +24,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use nix::sys::signal::{Signal, kill};
+#[cfg(unix)]
+use nix::unistd::Pid;
+
 use crate::logging::{self, Level};
 use crate::ports::Cancel;
 
@@ -500,8 +505,7 @@ impl ProcessRunner {
         }
 
         let started = Instant::now();
-        let mut command = Command::new(&spec.program);
-        command.args(&spec.args);
+        let (mut command, starts_new_session) = command_for(spec);
         if let Some(dir) = &spec.cwd {
             command.current_dir(dir);
         }
@@ -534,6 +538,14 @@ impl ProcessRunner {
             }
         };
 
+        // A process can spawn helpers which inherit its process group. Linux launches
+        // each command through `setsid` *before* it execs the requested program, so
+        // cancellation and timeout can stop the runner-owned group without the race a
+        // parent-side `setpgid` has after `Command::spawn` (IR-08). On other platforms,
+        // `terminate` retains direct-child behaviour and the limitation is documented.
+        #[cfg(unix)]
+        let group = starts_new_session.then(|| OwnedProcessGroup::from_child(&child));
+
         // Read both pipes on their own threads: a child that fills one pipe while
         // we block on the other would otherwise deadlock.
         let cap = self.output_cap;
@@ -552,14 +564,20 @@ impl ProcessRunner {
                 break status;
             }
             if cancel.is_cancelled() {
-                let _ = child.kill();
+                #[cfg(unix)]
+                terminate(&mut child, group);
+                #[cfg(not(unix))]
+                terminate(&mut child);
                 let _ = child.wait();
                 return Err(ProcessError::Cancelled {
                     command: spec.diagnostic(),
                 });
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
+                #[cfg(unix)]
+                terminate(&mut child, group);
+                #[cfg(not(unix))]
+                terminate(&mut child);
                 let _ = child.wait();
                 return Err(ProcessError::Timeout {
                     command: spec.diagnostic(),
@@ -639,6 +657,68 @@ impl ProcessRunner {
             stderr: output.stderr_tail(),
         })
     }
+}
+
+/// Builds the process command, isolating it on Linux before it can spawn helpers.
+fn command_for(spec: &CommandSpec) -> (Command, bool) {
+    #[cfg(target_os = "linux")]
+    if (is_explicit_path(&spec.program) || program_is_on_path(&spec.program))
+        && let Some(setsid) = ["/usr/bin/setsid", "/bin/setsid"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+    {
+        let mut command = Command::new(setsid);
+        command.arg(&spec.program).args(&spec.args);
+        return (command, true);
+    }
+
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    (command, false)
+}
+
+/// Whether a bare program name can be resolved before wrapping it with `setsid`.
+///
+/// The normal `Command` path deliberately leaves PATH resolution to the operating
+/// system. The wrapper needs this one narrow preflight so a missing program still
+/// reports [`ProcessError::NotFound`] rather than `setsid`'s exit status.
+#[cfg(target_os = "linux")]
+fn program_is_on_path(program: &Path) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| is_executable_file(&directory.join(program)))
+    })
+}
+
+/// A process group that belongs only to one child started by this runner.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct OwnedProcessGroup(Pid);
+
+#[cfg(unix)]
+impl OwnedProcessGroup {
+    /// The Linux `setsid` launcher keeps its own pid as the session and group id.
+    fn from_child(child: &std::process::Child) -> Self {
+        let raw = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        Self(Pid::from_raw(raw))
+    }
+}
+
+/// Stops the child and, when available, its runner-owned descendant group.
+#[cfg(unix)]
+fn terminate(child: &mut std::process::Child, group: Option<OwnedProcessGroup>) {
+    if let Some(OwnedProcessGroup(pid)) = group {
+        // A negative pid addresses only this process group, established above. It can
+        // never match the application's inherited group, even if the child has already
+        // exited and only one of its helpers remains.
+        let _ = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+/// Stops the direct child where the platform has no approved safe group primitive.
+#[cfg(not(unix))]
+fn terminate(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 /// How long the reader threads are given to finish after the child is gone.
@@ -969,6 +1049,35 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "cancellation must be prompt, took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_the_runners_owned_descendants() {
+        let directory = crate::test_support::temp_home();
+        let marker = directory.path().join("descendant-survived");
+        let cancel = Cancel::new();
+        let signal = cancel.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(60));
+            signal.cancel();
+        });
+        // The background subshell remains alive after the direct shell would be killed
+        // unless its process group is terminated too.
+        let script = format!(
+            "(sleep 0.3; touch {}) & wait",
+            quote(&marker.display().to_string())
+        );
+        let error = runner()
+            .run(&shell(&script).timeout(Duration::from_secs(30)), &cancel)
+            .unwrap_err();
+        assert!(handle.join().is_ok());
+        assert!(matches!(error, ProcessError::Cancelled { .. }), "{error:?}");
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            !marker.exists(),
+            "a descendant of a cancelled command must not survive"
         );
     }
 

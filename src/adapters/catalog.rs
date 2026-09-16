@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::adapters::http::HttpFetch;
 use crate::domain::model::Catalog;
 use crate::logging::{self, Level};
+use crate::ports::Cancel;
 use crate::ports::Clock;
 use crate::ports::catalog::{
     CatalogFetchError, CatalogLoad, CatalogPolicy, CatalogSource, ModelCatalogPort,
@@ -121,10 +122,10 @@ impl ModelsDevCatalog {
     }
 
     /// Fetches, parses (via the caller) and caches in one step.
-    fn fetch_and_cache(&self) -> Result<Catalog, CatalogFetchError> {
+    fn fetch_and_cache(&self, cancel: &Cancel) -> Result<Catalog, CatalogFetchError> {
         let body = self
             .fetcher
-            .get(&self.url)
+            .get(&self.url, cancel)
             .map_err(CatalogFetchError::Unavailable)?;
         let catalog = Catalog::from_json(&body)
             .map_err(|error| CatalogFetchError::Malformed(error.to_string()))?;
@@ -139,7 +140,11 @@ impl ModelsDevCatalog {
 }
 
 impl ModelCatalogPort for ModelsDevCatalog {
-    fn load(&self, policy: CatalogPolicy) -> Result<CatalogLoad, CatalogFetchError> {
+    fn load(
+        &self,
+        policy: CatalogPolicy,
+        cancel: &Cancel,
+    ) -> Result<CatalogLoad, CatalogFetchError> {
         let cached = self.read_cache();
         let age_secs = |fetched_at: u64| self.clock.now_unix_secs().saturating_sub(fetched_at);
 
@@ -169,7 +174,7 @@ impl ModelCatalogPort for ModelsDevCatalog {
             ));
         }
 
-        match self.fetch_and_cache() {
+        match self.fetch_and_cache(cancel) {
             Ok(catalog) => {
                 logging::log(
                     Level::Info,
@@ -234,13 +239,26 @@ mod tests {
     }
 
     impl HttpFetch for FakeFetch {
-        fn get(&self, _url: &str) -> Result<String, String> {
+        fn get(&self, _url: &str, _cancel: &Cancel) -> Result<String, String> {
             *self.calls.lock().unwrap() += 1;
             self.body
                 .lock()
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| Err("no body configured".to_owned()))
+        }
+    }
+
+    /// A transport that will not answer until its caller stops waiting.
+    #[derive(Debug)]
+    struct HeldFetch;
+
+    impl HttpFetch for HeldFetch {
+        fn get(&self, _url: &str, cancel: &Cancel) -> Result<String, String> {
+            while !cancel.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err("the request was cancelled".to_owned())
         }
     }
 
@@ -275,13 +293,38 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_catalog_fetch_stops_when_cancelled() {
+        let home = temp_home();
+        let catalog = ModelsDevCatalog::new(
+            "https://models.dev/api.json",
+            home.path().join("cache/models.json"),
+            86_400,
+            Arc::new(HeldFetch),
+            Arc::new(FakeClock::new(1_000)),
+        );
+        let cancel = Cancel::new();
+        let signal = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            signal.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = catalog
+            .load(CatalogPolicy::Refresh, &cancel)
+            .expect_err("the cancelled fetch has no cache to return");
+        assert!(canceller.join().is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.to_string().contains("cancelled"), "{error}");
+    }
+
+    #[test]
     fn a_first_run_fetches_and_caches() {
         let fetch = FakeFetch::serving(FEED);
         let harness = harness(fetch.clone(), 86_400);
 
         let load = harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         assert_eq!(load.source, CatalogSource::Fetched);
         assert!(load.catalog.provider("deepseek").is_some());
@@ -303,13 +346,13 @@ mod tests {
         let harness = harness(fetch.clone(), 86_400);
         harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         harness.clock.advance(60);
 
         let load = harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("cached");
         assert_eq!(load.source, CatalogSource::Cached { age_secs: 60 });
         assert_eq!(fetch.calls(), 1, "the network was not used again");
@@ -321,14 +364,14 @@ mod tests {
         let harness = harness(fetch.clone(), 60);
         harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         harness.clock.advance(120);
         fetch.set(OTHER_FEED);
 
         let load = harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("refreshed");
         assert_eq!(load.source, CatalogSource::Fetched);
         assert!(
@@ -344,7 +387,7 @@ mod tests {
         let harness = harness(fetch.clone(), 60);
         harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         harness.clock.advance(120);
 
@@ -357,7 +400,7 @@ mod tests {
             harness.clock.clone(),
         );
         let load = offline
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("the cache answers");
         match load.source {
             CatalogSource::Stale { age_secs, reason } => {
@@ -374,7 +417,7 @@ mod tests {
         let harness = harness(FakeFetch::failing("could not connect"), 60);
         let error = harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect_err("nothing to fall back on");
         assert!(
             matches!(error, CatalogFetchError::Unavailable(_)),
@@ -392,7 +435,7 @@ mod tests {
         let harness = harness(fetch.clone(), 60);
         harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         let good = std::fs::read_to_string(harness.catalog.cache_path()).unwrap();
         harness.clock.advance(120);
@@ -402,7 +445,7 @@ mod tests {
         fetch.set(r#"{"message": "rate limited"}"#);
         let load = harness
             .catalog
-            .load(CatalogPolicy::Refresh)
+            .load(CatalogPolicy::Refresh, &Cancel::new())
             .expect("degraded");
         assert!(
             matches!(load.source, CatalogSource::Stale { .. }),
@@ -422,7 +465,7 @@ mod tests {
         let harness = harness(fetch, 60);
         let error = harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect_err("not a catalog");
         assert!(
             matches!(error, CatalogFetchError::Malformed(_)),
@@ -436,13 +479,13 @@ mod tests {
         let harness = harness(fetch.clone(), 86_400);
         harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         fetch.set(OTHER_FEED);
 
         let load = harness
             .catalog
-            .load(CatalogPolicy::Refresh)
+            .load(CatalogPolicy::Refresh, &Cancel::new())
             .expect("refreshed");
         assert_eq!(load.source, CatalogSource::Fetched);
         assert_eq!(fetch.calls(), 2, ":catalog refresh must really fetch");
@@ -454,13 +497,13 @@ mod tests {
         let harness = harness(fetch.clone(), 1);
         harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("fetched");
         harness.clock.advance(999_999);
 
         let load = harness
             .catalog
-            .load(CatalogPolicy::CacheOnly)
+            .load(CatalogPolicy::CacheOnly, &Cancel::new())
             .expect("cached");
         assert!(matches!(load.source, CatalogSource::Cached { .. }));
         assert_eq!(fetch.calls(), 1, "no fetch, however stale the cache is");
@@ -471,7 +514,7 @@ mod tests {
         let harness = harness(FakeFetch::serving(FEED), 60);
         let error = harness
             .catalog
-            .load(CatalogPolicy::CacheOnly)
+            .load(CatalogPolicy::CacheOnly, &Cancel::new())
             .expect_err("nothing cached");
         assert!(
             error.to_string().contains("no catalog is cached"),
@@ -489,7 +532,7 @@ mod tests {
         let harness = harness(fetch, 60);
         let load = harness
             .catalog
-            .load(CatalogPolicy::CacheFirst)
+            .load(CatalogPolicy::CacheFirst, &Cancel::new())
             .expect("loaded");
         assert_eq!(load.catalog.reachable().count(), 0);
         assert_eq!(load.catalog.len(), 1);

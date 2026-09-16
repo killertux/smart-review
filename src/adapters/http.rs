@@ -14,6 +14,9 @@
 
 use std::fmt;
 use std::future::Future;
+use std::time::Duration;
+
+use crate::ports::Cancel;
 
 /// Why the async work could not be driven.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -21,6 +24,20 @@ pub enum RuntimeError {
     /// The runtime could not be created.
     #[error("could not start the async runtime: {0}")]
     Start(String),
+}
+
+/// Why an async wait did not reach its future's result.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AsyncWaitError {
+    /// The runtime could not be created.
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    /// The caller stopped waiting for this work.
+    #[error("the request was cancelled")]
+    Cancelled,
+    /// The request's own deadline elapsed.
+    #[error("the request timed out")]
+    TimedOut,
 }
 
 /// Runs a future to completion on a fresh current-thread runtime.
@@ -40,6 +57,42 @@ where
     Ok(runtime.block_on(future))
 }
 
+/// Drives a future until it completes, is cancelled, or reaches its own deadline.
+///
+/// Dropping the losing future closes its transport resources before the worker reports
+/// completion, so a cancelled request releases the job slot instead of waiting for a
+/// socket timeout (IR-08).
+///
+/// # Errors
+///
+/// Returns [`AsyncWaitError::Cancelled`] when `cancel` is raised,
+/// [`AsyncWaitError::TimedOut`] when `timeout` elapses, or
+/// [`AsyncWaitError::Runtime`] when Tokio cannot start.
+pub fn block_on_cancellable<F>(
+    future: F,
+    cancel: &Cancel,
+    timeout: Duration,
+) -> Result<F::Output, AsyncWaitError>
+where
+    F: Future,
+{
+    if cancel.is_cancelled() {
+        return Err(AsyncWaitError::Cancelled);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| RuntimeError::Start(error.to_string()))
+        .map_err(AsyncWaitError::Runtime)?;
+    runtime.block_on(async {
+        tokio::select! {
+            result = future => Ok(result),
+            () = cancel.cancelled() => Err(AsyncWaitError::Cancelled),
+            () = tokio::time::sleep(timeout) => Err(AsyncWaitError::TimedOut),
+        }
+    })
+}
+
 /// An error message from an HTTP fetch, as the catalog adapter reports it.
 pub type FetchError = String;
 
@@ -55,7 +108,7 @@ pub trait HttpFetch: fmt::Debug + Send + Sync {
     ///
     /// Returns a human-readable reason: it is shown to the user when the catalog is
     /// being refreshed by hand.
-    fn get(&self, url: &str) -> Result<String, FetchError>;
+    fn get(&self, url: &str, cancel: &Cancel) -> Result<String, FetchError>;
 }
 
 /// The real thing, over `reqwest` with rustls.
@@ -77,7 +130,6 @@ impl ReqwestFetcher {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .user_agent(concat!("smart-review/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default();
         Self { client }
@@ -85,20 +137,24 @@ impl ReqwestFetcher {
 }
 
 impl HttpFetch for ReqwestFetcher {
-    fn get(&self, url: &str) -> Result<String, FetchError> {
-        block_on(async {
-            let response = self
-                .client
-                .get(url)
-                .send()
-                .await
-                .map_err(|error| describe(&error))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(format!("the server answered {status}"));
-            }
-            response.text().await.map_err(|error| describe(&error))
-        })
+    fn get(&self, url: &str, cancel: &Cancel) -> Result<String, FetchError> {
+        block_on_cancellable(
+            async {
+                let response = self
+                    .client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|error| describe(&error))?;
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(format!("the server answered {status}"));
+                }
+                response.text().await.map_err(|error| describe(&error))
+            },
+            cancel,
+            Duration::from_secs(30),
+        )
         .map_err(|error| error.to_string())?
     }
 }
@@ -137,6 +193,35 @@ mod tests {
         let first = block_on(async { 1 }).expect("starts");
         let second = block_on(async { 2 }).expect("starts again");
         assert_eq!((first, second), (1, 2));
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_pending_future() {
+        let cancel = Cancel::new();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            block_on_cancellable(
+                async { tokio::time::sleep(Duration::from_secs(30)).await },
+                &worker_cancel,
+                Duration::from_secs(60),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        cancel.cancel();
+        let result = worker.join().unwrap_or(Err(AsyncWaitError::Cancelled));
+        assert_eq!(result, Err(AsyncWaitError::Cancelled));
+    }
+
+    #[test]
+    fn a_deadline_is_not_reported_as_cancellation() {
+        let cancel = Cancel::new();
+        let result = block_on_cancellable(
+            async { tokio::time::sleep(Duration::from_secs(30)).await },
+            &cancel,
+            Duration::from_millis(1),
+        );
+        assert_eq!(result, Err(AsyncWaitError::TimedOut));
     }
 
     #[test]

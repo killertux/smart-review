@@ -680,6 +680,7 @@ impl crate::ports::ModelCatalogPort for NoCatalog {
     fn load(
         &self,
         _policy: crate::ports::CatalogPolicy,
+        _cancel: &crate::ports::Cancel,
     ) -> Result<crate::ports::CatalogLoad, crate::ports::CatalogFetchError> {
         Err(crate::ports::CatalogFetchError::Unavailable(
             "this test has no model catalog".to_owned(),

@@ -8,6 +8,7 @@
 
 use crate::config::ModelSelection;
 use crate::domain::model::{Catalog, CatalogModel, Route, Thinking, ThinkingChoice};
+use crate::ports::Cancel;
 use crate::ports::catalog::{CatalogFetchError, CatalogLoad, CatalogPolicy, ModelCatalogPort};
 use crate::ports::llm::ChatRequest;
 use crate::ports::secret::{ApiKey, KeySource, KeyStatus, SecretError, SecretStore};
@@ -83,8 +84,9 @@ impl ProviderChoice {
 pub fn load_catalog(
     port: &dyn ModelCatalogPort,
     policy: CatalogPolicy,
+    cancel: &Cancel,
 ) -> Result<CatalogState, CatalogFetchError> {
-    let load = port.load(policy)?;
+    let load = port.load(policy, cancel)?;
     let providers = provider_choices(&load.catalog);
     Ok(CatalogState { load, providers })
 }

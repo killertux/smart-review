@@ -8,6 +8,7 @@
 use std::fmt;
 
 use crate::domain::model::Catalog;
+use crate::ports::Cancel;
 
 /// How hard to try the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +101,11 @@ pub trait ModelCatalogPort: fmt::Debug + Send + Sync {
     /// Returns [`CatalogFetchError`] when no catalog can be produced at all. A
     /// stale cache is a successful answer, not an error: the caller learns about it
     /// from [`CatalogSource`].
-    fn load(&self, policy: CatalogPolicy) -> Result<CatalogLoad, CatalogFetchError>;
+    fn load(
+        &self,
+        policy: CatalogPolicy,
+        cancel: &Cancel,
+    ) -> Result<CatalogLoad, CatalogFetchError>;
 }
 
 #[cfg(test)]

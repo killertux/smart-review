@@ -4,6 +4,14 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tokio::sync::Notify;
+
+#[derive(Default)]
+struct State {
+    flag: AtomicBool,
+    changed: Notify,
+}
+
 /// A shareable "stop what you are doing" flag.
 ///
 /// The event loop keeps one and hands a clone to whatever is running: a process
@@ -12,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// channel so that a cancelled job cannot deadlock waiting for a reader.
 #[derive(Clone, Default)]
 pub struct Cancel {
-    flag: Arc<AtomicBool>,
+    state: Arc<State>,
 }
 
 impl Cancel {
@@ -24,13 +32,31 @@ impl Cancel {
 
     /// Raises the flag. Idempotent, and safe to call from any thread.
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        self.state.flag.store(true, Ordering::SeqCst);
+        self.state.changed.notify_waiters();
     }
 
     /// Whether the flag has been raised.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.state.flag.load(Ordering::SeqCst)
+    }
+
+    /// Waits until cancellation is requested.
+    ///
+    /// The check before and after subscribing closes the race where cancellation is
+    /// requested between a caller's initial check and its async `select!`.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.state.changed.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -63,5 +89,18 @@ mod tests {
         cancel.cancel();
         cancel.cancel();
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn async_waiter_observes_cancellation() {
+        let cancel = Cancel::new();
+        let waiter = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            let result = crate::adapters::http::block_on(async { waiter.cancelled().await });
+            assert!(result.is_ok());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cancel.cancel();
+        assert!(thread.join().is_ok());
     }
 }

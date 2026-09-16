@@ -20,7 +20,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::time::Duration;
 
 use crate::application::analysis::{
     AnalysisIntent, AnalysisRequest, AnalysisRun, Analyst, Progress as AnalysisProgress,
@@ -47,10 +48,21 @@ use crate::tui::app::Effect;
 use crate::tui::app::ReviewSession;
 use crate::tui::list_view::PrListState;
 
-/// How many progress messages are handed to the interface in one poll. Anything
-/// beyond it is dropped: the answer arrives whole in the completion, so a dropped
-/// preview costs nothing but a redrawn frame that is already stale.
-pub const MAX_PROGRESS_MESSAGES: usize = 256;
+/// How many progress messages may wait for the interface.
+///
+/// Producers wait when this is full instead of silently discarding text fragments.
+/// The bound applies to every streaming job together, preventing a fast provider from
+/// consuming unbounded memory (IR-08).
+pub const MAX_QUEUED_PROGRESS: usize = 256;
+
+/// How many progress messages the event loop accepts in one pass.
+///
+/// The remainder stays queued in order, so keyboard, mouse and completions cannot be
+/// starved by a provider that produces faster than the terminal can draw (IR-08).
+pub const MAX_PROGRESS_MESSAGES: usize = 64;
+
+/// How long a worker waits before retrying a full progress queue.
+const PROGRESS_BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 
 /// How many jobs may run at once. Process jobs are the expensive ones, and four is
 /// what ARCH-5 allows.
@@ -1217,7 +1229,7 @@ pub struct JobRunner {
     sender: Sender<Completion>,
     receiver: Receiver<Completion>,
     /// Progress from jobs that stream.
-    progress_sender: Sender<Progress>,
+    progress_sender: SyncSender<Progress>,
     progress_receiver: Receiver<Progress>,
 }
 
@@ -1242,7 +1254,7 @@ impl JobRunner {
         request: DetectRequest,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::sync_channel(MAX_QUEUED_PROGRESS);
         Self {
             executor: None,
             workspace,
@@ -1358,15 +1370,16 @@ impl JobRunner {
 
     /// Everything the running jobs have said since the last call.
     ///
-    /// Bounded: a provider that streams faster than the interface draws must not be
-    /// able to grow the queue without limit, and the text on screen is a preview of
-    /// the answer rather than the answer.
+    /// Bounded: a provider that streams faster than the interface draws cannot grow
+    /// the queue without limit or make this poll loop drain forever. Messages left in
+    /// the channel retain their order for the next frame (IR-08).
     pub fn poll_progress(&mut self) -> Vec<Progress> {
         let mut progress = Vec::new();
-        while let Ok(update) = self.progress_receiver.try_recv() {
-            if progress.len() < MAX_PROGRESS_MESSAGES {
-                progress.push(update);
-            }
+        while progress.len() < MAX_PROGRESS_MESSAGES {
+            let Ok(update) = self.progress_receiver.try_recv() else {
+                break;
+            };
+            progress.push(update);
         }
         progress
     }
@@ -1418,6 +1431,7 @@ impl JobRunner {
                     sender: &progress_sender,
                     job: id,
                     owner: worker_owner.clone(),
+                    cancel: &worker_cancel,
                 };
                 let body =
                     std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel, &sink));
@@ -1470,21 +1484,36 @@ impl JobRunner {
 
 /// Where a streaming job reports what it is doing, and which job it is (FR-4.4).
 struct ProgressSink<'a> {
-    sender: &'a Sender<Progress>,
+    sender: &'a SyncSender<Progress>,
     job: u64,
     owner: JobOwner,
+    cancel: &'a Cancel,
 }
 
 impl ProgressSink<'_> {
-    /// Sends an update, dropping it when nobody is listening.
+    /// Sends an update in order, applying backpressure rather than dropping text.
     ///
-    /// A dropped preview costs nothing: the answer arrives whole in the completion.
+    /// A cancellation unblocks a producer waiting on a full queue. Completion travels
+    /// over a separate unbounded channel, so it can never be stranded behind preview
+    /// traffic (IR-08).
     fn send(&self, update: ProgressUpdate) {
-        let _ = self.sender.send(Progress {
+        let mut progress = Progress {
             job: self.job,
             owner: self.owner.clone(),
             update,
-        });
+        };
+        loop {
+            match self.sender.try_send(progress) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(queued)) => {
+                    if self.cancel.is_cancelled() {
+                        return;
+                    }
+                    progress = queued;
+                    std::thread::sleep(PROGRESS_BACKPRESSURE_POLL);
+                }
+            }
+        }
     }
 }
 
@@ -1512,7 +1541,7 @@ fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel, sink: &ProgressSink
             Err(error) => Outcome::EnvironmentFailed(Box::new(error)),
         },
         Job::Report { context } => Outcome::Checks(doctor::collect(context)),
-        Job::Catalog { policy } => match ports.catalog.load(*policy) {
+        Job::Catalog { policy } => match ports.catalog.load(*policy, cancel) {
             Ok(load) => Outcome::Catalog(Box::new(load)),
             Err(error) => Outcome::Failed(error.to_string()),
         },
@@ -2082,6 +2111,39 @@ mod tests {
                 .iter()
                 .all(|completion| !matches!(completion.outcome, Outcome::Failed(_))),
             "{collected:?}"
+        );
+    }
+
+    #[test]
+    fn progress_is_lossless_and_bounded_per_poll() {
+        let (mut runner, _forge) = runner_with(Duration::ZERO);
+        let total = MAX_PROGRESS_MESSAGES + 3;
+        for index in 0..total {
+            let sent = runner.progress_sender.send(Progress {
+                job: 17,
+                owner: JobOwner::Global,
+                update: ProgressUpdate::Analysis(AnalysisProgress::Delta(index.to_string())),
+            });
+            assert!(sent.is_ok());
+        }
+
+        let first = runner.poll_progress();
+        assert_eq!(first.len(), MAX_PROGRESS_MESSAGES);
+        let second = runner.poll_progress();
+        assert_eq!(second.len(), 3);
+        let labels: Vec<String> = first
+            .into_iter()
+            .chain(second)
+            .map(|progress| match progress.update {
+                ProgressUpdate::Analysis(AnalysisProgress::Delta(delta)) => delta,
+                other => panic!("expected analysis delta, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            (0..total)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
