@@ -170,6 +170,62 @@ impl crate::ports::DraftStorePort for FakeDraftStore {
     }
 }
 
+/// An in-memory [`MutationStorePort`](crate::ports::MutationStorePort) for mutation
+/// lifecycle tests (IR-07).
+#[derive(Debug, Default)]
+pub(crate) struct FakeMutationStore {
+    operations:
+        Mutex<std::collections::BTreeMap<String, crate::domain::mutation::MutationOperation>>,
+}
+
+impl crate::ports::MutationStorePort for FakeMutationStore {
+    fn create(
+        &self,
+        operation: &crate::domain::mutation::MutationOperation,
+    ) -> Result<(), crate::ports::MutationStoreError> {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if operations.contains_key(&operation.id) {
+            return Err(crate::ports::MutationStoreError::Conflict);
+        }
+        operations.insert(operation.id.clone(), operation.clone());
+        Ok(())
+    }
+
+    fn save(
+        &self,
+        operation: &crate::domain::mutation::MutationOperation,
+    ) -> Result<(), crate::ports::MutationStoreError> {
+        self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(operation.id.clone(), operation.clone());
+        Ok(())
+    }
+
+    fn unresolved(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Vec<crate::domain::mutation::MutationOperation>, crate::ports::MutationStoreError>
+    {
+        Ok(self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|operation| {
+                operation.repo == *repo
+                    && operation.pr == pr
+                    && operation.state.needs_reconciliation()
+            })
+            .cloned()
+            .collect())
+    }
+}
+
 /// An in-memory [`CacheStore`](crate::ports::CacheStore) for tests.
 ///
 /// Exists so the cache-first and offline paths of the application layer can be

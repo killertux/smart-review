@@ -95,6 +95,8 @@ pub struct Startup {
     /// Where review drafts are kept (FR-6.1). Deliberately *not* under `cache/`: a
     /// draft cannot be fetched again.
     pub drafts: Arc<dyn DraftStorePort>,
+    /// Durable records for remote mutations that may need reconciliation (IR-07).
+    pub mutations: Arc<dyn crate::ports::MutationStorePort>,
     /// Whether mutating calls are recorded rather than run (FR-6.5).
     pub dry_run: bool,
     /// The calls a dry run recorded, which the loop writes out (FR-6.5).
@@ -128,6 +130,7 @@ struct Ports {
     /// Where conversations live (FR-5.1).
     chat: Arc<dyn crate::ports::ChatStorePort>,
     drafts: Arc<dyn DraftStorePort>,
+    mutations: Arc<dyn crate::ports::MutationStorePort>,
     dry_run_ledger: crate::adapters::process::DryRunLedger,
 }
 
@@ -199,6 +202,9 @@ impl Ports {
                 analysis: Arc::new(analysis_store),
                 chat: Arc::new(chat_store),
                 drafts: Arc::new(crate::adapters::draft_store::FileDraftStore::new(
+                    home.root(),
+                )),
+                mutations: Arc::new(crate::adapters::mutation_store::FileMutationStore::new(
                     home.root(),
                 )),
                 dry_run_ledger: ledger,
@@ -345,6 +351,7 @@ impl Startup {
             analysis: ports.analysis,
             chat: ports.chat,
             drafts: ports.drafts,
+            mutations: ports.mutations,
             dry_run,
             dry_run_ledger: ports.dry_run_ledger,
         })

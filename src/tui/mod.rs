@@ -362,13 +362,16 @@ pub(crate) fn apply(
         // auditable in one place (FR-6.3, FR-6.5).
         Effect::LoadDraft
         | Effect::SaveDraft
+        | Effect::SaveDraftAndReload
         | Effect::ClearDraft
         | Effect::CancelPublish
         | Effect::WriteDryRun
         | Effect::ListDrafts
         | Effect::ExportDraft(_)
         | Effect::ListWorktrees => {
-            apply_draft_effect(&effect, app, runner);
+            if let Some(follow_up) = apply_draft_effect(&effect, app, runner) {
+                pending_effects.push(follow_up);
+            }
         }
 
         // The chat effects are their own group for the same reason: they share the
@@ -971,22 +974,16 @@ fn drain_effects(
 ///
 /// This is the loop, so this is where the file system work happens: the reducer
 /// decided *that* the draft changed, and the store is here.
-fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
+fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> Option<Effect> {
     match effect {
         Effect::LoadDraft => {
-            let Some(service) = app.draft_service.as_ref() else {
-                return;
-            };
-            let Some(number) = app.detail.as_ref().map(|detail| detail.summary.number) else {
-                return;
-            };
+            let service = app.draft_service.as_ref()?;
+            let number = app.detail.as_ref().map(|detail| detail.summary.number)?;
             let (draft, warning) = service.load(number, app.now());
             app.apply_loaded_draft(number, draft, warning);
         }
-        Effect::SaveDraft => {
-            let Some(service) = app.draft_service.as_ref() else {
-                return;
-            };
+        Effect::SaveDraft | Effect::SaveDraftAndReload => {
+            let service = app.draft_service.as_ref()?;
             if let Err(error) = service.save(&app.drafts.draft) {
                 // The text is still in memory and the user can carry on, but a draft
                 // that is not on disk must never look like one that is (NFR-3.4).
@@ -995,6 +992,9 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
                 app.notice(app::NoticeLevel::Warn, message);
             } else {
                 app.drafts.dirty = false;
+            }
+            if matches!(effect, Effect::SaveDraftAndReload) {
+                return Some(app.reload_after_publish());
             }
         }
         Effect::ClearDraft => {
@@ -1026,6 +1026,7 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) {
         Effect::ListWorktrees => list_worktrees(app),
         _ => {}
     }
+    None
 }
 
 /// Says which drafts this repository has (FR-6.1).
@@ -1150,6 +1151,7 @@ pub(crate) fn executor_for(
 ) -> Option<Arc<Executor>> {
     let chat = app.chat_store.clone();
     let drafts = app.draft_store.clone();
+    let mutations = app.mutation_store.clone();
     let repo: RepoId = app.environment.as_ref()?.repo.clone();
     Some(Arc::new(Executor::new(jobs::ExecutorPorts {
         forge: factory.forge(&repo),
@@ -1159,6 +1161,7 @@ pub(crate) fn executor_for(
         analysis,
         chat,
         drafts,
+        mutations,
         llm,
         repo,
         policy: CachePolicy {
@@ -1166,5 +1169,6 @@ pub(crate) fn executor_for(
             detail_ttl_secs: app.config.cache.ttl_detail_secs,
             ..CachePolicy::default()
         },
+        dry_run: app.dry_run,
     })))
 }

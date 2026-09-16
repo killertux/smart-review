@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::application::analysis::{
@@ -54,6 +55,11 @@ pub const MAX_PROGRESS_MESSAGES: usize = 256;
 /// How many jobs may run at once. Process jobs are the expensive ones, and four is
 /// what ARCH-5 allows.
 pub const MAX_IN_FLIGHT: usize = 4;
+
+/// Disambiguates operation records created in one process. The durable store still
+/// rejects a collision after restart rather than assuming this local counter is an API
+/// idempotency key (IR-07).
+static NEXT_MUTATION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Which kind of work a job is, one at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +256,8 @@ pub enum Job {
     },
     /// Resolve or unresolve a thread (FR-6.4).
     ResolveThread {
+        /// The pull request whose thread is changed.
+        number: u64,
         /// GitHub's thread id.
         thread_id: String,
         /// Which way.
@@ -508,12 +516,16 @@ pub struct ExecutorPorts {
     /// Where review drafts live (FR-6.1). The publishing job reads and clears the
     /// document it just sent, and that must not happen on the interface's thread.
     pub drafts: Arc<dyn crate::ports::DraftStorePort>,
+    /// Durable remote-mutation records (IR-07).
+    pub mutations: Arc<dyn crate::ports::MutationStorePort>,
     /// The provider (FR-4.1).
     pub llm: Arc<dyn LlmPort>,
     /// Which repository these are scoped to.
     pub repo: RepoId,
     /// How long the forge answers are reused.
     pub policy: crate::application::prs::CachePolicy,
+    /// Whether forge mutations are recorded rather than dispatched (FR-6.5).
+    pub dry_run: bool,
 }
 
 /// A job that is running.
@@ -537,10 +549,14 @@ pub struct Executor {
     chat: Arc<dyn crate::ports::ChatStorePort>,
     /// Where review drafts are read and written (FR-6.1).
     drafts: Arc<dyn crate::ports::DraftStorePort>,
+    /// Durable remote-mutation records (IR-07).
+    mutations: Arc<dyn crate::ports::MutationStorePort>,
     /// The provider, for the analysis request itself (FR-4.1).
     llm: Arc<dyn LlmPort>,
     repo: RepoId,
     policy: crate::application::prs::CachePolicy,
+    /// Whether mutation outcomes are simulated (FR-6.5).
+    dry_run: bool,
 }
 
 impl Executor {
@@ -555,9 +571,11 @@ impl Executor {
             analysis,
             chat,
             drafts,
+            mutations,
             llm,
             repo,
             policy,
+            dry_run,
         } = ports;
         Self {
             forge,
@@ -567,9 +585,11 @@ impl Executor {
             analysis,
             chat,
             drafts,
+            mutations,
             llm,
             repo,
             policy,
+            dry_run,
         }
     }
 
@@ -663,9 +683,10 @@ impl Executor {
             } => self.post_reply(*number, *comment_id, body, cancel),
             Job::PostConversation { number, body } => self.post_conversation(*number, body, cancel),
             Job::ResolveThread {
+                number,
                 thread_id,
                 resolved,
-            } => self.resolve_thread(thread_id, *resolved, cancel),
+            } => self.resolve_thread(*number, thread_id, *resolved, cancel),
             // Detection, the report, the catalog, the worktree and the connection
             // check do not need a repository resolved through the forge, so
             // `JobRunner` handles them directly.
@@ -687,53 +708,207 @@ impl Executor {
     /// A dry run clears nothing — nothing was sent (FR-6.5) — and the loop writes the
     /// recorded calls out where the user can read them.
     fn submit_review(&self, draft: &crate::domain::draft::Draft, cancel: &Cancel) -> Outcome {
+        let mut operation = match self.prepare_mutation(
+            draft.pr,
+            draft.head_sha.clone(),
+            crate::domain::mutation::MutationKind::Review {
+                draft: draft.clone(),
+            },
+        ) {
+            Ok(operation) => operation,
+            Err(error) => return Outcome::Failed(error),
+        };
         let service =
             crate::application::drafts::Drafts::new(Arc::clone(&self.drafts), self.repo.clone());
         match service.publish(self.forge.as_ref(), draft, cancel) {
             Ok(posted) => {
-                if !posted.dry_run
-                    && let Err(error) = service.remove(draft.pr)
-                {
-                    // The review is on GitHub: a failure to tidy up afterwards is a
-                    // warning, never a failed publish.
-                    logging::log(
-                        Level::Warn,
-                        format!("the sent draft could not be removed: {error}"),
-                    );
-                }
+                self.record_success(
+                    &mut operation,
+                    posted.id,
+                    posted.url.clone(),
+                    posted.dry_run,
+                );
                 Outcome::ReviewPosted(Box::new(posted))
             }
-            Err(error) => Outcome::Failed(error.to_string()),
+            Err(error) => {
+                self.record_failure(&mut operation, cancel, error.to_string());
+                Outcome::Failed(error.to_string())
+            }
         }
     }
 
     /// Posts a reply, through the service that validates it (FR-6.4).
     fn post_reply(&self, number: u64, comment_id: u64, body: &str, cancel: &Cancel) -> Outcome {
+        let mut operation = match self.prepare_mutation(
+            number,
+            None,
+            crate::domain::mutation::MutationKind::Reply {
+                comment_id,
+                body: body.to_owned(),
+            },
+        ) {
+            Ok(operation) => operation,
+            Err(error) => return Outcome::Failed(error),
+        };
         let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
         match posts.reply(number, comment_id, body, cancel) {
-            Ok(posted) => Outcome::CommentPosted(Box::new(posted)),
-            Err(error) => Outcome::Failed(error.to_string()),
+            Ok(posted) => {
+                self.record_success(
+                    &mut operation,
+                    posted.id,
+                    posted.url.clone(),
+                    posted.dry_run,
+                );
+                Outcome::CommentPosted(Box::new(posted))
+            }
+            Err(error) => {
+                self.record_failure(&mut operation, cancel, error.to_string());
+                Outcome::Failed(error.to_string())
+            }
         }
     }
 
     /// Posts a comment on the pull request's conversation (FR-6.4).
     fn post_conversation(&self, number: u64, body: &str, cancel: &Cancel) -> Outcome {
+        let mut operation = match self.prepare_mutation(
+            number,
+            None,
+            crate::domain::mutation::MutationKind::Conversation {
+                body: body.to_owned(),
+            },
+        ) {
+            Ok(operation) => operation,
+            Err(error) => return Outcome::Failed(error),
+        };
         let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
         match posts.comment(number, body, cancel) {
-            Ok(posted) => Outcome::CommentPosted(Box::new(posted)),
-            Err(error) => Outcome::Failed(error.to_string()),
+            Ok(posted) => {
+                self.record_success(
+                    &mut operation,
+                    posted.id,
+                    posted.url.clone(),
+                    posted.dry_run,
+                );
+                Outcome::CommentPosted(Box::new(posted))
+            }
+            Err(error) => {
+                self.record_failure(&mut operation, cancel, error.to_string());
+                Outcome::Failed(error.to_string())
+            }
         }
     }
 
     /// Resolves or unresolves a thread (FR-6.4).
-    fn resolve_thread(&self, thread_id: &str, resolved: bool, cancel: &Cancel) -> Outcome {
-        let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
-        match posts.resolve(thread_id, resolved, cancel) {
-            Ok(()) => Outcome::ThreadResolved {
+    fn resolve_thread(
+        &self,
+        number: u64,
+        thread_id: &str,
+        resolved: bool,
+        cancel: &Cancel,
+    ) -> Outcome {
+        let mut operation = match self.prepare_mutation(
+            number,
+            None,
+            crate::domain::mutation::MutationKind::ThreadResolution {
                 thread_id: thread_id.to_owned(),
                 resolved,
             },
-            Err(error) => Outcome::Failed(error.to_string()),
+        ) {
+            Ok(operation) => operation,
+            Err(error) => return Outcome::Failed(error),
+        };
+        let posts = crate::application::posts::Posts::new(self.forge.as_ref(), self.repo.clone());
+        match posts.resolve(thread_id, resolved, cancel) {
+            Ok(()) => {
+                self.record_success(&mut operation, None, None, self.dry_run);
+                Outcome::ThreadResolved {
+                    thread_id: thread_id.to_owned(),
+                    resolved,
+                }
+            }
+            Err(error) => {
+                self.record_failure(&mut operation, cancel, error.to_string());
+                Outcome::Failed(error.to_string())
+            }
+        }
+    }
+
+    /// Creates and marks a mutation durable before the forge can receive it (IR-07).
+    fn prepare_mutation(
+        &self,
+        pr: u64,
+        head_sha: Option<String>,
+        kind: crate::domain::mutation::MutationKind,
+    ) -> Result<crate::domain::mutation::MutationOperation, String> {
+        let seconds = self.clock.now_unix_secs();
+        let now = crate::domain::time::from_unix_secs(i64::try_from(seconds).unwrap_or(i64::MAX));
+        let serial = NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed);
+        let mut operation = crate::domain::mutation::MutationOperation::queued(
+            format!("{seconds}-{serial}"),
+            self.repo.clone(),
+            pr,
+            head_sha,
+            kind,
+            now,
+        );
+        self.mutations.create(&operation).map_err(|error| {
+            format!("could not record this operation; it was not sent: {error}")
+        })?;
+        operation.mark_dispatching(now);
+        self.mutations.save(&operation).map_err(|error| {
+            format!("could not mark this operation ready to send; it was not sent: {error}")
+        })?;
+        Ok(operation)
+    }
+
+    /// Keeps a confirmed remote result even if persisting its receipt fails.
+    fn record_success(
+        &self,
+        operation: &mut crate::domain::mutation::MutationOperation,
+        id: Option<u64>,
+        url: Option<String>,
+        dry_run: bool,
+    ) {
+        let now = crate::domain::time::from_unix_secs(
+            i64::try_from(self.clock.now_unix_secs()).unwrap_or(i64::MAX),
+        );
+        if dry_run {
+            operation.mark_simulated(now);
+        } else {
+            operation.mark_succeeded(id, url, now);
+        }
+        if let Err(error) = self.mutations.save(operation) {
+            logging::log(
+                Level::Warn,
+                format!(
+                    "remote mutation succeeded but its recovery record could not be updated: {error}"
+                ),
+            );
+        }
+    }
+
+    /// Makes cancellation after dispatch explicitly uncertain; other forge refusals are
+    /// retained as a definite rejection with the confirmed snapshot still available.
+    fn record_failure(
+        &self,
+        operation: &mut crate::domain::mutation::MutationOperation,
+        cancel: &Cancel,
+        reason: String,
+    ) {
+        let now = crate::domain::time::from_unix_secs(
+            i64::try_from(self.clock.now_unix_secs()).unwrap_or(i64::MAX),
+        );
+        if cancel.is_cancelled() {
+            operation
+                .mark_outcome_unknown(format!("local cancellation after dispatch: {reason}"), now);
+        } else {
+            operation.mark_rejected(reason, now);
+        }
+        if let Err(error) = self.mutations.save(operation) {
+            logging::log(
+                Level::Warn,
+                format!("could not update the remote mutation record: {error}"),
+            );
         }
     }
 
@@ -1327,9 +1502,11 @@ pub fn job_for(
             body: body.clone(),
         }),
         Effect::ResolveThread {
+            number,
             thread_id,
             resolved,
         } => Some(Job::ResolveThread {
+            number: *number,
             thread_id: thread_id.clone(),
             resolved: *resolved,
         }),
@@ -1361,6 +1538,7 @@ pub fn job_for(
         | Effect::SaveContextFiles
         | Effect::LoadDraft
         | Effect::SaveDraft
+        | Effect::SaveDraftAndReload
         | Effect::ClearDraft
         | Effect::CancelPublish
         | Effect::WriteDryRun
@@ -1611,6 +1789,7 @@ mod tests {
         runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
             chat: Arc::new(crate::test_support::FakeChatStore::default()),
             drafts: Arc::new(crate::test_support::FakeDraftStore::default()),
+            mutations: Arc::new(crate::test_support::FakeMutationStore::default()),
             forge: Arc::clone(&forge) as Arc<dyn ForgePort>,
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),
@@ -1619,6 +1798,7 @@ mod tests {
             llm: Arc::new(crate::test_support::NoLlm),
             repo: RepoId::parse("acme/service").unwrap(),
             policy: crate::application::prs::CachePolicy::default(),
+            dry_run: false,
         })));
         (runner, forge)
     }
@@ -1932,6 +2112,7 @@ mod tests {
         runner.set_executor(Arc::new(Executor::new(ExecutorPorts {
             chat: Arc::new(crate::test_support::FakeChatStore::default()),
             drafts: Arc::new(crate::test_support::FakeDraftStore::default()),
+            mutations: Arc::new(crate::test_support::FakeMutationStore::default()),
             forge: Arc::new(PanicForge) as Arc<dyn ForgePort>,
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),
@@ -1940,6 +2121,7 @@ mod tests {
             llm: Arc::new(crate::test_support::NoLlm),
             repo: RepoId::parse("acme/service").unwrap(),
             policy: crate::application::prs::CachePolicy::default(),
+            dry_run: false,
         })));
 
         // Three panicking jobs in a row: if a panic lost its slot, the third submit

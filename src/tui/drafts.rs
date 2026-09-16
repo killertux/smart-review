@@ -303,6 +303,8 @@ pub struct DraftState {
     /// runner and can be in flight at once, and one field for both would drop the
     /// completion of whichever started first.
     pub post_job: u64,
+    /// The immutable review snapshot submitted to GitHub (IR-07).
+    pub publishing_draft: Option<Draft>,
     /// The number in the draft panel the user is on, for `remove`.
     pub cursor: usize,
     /// Whether the draft has changed since it was last written.
@@ -334,6 +336,7 @@ impl Default for DraftState {
             status: DraftStatus::Idle,
             job: 0,
             post_job: 0,
+            publishing_draft: None,
             cursor: 1,
             dirty: false,
             warning: None,
@@ -356,6 +359,7 @@ impl DraftState {
         self.status = DraftStatus::Idle;
         self.job = 0;
         self.post_job = 0;
+        self.publishing_draft = None;
         self.cursor = 1;
         self.scroll = 0;
         self.dirty = false;
@@ -375,6 +379,7 @@ impl DraftState {
         self.status = DraftStatus::Idle;
         self.job = 0;
         self.post_job = 0;
+        self.publishing_draft = None;
         self.cursor = 1;
         self.scroll = 0;
         self.dirty = false;
@@ -612,8 +617,11 @@ impl DraftState {
 
     /// The status the publish in flight should end in (FR-6.3).
     pub fn published(&mut self, url: Option<&str>, now: Timestamp) {
-        self.draft.clear(now);
-        self.dirty = true;
+        let submitted = self.publishing_draft.take();
+        if submitted.as_ref() == Some(&self.draft) {
+            self.draft.clear(now);
+            self.dirty = true;
+        }
         self.job = 0;
         self.status = DraftStatus::Idle;
         self.modal = false;
@@ -625,6 +633,7 @@ impl DraftState {
     /// Records that the publish failed, keeping the draft (FR-6.3).
     pub fn publish_failed(&mut self, reason: impl Into<String>) {
         self.job = 0;
+        self.publishing_draft = None;
         self.armed = false;
         self.status = DraftStatus::Failed {
             reason: reason.into(),
@@ -818,6 +827,7 @@ mod tests {
 
         state.status = DraftStatus::Publishing;
         state.job = 7;
+        state.publishing_draft = Some(state.draft.clone());
         assert!(
             state.status.is_publishing(),
             "the second Enter does nothing"
@@ -828,6 +838,26 @@ mod tests {
         assert!(!state.modal, "and closes the modal");
         assert_eq!(state.job, 0);
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn ir_07_a_success_does_not_clear_writing_added_after_dispatch() {
+        let mut state = fresh();
+        state.compose(Anchor::line("src/a.rs", Side::New, 1));
+        state
+            .composer
+            .as_mut()
+            .expect("open")
+            .input
+            .insert_str("first");
+        state.stage(now()).expect("staged");
+        state.publishing_draft = Some(state.draft.clone());
+        state.draft.set_body("newer writing", now());
+
+        state.published(None, now());
+
+        assert_eq!(state.draft.body.as_deref(), Some("newer writing"));
+        assert_eq!(state.draft.comments.len(), 1);
     }
 
     #[test]
