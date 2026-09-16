@@ -147,8 +147,10 @@ LLM_PID=$!
 
 for _ in $(seq 1 40); do
   if python3 - "$CATALOG_PORT" "$LLM_PORT" <<'PY' 2>/dev/null
-import sys, urllib.request
+import socket, sys, urllib.request
 urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/api.json", timeout=1).read(16)
+with socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=1):
+    pass
 PY
   then break; fi
   sleep 0.25
@@ -337,6 +339,7 @@ shown() {
 
 run_tui() {
   local home="$1" keys="$2" waits="$3" log="$4"
+  local driver_code=0
   # Every provider in the fake catalog gets a key: which variable holds it is the
   # catalog's business (FR-4.5), and a step that fails for want of a key would be
   # testing the credential lookup instead of what it names.
@@ -347,7 +350,10 @@ run_tui() {
       --cols 160 --rows 40 --log "$log" \
       --ready "Add retry to the webhook dispatcher" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone"
+      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" || driver_code=$?
+  if [ "$driver_code" -ne 0 ]; then
+    touch "$TMP/driver.failed"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -374,7 +380,9 @@ ASK='why does it round?\r~\r'
 ASK_WAIT='Nothing has been sent yet~tokens · ~'
 
 step "1/8 build"
-if cargo build --quiet 2>"$TMP/build.log"; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  the parent validator already built the debug binary\n'
+elif cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
   bad "the debug binary does not build"
@@ -430,7 +438,8 @@ make_home "$HOME_FRESH"
 rm -f "$HOME_FRESH/state.toml"
 : >"$TMP/requests.jsonl"
 FRAMES="$TMP/confirm.log"
-SCREEN="$(run_tui "$HOME_FRESH" "$OPEN~why does it round?\r" "$OPEN_WAIT~Nothing has been sent yet" "$FRAMES")"
+SCREEN="$(run_tui "$HOME_FRESH" "$OPEN~why does it round?\r" \
+  "$OPEN_WAIT~Press Enter again to send" "$FRAMES")"
 if [ ! -s "$TMP/requests.jsonl" ]; then
   ok "the first question sent nothing at all"
 else
@@ -454,7 +463,7 @@ fi
 # Esc, before agreeing, sends nothing — and the app is stopped by the driver rather than
 # by `:q`, because `:` is a letter in a compose box.
 run_tui "$HOME_FRESH" "$OPEN~why does it round?\r~\e" \
-  "$OPEN_WAIT~Nothing has been sent yet~~" "$TMP/decline.log" >/dev/null
+  "$OPEN_WAIT~Press Enter again to send~" "$TMP/decline.log" >/dev/null
 if [ ! -s "$TMP/requests.jsonl" ]; then
   ok "declining sent nothing"
 else
@@ -626,7 +635,7 @@ step "7/8 the conversation survives, and can be exported"
 # no question, and what was said last is on screen.
 echo chat >"$TMP/mode"
 FRAMES="$TMP/restart.log"
-SCREEN="$(run_tui "$HOME_MAIN" "$OPEN" "$OPEN_WAIT~explain the rounding" "$FRAMES")"
+SCREEN="$(run_tui "$HOME_MAIN" "$OPEN" 'money\.rs~explain the rounding' "$FRAMES")"
 if printf '%s' "$SCREEN" | grep -q "explain the rounding"; then
   ok "opening the pull request again shows the conversation"
 else
@@ -798,7 +807,8 @@ keep_requests step8-dead
 # analysis"). A dead provider has to leave the panel saying so rather than "asking the
 # provider" forever.
 FRAMES="$TMP/dead-analysis.log"
-SCREEN="$(run_tui "$HOME_DEAD" ':pr 141\r~ a~ a' 'money\.rs~~' "$FRAMES")"
+SCREEN="$(run_tui "$HOME_DEAD" ':pr 141\r~ a~ a' \
+  'money\.rs~~the provider did not answer' "$FRAMES")"
 if shown "$FRAMES" "the provider did not answer"; then
   ok "a failed analysis is shown in the panel"
 else
@@ -810,12 +820,16 @@ if shown "$FRAMES" "failed: "; then
 else
   bad "the panel title does not say the analysis failed"
 fi
-if shown "$FRAMES" "asking the provider"; then
+if printf '%s' "$SCREEN" | grep -q "asking the provider"; then
   bad "the panel is still saying it is asking the provider"
 else
   ok "the panel stopped saying it was asking"
 fi
 keep_requests step8-dead-analysis
+
+if [ -f "$TMP/driver.failed" ]; then
+  bad "one or more PTY steps did not reach their expected screen state"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ]

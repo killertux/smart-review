@@ -104,8 +104,10 @@ LLM_PID=$!
 
 for _ in $(seq 1 40); do
   if python3 - "$CATALOG_PORT" "$LLM_PORT" <<'PY' 2>/dev/null
-import sys, urllib.request
+import socket, sys, urllib.request
 urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/api.json", timeout=1).read(16)
+with socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=1):
+    pass
 PY
   then break; fi
   sleep 0.25
@@ -286,16 +288,22 @@ shown() {
 
 run_tui() {
   local home="$1" keys="$2" waits="$3" log="$4"
+  local driver_code=0
   PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" FAKE_API_KEY=sk-fake-validation \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
       --ready "Add retry to the webhook dispatcher" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone"
+      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" || driver_code=$?
+  if [ "$driver_code" -ne 0 ]; then
+    touch "$TMP/driver.failed"
+  fi
 }
 
 step "1/6 build"
-if cargo build --quiet 2>"$TMP/build.log"; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  the parent validator already built the debug binary\n'
+elif cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
   bad "the debug binary does not build"
@@ -429,8 +437,8 @@ fi
 step "5/6 a cache hit with no network, and what the analysis corrected"
 # Stopping the provider proves the panel came from the cache (FR-4.3).
 kill "$LLM_PID" 2>/dev/null
+wait "$LLM_PID" 2>/dev/null
 LLM_PID=""
-sleep 0.5
 : >"$TMP/requests.jsonl"
 SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Money now rounds half up~' "$TMP/cached.log")"
 if shown "$TMP/cached.log" "Money now rounds half up"; then
@@ -460,7 +468,15 @@ step "6/6 the paths that must not be silent"
 python3 "$ROOT/scripts/validate/fake_llm.py" "$LLM_PORT" "$TMP/mode" "$TMP/repair.jsonl" \
   >"$TMP/llm-repair.log" 2>&1 &
 LLM_PID=$!
-sleep 0.5
+for _ in $(seq 1 40); do
+  if python3 - "$LLM_PORT" <<'PY' 2>/dev/null
+import socket, sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1):
+    pass
+PY
+  then break; fi
+  sleep 0.05
+done
 echo prose-then-good >"$TMP/mode"
 : >"$TMP/repair.jsonl"
 HOME_REPAIR="$TMP/home-repair"
@@ -470,7 +486,7 @@ make_home "$HOME_REPAIR"
 # "repairing", and the quit that follows cuts the run off before the retry lands. The
 # prose is "I looked at the diff…"; the analysis it is replaced by has an intent line.
 SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' \
-  'money\.rs~Nothing has been sent yet~Finance reported a rounding drift' \
+  'money\.rs~Nothing has been sent yet~Finance reported a rounding drift~' \
   "$TMP/repair.log")"
 if shown "$TMP/repair.log" "Finance reported a rounding drift"; then
   ok "prose was repaired into a usable analysis"
@@ -536,6 +552,10 @@ if shown "$TMP/small.log" "AGENTS.md"; then
   ok "the inspector names what is included"
 else
   bad "the inspector does not list what is included"
+fi
+
+if [ -f "$TMP/driver.failed" ]; then
+  bad "one or more PTY steps did not reach their expected screen state"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

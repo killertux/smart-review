@@ -86,46 +86,10 @@ jobs:
             grep -qE 'gh auth login|not a git repository|--repo|cli.github.com' /tmp/check.txt
           fi
 
-      # The milestones' own gates: formatting, lints, tests, first-run layout,
-      # permissions, configuration robustness, and — for M1 — the whole browsing
-      # and diff chain driven through a fake `gh`, with the screen reconstructed
-      # from the pty capture (the pty steps need GNU `script`).
-      - name: Milestone validation (M0)
-        run: bash scripts/validate/m0.sh
-
-      - name: Milestone validation (M1)
-        run: bash scripts/validate/m1.sh
-
-      # M2a adds a managed worktree, a local diff and the model picker: the validator
-      # builds a real repository with a pull request ref, serves the catalog from a
-      # local HTTP server, and drives the picker through a pty.
-      - name: Milestone validation (M2a)
-        run: bash scripts/validate/m2a.sh
-
-      # M2b adds the analysis path: the validator stands in for the provider with a
-      # scripted OpenAI-compatible server, so the whole chain — context, request,
-      # stream, normalize, cache, ordered review — runs offline, and the request the
-      # app actually sent is checked on the wire for what must and must not be in it.
-      - name: Milestone validation (M2b)
-        run: bash scripts/validate/m2b.sh
-
-      # M3 adds the conversation: the validator stands in for the provider again, this
-      # time with a scripted answer that streams, and reads the wire for what a chat
-      # request must and must not carry — the bundle in the system prompt, the earlier
-      # turns in the history, and a committed `.env` never.
-      - name: Milestone validation (M3)
-        run: bash scripts/validate/m3.sh
-
-      # M4 adds publishing. The fake `gh` records its argv and keeps a copy of every
-      # `--input` payload, so the step that matters asserts on what reached the wire:
-      # one review, with the decision and every comment in it, and no per-comment call
-      # at all — plus a dry run that reaches nothing.
-      - name: Milestone validation (M4)
-        run: bash scripts/validate/m4.sh
-
-      # M5 completes the public review loop. Its fake forge asserts reply routes,
-      # GraphQL thread mutations, PR-conversation posts, failure preservation and the
-      # dry-run ledger; it also runs a non-interactive $EDITOR and checks the generated
-      # docs plus the native-release workflow contract.
-      - name: Milestone validation (M5)
-        run: bash scripts/validate/m5.sh
+      # Cargo's gates already passed above. The aggregate runner therefore executes
+      # only the independent black-box milestone scenarios, in parallel, with local
+      # fake forge/catalog/model services and reconstructed PTY screens.
+      - name: Milestone validation
+        env:
+          SMART_REVIEW_SKIP_CARGO: "1"
+        run: bash scripts/validate/all.sh

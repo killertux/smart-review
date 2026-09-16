@@ -22,35 +22,40 @@ BIN="target/debug/smart-review"
 cleanup() { rm -rf "$TMP_HOME"; }
 trap cleanup EXIT
 
-step "1/7 formatting"
-if cargo fmt --all --check >/dev/null 2>&1; then
-  ok "cargo fmt --check"
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  step "1-4/7 shared Cargo gates"
+  printf '  SKIP  formatting, lints, tests and build already passed in the parent validator\n'
 else
-  bad "cargo fmt --check"
-fi
+  step "1/7 formatting"
+  if cargo fmt --all --check >/dev/null 2>&1; then
+    ok "cargo fmt --check"
+  else
+    bad "cargo fmt --check"
+  fi
 
-step "2/7 lints"
-if cargo clippy --all-targets --all-features -- -D warnings >/tmp/m0-clippy.log 2>&1; then
-  ok "cargo clippy -- -D warnings"
-else
-  bad "cargo clippy -- -D warnings"
-  tail -20 /tmp/m0-clippy.log
-fi
+  step "2/7 lints"
+  if cargo clippy --all-targets --all-features -- -D warnings >/tmp/m0-clippy.log 2>&1; then
+    ok "cargo clippy -- -D warnings"
+  else
+    bad "cargo clippy -- -D warnings"
+    tail -20 /tmp/m0-clippy.log
+  fi
 
-step "3/7 tests"
-if cargo test --all-features >/tmp/m0-test.log 2>&1; then
-  ok "cargo test --all-features ($(grep -c '^test .* ok$' /tmp/m0-test.log) tests reported)"
-else
-  bad "cargo test --all-features"
-  grep -E '^test .* FAILED|panicked' /tmp/m0-test.log | head -10
-fi
+  step "3/7 tests"
+  if cargo test --all-features >/tmp/m0-test.log 2>&1; then
+    ok "cargo test --all-features ($(grep -c '^test .* ok$' /tmp/m0-test.log) tests reported)"
+  else
+    bad "cargo test --all-features"
+    grep -E '^test .* FAILED|panicked' /tmp/m0-test.log | head -10
+  fi
 
-step "4/7 build"
-if cargo build >/tmp/m0-build.log 2>&1; then
-  ok "cargo build"
-else
-  bad "cargo build"
-  tail -20 /tmp/m0-build.log
+  step "4/7 build"
+  if cargo build >/tmp/m0-build.log 2>&1; then
+    ok "cargo build"
+  else
+    bad "cargo build"
+    tail -20 /tmp/m0-build.log
+  fi
 fi
 
 if [ ! -x "$BIN" ]; then
@@ -179,23 +184,15 @@ else
 fi
 
 step "7/7 terminal lifecycle in a real pty"
-# `script -qec` is GNU-only; BSD/macOS script has different flags, so skip there
-# rather than report a false failure.
-if script --version 2>&1 | grep -q util-linux; then
+if command -v python3 >/dev/null 2>&1; then
   PTY_HOME="$(mktemp -d)"
   set +e
-  # `script` gives the command a pty whose window size is 0x0 when there is no
-  # controlling terminal, which makes the app render an empty screen; `stty`
-  # inside the pty fixes the size so this check actually exercises rendering.
-  # 1. the leader menu must appear as soon as the leader is pressed, so Esc 200 ms
-  #    later still catches it open (waiting for `timeoutlen` would mean the menu
-  #    never opened at all, and the frame would never be written);
-  # 2. an unknown command must be reported on screen, not swallowed (FR-7.4);
-  # 3. then quit normally.
-  (sleep 1; printf ' '; sleep 0.2; printf '\033'; sleep 1; printf ':bogus\r'; sleep 1; printf ':q\r'; sleep 2) \
-    | SMART_REVIEW_HOME="$PTY_HOME" timeout 20 \
-      script -qefc "stty rows 40 cols 120 2>/dev/null; '$ROOT/$BIN'" /dev/null \
-    >/tmp/m0-tui.log 2>&1
+  # The driver advances on visible postconditions and an actual quiet PTY rather than
+  # paying a fixed sleep after every key.
+  SMART_REVIEW_HOME="$PTY_HOME" python3 "$ROOT/scripts/validate/drive.py" \
+    --cols 120 --rows 40 --log /tmp/m0-tui.log --ready 'smart-review' \
+    --keys ' ~\e~:bogus\r~:q\r' --waits 'leader~~not a command~' -- \
+    "$ROOT/$BIN" >/tmp/m0-tui-screen.log
   TUI_CODE=$?
   set -e
 
@@ -211,31 +208,30 @@ if script --version 2>&1 | grep -q util-linux; then
     bad "no clean shutdown was logged"
   fi
 
-  # The screen is a stream of escape sequences; strip them so the text can be
-  # matched as the user would see it.
-  sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\][^\x07]*\x07//g' /tmp/m0-tui.log >/tmp/m0-tui-text.log
-
   # Prove the screen was painted at all, otherwise the checks below would pass
   # vacuously on an empty render.
-  if grep -q 'smart-review' /tmp/m0-tui-text.log && grep -q 'NORMAL' /tmp/m0-tui-text.log; then
+  if grep -q 'smart-review' /tmp/m0-tui-screen.log && grep -q 'NORMAL' /tmp/m0-tui-screen.log; then
     ok "the interface painted the header and the status line"
   else
     bad "the interface rendered nothing"
   fi
 
-  if grep -q 'leader' /tmp/m0-tui-text.log; then
+  if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
+      --path /tmp/m0-tui.log --when leader >/dev/null 2>&1; then
     ok "the leader menu appears without waiting for the timeout"
   else
     bad "the leader menu did not appear on the key press"
   fi
 
-  if grep -q 'bogus' /tmp/m0-tui-text.log; then
+  if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
+      --path /tmp/m0-tui.log --when bogus >/dev/null 2>&1; then
     ok "an unknown command is reported on screen"
   else
     bad "an unknown command produced no visible output"
   fi
 
-  if grep -q 'not a command' /tmp/m0-tui-text.log; then
+  if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
+      --path /tmp/m0-tui.log --when 'not a command' >/dev/null 2>&1; then
     ok "the unknown command error names the problem"
   else
     bad "the unknown command error is missing"
@@ -255,7 +251,7 @@ if script --version 2>&1 | grep -q util-linux; then
 
   rm -rf "$PTY_HOME"
 else
-  printf '  SKIP  a GNU `script` is not available, so the pty check was skipped\n'
+  printf '  SKIP  python3 is not available, so the pty check was skipped\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -5,11 +5,12 @@
 #
 # The catalog is served by a local HTTP server rather than models.dev, so the checks
 # are offline and deterministic, and so that one of them can be "a provider this build
-# cannot reach is hidden". The last step runs against the *published* feed, because
-# that is what actually broke the picker once: a single provider publishing
-# `"min": -1` made the whole document unreadable.
+# cannot reach is hidden". An optional last step runs against the *published* feed,
+# because that is what actually broke the picker once: a single provider publishing
+# `"min": -1` made the whole document unreadable. The normal suite remains offline.
 #
-# Usage: scripts/validate/m2a.sh        (KEEP=1 keeps the temporary directory)
+# Usage: scripts/validate/m2a.sh
+#        KEEP=1 keeps temporary files; SMART_REVIEW_LIVE_TESTS=1 also probes models.dev.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -121,13 +122,17 @@ EOF
 # effect to appear on screen. The drive is the same as m1.sh's: see the comment there.
 run_tui() {
   local home="$1" keys="$2" waits="$3" fake="$4" log="$5" step_timeout="${6:-15}"
+  local driver_code=0
   PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
       --ready "Add retry to the webhook dispatcher" \
       --step-timeout "$step_timeout" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service ${EXTRA_ARGS:-}
+      "$ROOT/$BIN" --repo acme/service ${EXTRA_ARGS:-} || driver_code=$?
+  if [ "$driver_code" -ne 0 ]; then
+    touch "$TMP/driver.failed"
+  fi
   if [ -f "$home/logs/smart-review.log" ] && grep -q 'panicked' "$home/logs/smart-review.log"; then
     printf '  note: the interface panicked; see %s\n' "$home/logs/smart-review.log"
   fi
@@ -144,7 +149,9 @@ shown() {
 }
 
 step "1/7 build"
-if cargo build --quiet 2>"$TMP/build.log"; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  the parent validator already built the debug binary\n'
+elif cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
   bad "the debug binary does not build"
@@ -410,8 +417,8 @@ step "6/7 offline behaviour"
 # Stopping the server proves the cache is what answered, and it happens after every
 # check that needs the network rather than in the middle of them.
 kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null
 SERVER_PID=""
-sleep 0.5
 SCREEN="$(run_tui "$HOME_CATALOG" ' m~' 'providers,~' "$FAKE" "$TMP/catalog-offline.log")"
 if printf '%s' "$SCREEN" | saw "cached"; then
   ok "a cached catalog is used when the server is gone"
@@ -422,11 +429,12 @@ fi
 
 step "7/7 the live catalog"
 # The published feed is what broke the picker once, so the check that matters runs the
-# app against models.dev itself rather than a fixture that agrees with the parser. It
-# is a third party, so an unreachable network is a note rather than a failure.
-HOME_LIVE="$TMP/home-live"
-mkdir -p "$HOME_LIVE"
-cat >"$HOME_LIVE/config.toml" <<'EOF'
+# app against models.dev itself rather than a fixture that agrees with the parser. It is
+# deliberately opt-in: the normal suite is hermetic and cannot wait on a third party.
+if [ "${SMART_REVIEW_LIVE_TESTS:-0}" = "1" ]; then
+  HOME_LIVE="$TMP/home-live"
+  mkdir -p "$HOME_LIVE"
+  cat >"$HOME_LIVE/config.toml" <<'EOF'
 [ui]
 theme = "dark"
 
@@ -434,17 +442,24 @@ theme = "dark"
 url = "https://models.dev/api.json"
 ttl_hours = 24
 EOF
-SCREEN="$(run_tui "$HOME_LIVE" ' m~' 'providers,|could not be fetched~' "$FAKE" "$TMP/live.log" 40)"
-if printf '%s' "$SCREEN" | saw "providers,"; then
-  ok "the published catalog is readable"
-  if printf '%s' "$SCREEN" | saw "unreadable"; then
-    printf '  note: the published catalog contained entries this build could not read\n'
+  SCREEN="$(run_tui "$HOME_LIVE" ' m~' 'providers,|could not be fetched~' "$FAKE" "$TMP/live.log" 40)"
+  if printf '%s' "$SCREEN" | saw "providers,"; then
+    ok "the published catalog is readable"
+    if printf '%s' "$SCREEN" | saw "unreadable"; then
+      printf '  note: the published catalog contained entries this build could not read\n'
+    fi
+  elif printf '%s' "$SCREEN" | saw "could not be fetched"; then
+    printf '  note: models.dev is unreachable from here; the live-catalog check was skipped\n'
+  else
+    bad "the published catalog could not be read"
+    printf '%s\n' "$SCREEN" | tail -8
   fi
-elif printf '%s' "$SCREEN" | saw "could not be fetched"; then
-  printf '  note: models.dev is unreachable from here; the live-catalog check was skipped\n'
 else
-  bad "the published catalog could not be read"
-  printf '%s\n' "$SCREEN" | tail -8
+  printf '  SKIP  live models.dev probe (set SMART_REVIEW_LIVE_TESTS=1 to opt in)\n'
+fi
+
+if [ -f "$TMP/driver.failed" ]; then
+  bad "one or more PTY steps did not reach their expected screen state"
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

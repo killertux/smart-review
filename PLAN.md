@@ -342,6 +342,11 @@ names the active model.
 - **Committed fixtures**: a trimmed `models.dev` sample (2 providers × 3 models incl. a reasoning model), sample `gh pr view/list` JSON, sample unified diffs (renames, binary, CRLF, no-newline).
 - **Snapshot tests** (`TestBackend`) are the primary UI regression net; snapshots are reviewed like code.
 - **Clock is injected** so TTL/cache/staleness tests are deterministic.
+- **Fast aggregate gate:** `scripts/validate/all.sh` runs fmt, Clippy, tests and the
+  debug build once, then runs the hermetic milestone scenarios in parallel. Individual
+  `m<N>.sh` scripts remain standalone; the aggregate sets `SMART_REVIEW_SKIP_CARGO=1`
+  so they do not repeat the shared gates. Live third-party catalog probing is opt-in
+  with `SMART_REVIEW_LIVE_TESTS=1` and is never part of CI.
 
 ---
 
