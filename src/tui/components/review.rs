@@ -25,32 +25,64 @@ pub const SPLIT_MIN_WIDTH: u16 = 140;
 /// The width of the file tree when both panes are shown.
 pub const TREE_WIDTH: u16 = 34;
 
+/// Every rectangle that makes up a review frame (IR-09).
+///
+/// Rendering, focus, scrolling and hit-testing use this one model.  In particular, the
+/// diff rectangle is the part left after both the chat and a visible comment composer,
+/// rather than an approximation of the review body's height.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewLayout {
+    /// The numbered tab row.
+    pub tabs: Rect,
+    /// The file tree.
+    pub tree: Rect,
+    /// The visible diff rows.
+    pub diff: Rect,
+    /// The optional inline comment composer.
+    pub composer: Option<Rect>,
+    /// The optional chat pane.
+    pub chat: Option<Rect>,
+}
+
+/// Calculates the review frame's rectangles once (IR-09).
+#[must_use]
+pub fn layout(area: Rect, chat_open: bool, composing: bool) -> ReviewLayout {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
+    let (body, chat) = super::chat::chat_split(rows[1], chat_open);
+    let columns =
+        Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).split(body);
+    let (diff, composer) = super::drafts::composer_split(columns[1], composing);
+    ReviewLayout {
+        tabs: rows[0],
+        tree: columns[0],
+        diff,
+        composer,
+        chat,
+    }
+}
+
 /// Renders the review screen (FR-3.3).
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(view) = app.review.as_ref() else {
         return;
     };
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
-    render_tabs(frame, rows[0], app);
-
-    // The chat pane takes the bottom of the body when it is open, through the same
-    // split the mouse handler uses (FR-7.5).
-    let (body, chat) = super::chat::chat_split(rows[1], app.chat_state().is_some());
-    let columns =
-        Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).split(body);
-
-    // The composer sits at the bottom of the diff pane, through the same split the
-    // mouse handler uses, so a click lands where the drawing is (FR-6.2, FR-7.5).
-    let (diff, composer) = super::drafts::composer_split(columns[1], app.drafts().is_composing());
-    render_tree(frame, columns[0], app, view);
-    render_diff(frame, diff, app, view);
-    if let Some(composer_area) = composer
+    let layout = app.review_layout().unwrap_or_else(|| {
+        layout(
+            area,
+            app.chat_state().is_some(),
+            app.drafts().is_composing(),
+        )
+    });
+    render_tabs(frame, layout.tabs, app);
+    render_tree(frame, layout.tree, app, view);
+    render_diff(frame, layout.diff, app, view);
+    if let Some(composer_area) = layout.composer
         && let Some(composer) = app.drafts().composer.as_ref()
     {
         super::drafts::render_composer(frame, composer_area, app, composer);
     }
-    if let Some(chat) = chat {
+    if let Some(chat) = layout.chat {
         super::chat::render(frame, chat, app);
     }
 }

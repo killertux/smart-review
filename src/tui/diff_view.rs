@@ -104,6 +104,10 @@ pub struct SplitRow {
     /// The first unified row this split row covers, so the cursor and the split view
     /// stay about the same thing.
     pub unified: usize,
+    /// The source row rendered on the old side, when any (IR-09).
+    left_unified: Option<usize>,
+    /// The source row rendered on the new side, when any (IR-09).
+    right_unified: Option<usize>,
 }
 
 impl SplitRow {
@@ -234,6 +238,8 @@ pub struct DiffView {
     pub split_rows: Vec<SplitRow>,
     /// For each unified row, the split row that shows it.
     split_index: Vec<usize>,
+    /// The first split row rendered in the most recent frame (IR-09).
+    split_start: usize,
     /// The file tree, rebuilt with [`Self::rebuild`].
     pub tree: Vec<TreeRow>,
     /// The cursor, as an index into [`Self::rows`].
@@ -295,6 +301,7 @@ impl DiffView {
             rows: Vec::new(),
             split_rows: Vec::new(),
             split_index: Vec::new(),
+            split_start: 0,
             tree: Vec::new(),
             cursor: 0,
             scroll: 0,
@@ -495,13 +502,34 @@ impl DiffView {
             return &[];
         }
         let first = self
-            .split_index
-            .get(self.cursor)
-            .copied()
-            .unwrap_or_default();
+            .split_start
+            .min(self.split_rows.len().saturating_sub(1));
         let height = usize::from(height.max(1));
         let end = (first + height).min(self.split_rows.len());
         &self.split_rows[first..end]
+    }
+
+    /// Selects the source row rendered under a split-view pointer (IR-09).
+    pub fn select_split_row(
+        &mut self,
+        visible_row: usize,
+        column: u16,
+        area: ratatui::layout::Rect,
+    ) {
+        let start = self.split_start;
+        let Some(row) = self.split_rows.get(start.saturating_add(visible_row)) else {
+            return;
+        };
+        let midpoint = area.x.saturating_add(area.width / 2);
+        let source = if column < midpoint {
+            row.left_unified.or(row.right_unified)
+        } else {
+            row.right_unified.or(row.left_unified)
+        }
+        .or_else(|| row.full.as_ref().map(|_| row.unified));
+        if let Some(source) = source {
+            self.select_row(source);
+        }
     }
 
     /// Which unified row the split view should show as selected.
@@ -517,6 +545,11 @@ impl DiffView {
     /// on the world.
     pub fn prepare(&mut self, diff_height: u16, tree_height: u16) {
         self.ensure_visible(diff_height);
+        self.split_start = self
+            .split_index
+            .get(self.cursor)
+            .copied()
+            .unwrap_or_default();
         self.tree_viewport = tree_height.max(1);
         self.tree_scroll = crate::tui::components::ensure_visible(
             self.tree_cursor,
@@ -1263,6 +1296,8 @@ fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
                 right: None,
                 file: row.file,
                 unified: position,
+                left_unified: None,
+                right_unified: None,
             });
             position += 1;
             continue;
@@ -1293,6 +1328,8 @@ fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
                 right: Some(line),
                 file: row.file,
                 unified: position,
+                left_unified: Some(position),
+                right_unified: Some(position),
             });
             position += 1;
             continue;
@@ -1300,12 +1337,16 @@ fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
 
         // The pairing for a run: deletion i against addition i.
         for slot in 0..deletions.len().max(additions.len()) {
+            let left_unified = (slot < deletions.len()).then_some(start + slot);
+            let right_unified = (slot < additions.len()).then_some(start + deletions.len() + slot);
             split.push(SplitRow {
                 full: None,
                 left: deletions.get(slot).cloned(),
                 right: additions.get(slot).cloned(),
                 file: row.file,
                 unified: start,
+                left_unified,
+                right_unified,
             });
         }
     }
