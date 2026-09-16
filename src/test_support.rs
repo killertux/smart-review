@@ -155,6 +155,23 @@ impl crate::ports::DraftStorePort for FakeDraftStore {
         Ok(())
     }
 
+    fn remove_if_matches(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        submitted: &crate::domain::draft::Draft,
+    ) -> Result<bool, crate::ports::DraftStoreError> {
+        let mut drafts = self
+            .drafts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (repo.key(), submitted.pr);
+        if drafts.get(&key) == Some(submitted) {
+            drafts.remove(&key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn list(
         &self,
         repo: &crate::domain::repo::RepoId,
@@ -179,7 +196,7 @@ pub(crate) struct FakeMutationStore {
 }
 
 impl crate::ports::MutationStorePort for FakeMutationStore {
-    fn create(
+    fn begin(
         &self,
         operation: &crate::domain::mutation::MutationOperation,
     ) -> Result<(), crate::ports::MutationStoreError> {

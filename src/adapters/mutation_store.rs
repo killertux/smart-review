@@ -7,7 +7,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::adapters::fs::write_atomic;
+use crate::adapters::fs::{create_private_parents, write_atomic};
 use crate::domain::mutation::{MUTATION_VERSION, MutationOperation};
 use crate::domain::repo::RepoId;
 use crate::ports::{MutationStoreError, MutationStorePort};
@@ -64,73 +64,8 @@ impl FileMutationStore {
         }
         Ok(operation)
     }
-}
 
-impl MutationStorePort for FileMutationStore {
-    fn create(&self, operation: &MutationOperation) -> Result<(), MutationStoreError> {
-        let path = self.path(operation)?;
-        let parent = path.parent().ok_or_else(|| MutationStoreError::Malformed {
-            path: path.clone(),
-            reason: "the mutation path has no parent directory".to_owned(),
-        })?;
-        std::fs::create_dir_all(parent).map_err(|source| MutationStoreError::Io {
-            action: "create the operation directory",
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        let text = serde_json::to_vec_pretty(operation).map_err(|error| {
-            MutationStoreError::Malformed {
-                path: path.clone(),
-                reason: error.to_string(),
-            }
-        })?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|source| {
-                if source.kind() == std::io::ErrorKind::AlreadyExists {
-                    MutationStoreError::Conflict
-                } else {
-                    MutationStoreError::Io {
-                        action: "create the operation record",
-                        path: path.clone(),
-                        source,
-                    }
-                }
-            })?;
-        file.write_all(&text)
-            .and_then(|()| file.sync_all())
-            .map_err(|source| MutationStoreError::Io {
-                action: "write the operation record",
-                path,
-                source,
-            })
-    }
-
-    fn save(&self, operation: &MutationOperation) -> Result<(), MutationStoreError> {
-        let path = self.path(operation)?;
-        if !path.exists() {
-            return Err(MutationStoreError::Io {
-                action: "update the operation record",
-                path,
-                source: std::io::Error::new(std::io::ErrorKind::NotFound, "operation not found"),
-            });
-        }
-        let text = serde_json::to_string_pretty(operation).map_err(|error| {
-            MutationStoreError::Malformed {
-                path: path.clone(),
-                reason: error.to_string(),
-            }
-        })?;
-        write_atomic(&path, &text).map_err(|source| MutationStoreError::Io {
-            action: "update the operation record",
-            path,
-            source,
-        })
-    }
-
-    fn unresolved(
+    fn unresolved_in(
         &self,
         repo: &RepoId,
         pr: u64,
@@ -164,15 +99,126 @@ impl MutationStorePort for FileMutationStore {
                 source,
             })?;
             let operation = Self::decode(path, &text)?;
-            if operation.repo == *repo
-                && operation.pr == pr
-                && operation.state.needs_reconciliation()
-            {
+            if operation.repo == *repo && operation.pr == pr && operation.state.blocks_dispatch() {
                 operations.push(operation);
             }
         }
         operations.sort_by_key(|operation| operation.created_at);
         Ok(operations)
+    }
+
+    fn create(&self, operation: &MutationOperation) -> Result<(), MutationStoreError> {
+        let path = self.path(operation)?;
+        let parent = path.parent().ok_or_else(|| MutationStoreError::Malformed {
+            path: path.clone(),
+            reason: "the mutation path has no parent directory".to_owned(),
+        })?;
+        create_private_parents(parent).map_err(|source| MutationStoreError::Io {
+            action: "create the operation directory",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let text = serde_json::to_vec_pretty(operation).map_err(|error| {
+            MutationStoreError::Malformed {
+                path: path.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                MutationStoreError::Conflict
+            } else {
+                MutationStoreError::Io {
+                    action: "create the operation record",
+                    path: path.clone(),
+                    source,
+                }
+            }
+        })?;
+        file.write_all(&text)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| MutationStoreError::Io {
+                action: "write the operation record",
+                path,
+                source,
+            })
+    }
+}
+
+impl MutationStorePort for FileMutationStore {
+    fn begin(&self, operation: &MutationOperation) -> Result<(), MutationStoreError> {
+        use fs2::FileExt as _;
+        let dir = self.pr_dir(&operation.repo, operation.pr);
+        create_private_parents(&dir).map_err(|source| MutationStoreError::Io {
+            action: "create the operation directory",
+            path: dir.clone(),
+            source,
+        })?;
+        let lock_path = dir.join(".mutation.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| MutationStoreError::Io {
+                action: "open the operation lock",
+                path: lock_path,
+                source,
+            })?;
+        lock.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                MutationStoreError::Conflict
+            } else {
+                MutationStoreError::Io {
+                    action: "lock the operation journal",
+                    path: dir.clone(),
+                    source: error,
+                }
+            }
+        })?;
+        let unresolved = self.unresolved_in(&operation.repo, operation.pr)?;
+        if !unresolved.is_empty() {
+            return Err(MutationStoreError::Conflict);
+        }
+        self.create(operation)
+    }
+
+    fn save(&self, operation: &MutationOperation) -> Result<(), MutationStoreError> {
+        let path = self.path(operation)?;
+        if !path.exists() {
+            return Err(MutationStoreError::Io {
+                action: "update the operation record",
+                path,
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "operation not found"),
+            });
+        }
+        let text = serde_json::to_string_pretty(operation).map_err(|error| {
+            MutationStoreError::Malformed {
+                path: path.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        write_atomic(&path, &text).map_err(|source| MutationStoreError::Io {
+            action: "update the operation record",
+            path,
+            source,
+        })
+    }
+
+    fn unresolved(
+        &self,
+        repo: &RepoId,
+        pr: u64,
+    ) -> Result<Vec<MutationOperation>, MutationStoreError> {
+        self.unresolved_in(repo, pr)
     }
 }
 
@@ -208,7 +254,7 @@ mod tests {
         let home = temp_home();
         let store = FileMutationStore::new(home.path());
         let mut operation = operation();
-        store.create(&operation).expect("created");
+        store.begin(&operation).expect("created");
         operation.mark_dispatching(from_unix_secs(1_700_000_001));
         store.save(&operation).expect("updated");
 
@@ -225,7 +271,7 @@ mod tests {
         let home = temp_home();
         let store = FileMutationStore::new(home.path());
         let mut operation = operation();
-        store.create(&operation).expect("created");
+        store.begin(&operation).expect("created");
         operation.mark_succeeded(Some(12), None, from_unix_secs(1_700_000_001));
         store.save(&operation).expect("updated");
 
@@ -243,10 +289,40 @@ mod tests {
         let home = temp_home();
         let store = FileMutationStore::new(home.path());
         let operation = operation();
-        store.create(&operation).expect("created");
+        store.begin(&operation).expect("created");
         assert!(matches!(
-            store.create(&operation),
+            store.begin(&operation),
             Err(MutationStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn ir_07_an_unresolved_operation_blocks_a_different_dispatch_id() {
+        let home = temp_home();
+        let store = FileMutationStore::new(home.path());
+        let first = operation();
+        store.begin(&first).expect("created");
+        let mut second = operation();
+        second.id = "op-2".to_owned();
+
+        assert!(matches!(
+            store.begin(&second),
+            Err(MutationStoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn ir_07_an_unreadable_journal_record_blocks_new_dispatches() {
+        let home = temp_home();
+        let store = FileMutationStore::new(home.path());
+        let operation = operation();
+        let directory = store.pr_dir(&operation.repo, operation.pr);
+        std::fs::create_dir_all(&directory).expect("creates operation directory");
+        std::fs::write(directory.join("broken.json"), "not json").expect("writes broken record");
+
+        assert!(matches!(
+            store.begin(&operation),
+            Err(MutationStoreError::Malformed { .. })
         ));
     }
 }

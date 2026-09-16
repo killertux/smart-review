@@ -155,6 +155,8 @@ pub enum Effect {
     SaveContextFiles,
     /// Read the stored draft for the open pull request (FR-6.1).
     LoadDraft,
+    /// Recover unresolved remote mutations without blocking the event loop (IR-07).
+    LoadMutations,
     /// Write the draft, which the reducer changed but may not save itself (FR-6.1).
     SaveDraft,
     /// Persist the draft after a confirmed publish, then refresh remote discussion.
@@ -293,6 +295,7 @@ fn effect_name(effect: &Effect) -> String {
         Effect::PruneChat => "prune-chat".to_owned(),
         Effect::SaveContextFiles => "save-context-files".to_owned(),
         Effect::LoadDraft => "load-draft".to_owned(),
+        Effect::LoadMutations => "load-mutations".to_owned(),
         Effect::SaveDraft => "save-draft".to_owned(),
         Effect::SaveDraftAndReload => "save-draft-and-reload".to_owned(),
         Effect::ClearDraft => "clear-draft".to_owned(),
@@ -894,6 +897,8 @@ pub struct App {
     pub(crate) detail_job: u64,
     /// The job id of the newest diff request.
     pub(crate) patch_job: u64,
+    /// The job id checking the current pull request's durable mutation journal.
+    pub(crate) mutation_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
     /// The last doctor report, delivered by a job (FR-9.3).
@@ -1022,6 +1027,7 @@ impl App {
             count_job: 0,
             detail_job: 0,
             patch_job: 0,
+            mutation_job: 0,
             state,
             warnings,
             repo,
@@ -1315,6 +1321,7 @@ impl App {
                 self.drafts.post_job = id;
             }
             Effect::ResolveThread { .. } => self.discussion.job = id,
+            Effect::LoadMutations => self.mutation_job = id,
             // The rest ask for no job, or are handled by `apply` rather than here.
             _ => {}
         }
@@ -1445,6 +1452,14 @@ impl App {
                     Some(self.apply_thread_resolved(&thread_id, resolved))
                 }
             }
+            Outcome::MutationsRecovered { blocked, warning } if job == self.mutation_job => {
+                self.mutation_job = 0;
+                self.drafts.unresolved_mutation = blocked;
+                if let Some(warning) = warning {
+                    self.notice(NoticeLevel::Warn, warning);
+                }
+                None
+            }
             // The analysis group has its own handler: three outcomes that share the
             // panel's state, and a match with twenty arms is one where the interesting
             // ones hide.
@@ -1488,6 +1503,7 @@ impl App {
             | Outcome::ReviewPosted(_)
             | Outcome::CommentPosted(_)
             | Outcome::ThreadResolved { .. }
+            | Outcome::MutationsRecovered { .. }
             | Outcome::Stored { .. }
             | Outcome::Context { .. }
             | Outcome::Analyzed(_)
@@ -2496,13 +2512,6 @@ impl App {
             );
             return Effect::None;
         }
-        if self.drafts.unresolved_mutation {
-            self.notice(
-                NoticeLevel::Warn,
-                "a previous GitHub mutation has an unknown outcome; check the pull request before publishing again",
-            );
-            return Effect::None;
-        }
         self.drafts.panel = true;
         self.open_overlay(Overlay::Draft);
         Effect::None
@@ -2518,6 +2527,13 @@ impl App {
             return Effect::None;
         }
         if self.drafts.status.is_publishing() {
+            return Effect::None;
+        }
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before publishing again",
+            );
             return Effect::None;
         }
         if self.draft_drifted() {
@@ -2566,6 +2582,13 @@ impl App {
     /// Sends the staged review (FR-6.3).
     pub(crate) fn publish_draft(&mut self) -> Effect {
         if !self.drafts.open || self.drafts.status.is_publishing() {
+            return Effect::None;
+        }
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before publishing again",
+            );
             return Effect::None;
         }
         if self.draft_drifted() {

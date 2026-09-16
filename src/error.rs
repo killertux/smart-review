@@ -10,6 +10,15 @@ use crate::tui::theme::ThemeError;
 /// Convenience alias used across the crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Whether a forge mutation error proves that GitHub did not apply the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeDelivery {
+    /// GitHub returned a definite refusal, so the snapshot can be edited and retried.
+    Refused,
+    /// The request may have reached GitHub, so retrying blindly is unsafe.
+    Unknown,
+}
+
 /// Anything that can stop the application.
 ///
 /// Each variant carries enough context for the user to act on it (DEV-7): the
@@ -43,7 +52,11 @@ pub enum Error {
     Terminal(#[from] std::io::Error),
 
     #[error("{message}")]
-    Forge { command: String, message: String },
+    Forge {
+        command: String,
+        message: String,
+        delivery: ForgeDelivery,
+    },
 
     #[error("{0}")]
     Cache(String),
@@ -58,6 +71,25 @@ impl Error {
         Self::Forge {
             command: command.into(),
             message: message.into(),
+            delivery: ForgeDelivery::Refused,
+        }
+    }
+
+    /// Builds a forge error after a mutation's delivery could not be established.
+    pub fn forge_outcome_unknown(command: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Forge {
+            command: command.into(),
+            message: message.into(),
+            delivery: ForgeDelivery::Unknown,
+        }
+    }
+
+    /// Whether this forge failure may have applied a remote mutation.
+    #[must_use]
+    pub const fn forge_delivery(&self) -> Option<ForgeDelivery> {
+        match self {
+            Self::Forge { delivery, .. } => Some(*delivery),
+            _ => None,
         }
     }
 

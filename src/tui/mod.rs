@@ -300,6 +300,16 @@ pub(crate) fn apply(
             }
         }
 
+        Effect::LoadMutations => {
+            if let Some(number) = app.detail.as_ref().map(|detail| detail.summary.number) {
+                let id = runner.submit_owned(
+                    review_job_owner(app),
+                    jobs::Job::RecoverMutations { pr: number },
+                );
+                app.record_job(&effect, id);
+            }
+        }
+
         Effect::CancelInFlight => {
             // Cancelling the slot rather than the process only: whichever job is
             // running for this screen kills its child within a poll interval
@@ -981,27 +991,7 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             let number = app.detail.as_ref().map(|detail| detail.summary.number)?;
             let (draft, warning) = service.load(number, app.now());
             app.apply_loaded_draft(number, draft, warning);
-            let repo = app
-                .environment
-                .as_ref()
-                .map(|environment| environment.repo.clone())?;
-            match app.mutation_store.unresolved(&repo, number) {
-                Ok(operations) if operations.is_empty() => {}
-                Ok(operations) => {
-                    app.drafts.unresolved_mutation = true;
-                    app.notice(
-                        app::NoticeLevel::Warn,
-                        format!(
-                            "{} earlier GitHub mutation(s) have an unknown outcome; check the pull request before posting again",
-                            operations.len()
-                        ),
-                    );
-                }
-                Err(error) => app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("could not recover earlier GitHub mutations: {error}; do not retry until it is fixed"),
-                ),
-            }
+            return Some(Effect::LoadMutations);
         }
         Effect::SaveDraft | Effect::SaveDraftAndReload => {
             let service = app.draft_service.as_ref()?;
@@ -1035,10 +1025,15 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             runner.cancel(jobs::Slot::Review);
             app.drafts.job = 0;
             app.drafts.armed = false;
-            app.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+            app.drafts.unresolved_mutation = true;
+            app.drafts.status = crate::tui::drafts::DraftStatus::Failed {
+                reason:
+                    "the request may have reached GitHub; check the pull request before retrying"
+                        .to_owned(),
+            };
             app.notice(
                 app::NoticeLevel::Warn,
-                "the review was not sent; the draft is still here",
+                "the request may have reached GitHub; its outcome is unknown and retries are blocked",
             );
         }
         Effect::WriteDryRun => write_dry_run(app),

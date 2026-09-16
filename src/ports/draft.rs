@@ -40,6 +40,14 @@ pub trait DraftStorePort: std::fmt::Debug + Send + Sync {
     /// Returns an error when a file exists and cannot be removed.
     fn remove(&self, repo: &RepoId, number: u64) -> Result<(), DraftStoreError>;
 
+    /// Deletes the draft only when it still equals the submitted immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current document cannot be read or removed. A newer
+    /// draft is preserved and returns `Ok(false)`.
+    fn remove_if_matches(&self, repo: &RepoId, submitted: &Draft) -> Result<bool, DraftStoreError>;
+
     /// Every draft for a repository, with the pull request each belongs to.
     ///
     /// Used to say "you have unsent comments on three pull requests" at startup, and

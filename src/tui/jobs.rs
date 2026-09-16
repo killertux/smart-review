@@ -105,6 +105,8 @@ pub enum Slot {
     /// Its own slot, deliberately: resolving is not a post, and superseding a reply
     /// with a resolve would cancel a request that may already have reached GitHub.
     Thread,
+    /// Reading the durable mutation journal (IR-07).
+    Mutation,
 }
 
 /// What a job was asked to do.
@@ -263,6 +265,11 @@ pub enum Job {
         /// Which way.
         resolved: bool,
     },
+    /// Reads unresolved mutation records for a pull request (IR-07).
+    RecoverMutations {
+        /// The pull request whose journal is read.
+        pr: u64,
+    },
 }
 
 impl Job {
@@ -301,6 +308,7 @@ impl Job {
             Self::SubmitReview { .. } => Slot::Review,
             Self::PostReply { .. } | Self::PostConversation { .. } => Slot::Post,
             Self::ResolveThread { .. } => Slot::Thread,
+            Self::RecoverMutations { .. } => Slot::Mutation,
         }
     }
 
@@ -414,6 +422,13 @@ pub enum Outcome {
         thread_id: String,
         /// What the thread is now.
         resolved: bool,
+    },
+    /// The durable mutation journal was checked for the current pull request (IR-07).
+    MutationsRecovered {
+        /// Whether another remote mutation must remain blocked.
+        blocked: bool,
+        /// An actionable warning when recovery could not prove safety.
+        warning: Option<String>,
     },
     /// The review was posted, or recorded by a dry run (FR-6.3, FR-6.5).
     ReviewPosted(Box<crate::ports::ReviewPosted>),
@@ -687,6 +702,7 @@ impl Executor {
                 thread_id,
                 resolved,
             } => self.resolve_thread(*number, thread_id, *resolved, cancel),
+            Job::RecoverMutations { pr } => self.recover_mutations(*pr),
             // Detection, the report, the catalog, the worktree and the connection
             // check do not need a repository resolved through the forge, so
             // `JobRunner` handles them directly.
@@ -696,6 +712,30 @@ impl Executor {
             | Job::Workspace { .. }
             | Job::ModelCheck { .. }
             | Job::CleanWorkspaces { .. } => Outcome::Abandoned,
+        }
+    }
+
+    /// Reads the durable mutation journal without allowing an unreadable record to
+    /// become permission to post again (IR-07).
+    fn recover_mutations(&self, pr: u64) -> Outcome {
+        match self.mutations.unresolved(&self.repo, pr) {
+            Ok(operations) if operations.is_empty() => Outcome::MutationsRecovered {
+                blocked: false,
+                warning: None,
+            },
+            Ok(operations) => Outcome::MutationsRecovered {
+                blocked: true,
+                warning: Some(format!(
+                    "{} earlier GitHub mutation(s) have an unknown outcome; check the pull request before posting again",
+                    operations.len()
+                )),
+            },
+            Err(error) => Outcome::MutationsRecovered {
+                blocked: true,
+                warning: Some(format!(
+                    "could not recover earlier GitHub mutations: {error}; do not retry until it is fixed"
+                )),
+            },
         }
     }
 
@@ -728,10 +768,22 @@ impl Executor {
                     posted.url.clone(),
                     posted.dry_run,
                 );
+                if !posted.dry_run
+                    && let Err(error) = service.remove_if_matches(draft)
+                {
+                    logging::log(
+                        Level::Warn,
+                        format!("the sent draft could not be cleared safely: {error}"),
+                    );
+                }
                 Outcome::ReviewPosted(Box::new(posted))
             }
             Err(error) => {
-                self.record_failure(&mut operation, cancel, error.to_string());
+                self.record_failure(
+                    &mut operation,
+                    error.to_string(),
+                    publish_failure_is_unknown(&error),
+                );
                 Outcome::Failed(error.to_string())
             }
         }
@@ -762,7 +814,11 @@ impl Executor {
                 Outcome::CommentPosted(Box::new(posted))
             }
             Err(error) => {
-                self.record_failure(&mut operation, cancel, error.to_string());
+                self.record_failure(
+                    &mut operation,
+                    error.to_string(),
+                    reply_failure_is_unknown(&error),
+                );
                 Outcome::Failed(error.to_string())
             }
         }
@@ -792,7 +848,11 @@ impl Executor {
                 Outcome::CommentPosted(Box::new(posted))
             }
             Err(error) => {
-                self.record_failure(&mut operation, cancel, error.to_string());
+                self.record_failure(
+                    &mut operation,
+                    error.to_string(),
+                    reply_failure_is_unknown(&error),
+                );
                 Outcome::Failed(error.to_string())
             }
         }
@@ -827,7 +887,11 @@ impl Executor {
                 }
             }
             Err(error) => {
-                self.record_failure(&mut operation, cancel, error.to_string());
+                self.record_failure(
+                    &mut operation,
+                    error.to_string(),
+                    reply_failure_is_unknown(&error),
+                );
                 Outcome::Failed(error.to_string())
             }
         }
@@ -851,7 +915,7 @@ impl Executor {
             kind,
             now,
         );
-        self.mutations.create(&operation).map_err(|error| {
+        self.mutations.begin(&operation).map_err(|error| {
             format!("could not record this operation; it was not sent: {error}")
         })?;
         operation.mark_dispatching(now);
@@ -887,20 +951,19 @@ impl Executor {
         }
     }
 
-    /// Makes cancellation after dispatch explicitly uncertain; other forge refusals are
-    /// retained as a definite rejection with the confirmed snapshot still available.
+    /// GitHub's explicit refusal is safe to retry. A canceled child, timeout or an
+    /// unclassified transport failure may have reached GitHub and remains unknown.
     fn record_failure(
         &self,
         operation: &mut crate::domain::mutation::MutationOperation,
-        cancel: &Cancel,
         reason: String,
+        outcome_unknown: bool,
     ) {
         let now = crate::domain::time::from_unix_secs(
             i64::try_from(self.clock.now_unix_secs()).unwrap_or(i64::MAX),
         );
-        if cancel.is_cancelled() {
-            operation
-                .mark_outcome_unknown(format!("local cancellation after dispatch: {reason}"), now);
+        if outcome_unknown {
+            operation.mark_outcome_unknown(reason, now);
         } else {
             operation.mark_rejected(reason, now);
         }
@@ -1082,6 +1145,24 @@ impl Executor {
             self.clock.as_ref(),
             &self.repo,
         )
+    }
+}
+
+fn is_definite_forge_refusal(error: &crate::Error) -> bool {
+    error.forge_delivery() == Some(crate::error::ForgeDelivery::Refused)
+}
+
+fn publish_failure_is_unknown(error: &crate::application::drafts::PublishError) -> bool {
+    match error {
+        crate::application::drafts::PublishError::Refused(_) => false,
+        crate::application::drafts::PublishError::Forge(error) => !is_definite_forge_refusal(error),
+    }
+}
+
+fn reply_failure_is_unknown(error: &crate::application::posts::ReplyError) -> bool {
+    match error {
+        crate::application::posts::ReplyError::Refused(_) => false,
+        crate::application::posts::ReplyError::Forge(error) => !is_definite_forge_refusal(error),
     }
 }
 
@@ -1516,6 +1597,7 @@ pub fn job_for(
         Effect::LoadCatalog(policy) => Some(Job::Catalog { policy: *policy }),
         // A diff reload needs the head SHA, which the caller knows and this does not.
         Effect::ReloadDiff
+        | Effect::LoadMutations
         | Effect::EnsureWorkspace(_)
         | Effect::CheckModel
         | Effect::ClearKey(_)

@@ -78,6 +78,15 @@ impl Drafts {
         self.store.remove(&self.repo, pr)
     }
 
+    /// Removes a submitted draft only if later edits have not replaced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable draft cannot be read or removed.
+    pub fn remove_if_matches(&self, submitted: &Draft) -> Result<bool, DraftStoreError> {
+        self.store.remove_if_matches(&self.repo, submitted)
+    }
+
     /// Every draft this repository has, for `:draft list` (FR-6.1).
     ///
     /// # Errors

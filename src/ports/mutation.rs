@@ -34,13 +34,14 @@ pub enum MutationStoreError {
 
 /// Stores confirmed remote-mutation snapshots independently of transient UI state.
 pub trait MutationStorePort: std::fmt::Debug + Send + Sync {
-    /// Persists a newly confirmed operation before network dispatch.
+    /// Atomically verifies that no earlier unresolved operation exists, then persists
+    /// a newly confirmed operation before network dispatch.
     ///
     /// # Errors
     ///
     /// Returns [`MutationStoreError::Conflict`] if that id already exists, or an IO or
     /// parse error that must prevent dispatch.
-    fn create(&self, operation: &MutationOperation) -> Result<(), MutationStoreError>;
+    fn begin(&self, operation: &MutationOperation) -> Result<(), MutationStoreError>;
 
     /// Replaces an existing operation after a state transition.
     ///

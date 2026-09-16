@@ -98,6 +98,16 @@ impl DraftStorePort for FileDraftStore {
         }
     }
 
+    fn remove_if_matches(&self, repo: &RepoId, submitted: &Draft) -> Result<bool, DraftStoreError> {
+        match self.load(repo, submitted.pr)? {
+            Some(current) if current == *submitted => {
+                self.remove(repo, submitted.pr)?;
+                Ok(true)
+            }
+            Some(_) | None => Ok(false),
+        }
+    }
+
     fn list(&self, repo: &RepoId) -> Result<Vec<Draft>, DraftStoreError> {
         let dir = self.repo_dir(repo);
         let entries = match std::fs::read_dir(&dir) {
@@ -254,6 +264,23 @@ mod tests {
         store.save(&repo(), &staged(141)).expect("writable");
         store.remove(&repo(), 141).expect("removable");
         assert_eq!(store.load(&repo(), 141).expect("readable"), None);
+    }
+
+    #[test]
+    fn ir_07_a_submitted_snapshot_never_removes_newer_draft_writing() {
+        let home = temp_home();
+        let store = FileDraftStore::new(home.path());
+        let submitted = staged(141);
+        let mut newer = submitted.clone();
+        newer.set_body("newer words", now());
+        store.save(&repo(), &newer).expect("writes newer draft");
+
+        assert!(
+            !store
+                .remove_if_matches(&repo(), &submitted)
+                .expect("compares")
+        );
+        assert_eq!(store.load(&repo(), 141).expect("loads"), Some(newer));
     }
 
     #[test]
