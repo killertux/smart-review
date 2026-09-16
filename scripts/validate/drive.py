@@ -29,6 +29,7 @@ is empty just settles briefly. Key groups use the same escapes `printf '%b'` did
 """
 
 import argparse
+import codecs
 import fcntl
 import os
 import re
@@ -89,9 +90,29 @@ def interpret_keys(text: str) -> bytes:
     return bytes(output)
 
 
-def drain(master: int) -> bytes:
-    """Reads whatever the pty has to say right now, without blocking."""
-    chunks = []
+class Capture:
+    """The raw capture and its incrementally reconstructed terminal screen."""
+
+    def __init__(self, cols: int, rows: int) -> None:
+        self.raw = bytearray()
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.replay = screen.Replay(cols, rows)
+
+    def add(self, data: bytes) -> None:
+        self.raw.extend(data)
+        self.replay.feed(self.decoder.decode(data))
+
+    def finish(self) -> None:
+        self.replay.feed(self.decoder.decode(b"", final=True), final=True)
+        self.replay.finish()
+
+    def text(self) -> str:
+        return self.replay.text()
+
+
+def drain(master: int, capture: Capture) -> tuple[bool, bool]:
+    """Reads available PTY output. Returns `(read_data, reached_eof)`."""
+    read_data = False
     while True:
         ready, _, _ = select.select([master], [], [], 0)
         if not ready:
@@ -99,40 +120,53 @@ def drain(master: int) -> bytes:
         try:
             data = os.read(master, 65536)
         except OSError:
-            break
+            return read_data, True
         if not data:
-            break
-        chunks.append(data)
-    return b"".join(chunks)
+            return read_data, True
+        capture.add(data)
+        read_data = True
+    return read_data, False
 
 
 def wait_for(
     master: int,
-    capture: bytearray,
+    capture: Capture,
     pattern: str,
     deadline: float,
-    cols: int,
-    rows: int,
 ) -> bool:
-    """Polls the pty until `pattern` matches the replayed screen, or the deadline."""
+    """Waits until `pattern` matches the live screen, or the deadline."""
     matcher = re.compile(pattern)
+    if matcher.search(capture.text()):
+        return True
     while time.monotonic() < deadline:
-        capture.extend(drain(master))
-        if matcher.search(
-            screen.replay(capture.decode("utf-8", errors="replace"), cols, rows)
-        ):
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([master], [], [], min(0.1, remaining))
+        if not ready:
+            continue
+        read_data, reached_eof = drain(master, capture)
+        if read_data and matcher.search(capture.text()):
             return True
-        time.sleep(0.03)
-    capture.extend(drain(master))
+        if reached_eof:
+            return False
+    drain(master, capture)
     return False
 
 
-def settle(master: int, capture: bytearray, seconds: float) -> None:
-    """Waits for a short quiet period, absorbing anything the pty writes meanwhile."""
-    deadline = time.monotonic() + seconds
+def settle(master: int, capture: Capture, quiet_seconds: float, deadline: float) -> None:
+    """Returns after the PTY has stayed quiet, bounded by `deadline`."""
+    quiet_deadline = min(deadline, time.monotonic() + quiet_seconds)
     while time.monotonic() < deadline:
-        capture.extend(drain(master))
-        time.sleep(min(0.03, max(0.0, deadline - time.monotonic())))
+        remaining = max(0.0, quiet_deadline - time.monotonic())
+        if remaining == 0:
+            return
+        ready, _, _ = select.select([master], [], [], remaining)
+        if not ready:
+            return
+        read_data, reached_eof = drain(master, capture)
+        if reached_eof:
+            return
+        if read_data:
+            quiet_deadline = min(deadline, time.monotonic() + quiet_seconds)
 
 
 def main() -> int:
@@ -143,7 +177,12 @@ def main() -> int:
     parser.add_argument("--ready", default="", help="regex to wait for before the first key")
     parser.add_argument("--timeout", type=float, default=60.0, help="overall cap in seconds")
     parser.add_argument("--step-timeout", type=float, default=15.0, help="per-step wait cap")
-    parser.add_argument("--settle", type=float, default=0.25, help="quiet period for empty waits")
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=0.1,
+        help="required PTY idle period for empty waits (not a fixed sleep)",
+    )
     parser.add_argument("--keys", default="", help="`~`-separated key groups")
     parser.add_argument("--waits", default="", help="`~`-separated regexes, one per key group")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -159,8 +198,15 @@ def main() -> int:
 
     key_groups = arguments.keys.split("~") if arguments.keys else []
     wait_groups = arguments.waits.split("~") if arguments.waits else []
-    while len(wait_groups) < len(key_groups):
-        wait_groups.append("")
+    if key_groups and not wait_groups:
+        wait_groups = [""] * len(key_groups)
+    if len(wait_groups) != len(key_groups):
+        print(
+            "drive.py: --keys and --waits must contain the same number of groups "
+            f"({len(key_groups)} keys, {len(wait_groups)} waits)",
+            file=sys.stderr,
+        )
+        return 2
 
     master, slave = os.openpty()
     fcntl.ioctl(
@@ -180,12 +226,13 @@ def main() -> int:
     )
     os.close(slave)
 
-    capture = bytearray()
+    capture = Capture(arguments.cols, arguments.rows)
     overall_deadline = time.monotonic() + arguments.timeout
     step_deadline = lambda: min(  # noqa: E731
         overall_deadline, time.monotonic() + arguments.step_timeout
     )
 
+    failure = ""
     try:
         if arguments.ready:
             if not wait_for(
@@ -193,50 +240,51 @@ def main() -> int:
                 capture,
                 arguments.ready,
                 step_deadline(),
-                arguments.cols,
-                arguments.rows,
             ):
-                print(
-                    f"drive.py: the ready state {arguments.ready!r} never appeared",
-                    file=sys.stderr,
-                )
+                failure = f"the ready state {arguments.ready!r} never appeared"
 
-        for keys, pattern in zip(key_groups, wait_groups):
-            os.write(master, interpret_keys(keys))
+        for index, (keys, pattern) in enumerate(zip(key_groups, wait_groups), start=1):
+            if failure:
+                break
+            try:
+                os.write(master, interpret_keys(keys))
+            except OSError as error:
+                failure = f"step {index} could not send its keys: {error}"
+                break
             if pattern:
                 if not wait_for(
                     master,
                     capture,
                     pattern,
                     step_deadline(),
-                    arguments.cols,
-                    arguments.rows,
                 ):
-                    print(
-                        f"drive.py: step pattern {pattern!r} never appeared",
-                        file=sys.stderr,
-                    )
+                    failure = f"step {index} pattern {pattern!r} never appeared"
             else:
-                settle(master, capture, arguments.settle)
+                settle(master, capture, arguments.settle, step_deadline())
 
         # Capture the last frame and the terminal restore, then stop the app if it is
         # still running (a run whose keys do not quit).
-        settle(master, capture, arguments.settle)
+        settle(master, capture, arguments.settle, step_deadline())
         if process.poll() is None:
             try:
-                process.send_signal(signal.SIGTERM)
+                # The child owns a fresh session. Signal that process group so a
+                # cancelled validator cannot leave a fake `gh` or editor behind.
+                os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass  # it exited between the poll and the signal
             try:
-                process.wait(timeout=2.0)
+                process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 process.wait()
-        settle(master, capture, 0.1)
+        settle(master, capture, 0.05, time.monotonic() + 0.25)
     finally:
         if process.poll() is None:
             try:
-                process.kill()
+                os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.wait()
@@ -245,10 +293,14 @@ def main() -> int:
         except OSError:
             pass
 
-    raw = bytes(capture)
+    capture.finish()
+    raw = bytes(capture.raw)
     with open(arguments.log, "wb") as handle:
         handle.write(raw)
-    print(screen.replay(raw.decode("utf-8", errors="replace"), arguments.cols, arguments.rows))
+    print(capture.text())
+    if failure:
+        print(f"drive.py: {failure}; capture: {arguments.log}", file=sys.stderr)
+        return 1
     return 0
 
 

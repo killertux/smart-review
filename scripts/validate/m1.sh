@@ -108,12 +108,16 @@ GH
 # popups that `:q` closes can be replayed from it (see `shown` in m2b.sh).
 run_tui() {
   local home="$1" keys="$2" waits="$3" fake="$4" log="$5"
+  local driver_code=0
   PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
       --ready "Add retry to the webhook dispatcher" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service
+      "$ROOT/$BIN" --repo acme/service || driver_code=$?
+  if [ "$driver_code" -ne 0 ]; then
+    touch "$TMP/driver.failed"
+  fi
   if grep -q 'panicked' "$log" 2>/dev/null; then
     printf '  note: the interface panicked; see %s\n' "$log"
   fi
@@ -122,46 +126,50 @@ run_tui() {
 # Matches text on the reconstructed screen, ignoring the padding between columns.
 saw() { grep -q "$1"; }
 
-# The screen checks need a pty (`script`), a replayable capture (`python3`) and a
-# bounded run (`timeout`). Missing any of them is a skip with a reason, not a crash
-# half way through the run.
+# The screen checks need Python's PTY support and replay helper. Missing Python is a
+# skip with a reason, not a crash half way through the run.
 HAVE_PTY=0
-if ! script --version 2>&1 | grep -q util-linux; then
-  printf 'note: GNU script not found; the screen checks will be skipped\n'
-elif ! command -v python3 >/dev/null 2>&1; then
+if ! command -v python3 >/dev/null 2>&1; then
   printf 'note: python3 not found; the screen checks will be skipped\n'
-elif ! command -v timeout >/dev/null 2>&1; then
-  printf 'note: timeout not found; the screen checks will be skipped\n'
 else
   HAVE_PTY=1
 fi
 
 # ---------------------------------------------------------------------------
 step "1/6 formatting, lints, tests"
-if cargo fmt --all --check >/dev/null 2>&1; then
-  ok "cargo fmt --check"
+TESTS_PASSED=0
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  shared formatting, lint and test gates already passed\n'
+  TESTS_PASSED=1
 else
-  bad "cargo fmt --check"
-fi
+  if cargo fmt --all --check >/dev/null 2>&1; then
+    ok "cargo fmt --check"
+  else
+    bad "cargo fmt --check"
+  fi
 
-if cargo clippy --all-targets --all-features -- -D warnings >/tmp/m1-clippy.log 2>&1; then
-  ok "cargo clippy -- -D warnings"
-else
-  bad "cargo clippy -- -D warnings"
-  tail -20 /tmp/m1-clippy.log
-fi
+  if cargo clippy --all-targets --all-features -- -D warnings >/tmp/m1-clippy.log 2>&1; then
+    ok "cargo clippy -- -D warnings"
+  else
+    bad "cargo clippy -- -D warnings"
+    tail -20 /tmp/m1-clippy.log
+  fi
 
-if cargo test --all-features >/tmp/m1-test.log 2>&1; then
-  ok "cargo test --all-features"
-else
-  bad "cargo test --all-features"
-  grep -E '^test .* FAILED|panicked' /tmp/m1-test.log | head -10
+  if cargo test --all-features >/tmp/m1-test.log 2>&1; then
+    ok "cargo test --all-features"
+    TESTS_PASSED=1
+  else
+    bad "cargo test --all-features"
+    grep -E '^test .* FAILED|panicked' /tmp/m1-test.log | head -10
+  fi
 fi
 
 # ---------------------------------------------------------------------------
 step "2/6 the diff parser handles the fixture's awkward cases"
-if cargo test --all-features --lib domain::diff >/tmp/m1-parser.log 2>&1; then
-  ok "the parser's unit tests pass (renames, binary, mode-only, submodule, CRLF)"
+if [ "$TESTS_PASSED" = "1" ]; then
+  ok "the full test gate includes parser cases (renames, binary, mode-only, submodule, CRLF)"
+elif cargo test --all-features --lib domain::diff >/tmp/m1-parser.log 2>&1; then
+  ok "the parser's focused tests pass despite another test failure"
 else
   bad "the parser's unit tests fail"
   grep -E '^test .* FAILED' /tmp/m1-parser.log | head -5
@@ -169,7 +177,9 @@ fi
 
 # ---------------------------------------------------------------------------
 step "3/6 build"
-if cargo build >/tmp/m1-build.log 2>&1; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  the parent validator already built the debug binary\n'
+elif cargo build >/tmp/m1-build.log 2>&1; then
   ok "cargo build"
 else
   bad "cargo build"
@@ -381,20 +391,21 @@ else
     bad ":copy-path wrote no OSC 52 sequence"
   fi
 
-  # A signal must give the terminal back (NFR-4.2). `SIGINT` arrives as a key in raw
-  # mode, so this is about the signals a `kill` sends.
+  # A signal must give the terminal back (NFR-4.2). The PTY driver signals the exact
+  # child process as soon as the list is visible; a broad `pkill` was slow and could
+  # terminate another validator running concurrently.
   HOME_SIGNAL="$TMP/home-signal"
   set +e
-  (sleep 6) | PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$HOME_SIGNAL" timeout 20 \
-    script -qefc "stty rows 40 cols 160 2>/dev/null; '$ROOT/$BIN' --repo acme/service" /dev/null \
-    >/tmp/m1-signal.log 2>&1 &
-  SIGNAL_JOB=$!
-  sleep 4
-  pkill -TERM -f 'target/debug/smart-review' 2>/dev/null
-  wait "$SIGNAL_JOB" 2>/dev/null
+  PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$HOME_SIGNAL" \
+    python3 "$ROOT/scripts/validate/drive.py" \
+      --cols 160 --rows 40 --log /tmp/m1-signal.log \
+      --ready "Add retry to the webhook dispatcher" -- \
+      "$ROOT/$BIN" --repo acme/service >/dev/null
+  SIGNAL_CODE=$?
   set -e
 
-  if grep -q 'restoring the terminal' "$HOME_SIGNAL/logs/smart-review.log" 2>/dev/null; then
+  if [ "$SIGNAL_CODE" -eq 0 ] \
+     && grep -q 'restoring the terminal' "$HOME_SIGNAL/logs/smart-review.log" 2>/dev/null; then
     ok "SIGTERM restores the terminal"
   else
     bad "SIGTERM did not restore the terminal"
@@ -421,6 +432,10 @@ else
   else
     bad "the offline indicator is missing"
   fi
+fi
+
+if [ -f "$TMP/driver.failed" ]; then
+  bad "one or more PTY steps did not reach their expected screen state"
 fi
 
 # ---------------------------------------------------------------------------

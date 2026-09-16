@@ -23,7 +23,10 @@ import argparse
 import re
 import sys
 
-CSI = re.compile(r"\x1b\[([0-9;?]*)([a-zA-Z])")
+# ECMA-48 final bytes span `@` through `~`; most terminal controls use a letter,
+# while keys and a few controls end in `~`. Unrecognised finals are harmlessly ignored
+# by `Screen.csi`, but they still have to be consumed as one sequence.
+CSI = re.compile(r"\x1b\[([0-9;?]*)([@-~])")
 OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
@@ -100,31 +103,68 @@ class Screen:
         return "\n".join("".join(row).rstrip() for row in self.grid)
 
 
-def replay(data: str, cols: int, rows: int) -> str:
-    screen = Screen(cols, rows)
-    index = 0
-    while index < len(data):
-        character = data[index]
-        if character == "\x1b":
+class Replay:
+    """Incrementally applies terminal output to one screen.
+
+    PTY reads may split an escape sequence between two chunks. `pending` keeps that
+    incomplete suffix until the next read, so the live driver does not need to replay
+    its whole capture after every poll.
+    """
+
+    def __init__(self, cols: int, rows: int) -> None:
+        self.screen = Screen(cols, rows)
+        self.pending = ""
+
+    def feed(self, data: str, *, final: bool = False) -> None:
+        data = self.pending + data
+        self.pending = ""
+        index = 0
+        while index < len(data):
+            character = data[index]
+            if character != "\x1b":
+                self.screen.put(character)
+                index += 1
+                continue
+
             remainder = data[index:]
             match = CSI.match(remainder)
             if match:
-                screen.csi(match.group(1), match.group(2))
+                self.screen.csi(match.group(1), match.group(2))
                 index += match.end()
                 continue
             osc = OSC.match(remainder)
             if osc:
-                # An operating-system command such as a window title or the OSC 52
-                # clipboard write: nothing is drawn.
+                self.pending = ""
                 index += osc.end()
                 continue
-            # A two-character escape (for example the alternate screen switch), which
-            # this replay can ignore: the grid keeps being drawn into.
-            index += 2
-            continue
-        screen.put(character)
-        index += 1
-    return screen.text()
+
+            # A CSI or OSC can be split anywhere by a PTY read. Keep it for the next
+            # chunk unless this is the final feed; an unknown complete escape remains
+            # the same harmless two-character sequence the old replay ignored.
+            if not final and (
+                remainder == "\x1b"
+                or remainder.startswith("\x1b[")
+                or remainder.startswith("\x1b]")
+            ):
+                self.pending = remainder
+                return
+            index += min(2, len(remainder))
+
+    def finish(self) -> None:
+        if self.pending:
+            pending = self.pending
+            self.pending = ""
+            self.feed(pending, final=True)
+
+    def text(self) -> str:
+        return self.screen.text()
+
+
+def replay(data: str, cols: int, rows: int) -> str:
+    replayed = Replay(cols, rows)
+    replayed.feed(data, final=True)
+    replayed.finish()
+    return replayed.text()
 
 
 def replay_until(raw: str, cols: int, rows: int, pattern: str) -> str | None:

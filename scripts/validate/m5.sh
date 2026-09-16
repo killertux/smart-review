@@ -71,6 +71,7 @@ pub fn round(cents: i64) -> i64 {
 EOF
 git -C "$REPO/clone" add -A
 git -C "$REPO/clone" commit --quiet -m "round half up in money"
+PR_SHA="$(git -C "$REPO/clone" rev-parse HEAD)"
 git -C "$REPO/clone" diff --no-color --no-ext-diff main HEAD >"$TMP/diff.patch"
 git -C "$REPO/clone" push --quiet --force origin HEAD:refs/pull/141/head
 git -C "$REPO/clone" checkout --quiet main
@@ -102,7 +103,7 @@ case "$1:$2" in
   pr:list) cat "$fixtures/pr-list.json"; exit 0 ;;
   pr:view)
     number=$(printf '%s' "$*" | sed -n 's/.*view \([0-9][0-9]*\).*/\1/p')
-    sed "s/\"number\": 141/\"number\": ${number:-141}/" "$fixtures/pr-view.json"
+    sed "s/\"number\": 141/\"number\": ${number:-141}/" "$here/view.json"
     exit 0 ;;
   pr:diff) cat "$here/diff.patch"; exit 0 ;;
   api:graphql)
@@ -192,6 +193,16 @@ printf '0' >"$FAKE/fail_resolve"
 printf '0' >"$FAKE/fail_reply"
 printf '0' >"$FAKE/fail_conversation"
 cp "$TMP/diff.patch" "$FAKE/diff.patch"
+python3 - "$ROOT/tests/fixtures/gh/pr-view.json" "$FAKE/view.json" "$PR_SHA" <<'PY'
+import json, sys
+source, target, head = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    document = json.load(handle)
+document["headRefOid"] = head
+document["baseRefName"] = "main"
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+PY
 
 # What is already on the pull request: one thread of two comments on the changed line,
 # and one comment on the conversation. The line numbers are the ones in the patch, so
@@ -277,6 +288,7 @@ EOF
 
 run_tui() {
   local home="$1" keys="$2" waits="$3" log="$4"
+  local driver_code=0
   shift 4
   # The keystrokes and the waits are index-paired, so two lists of different lengths
   # shift every pattern one group and the step silently checks the wrong moment. That
@@ -289,10 +301,13 @@ run_tui() {
   PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
-      --timeout 180 --step-timeout 20 --settle 3 \
+      --timeout 90 --step-timeout 12 --settle 0.1 \
       --ready "Add retry to the webhook dispatcher" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@"
+      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+  if [ "$driver_code" -ne 0 ]; then
+    touch "$TMP/driver.failed"
+  fi
 }
 
 shown() {
@@ -302,20 +317,20 @@ shown() {
 
 # The keystrokes, as groups: `~` separates one group per wait.
 #
-#   OPEN      `:pr 141`
-#   SETTLE    an empty pause, while the forge's diff is replaced by the worktree's:
-#             the swap rebuilds the view, and a rebuilt view has its cursor at the top
+#   OPEN      `:pr 141`; its wait is the worktree diff, whose swap rebuilds the view
+#             with its cursor at the top. The earlier GitHub notice is not observed.
 #   LINES     `}` to the second file, then `jjjj` to the changed line — header rows have
 #             no line to anchor to, and the app says so rather than guessing
 #   ON_THREAD one more `j`: the discussion is drawn *under* the line it is about, so the
 #             row after the changed line is the comment
 OPEN=':pr 141\r'
-SETTLE=''
 LINES='}jjjj'
 ON_THREAD='}jjjjj'
 
 step "1/12 build"
-if cargo build --quiet 2>"$TMP/build.log"; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  the parent validator already built the debug binary\n'
+elif cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
   bad "the debug binary does not build"
@@ -326,8 +341,8 @@ step "2/12 the discussion GitHub already has is drawn where it belongs"
 HOME_ONE="$TMP/home-one"
 home_for "$HOME_ONE"
 FRAMES="$TMP/discussion.log"
-SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$SETTLE~$LINES~q" \
-  "from the github~~M src/domain/money~" "$FRAMES")"
+SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$LINES~q" \
+  "from the worktree~M src/domain/money~" "$FRAMES")"
 if shown "$FRAMES" "carol: Rounding twice loses money on ties."; then
   ok "an existing comment is drawn under the line it is about"
 else
@@ -351,8 +366,8 @@ step "4/12 replying answers the comment, in one call, with the words typed"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/reply.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~$ON_THREAD~r~agreed, fixed in the follow-up\r~\r~\r~q" \
-  "from the github~~M src/domain/money~reply on src/domain/money.rs:2~post · #141~Enter again sends it to GitHub~comment posted~" \
+  "$OPEN~$ON_THREAD~r~agreed, fixed in the follow-up\r~\r~\r~q" \
+  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~Enter again sends it to GitHub~comment posted~" \
   "$FRAMES")"
 if shown "$FRAMES" 'reply on src/domain/money.rs:2 \(new\)'; then
   ok "the composer says which comment is being answered"
@@ -386,8 +401,8 @@ fi
 step '5/12 $EDITOR returns to the same composer, with the words it wrote'
 FRAMES="$TMP/editor.log"
 SCREEN="$(EDITOR="$FAKE/editor" run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~$LINES~c~before the editor~\005~\r~q" \
-  'from the github~~M src/domain/money~comment on src/domain/money.rs:2~~composer updated from \$EDITOR~1 draft~' \
+  "$OPEN~$LINES~c~before the editor~\005~\r~q" \
+  'from the worktree~M src/domain/money~comment on src/domain/money.rs:2~~composer updated from \$EDITOR~1 draft~' \
   "$FRAMES")"
 if shown "$FRAMES" 'composer updated from \$EDITOR'; then
   ok 'the terminal returned from $EDITOR to the composer'
@@ -405,8 +420,8 @@ step "6/12 resolving a thread asks first, then says so in the thread's own words
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/resolve.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~$ON_THREAD~ pt~y~~q" \
-  "from the github~~M src/domain/money~▸ carol~resolve this thread~✓ carol \\(resolved\\)~" \
+  "$OPEN~$ON_THREAD~ pt~y~~q" \
+  "from the worktree~M src/domain/money~▸ carol~resolve this thread~✓ carol \\(resolved\\)~" \
   "$FRAMES")"
 if shown "$FRAMES" "resolve this thread on GitHub?"; then
   ok "the confirmation says what is about to change on GitHub"
@@ -438,8 +453,8 @@ printf '1' >"$FAKE/fail_resolve"
 printf '0' >"$FAKE/resolved_flag"
 FRAMES="$TMP/resolve-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~$ON_THREAD~ pt~y~~q" \
-  "from the github~~M src/domain/money~▸ carol~▸ carol~the thread was not changed~" \
+  "$OPEN~$ON_THREAD~ pt~y~~q" \
+  "from the worktree~M src/domain/money~▸ carol~▸ carol~the thread was not changed~" \
   "$FRAMES")"
 if shown "$FRAMES" "the thread was not changed"; then
   ok "the reason is on screen"
@@ -464,8 +479,8 @@ step "8/12 a failed reply keeps the words in the modal"
 printf '1' >"$FAKE/fail_reply"
 FRAMES="$TMP/reply-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~$ON_THREAD~r~this must not be lost\r~\r~\r~\r~q" \
-  "from the github~~M src/domain/money~▸ carol~reply on src/domain/money.rs:2~post · #141~this must not be lost~comment is still here~" \
+  "$OPEN~$ON_THREAD~r~this must not be lost\r~\r~\r~\r~q" \
+  "from the worktree~M src/domain/money~▸ carol~reply on src/domain/money.rs:2~post · #141~this must not be lost~comment is still here~" \
   "$FRAMES")"
 if shown "$FRAMES" "the comment is still here"; then
   ok "the modal says the comment was kept"
@@ -489,8 +504,8 @@ step "9/12 the conversation is readable, and a comment on it reaches the issue"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/conversation.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~ pc~c~thanks, looking at it now\r~\r~\r~q" \
-  "from the github~~conversation · #141~~post · #141~Enter again sends it to GitHub~comment posted~" \
+  "$OPEN~ pc~c~thanks, looking at it now\r~\r~\r~q" \
+  "from the worktree~conversation · #141~~post · #141~Enter again sends it to GitHub~comment posted~" \
   "$FRAMES")"
 if shown "$FRAMES" "This came out of the incident on Tuesday."; then
   ok "the conversation panel shows what has been said"
@@ -513,8 +528,8 @@ step "10/12 a refused conversation comment says so and keeps the words"
 printf '1' >"$FAKE/fail_conversation"
 FRAMES="$TMP/conversation-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~ pc~c~please keep this\r~\r~\r~q" \
-  "from the github~~conversation · #141~~post · #141~Enter again sends it to GitHub~comment is still here~" \
+  "$OPEN~ pc~c~please keep this\r~\r~\r~q" \
+  "from the worktree~conversation · #141~~post · #141~Enter again sends it to GitHub~comment is still here~" \
   "$FRAMES")"
 if shown "$FRAMES" "comment is still here"; then
   ok "a refused comment is kept rather than lost"
@@ -541,8 +556,8 @@ EOF
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/dry.log"
 SCREEN="$(run_tui "$HOME_DRY" \
-  "$OPEN~$SETTLE~$ON_THREAD~r~a dry run reply\r~\r~\r~\e~ pt~y~~ pc~c~a dry run comment\r~\r~\r~q" \
-  "from the github~~M src/domain/money~reply on src/domain/money.rs:2~post · #141~DRY RUN~dry run: nothing was posted~~~thread resolved~~~~~~~" \
+  "$OPEN~$ON_THREAD~r~a dry run reply\r~\r\r~\e~ pt~y~~ pc~c~a dry run comment\r~\r\r~\e" \
+  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~Enter records~dry run: nothing was posted~~resolve this thread~nothing changed on GitHub~~conversation · #141~~post · #141~dry run: nothing was posted~" \
   "$FRAMES")"
 if [ "$(count_calls 'comments/9001/replies')" != "0" ]; then
   bad "a dry run posted the reply anyway"
@@ -569,7 +584,9 @@ else
 fi
 
 step "12/12 generated docs and release workflow describe the shipped binary"
-if cargo test --quiet tui::keymap::tests::checked_keymap_documentation_is_generated_from_the_registry; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  ok "the shared test gate checked generated keymap documentation"
+elif cargo test --quiet tui::keymap::tests::checked_keymap_documentation_is_generated_from_the_registry; then
   ok "the checked keymap document still matches the action registry"
 else
   bad "docs/keymaps.md drifted from the action registry"
@@ -583,6 +600,10 @@ if [ -s docs/themes.md ] && [ -s docs/configuration.md ] \
   ok "the docs, release profile and three native release targets are present"
 else
   bad "the M5 docs or release configuration is incomplete"
+fi
+
+if [ -f "$TMP/driver.failed" ]; then
+  bad "one or more PTY steps did not reach their expected screen state"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

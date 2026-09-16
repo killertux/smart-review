@@ -71,6 +71,7 @@ printf 'pub fn currency(cents: i64) -> String {\n    format!("{cents}")\n}\n' \
   >"$REPO/clone/src/domain/amount.rs"
 git -C "$REPO/clone" add -A
 git -C "$REPO/clone" commit --quiet -m "round half up in money"
+PR_SHA="$(git -C "$REPO/clone" rev-parse HEAD)"
 # The patch the forge would send, generated from the same commits: the fake `gh` serves
 # it for `pr diff`, and the local worktree diff is the same change — so which of the two
 # the app reads does not change what is on screen, and the validator cannot pass or fail
@@ -106,7 +107,7 @@ case "$1:$2" in
   pr:list) cat "$fixtures/pr-list.json"; exit 0 ;;
   pr:view)
     number=$(printf '%s' "$*" | sed -n 's/.*view \([0-9][0-9]*\).*/\1/p')
-    sed "s/\"number\": 141/\"number\": ${number:-141}/" "$fixtures/pr-view.json"
+    sed "s/\"number\": 141/\"number\": ${number:-141}/" "$here/view.json"
     exit 0 ;;
   pr:diff) cat "$here/diff.patch"; exit 0 ;;
   api:*)
@@ -144,6 +145,16 @@ printf '%s' "$FIXTURES" >"$FAKE/fixtures"
 printf '0' >"$FAKE/fail_review"
 printf '0' >"$FAKE/review_delay"
 cp "$TMP/diff.patch" "$FAKE/diff.patch"
+python3 - "$FIXTURES/pr-view.json" "$FAKE/view.json" "$PR_SHA" <<'PY'
+import json, sys
+source, target, head = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    document = json.load(handle)
+document["headRefOid"] = head
+document["baseRefName"] = "main"
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+PY
 # What GitHub already says about one of the changed lines, with a reply (FR-6.4). The
 # line numbers are the ones in the patch above, so the thread has somewhere to land.
 cat >"$FAKE/comments.json" <<'JSON'
@@ -203,14 +214,18 @@ EOF
 
 run_tui() {
   local home="$1" keys="$2" waits="$3" log="$4"
+  local driver_code=0
   shift 4
   PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
-      --timeout 180 --step-timeout 20 --settle 3 \
+      --timeout 90 --step-timeout 12 --settle 0.1 \
       --ready "Add retry to the webhook dispatcher" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@"
+      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+  if [ "$driver_code" -ne 0 ]; then
+    touch "$TMP/driver.failed"
+  fi
 }
 
 shown() {
@@ -232,17 +247,17 @@ draft_file() {
 #   PANEL    ` rd`, the staged comments
 #   MODAL    ` rr`, then `a` to choose approve, then Enter twice
 OPEN=':pr 141\r'
-# Nothing between the two: an empty key group with an empty wait is a pause, and the
-# pause is what lets the app finish replacing the forge's diff with the local one. That
-# swap rebuilds the view, and a view that is rebuilt has its cursor back at the top —
-# so navigating before it lands means commenting on the wrong file.
-SETTLE='' 
+# Opening waits for the stable local-diff notice. Waiting for the earlier GitHub frame
+# was both racy (it can be replaced between PTY reads) and wrong for navigation: the
+# worktree swap rebuilds the view with its cursor at the top.
 LINES='}jjjj'
 COMMENT='c~the rounding is hidden behind a magic ten\r'
 EXTRA='c~and this file has no callers\r'
 
 step "1/8 build"
-if cargo build --quiet 2>"$TMP/build.log"; then
+if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
+  printf '  SKIP  the parent validator already built the debug binary\n'
+elif cargo build --quiet 2>"$TMP/build.log"; then
   ok "the debug binary builds"
 else
   bad "the debug binary does not build"
@@ -253,7 +268,7 @@ step "2/8 a comment is staged on a line of the diff"
 HOME_ONE="$TMP/home-one"
 home_for "$HOME_ONE"
 FRAMES="$TMP/stage.log"
-SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$SETTLE~$LINES~c" "from the github~~M src/domain/money~comment on" "$FRAMES")"
+SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$LINES~c" "from the worktree~M src/domain/money~comment on" "$FRAMES")"
 if shown "$FRAMES" "comment on src/domain/money.rs"; then
   ok "the composer names the file and side the comment will land on"
 else
@@ -271,8 +286,8 @@ fi
 # ---------------------------------------------------------------------------
 FRAMES="$TMP/three.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$SETTLE~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rd" \
-  "from the github~~M src/domain/money~comment on~1 comment staged~M src/domain/money~comment on~2 comments staged~staged comments \\(2\\)" \
+  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rd" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~M src/domain/money~comment on~2 comments staged~staged comments \\(2\\)" \
   "$FRAMES")"
 if shown "$FRAMES" "staged comments \\(2\\)"; then
   ok "two comments are staged and listed"
@@ -310,8 +325,8 @@ fi
 
 step "3/8 an empty comment is refused, not sent"
 FRAMES="$TMP/empty.log"
-SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$SETTLE~$LINES~c~\r" \
-  "money.rs~comment on~needs a body" "$FRAMES")"
+SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$LINES~c~\r" \
+  "from the worktree~M src/domain/money~comment on~needs a body" "$FRAMES")"
 if shown "$FRAMES" "needs a body"; then
   ok "an empty comment is refused with a reason"
 else
@@ -325,8 +340,8 @@ home_for "$HOME_TWO"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/publish.log"
 SCREEN="$(run_tui "$HOME_TWO" \
-  "$OPEN~$SETTLE~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r~\r" \
-  "from the github~~M src/domain/money~comment on~1 comment staged~M src/domain/money~comment on~2 comments staged~publish review~approve —~Enter again~review posted" \
+  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r~\r" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~M src/domain/money~comment on~2 comments staged~publish review~approve —~Enter again~review posted" \
   "$FRAMES")"
 if shown "$FRAMES" "approve — this unblocks the pull request"; then
   ok "the modal names the verdict it is about to give"
@@ -380,8 +395,8 @@ printf '1' >"$FAKE/fail_review"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/refused.log"
 SCREEN="$(run_tui "$HOME_THREE" \
-  "$OPEN~$SETTLE~$LINES~c~please take another look\r~ rr~a~\r~\r" \
-  "from the github~~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~is yours" \
+  "$OPEN~$LINES~c~please take another look\r~ rr~a~\r~\r" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~is yours" \
   "$FRAMES")"
 if shown "$FRAMES" "is yours"; then
   ok "your own pull request is explained rather than quoted"
@@ -403,8 +418,8 @@ printf '0' >"$FAKE/fail_review"
 
 step "6/8 the discussion that is already there"
 FRAMES="$TMP/discussion.log"
-SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$SETTLE~$LINES~c~ok\r~q" \
-  "from the github~~M src/domain/money~comment on~1 comment staged~" "$FRAMES")"
+SCREEN="$(run_tui "$HOME_ONE" "$OPEN~$LINES~q" \
+  "from the worktree~M src/domain/money~" "$FRAMES")"
 if shown "$FRAMES" "carol: Rounding twice loses money on ties."; then
   ok "an existing comment is drawn under the line it is about"
 else
@@ -428,8 +443,8 @@ EOF
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/dry.log"
 SCREEN="$(run_tui "$HOME_DRY" \
-  "$OPEN~$SETTLE~$LINES~c~a dry run must not post this\r~ rr~\r~\r~q" \
-  "from the github~~M src/domain/money~comment on~1 comment staged~publish review~DRY RUN~Enter records~dry run: nothing was sent~" \
+  "$OPEN~$LINES~c~a dry run must not post this\r~ rr~\r\r~\e" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~Enter records~dry run: nothing was sent~" \
   "$FRAMES")"
 if [ "$(count_calls 'pulls/141/reviews')" != "0" ]; then
   bad "a dry run posted the review anyway"
@@ -460,8 +475,8 @@ printf '2' >"$FAKE/review_delay"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/slow.log"
 SCREEN="$(run_tui "$HOME_SLOW" \
-  "$OPEN~$SETTLE~$LINES~c~one review only please\r~ rr~a~\r~\r~\r~q" \
-  "from the github~~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~review posted~~" \
+  "$OPEN~$LINES~c~one review only please\r~ rr~a~\r~\r~\r~q" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~review posted~~" \
   "$FRAMES")"
 POSTS="$(count_calls 'pulls/141/reviews')"
 if [ "$POSTS" = "1" ]; then
@@ -470,6 +485,10 @@ else
   bad "in-flight Enter posted the review $POSTS times"
 fi
 printf '0' >"$FAKE/review_delay"
+
+if [ -f "$TMP/driver.failed" ]; then
+  bad "one or more PTY steps did not reach their expected screen state"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
