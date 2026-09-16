@@ -733,18 +733,18 @@ fn ask_chat(app: &mut App, runner: &mut JobRunner, retry: bool) {
     // what gets sent (FR-4.6): gathering again would be slower and a chance for the two
     // to differ.
     if let Some(bundle) = app.take_chat_bundle() {
-        app.begin_chat_answer(&question, session.clone());
         let id = runner.submit_owned(
             review_job_owner(app),
             jobs::Job::AskChat {
                 request: Box::new(jobs::ChatAsk {
                     spec,
-                    session: Box::new(session),
-                    question,
+                    session: Box::new(session.clone()),
+                    question: question.clone(),
                     bundle: Box::new(bundle),
                 }),
             },
         );
+        app.begin_chat_answer(&question, session.clone(), runner.is_queued(id));
         app.record_chat_job(id);
         return;
     }

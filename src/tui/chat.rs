@@ -19,6 +19,8 @@ pub enum ChatStatus {
     /// Nothing in flight.
     #[default]
     Idle,
+    /// Accepted by the runner but waiting for a bounded worker slot (IR-08).
+    Queued,
     /// Waiting for the provider.
     Sending {
         /// What the job is doing now.
@@ -29,6 +31,8 @@ pub enum ChatStatus {
         /// What the job is doing now.
         stage: String,
     },
+    /// Cancellation was requested; the worker has not released its slot yet (IR-08).
+    Cancelling,
     /// The last attempt failed, with the reason to show.
     Failed {
         /// The provider's own message.
@@ -42,7 +46,10 @@ impl ChatStatus {
     /// Whether work is in flight, which is what `Esc` cancels.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        matches!(self, Self::Sending { .. } | Self::Streaming { .. })
+        matches!(
+            self,
+            Self::Queued | Self::Sending { .. } | Self::Streaming { .. } | Self::Cancelling
+        )
     }
 
     /// The one-line description for the pane's footer.
@@ -50,7 +57,9 @@ impl ChatStatus {
     pub fn label(&self) -> String {
         match self {
             Self::Idle => "ready".to_owned(),
+            Self::Queued => "queued; waiting for a worker".to_owned(),
             Self::Sending { stage } | Self::Streaming { stage } => stage.clone(),
+            Self::Cancelling => "cancelling; waiting for the worker to stop".to_owned(),
             Self::Failed { reason } => format!("failed: {reason}"),
             Self::Stopped => "stopped; the answer is kept".to_owned(),
         }
@@ -191,7 +200,7 @@ impl ChatState {
 
     /// Forgets the answer in flight, keeping whatever arrived.
     pub fn stop(&mut self) {
-        self.status = ChatStatus::Stopped;
+        self.status = ChatStatus::Cancelling;
         self.pending = None;
         self.staged = None;
     }

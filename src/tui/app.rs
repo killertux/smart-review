@@ -1498,6 +1498,7 @@ impl App {
             Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
+            | Outcome::Abandoned
             | Outcome::MutationFailed { .. }
                 if job == self.chat.load_job
                     || job == self.chat.job
@@ -1772,9 +1773,14 @@ impl App {
         &mut self,
         question: &str,
         session: crate::domain::chat::Session,
+        queued: bool,
     ) {
-        self.chat.status = crate::tui::chat::ChatStatus::Sending {
-            stage: format!("asking {}", self.model_label()),
+        self.chat.status = if queued {
+            crate::tui::chat::ChatStatus::Queued
+        } else {
+            crate::tui::chat::ChatStatus::Sending {
+                stage: format!("asking {}", self.model_label()),
+            }
         };
         self.chat.pending = Some(question.to_owned());
         self.chat.awaiting_confirmation = None;
@@ -2828,7 +2834,9 @@ impl App {
                 self.apply_chat_loaded(outcome);
                 None
             }
-            Outcome::ChatAnswered(_) if job == self.chat.job || job == self.cancelled_chat_job => {
+            Outcome::ChatAnswered(_) | Outcome::Abandoned
+                if job == self.chat.job || job == self.cancelled_chat_job =>
+            {
                 self.apply_chat_answer(job, outcome);
                 None
             }
@@ -2866,6 +2874,13 @@ impl App {
 
     /// Appends an answer to the conversation it belongs to (FR-5.1, FR-5.2).
     fn apply_chat_answer(&mut self, job: u64, outcome: jobs::Outcome) {
+        if matches!(outcome, jobs::Outcome::Abandoned) {
+            if self.cancelled_chat_job == job {
+                self.cancelled_chat_job = 0;
+                self.chat.status = crate::tui::chat::ChatStatus::Stopped;
+            }
+            return;
+        }
         let jobs::Outcome::ChatAnswered(answered) = outcome else {
             return;
         };
@@ -2969,20 +2984,38 @@ impl App {
             }
             Outcome::Context { bundle, intent } if job == self.panel.context_job => {
                 self.panel.context_job = 0;
+                if self.panel.state == AnalysisState::Cancelling {
+                    self.panel.state = AnalysisState::Cancelled;
+                    return None;
+                }
                 self.apply_context(*bundle, intent)
             }
             Outcome::Analyzed(run) if job == self.panel.job => {
                 self.panel.job = 0;
+                if self.panel.state == AnalysisState::Cancelling {
+                    if let crate::application::analysis::AnalysisRun::Cancelled { raw } = *run {
+                        self.panel.stream.clear();
+                        self.panel.stream.push(&raw);
+                    }
+                    self.panel.state = AnalysisState::Cancelled;
+                    return None;
+                }
                 self.apply_analysis(*run);
                 None
             }
             Outcome::Abandoned
-                if job == self.panel.job && self.panel.state == AnalysisState::Cancelling =>
+                if (job == self.panel.job || job == self.panel.context_job)
+                    && self.panel.state == AnalysisState::Cancelling =>
             {
                 // The worker's completion is the acknowledgement that its slot is free.
                 // Until it arrives, keep the cancellation visible rather than claiming
                 // the work stopped merely because the request was sent (IR-08).
-                self.panel.job = 0;
+                if job == self.panel.job {
+                    self.panel.job = 0;
+                }
+                if job == self.panel.context_job {
+                    self.panel.context_job = 0;
+                }
                 self.panel.state = AnalysisState::Cancelled;
                 None
             }
@@ -3187,7 +3220,9 @@ impl App {
                 );
                 self.open_overlay(Overlay::RawAnswer);
             }
-            AnalysisRun::Cancelled => {
+            AnalysisRun::Cancelled { raw } => {
+                self.panel.stream.clear();
+                self.panel.stream.push(&raw);
                 self.panel.state = AnalysisState::Cancelled;
                 self.notice(
                     NoticeLevel::Info,
@@ -3508,7 +3543,6 @@ impl App {
 
     /// Gives up on a run, keeping whatever text arrived (FR-4.4).
     pub(crate) fn cancelled_analysis(&mut self) {
-        self.panel.context_job = 0;
         self.panel.stored_job = 0;
         if self.panel.state.is_running() {
             self.panel.state = AnalysisState::Cancelling;
@@ -7127,6 +7161,57 @@ mod tests {
     }
 
     #[test]
+    fn ir_08_cancelling_context_waits_for_and_consumes_its_acknowledgement() {
+        let (_dir, mut app) = draft_app();
+        app.panel.context_job = 7;
+        app.panel.state = AnalysisState::Gathering;
+        app.cancelled_analysis();
+        assert_eq!(app.panel.state, AnalysisState::Cancelling);
+        assert_eq!(
+            app.panel.context_job, 7,
+            "the completion still has an owner"
+        );
+
+        app.apply_completion(crate::tui::jobs::Completion {
+            progress_through: 0,
+            job: 7,
+            owner: crate::tui::jobs::JobOwner::Global,
+            outcome: crate::tui::jobs::Outcome::Abandoned,
+        });
+        assert_eq!(app.panel.state, AnalysisState::Cancelled);
+        assert_eq!(app.panel.context_job, 0);
+    }
+
+    #[test]
+    fn ir_08_a_success_queued_before_escape_cannot_revive_analysis() {
+        let (_dir, mut app) = draft_app();
+        app.panel.job = 7;
+        app.panel.state = AnalysisState::Running {
+            stage: "asking".to_owned(),
+        };
+        app.cancelled_analysis();
+
+        app.apply_completion(crate::tui::jobs::Completion {
+            progress_through: 0,
+            job: 7,
+            owner: crate::tui::jobs::JobOwner::Global,
+            outcome: crate::tui::jobs::Outcome::Analyzed(Box::new(
+                crate::application::analysis::AnalysisRun::Ready(Box::new(
+                    crate::application::analysis::Analyzed {
+                        raw: "late success".to_owned(),
+                        analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
+                        warnings: Vec::new(),
+                        repaired: false,
+                        usage: None,
+                    },
+                )),
+            )),
+        });
+        assert_eq!(app.panel.state, AnalysisState::Cancelled);
+        assert!(app.panel.analysis.is_none(), "late success is discarded");
+    }
+
+    #[test]
     fn a_comment_is_anchored_to_the_line_under_the_cursor() {
         // The bug this navigator exists for: with the cursor on a *header* row the
         // composer refuses, because a file header has no line number. The validator's
@@ -7901,7 +7986,7 @@ mod tests {
             None,
             1_000,
         );
-        app.begin_chat_answer("why?", session);
+        app.begin_chat_answer("why?", session, false);
         app.chat.job = 12;
         app.chat.status = crate::tui::chat::ChatStatus::Streaming {
             stage: "asking".to_owned(),
@@ -7909,8 +7994,8 @@ mod tests {
         app.stop_chat();
         assert_eq!(
             app.chat.status,
-            crate::tui::chat::ChatStatus::Stopped,
-            "the pane says so immediately"
+            crate::tui::chat::ChatStatus::Cancelling,
+            "the pane waits for the worker release acknowledgement"
         );
 
         let mut partial =
@@ -7940,6 +8025,24 @@ mod tests {
             store.all()[0].messages[1].partial,
             "the stored conversation says the answer was stopped"
         );
+    }
+
+    #[test]
+    fn ir_08_a_queued_chat_cancellation_waits_for_its_acknowledgement() {
+        let (_dir, mut app, _store) = chat_app();
+        app.chat.job = 12;
+        app.chat.status = crate::tui::chat::ChatStatus::Queued;
+        app.stop_chat();
+        assert_eq!(app.chat.status, crate::tui::chat::ChatStatus::Cancelling);
+
+        app.apply_completion(crate::tui::jobs::Completion {
+            progress_through: 0,
+            owner: crate::tui::jobs::JobOwner::Global,
+            job: 12,
+            outcome: crate::tui::jobs::Outcome::Abandoned,
+        });
+        assert_eq!(app.chat.status, crate::tui::chat::ChatStatus::Stopped);
+        assert_eq!(app.cancelled_chat_job, 0);
     }
 
     #[test]
@@ -8013,7 +8116,7 @@ mod tests {
         );
         // The question is asked: this is where the conversation is created and stored.
         app.chat.input.set_text("does it round?");
-        app.begin_chat_answer("does it round?", session);
+        app.begin_chat_answer("does it round?", session, false);
         assert_eq!(app.chat.session.as_ref().expect("session").turns(), 1);
         assert_eq!(
             store.all().len(),

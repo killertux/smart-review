@@ -2149,7 +2149,9 @@ mod tests {
     fn a_cancelled_run_says_so_without_pretending_it_failed() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(3);
-        app.apply_analysis(crate::application::analysis::AnalysisRun::Cancelled);
+        app.apply_analysis(crate::application::analysis::AnalysisRun::Cancelled {
+            raw: String::new(),
+        });
         assert_eq!(
             app.analysis_state(),
             &crate::tui::app::AnalysisState::Cancelled

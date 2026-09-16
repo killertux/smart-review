@@ -162,8 +162,8 @@ pub enum AnalysisRun {
     Ready(Box<Analyzed>),
     /// Text that could not be normalized, kept so it can be read.
     Unparsed(Box<Unparsed>),
-    /// The user cancelled it (FR-4.4). Partial text is in the progress stream.
-    Cancelled,
+    /// The user cancelled it (FR-4.4), keeping the authoritative partial text.
+    Cancelled { raw: String },
 }
 
 /// The analysis use case.
@@ -249,16 +249,18 @@ impl<'a> Analyst<'a> {
 
         let mut usage = UsageTotal::default();
         progress(Progress::Stage(format!("asking {}", request.chat.model)));
-        let first = self.ask(request, &system, &prompt, cancel, progress)?;
+        let first = match self.ask(request, &system, &prompt, cancel, progress) {
+            AskResult::Answer(answer) => answer,
+            AskResult::Cancelled(raw) => return Ok(Self::cancelled(&raw)),
+            AskResult::Failed(error) => return Err(error),
+        };
         usage.record(first.usage);
 
         if cancel.is_cancelled() {
-            return Ok(AnalysisRun::Cancelled);
+            return Ok(Self::cancelled(&first.text));
         }
 
         let model_label = format!("{}/{}", request.key.provider, request.chat.model);
-        // One timestamp for the whole run: a repair attempt must not look like a
-        // different analysis because a second passed between them.
         let created_at = self.now_rfc3339();
 
         let attempt = self.normalize(
@@ -281,9 +283,9 @@ impl<'a> Analyst<'a> {
                 }
                 progress(Progress::Reset(format!("repairing: {}", failure.reason)));
                 let second = match self.ask(request, &system, &repair, cancel, progress) {
-                    Ok(second) => second,
-                    Err(LlmError::Cancelled) => return Ok(AnalysisRun::Cancelled),
-                    Err(_) => {
+                    AskResult::Answer(answer) => answer,
+                    AskResult::Cancelled(raw) => return Ok(Self::cancelled(&raw)),
+                    AskResult::Failed(_) => {
                         usage.mark_unknown();
                         return Ok(AnalysisRun::Unparsed(Box::new(Unparsed {
                             raw: previous,
@@ -318,10 +320,6 @@ impl<'a> Analyst<'a> {
             }
         };
 
-        // The corrections and the repair flag are part of the answer, so they are
-        // stored with it: a reader who opens the analysis tomorrow is told what was
-        // fixed just as much as the reader who watched it arrive (FR-4.1). They go in
-        // *before* the write, because the stored copy is the one that is read back.
         let mut warnings = normalized.warnings;
         let stored = StoredAnalysis {
             key: request.key.clone(),
@@ -388,18 +386,30 @@ impl<'a> Analyst<'a> {
         prompt: &str,
         cancel: &Cancel,
         progress: &mut ProgressHandler<'_>,
-    ) -> Result<Answer, LlmError> {
+    ) -> AskResult {
         let mut chat = request.chat.clone();
         chat.system = Some(system.to_owned());
         prompt.clone_into(&mut chat.prompt);
-        let mut on_delta: Box<DeltaHandler<'_>> =
-            Box::new(|delta: &str| progress(Progress::Delta(delta.to_owned())));
-        self.llm
-            .stream(&chat, cancel, &mut on_delta)
-            .map(|outcome| Answer {
+        let mut partial = String::new();
+        let mut on_delta: Box<DeltaHandler<'_>> = Box::new(|delta: &str| {
+            partial.push_str(delta);
+            progress(Progress::Delta(delta.to_owned()));
+        });
+        let result = self.llm.stream(&chat, cancel, &mut on_delta);
+        drop(on_delta);
+        match result {
+            Ok(outcome) => AskResult::Answer(Answer {
                 text: outcome.text,
                 usage: outcome.usage,
-            })
+            }),
+            Err(LlmError::Cancelled) => AskResult::Cancelled(partial),
+            Err(error) => AskResult::Failed(error),
+        }
+    }
+
+    /// Builds the terminal cancellation outcome from text accepted before cancellation.
+    fn cancelled(raw: &str) -> AnalysisRun {
+        AnalysisRun::Cancelled { raw: cap_raw(raw) }
     }
 
     /// The stored analysis for a key, if there is one (FR-4.3).
@@ -484,6 +494,16 @@ fn rejected_repair(
 struct Answer {
     text: String,
     usage: Option<TokenUsage>,
+}
+
+/// The streamed request's terminal state, including text observed before cancellation.
+enum AskResult {
+    /// The provider completed normally.
+    Answer(Answer),
+    /// Cancellation won after some callback text may have been accepted.
+    Cancelled(String),
+    /// The provider failed for another reason.
+    Failed(LlmError),
 }
 
 /// Usage across intentionally executed analysis attempts.
@@ -1164,7 +1184,7 @@ mod tests {
         let outcome = use_case
             .run(&request, &bundle, &cancel, &mut handler)
             .expect("runs");
-        assert!(matches!(outcome, AnalysisRun::Cancelled));
+        assert!(matches!(outcome, AnalysisRun::Cancelled { .. }));
         assert!(cache.entries.lock().expect("lock").is_empty());
     }
 
@@ -1503,6 +1523,6 @@ mod tests {
             .run(&request, &bundle, &cancel, &mut progress)
             .expect("cancellation is a run outcome");
 
-        assert!(matches!(outcome, AnalysisRun::Cancelled));
+        assert!(matches!(outcome, AnalysisRun::Cancelled { .. }));
     }
 }
