@@ -16,6 +16,7 @@ pub mod diff;
 pub mod draft;
 pub mod environment;
 pub mod model;
+pub mod mutation;
 pub mod plan;
 pub mod pr;
 pub mod query;
@@ -41,6 +42,7 @@ pub use model::{
     Catalog, CatalogError, CatalogModel, Cost, EffortLevel, Limit, NativeBackend, Provider,
     ReasoningOption, Route, Thinking, ThinkingChoice, ThinkingError, ThinkingRequest,
 };
+pub use mutation::{MUTATION_VERSION, MutationKind, MutationOperation, MutationState};
 pub use plan::{OrderMode, Plan, PlanSource};
 pub use pr::{
     CheckRun, CheckState, CheckSummary, Commit, PrState, PullRequestDetail, PullRequestRef,

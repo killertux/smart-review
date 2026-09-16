@@ -204,17 +204,17 @@ impl GhCliForge {
     /// Runs a command and returns its stdout.
     fn text(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<String> {
         logging::log(Level::Debug, format!("running {}", spec.diagnostic()));
-        let output = self.runner.run(spec, cancel).map_err(|error| {
-            Error::forge(
+        let output = self.runner.run(spec, cancel).map_err(|error| match error {
+            crate::adapters::process::ProcessError::NotFound { .. } => Error::forge(
                 spec.diagnostic(),
-                match error {
-                    crate::adapters::process::ProcessError::NotFound { .. } => {
-                        "the GitHub CLI was not found; install it from https://cli.github.com"
-                            .to_owned()
-                    }
-                    other => other.to_string(),
-                },
-            )
+                "the GitHub CLI was not found; install it from https://cli.github.com",
+            ),
+            crate::adapters::process::ProcessError::Failed { .. }
+            | crate::adapters::process::ProcessError::Timeout { .. }
+            | crate::adapters::process::ProcessError::Cancelled { .. }
+            | crate::adapters::process::ProcessError::Spawn { .. } => {
+                Error::forge_outcome_unknown(spec.diagnostic(), error.to_string())
+            }
         })?;
 
         if !output.success() {
@@ -249,17 +249,19 @@ impl GhCliForge {
     /// dry-run promise is kept rather than one per feature.
     fn mutate(&self, spec: &CommandSpec, cancel: &Cancel) -> Result<Option<Output>> {
         logging::log(Level::Debug, format!("running {}", spec.diagnostic()));
-        let output = self.runner.run(spec, cancel).map_err(|error| {
-            Error::forge(
+        let output = self.runner.run(spec, cancel).map_err(|error| match error {
+            crate::adapters::process::ProcessError::NotFound { .. } => Error::forge(
                 spec.diagnostic(),
-                match error {
-                    crate::adapters::process::ProcessError::NotFound { .. } => {
-                        "the GitHub CLI was not found; install it from https://cli.github.com"
-                            .to_owned()
-                    }
-                    other => other.to_string(),
-                },
-            )
+                "the GitHub CLI was not found; install it from https://cli.github.com",
+            ),
+            crate::adapters::process::ProcessError::Spawn { .. } => {
+                Error::forge(spec.diagnostic(), error.to_string())
+            }
+            crate::adapters::process::ProcessError::Failed { .. }
+            | crate::adapters::process::ProcessError::Timeout { .. }
+            | crate::adapters::process::ProcessError::Cancelled { .. } => {
+                Error::forge_outcome_unknown(spec.diagnostic(), error.to_string())
+            }
         })?;
         if output.dry_run {
             return Ok(None);

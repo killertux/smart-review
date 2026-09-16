@@ -25,6 +25,7 @@ pub mod chat;
 pub mod draft;
 pub mod forge;
 pub mod llm;
+pub mod mutation;
 pub mod secret;
 pub mod workspace;
 
@@ -39,6 +40,7 @@ pub use forge::{
     PullRequestPage, ReviewPosted,
 };
 pub use llm::{ChatOutcome, ChatRequest, DeltaHandler, LlmError, LlmPort, TokenUsage};
+pub use mutation::{MutationStoreError, MutationStorePort};
 pub use secret::{ApiKey, KeySource, KeyStatus, SecretError, SecretStore};
 pub use workspace::{
     DiffOptions, DiffRequest, Remote, RepoInfo, Workspace, WorkspaceEntry, WorkspaceError,

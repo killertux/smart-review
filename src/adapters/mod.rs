@@ -17,4 +17,5 @@ pub mod gh;
 pub mod git;
 pub mod http;
 pub mod llm;
+pub mod mutation_store;
 pub mod process;

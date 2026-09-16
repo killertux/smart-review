@@ -155,6 +155,23 @@ impl crate::ports::DraftStorePort for FakeDraftStore {
         Ok(())
     }
 
+    fn remove_if_matches(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        submitted: &crate::domain::draft::Draft,
+    ) -> Result<bool, crate::ports::DraftStoreError> {
+        let mut drafts = self
+            .drafts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (repo.key(), submitted.pr);
+        if drafts.get(&key) == Some(submitted) {
+            drafts.remove(&key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn list(
         &self,
         repo: &crate::domain::repo::RepoId,
@@ -166,6 +183,68 @@ impl crate::ports::DraftStorePort for FakeDraftStore {
             .iter()
             .filter(|((key, _), _)| key == &repo.key())
             .map(|(_, draft)| draft.clone())
+            .collect())
+    }
+}
+
+/// An in-memory [`MutationStorePort`](crate::ports::MutationStorePort) for mutation
+/// lifecycle tests (IR-07).
+#[derive(Debug, Default)]
+pub(crate) struct FakeMutationStore {
+    operations:
+        Mutex<std::collections::BTreeMap<String, crate::domain::mutation::MutationOperation>>,
+}
+
+impl crate::ports::MutationStorePort for FakeMutationStore {
+    fn begin(
+        &self,
+        operation: &crate::domain::mutation::MutationOperation,
+    ) -> Result<(), crate::ports::MutationStoreError> {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if operations.contains_key(&operation.id)
+            || operations.values().any(|existing| {
+                existing.repo == operation.repo
+                    && existing.pr == operation.pr
+                    && existing.state.needs_reconciliation()
+            })
+        {
+            return Err(crate::ports::MutationStoreError::Conflict);
+        }
+        operations.insert(operation.id.clone(), operation.clone());
+        Ok(())
+    }
+
+    fn save(
+        &self,
+        operation: &crate::domain::mutation::MutationOperation,
+    ) -> Result<(), crate::ports::MutationStoreError> {
+        self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(operation.id.clone(), operation.clone());
+        Ok(())
+    }
+
+    fn unresolved(
+        &self,
+        repo: &crate::domain::repo::RepoId,
+        pr: u64,
+    ) -> Result<Vec<crate::domain::mutation::MutationOperation>, crate::ports::MutationStoreError>
+    {
+        Ok(self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|operation| {
+                operation.repo == *repo
+                    && operation.pr == pr
+                    && operation.state.needs_reconciliation()
+            })
+            .cloned()
             .collect())
     }
 }

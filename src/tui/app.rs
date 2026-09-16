@@ -155,8 +155,12 @@ pub enum Effect {
     SaveContextFiles,
     /// Read the stored draft for the open pull request (FR-6.1).
     LoadDraft,
+    /// Recover unresolved remote mutations without blocking the event loop (IR-07).
+    LoadMutations,
     /// Write the draft, which the reducer changed but may not save itself (FR-6.1).
     SaveDraft,
+    /// Persist the draft after a confirmed publish, then refresh remote discussion.
+    SaveDraftAndReload,
     /// Forget the draft on disk as well as on screen (FR-6.1).
     ClearDraft,
     /// Send the staged review (FR-6.3).
@@ -179,6 +183,8 @@ pub enum Effect {
     },
     /// Resolve or unresolve a thread (FR-6.4).
     ResolveThread {
+        /// The pull request whose thread is changed.
+        number: u64,
         /// GitHub's thread id.
         thread_id: String,
         /// Which way.
@@ -289,7 +295,9 @@ fn effect_name(effect: &Effect) -> String {
         Effect::PruneChat => "prune-chat".to_owned(),
         Effect::SaveContextFiles => "save-context-files".to_owned(),
         Effect::LoadDraft => "load-draft".to_owned(),
+        Effect::LoadMutations => "load-mutations".to_owned(),
         Effect::SaveDraft => "save-draft".to_owned(),
+        Effect::SaveDraftAndReload => "save-draft-and-reload".to_owned(),
         Effect::ClearDraft => "clear-draft".to_owned(),
         Effect::PublishDraft => "publish-draft".to_owned(),
         Effect::CancelPublish => "cancel-publish".to_owned(),
@@ -869,6 +877,8 @@ pub struct App {
     pub(crate) discussion: crate::tui::discussion::DiscussionState,
     /// Where drafts are kept between runs (FR-6.1).
     pub(crate) draft_store: std::sync::Arc<dyn crate::ports::DraftStorePort>,
+    /// Where confirmed remote mutations survive a lost local response (IR-07).
+    pub(crate) mutation_store: std::sync::Arc<dyn crate::ports::MutationStorePort>,
     /// The draft service, once the repository is known (FR-6.1).
     pub(crate) draft_service: Option<crate::application::drafts::Drafts>,
     /// A destructive action waiting for a second key (FR-6.5).
@@ -887,6 +897,8 @@ pub struct App {
     pub(crate) detail_job: u64,
     /// The job id of the newest diff request.
     pub(crate) patch_job: u64,
+    /// The job id checking the current pull request's durable mutation journal.
+    pub(crate) mutation_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
     /// The last doctor report, delivered by a job (FR-9.3).
@@ -949,6 +961,7 @@ impl App {
             analysis,
             chat: chat_store,
             drafts: draft_store,
+            mutations: mutation_store,
             dry_run,
             dry_run_ledger,
             ..
@@ -1004,6 +1017,7 @@ impl App {
             drafts: crate::tui::drafts::DraftState::default(),
             discussion: crate::tui::discussion::DiscussionState::default(),
             draft_store,
+            mutation_store,
             draft_service: None,
             confirmation: None,
             dry_run,
@@ -1013,6 +1027,7 @@ impl App {
             count_job: 0,
             detail_job: 0,
             patch_job: 0,
+            mutation_job: 0,
             state,
             warnings,
             repo,
@@ -1306,6 +1321,7 @@ impl App {
                 self.drafts.post_job = id;
             }
             Effect::ResolveThread { .. } => self.discussion.job = id,
+            Effect::LoadMutations => self.mutation_job = id,
             // The rest ask for no job, or are handled by `apply` rather than here.
             _ => {}
         }
@@ -1425,7 +1441,33 @@ impl App {
                 thread_id,
                 resolved,
             } if job == self.discussion.job => {
-                Some(self.apply_thread_resolved(&thread_id, resolved))
+                if self.dry_run {
+                    self.discussion.job = 0;
+                    self.notice(
+                        NoticeLevel::Info,
+                        "dry run: nothing changed on GitHub; the thread remains as shown",
+                    );
+                    Some(Effect::WriteDryRun)
+                } else {
+                    Some(self.apply_thread_resolved(&thread_id, resolved))
+                }
+            }
+            Outcome::MutationFailed {
+                message,
+                outcome_unknown,
+            } if self.is_current_job(job) => {
+                if outcome_unknown {
+                    self.drafts.unresolved_mutation = true;
+                }
+                self.apply_failure(job, &message)
+            }
+            Outcome::MutationsRecovered { blocked, warning } if job == self.mutation_job => {
+                self.mutation_job = 0;
+                self.drafts.unresolved_mutation = blocked;
+                if let Some(warning) = warning {
+                    self.notice(NoticeLevel::Warn, warning);
+                }
+                None
             }
             // The analysis group has its own handler: three outcomes that share the
             // panel's state, and a match with twenty arms is one where the interesting
@@ -1442,6 +1484,7 @@ impl App {
             Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
+            | Outcome::MutationFailed { .. }
                 if job == self.chat.load_job
                     || job == self.chat.job
                     || job == self.cancelled_chat_job =>
@@ -1470,12 +1513,14 @@ impl App {
             | Outcome::ReviewPosted(_)
             | Outcome::CommentPosted(_)
             | Outcome::ThreadResolved { .. }
+            | Outcome::MutationsRecovered { .. }
             | Outcome::Stored { .. }
             | Outcome::Context { .. }
             | Outcome::Analyzed(_)
             | Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
+            | Outcome::MutationFailed { .. }
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
@@ -2332,6 +2377,13 @@ impl App {
     /// rule as the draft keeping its comments (NFR-3.4), applied to the other surface
     /// that can put words on the internet.
     fn send_post(&mut self) -> Effect {
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before posting again",
+            );
+            return Effect::None;
+        }
         let Some(number) = self.detail.as_ref().map(|detail| detail.summary.number) else {
             self.notice(NoticeLevel::Warn, "no pull request is open");
             return Effect::None;
@@ -2367,6 +2419,17 @@ impl App {
 
     /// Asks before changing a thread's state (FR-6.4, FR-6.5).
     pub(crate) fn ask_toggle_thread(&mut self) -> Effect {
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before changing a thread",
+            );
+            return Effect::None;
+        }
+        let Some(number) = self.detail.as_ref().map(|detail| detail.summary.number) else {
+            self.notice(NoticeLevel::Warn, "open a pull request first");
+            return Effect::None;
+        };
         let Some(thread) = self.review.as_ref().and_then(DiffView::current_thread) else {
             self.notice(
                 NoticeLevel::Warn,
@@ -2386,6 +2449,7 @@ impl App {
         self.ask(
             format!("{verb} this thread on GitHub?"),
             Effect::ResolveThread {
+                number,
                 thread_id: id,
                 resolved: !thread.resolved,
             },
@@ -2476,6 +2540,13 @@ impl App {
         if self.drafts.status.is_publishing() {
             return Effect::None;
         }
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before publishing again",
+            );
+            return Effect::None;
+        }
         if self.draft_drifted() {
             self.notice(
                 NoticeLevel::Warn,
@@ -2524,6 +2595,13 @@ impl App {
         if !self.drafts.open || self.drafts.status.is_publishing() {
             return Effect::None;
         }
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before publishing again",
+            );
+            return Effect::None;
+        }
         if self.draft_drifted() {
             self.notice(
                 NoticeLevel::Warn,
@@ -2532,6 +2610,7 @@ impl App {
             return Effect::None;
         }
         self.drafts.armed = false;
+        self.drafts.publishing_draft = Some(self.drafts.draft.clone());
         self.drafts.status = crate::tui::drafts::DraftStatus::Publishing;
         Effect::PublishDraft
     }
@@ -2562,7 +2641,7 @@ impl App {
         // The review is on GitHub now, so what the pull request says about itself has
         // changed: the detail is refreshed rather than left describing the state before
         // the submit (FR-6.3).
-        self.reload_after_publish()
+        Effect::SaveDraftAndReload
     }
 
     /// Re-reads what the forge now knows about the pull request (FR-6.3).
@@ -3879,6 +3958,7 @@ impl App {
             || job == self.drafts.job
             || job == self.drafts.post_job
             || job == self.discussion.job
+            || job == self.mutation_job
     }
 
     /// Records a job failure where the user will see it.
@@ -7527,6 +7607,7 @@ mod tests {
         assert_eq!(
             effect,
             Effect::ResolveThread {
+                number: 141,
                 thread_id: "PRRT_1".to_owned(),
                 resolved: true
             }
@@ -7562,6 +7643,38 @@ mod tests {
             .filter(|row| row.kind == crate::tui::diff_view::RowKind::Discussion)
             .any(|row| row.text.contains('✓'));
         assert!(drawn, "and the row says so");
+    }
+
+    #[test]
+    fn ir_07_a_dry_run_thread_result_does_not_paint_a_remote_success() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        app.dry_run = true;
+        let effect = Effect::ResolveThread {
+            number: 141,
+            thread_id: "PRRT_1".to_owned(),
+            resolved: true,
+        };
+        let job = 45;
+        app.record_job(&effect, job);
+
+        let follow_up = app.apply_completion(crate::tui::jobs::Completion {
+            owner: crate::tui::jobs::JobOwner::Global,
+            job,
+            outcome: crate::tui::jobs::Outcome::ThreadResolved {
+                thread_id: "PRRT_1".to_owned(),
+                resolved: true,
+            },
+        });
+
+        assert_eq!(follow_up, Some(Effect::WriteDryRun));
+        assert!(
+            app.detail()
+                .expect("detail")
+                .comments
+                .iter()
+                .all(|comment| !comment.resolved),
+            "a dry run never changes the fetched GitHub truth"
+        );
     }
 
     #[test]
