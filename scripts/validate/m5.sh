@@ -420,8 +420,8 @@ step "6/12 resolving a thread asks first, then says so in the thread's own words
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/resolve.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$ON_THREAD~ pt~y~~q" \
-  "from the worktree~M src/domain/money~▸ carol~resolve this thread~✓ carol \\(resolved\\)~" \
+  "$OPEN~$ON_THREAD~ pt~y~q" \
+  "from the worktree~~resolve this thread~✓ carol \\(resolved\\)~" \
   "$FRAMES")"
 if shown "$FRAMES" "resolve this thread on GitHub?"; then
   ok "the confirmation says what is about to change on GitHub"
@@ -453,8 +453,8 @@ printf '1' >"$FAKE/fail_resolve"
 printf '0' >"$FAKE/resolved_flag"
 FRAMES="$TMP/resolve-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$ON_THREAD~ pt~y~~q" \
-  "from the worktree~M src/domain/money~▸ carol~▸ carol~the thread was not changed~" \
+  "$OPEN~$ON_THREAD~ pt~y~q" \
+  "from the worktree~~resolve this thread~the thread was not changed~" \
   "$FRAMES")"
 if shown "$FRAMES" "the thread was not changed"; then
   ok "the reason is on screen"
