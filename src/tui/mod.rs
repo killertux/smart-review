@@ -981,6 +981,27 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             let number = app.detail.as_ref().map(|detail| detail.summary.number)?;
             let (draft, warning) = service.load(number, app.now());
             app.apply_loaded_draft(number, draft, warning);
+            let repo = app
+                .environment
+                .as_ref()
+                .map(|environment| environment.repo.clone())?;
+            match app.mutation_store.unresolved(&repo, number) {
+                Ok(operations) if operations.is_empty() => {}
+                Ok(operations) => {
+                    app.drafts.unresolved_mutation = true;
+                    app.notice(
+                        app::NoticeLevel::Warn,
+                        format!(
+                            "{} earlier GitHub mutation(s) have an unknown outcome; check the pull request before posting again",
+                            operations.len()
+                        ),
+                    );
+                }
+                Err(error) => app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not recover earlier GitHub mutations: {error}; do not retry until it is fixed"),
+                ),
+            }
         }
         Effect::SaveDraft | Effect::SaveDraftAndReload => {
             let service = app.draft_service.as_ref()?;

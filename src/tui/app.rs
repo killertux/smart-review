@@ -2350,6 +2350,13 @@ impl App {
     /// rule as the draft keeping its comments (NFR-3.4), applied to the other surface
     /// that can put words on the internet.
     fn send_post(&mut self) -> Effect {
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before posting again",
+            );
+            return Effect::None;
+        }
         let Some(number) = self.detail.as_ref().map(|detail| detail.summary.number) else {
             self.notice(NoticeLevel::Warn, "no pull request is open");
             return Effect::None;
@@ -2385,6 +2392,13 @@ impl App {
 
     /// Asks before changing a thread's state (FR-6.4, FR-6.5).
     pub(crate) fn ask_toggle_thread(&mut self) -> Effect {
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before changing a thread",
+            );
+            return Effect::None;
+        }
         let Some(number) = self.detail.as_ref().map(|detail| detail.summary.number) else {
             self.notice(NoticeLevel::Warn, "open a pull request first");
             return Effect::None;
@@ -2479,6 +2493,13 @@ impl App {
             self.notice(
                 NoticeLevel::Warn,
                 "open a pull request first; a draft belongs to one",
+            );
+            return Effect::None;
+        }
+        if self.drafts.unresolved_mutation {
+            self.notice(
+                NoticeLevel::Warn,
+                "a previous GitHub mutation has an unknown outcome; check the pull request before publishing again",
             );
             return Effect::None;
         }

@@ -305,6 +305,8 @@ pub struct DraftState {
     pub post_job: u64,
     /// The immutable review snapshot submitted to GitHub (IR-07).
     pub publishing_draft: Option<Draft>,
+    /// A prior dispatch has no locally known GitHub result and blocks a blind repeat.
+    pub unresolved_mutation: bool,
     /// The number in the draft panel the user is on, for `remove`.
     pub cursor: usize,
     /// Whether the draft has changed since it was last written.
@@ -337,6 +339,7 @@ impl Default for DraftState {
             job: 0,
             post_job: 0,
             publishing_draft: None,
+            unresolved_mutation: false,
             cursor: 1,
             dirty: false,
             warning: None,
@@ -360,6 +363,7 @@ impl DraftState {
         self.job = 0;
         self.post_job = 0;
         self.publishing_draft = None;
+        self.unresolved_mutation = false;
         self.cursor = 1;
         self.scroll = 0;
         self.dirty = false;
@@ -380,6 +384,7 @@ impl DraftState {
         self.job = 0;
         self.post_job = 0;
         self.publishing_draft = None;
+        self.unresolved_mutation = false;
         self.cursor = 1;
         self.scroll = 0;
         self.dirty = false;
