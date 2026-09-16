@@ -25,12 +25,13 @@ use futures::StreamExt;
 use llm::builder::{LLMBackend, LLMBuilder};
 use llm::chat::ChatProvider;
 use llm::providers::openai_compatible::{OpenAICompatibleProvider, OpenAIProviderConfig};
+use std::time::Duration;
 // `chat`, `usage` and `thinking` come from `ChatProvider`/`ChatResponse`, which are
 // supertraits of the `llm::LLMProvider` this module returns; naming them again here
 // would be redundant.
 use llm::chat::{ChatMessage, ReasoningEffort};
 
-use crate::adapters::http::block_on;
+use crate::adapters::http::{AsyncWaitError, block_on_cancellable};
 use crate::domain::model::{EffortLevel, NativeBackend, Route, ThinkingRequest};
 use crate::logging::{self, Level};
 use crate::ports::Cancel;
@@ -92,7 +93,7 @@ impl LlmCrate {
         builder
             .build()
             .map(|provider| provider as Box<dyn ChatProvider>)
-            .map_err(|error| translate(&request.provider, &error))
+            .map_err(|error| translate(&request.provider, request.timeout_secs, &error))
     }
 
     /// The conversation as the crate's message types.
@@ -228,43 +229,43 @@ impl LlmCrate {
         cancel: &Cancel,
         on_delta: &mut DeltaHandler<'_>,
     ) -> Attempt {
-        let outcome = block_on(async {
-            let mut stream = provider.chat_stream_struct(messages).await?;
-            let mut text = String::new();
-            let mut usage = None;
-            while let Some(item) = stream.next().await {
-                // Checked between chunks: cancellation is a flag, and the cost of
-                // finishing an answer nobody wants is the user's money (ARCH-5). The
-                // flag travels as an error like any other, and the caller recognizes it.
-                if cancel.is_cancelled() {
-                    return Err(cancelled());
-                }
-                let response = item?;
-                for choice in response.choices {
-                    if let Some(content) = choice.delta.content
-                        && !content.is_empty()
-                    {
-                        text.push_str(&content);
-                        on_delta(&content);
+        let outcome = block_on_cancellable(
+            async {
+                let mut stream = provider.chat_stream_struct(messages).await?;
+                let mut text = String::new();
+                let mut usage = None;
+                while let Some(item) = stream.next().await {
+                    // Checked between chunks: cancellation is a flag, and the cost of
+                    // finishing an answer nobody wants is the user's money (ARCH-5). The
+                    // flag travels as an error like any other, and the caller recognizes it.
+                    if cancel.is_cancelled() {
+                        return Err(cancelled());
+                    }
+                    let response = item?;
+                    for choice in response.choices {
+                        if let Some(content) = choice.delta.content
+                            && !content.is_empty()
+                        {
+                            text.push_str(&content);
+                            on_delta(&content);
+                        }
+                    }
+                    if response.usage.is_some() {
+                        usage = response.usage;
                     }
                 }
-                if response.usage.is_some() {
-                    usage = response.usage;
-                }
-            }
-            Ok(ChatOutcome {
-                text,
-                usage: usage_of(usage),
-                // Streaming carries no thinking blocks in this crate version, so the
-                // field stays empty rather than pretending otherwise (DEC-18).
-                thinking: None,
-            })
-        });
-        if cancel.is_cancelled() {
-            Attempt::Failed(Failure::plain(LlmError::Cancelled))
-        } else {
-            Attempt::from(outcome, &request.provider)
-        }
+                Ok(ChatOutcome {
+                    text,
+                    usage: usage_of(usage),
+                    // Streaming carries no thinking blocks in this crate version, so the
+                    // field stays empty rather than pretending otherwise (DEC-18).
+                    thinking: None,
+                })
+            },
+            cancel,
+            Duration::from_secs(request.timeout_secs),
+        );
+        Attempt::from(outcome, &request.provider, request.timeout_secs)
     }
 
     /// Streams through the crate's *string* stream, which exists for backends that have
@@ -280,30 +281,30 @@ impl LlmCrate {
         cancel: &Cancel,
         on_delta: &mut DeltaHandler<'_>,
     ) -> Attempt {
-        let outcome = block_on(async {
-            let mut stream = provider.chat_stream(messages).await?;
-            let mut text = String::new();
-            while let Some(item) = stream.next().await {
-                if cancel.is_cancelled() {
-                    return Err(cancelled());
+        let outcome = block_on_cancellable(
+            async {
+                let mut stream = provider.chat_stream(messages).await?;
+                let mut text = String::new();
+                while let Some(item) = stream.next().await {
+                    if cancel.is_cancelled() {
+                        return Err(cancelled());
+                    }
+                    let delta = item?;
+                    if !delta.is_empty() {
+                        text.push_str(&delta);
+                        on_delta(&delta);
+                    }
                 }
-                let delta = item?;
-                if !delta.is_empty() {
-                    text.push_str(&delta);
-                    on_delta(&delta);
-                }
-            }
-            Ok(ChatOutcome {
-                text,
-                usage: None,
-                thinking: None,
-            })
-        });
-        if cancel.is_cancelled() {
-            Attempt::Failed(Failure::plain(LlmError::Cancelled))
-        } else {
-            Attempt::from(outcome, &request.provider)
-        }
+                Ok(ChatOutcome {
+                    text,
+                    usage: None,
+                    thinking: None,
+                })
+            },
+            cancel,
+            Duration::from_secs(request.timeout_secs),
+        );
+        Attempt::from(outcome, &request.provider, request.timeout_secs)
     }
 
     /// One request, no streaming: what a provider that cannot stream at all gets
@@ -327,7 +328,12 @@ impl LlmCrate {
             ),
         );
         match Attempt::from(
-            block_on(async { provider.chat(messages).await }).map(|answer| {
+            block_on_cancellable(
+                async { provider.chat(messages).await },
+                cancel,
+                Duration::from_secs(request.timeout_secs),
+            )
+            .map(|answer| {
                 answer.map(|answer| ChatOutcome {
                     text: answer.text().unwrap_or_default(),
                     usage: usage_of(answer.usage()),
@@ -335,6 +341,7 @@ impl LlmCrate {
                 })
             }),
             &request.provider,
+            request.timeout_secs,
         ) {
             Attempt::Done(outcome) => Ok(*outcome),
             Attempt::Failed(failure) => Err(failure),
@@ -435,18 +442,21 @@ impl Attempt {
     /// A runtime that will not start is a transport failure, because that is what it is
     /// from the caller's side: nothing was sent.
     fn from(
-        outcome: Result<
-            Result<ChatOutcome, llm::error::LLMError>,
-            crate::adapters::http::RuntimeError,
-        >,
+        outcome: Result<Result<ChatOutcome, llm::error::LLMError>, AsyncWaitError>,
         provider: &str,
+        timeout_secs: u64,
     ) -> Self {
         match outcome {
             Ok(Ok(outcome)) => Self::Done(Box::new(outcome)),
             Ok(Err(error)) => Self::Failed(Failure {
-                error: translate(provider, &error),
+                error: translate(provider, timeout_secs, &error),
             }),
-            Err(error) => Self::Failed(Failure {
+            Err(AsyncWaitError::Cancelled) => Self::Failed(Failure::plain(LlmError::Cancelled)),
+            Err(AsyncWaitError::TimedOut) => Self::Failed(Failure::plain(LlmError::Timeout {
+                provider: provider.to_owned(),
+                timeout_secs,
+            })),
+            Err(AsyncWaitError::Runtime(error)) => Self::Failed(Failure {
                 error: LlmError::Transport {
                     provider: provider.to_owned(),
                     reason: error.to_string(),
@@ -476,9 +486,12 @@ fn route(request: &ChatRequest) -> Result<(LLMBackend, Option<String>), LlmError
 }
 
 /// Turns a crate error into one the UI can act on.
-fn translate(provider: &str, error: &llm::error::LLMError) -> LlmError {
+fn translate(provider: &str, timeout_secs: u64, error: &llm::error::LLMError) -> LlmError {
     let text = error.to_string();
     let lowered = text.to_ascii_lowercase();
+    if lowered.contains("caller cancelled the request") {
+        return LlmError::Cancelled;
+    }
     if lowered.contains("401")
         || lowered.contains("unauthorized")
         || lowered.contains("invalid api key")
@@ -493,7 +506,7 @@ fn translate(provider: &str, error: &llm::error::LLMError) -> LlmError {
     if lowered.contains("timed out") || lowered.contains("timeout") {
         return LlmError::Timeout {
             provider: provider.to_owned(),
-            timeout_secs: 0,
+            timeout_secs,
         };
     }
     // Everything else is the provider refusing or misbehaving, which the user reads
@@ -789,6 +802,7 @@ mod tests {
     fn a_missing_key_is_reported_as_a_credential_problem() {
         let error = translate(
             "deepseek",
+            120,
             &llm::error::LLMError::AuthError("401 Unauthorized: invalid api key".to_owned()),
         );
         assert!(matches!(error, LlmError::Auth { .. }), "{error:?}");
@@ -799,6 +813,7 @@ mod tests {
     fn a_transport_failure_is_not_reported_as_a_bad_request() {
         let error = translate(
             "openrouter",
+            120,
             &llm::error::LLMError::HttpError(
                 "error sending request: connection refused".to_owned(),
             ),
@@ -807,9 +822,29 @@ mod tests {
     }
 
     #[test]
+    fn ir_08_a_provider_timeout_reports_the_configured_deadline() {
+        let error = translate(
+            "openrouter",
+            120,
+            &llm::error::LLMError::HttpError("request timed out".to_owned()),
+        );
+        assert!(
+            matches!(
+                error,
+                LlmError::Timeout {
+                    timeout_secs: 120,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn a_provider_error_keeps_the_providers_own_words() {
         let error = translate(
             "deepseek",
+            120,
             &llm::error::LLMError::ProviderError("model not found: gpt-9".to_owned()),
         );
         let message = error.to_string();
@@ -821,6 +856,7 @@ mod tests {
     fn only_the_first_line_of_a_long_provider_message_is_kept() {
         let error = translate(
             "openrouter",
+            120,
             &llm::error::LLMError::ResponseFormatError {
                 message: "no choices in response".to_owned(),
                 raw_response: "{\"a\": 1}\n{\"b\": 2}".to_owned(),

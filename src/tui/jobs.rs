@@ -17,10 +17,11 @@
 //! Process-bound work runs on plain threads, not async tasks: `gh` and `git` block,
 //! and a runtime would only add a dependency before M2 needs one for the LLM.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::time::Duration;
 
 use crate::application::analysis::{
     AnalysisIntent, AnalysisRequest, AnalysisRun, Analyst, Progress as AnalysisProgress,
@@ -47,10 +48,21 @@ use crate::tui::app::Effect;
 use crate::tui::app::ReviewSession;
 use crate::tui::list_view::PrListState;
 
-/// How many progress messages are handed to the interface in one poll. Anything
-/// beyond it is dropped: the answer arrives whole in the completion, so a dropped
-/// preview costs nothing but a redrawn frame that is already stale.
-pub const MAX_PROGRESS_MESSAGES: usize = 256;
+/// How many progress messages may wait for the interface.
+///
+/// Producers wait when this is full instead of silently discarding text fragments.
+/// The bound applies to every streaming job together, preventing a fast provider from
+/// consuming unbounded memory (IR-08).
+pub const MAX_QUEUED_PROGRESS: usize = 256;
+
+/// How many progress messages the event loop accepts in one pass.
+///
+/// The remainder stays queued in order, so keyboard, mouse and completions cannot be
+/// starved by a provider that produces faster than the terminal can draw (IR-08).
+pub const MAX_PROGRESS_MESSAGES: usize = 64;
+
+/// How long a worker waits before retrying a full progress queue.
+const PROGRESS_BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 
 /// How many jobs may run at once. Process jobs are the expensive ones, and four is
 /// what ARCH-5 allows.
@@ -463,6 +475,11 @@ pub enum Outcome {
 pub struct Progress {
     /// Which job this is about.
     pub job: u64,
+    /// Monotonic position within this job's progress stream.
+    ///
+    /// A terminal completion waits until this position has reached the interface, so
+    /// it cannot overtake text or a repair reset still queued behind a busy frame.
+    pub sequence: u64,
     /// The review session that requested this update, when it is PR-scoped (IR-05).
     pub owner: JobOwner,
     /// What it wants to say.
@@ -501,6 +518,8 @@ pub struct ChatAnswered {
 pub struct Completion {
     /// Which job this is the answer to.
     pub job: u64,
+    /// The last progress sequence sent before this completion.
+    pub progress_through: u64,
     /// The review session that requested this work, when it is PR-scoped (IR-05).
     pub owner: JobOwner,
     /// What it produced.
@@ -1216,8 +1235,12 @@ pub struct JobRunner {
     next_id: u64,
     sender: Sender<Completion>,
     receiver: Receiver<Completion>,
+    /// Completions whose earlier progress has not reached the reducer yet.
+    pending_completions: VecDeque<Completion>,
+    /// Highest progress sequence removed from the channel for each job.
+    delivered_progress: HashMap<u64, u64>,
     /// Progress from jobs that stream.
-    progress_sender: Sender<Progress>,
+    progress_sender: SyncSender<Progress>,
     progress_receiver: Receiver<Progress>,
 }
 
@@ -1242,7 +1265,7 @@ impl JobRunner {
         request: DetectRequest,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::sync_channel(MAX_QUEUED_PROGRESS);
         Self {
             executor: None,
             workspace,
@@ -1257,6 +1280,8 @@ impl JobRunner {
             next_id: 1,
             sender,
             receiver,
+            pending_completions: VecDeque::new(),
+            delivered_progress: HashMap::new(),
             progress_sender,
             progress_receiver,
         }
@@ -1334,20 +1359,56 @@ impl JobRunner {
             || self.queue.iter().any(|(_, _, job)| job.slot() == slot)
     }
 
+    /// Whether a submitted job is waiting for capacity rather than running.
+    #[must_use]
+    pub fn is_queued(&self, id: u64) -> bool {
+        self.queue.iter().any(|(queued, _, _)| *queued == id)
+    }
+
     /// Cancels every job in a slot, for `Esc` on the screen that owns it.
     pub fn cancel(&mut self, slot: Slot) {
         self.cancel_slot(slot);
-        self.queue.retain(|(_, _, queued)| queued.slot() != slot);
+        let queued = std::mem::take(&mut self.queue);
+        for (id, owner, job) in queued {
+            if job.slot() == slot {
+                // Queued work owns no worker slot, but its pane still needs the same
+                // cancellation acknowledgement as a running job. Otherwise it would
+                // remain "cancelling" forever because no worker can report back.
+                let _ = self.sender.send(Completion {
+                    job: id,
+                    progress_through: 0,
+                    owner,
+                    outcome: Outcome::Abandoned,
+                });
+            } else {
+                self.queue.push_back((id, owner, job));
+            }
+        }
     }
 
     /// Starts queued jobs while there is room, and collects finished ones.
     ///
     /// Returns the completions that arrived, in arrival order. It never blocks.
     pub fn poll(&mut self) -> Vec<Completion> {
-        let mut completions = Vec::new();
         while let Ok(completion) = self.receiver.try_recv() {
             self.running.retain(|running| running.id != completion.job);
-            completions.push(completion);
+            self.pending_completions.push_back(completion);
+        }
+
+        let mut completions = Vec::new();
+        let pending = std::mem::take(&mut self.pending_completions);
+        for completion in pending {
+            let delivered = self
+                .delivered_progress
+                .get(&completion.job)
+                .copied()
+                .unwrap_or_default();
+            if delivered >= completion.progress_through {
+                self.delivered_progress.remove(&completion.job);
+                completions.push(completion);
+            } else {
+                self.pending_completions.push_back(completion);
+            }
         }
 
         // Every job sends exactly one completion, including one that panicked, so
@@ -1358,15 +1419,17 @@ impl JobRunner {
 
     /// Everything the running jobs have said since the last call.
     ///
-    /// Bounded: a provider that streams faster than the interface draws must not be
-    /// able to grow the queue without limit, and the text on screen is a preview of
-    /// the answer rather than the answer.
+    /// Bounded: a provider that streams faster than the interface draws cannot grow
+    /// the queue without limit or make this poll loop drain forever. Messages left in
+    /// the channel retain their order for the next frame (IR-08).
     pub fn poll_progress(&mut self) -> Vec<Progress> {
         let mut progress = Vec::new();
-        while let Ok(update) = self.progress_receiver.try_recv() {
-            if progress.len() < MAX_PROGRESS_MESSAGES {
-                progress.push(update);
-            }
+        while progress.len() < MAX_PROGRESS_MESSAGES {
+            let Ok(update) = self.progress_receiver.try_recv() else {
+                break;
+            };
+            self.delivered_progress.insert(update.job, update.sequence);
+            progress.push(update);
         }
         progress
     }
@@ -1398,6 +1461,8 @@ impl JobRunner {
         let llm = Arc::clone(&self.llm);
         let request = self.request.clone();
         let worker_owner = owner.clone();
+        let progress_sequence = Arc::new(AtomicU64::new(0));
+        let worker_progress_sequence = Arc::clone(&progress_sequence);
 
         let spawned = std::thread::Builder::new()
             .name(format!("smart-review-job-{id}"))
@@ -1418,6 +1483,8 @@ impl JobRunner {
                     sender: &progress_sender,
                     job: id,
                     owner: worker_owner.clone(),
+                    cancel: &worker_cancel,
+                    sequence: worker_progress_sequence,
                 };
                 let body =
                     std::panic::AssertUnwindSafe(|| run_job(&job, &ports, &worker_cancel, &sink));
@@ -1442,6 +1509,7 @@ impl JobRunner {
 
                 let _ = sender.send(Completion {
                     job: id,
+                    progress_through: progress_sequence.load(Ordering::Acquire),
                     owner: worker_owner,
                     outcome,
                 });
@@ -1460,6 +1528,7 @@ impl JobRunner {
                 );
                 let _ = self.sender.send(Completion {
                     job: id,
+                    progress_through: 0,
                     owner,
                     outcome: Outcome::Failed(format!("could not start a worker thread: {error}")),
                 });
@@ -1470,21 +1539,47 @@ impl JobRunner {
 
 /// Where a streaming job reports what it is doing, and which job it is (FR-4.4).
 struct ProgressSink<'a> {
-    sender: &'a Sender<Progress>,
+    sender: &'a SyncSender<Progress>,
     job: u64,
     owner: JobOwner,
+    cancel: &'a Cancel,
+    sequence: Arc<AtomicU64>,
 }
 
 impl ProgressSink<'_> {
-    /// Sends an update, dropping it when nobody is listening.
+    /// Sends an update in order, applying backpressure rather than dropping text.
     ///
-    /// A dropped preview costs nothing: the answer arrives whole in the completion.
+    /// A cancellation unblocks a producer waiting on a full queue. Completion travels
+    /// over a separate unbounded channel, so it can never be stranded behind preview
+    /// traffic (IR-08).
     fn send(&self, update: ProgressUpdate) {
-        let _ = self.sender.send(Progress {
+        // Advance the completion watermark only after the message entered the channel.
+        // If cancellation wins while this producer is backpressured, an allocated but
+        // unsent sequence must not leave its completion waiting for a delta that the UI
+        // can never receive.
+        let sequence = self.sequence.load(Ordering::Acquire) + 1;
+        let mut progress = Progress {
             job: self.job,
+            sequence,
             owner: self.owner.clone(),
             update,
-        });
+        };
+        loop {
+            match self.sender.try_send(progress) {
+                Ok(()) => {
+                    self.sequence.store(sequence, Ordering::Release);
+                    return;
+                }
+                Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(queued)) => {
+                    if self.cancel.is_cancelled() {
+                        return;
+                    }
+                    progress = queued;
+                    std::thread::sleep(PROGRESS_BACKPRESSURE_POLL);
+                }
+            }
+        }
     }
 }
 
@@ -1512,7 +1607,7 @@ fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel, sink: &ProgressSink
             Err(error) => Outcome::EnvironmentFailed(Box::new(error)),
         },
         Job::Report { context } => Outcome::Checks(doctor::collect(context)),
-        Job::Catalog { policy } => match ports.catalog.load(*policy) {
+        Job::Catalog { policy } => match ports.catalog.load(*policy, cancel) {
             Ok(load) => Outcome::Catalog(Box::new(load)),
             Err(error) => Outcome::Failed(error.to_string()),
         },
@@ -2052,6 +2147,30 @@ mod tests {
     }
 
     #[test]
+    fn ir_08_cancelling_queued_work_acknowledges_without_a_worker() {
+        let (mut runner, _forge) = runner_with(Duration::ZERO);
+        let id = runner.next_id;
+        runner.next_id += 1;
+        runner.queue.push_back((
+            id,
+            JobOwner::Global,
+            Job::Report {
+                context: Box::new(context()),
+            },
+        ));
+
+        runner.cancel(Slot::Doctor);
+        let completions = runner.poll();
+        assert!(
+            completions.iter().any(|completion| {
+                completion.job == id && matches!(completion.outcome, Outcome::Abandoned)
+            }),
+            "a queued cancellation must still release its pane: {completions:?}"
+        );
+        assert!(!runner.is_busy_in(Slot::Doctor));
+    }
+
+    #[test]
     fn cancelling_everything_clears_the_queue_and_the_workers() {
         let (mut runner, _forge) = runner_with(Duration::from_millis(200));
         for index in 0..4 {
@@ -2083,6 +2202,113 @@ mod tests {
                 .all(|completion| !matches!(completion.outcome, Outcome::Failed(_))),
             "{collected:?}"
         );
+    }
+
+    #[test]
+    fn ir_08_progress_is_lossless_bounded_and_precedes_its_completion() {
+        let (mut runner, _forge) = runner_with(Duration::ZERO);
+        let total = MAX_QUEUED_PROGRESS;
+        for index in 1..=total {
+            let sent = runner.progress_sender.send(Progress {
+                sequence: u64::try_from(index).unwrap_or(u64::MAX),
+                job: 17,
+                owner: JobOwner::Global,
+                update: ProgressUpdate::Analysis(AnalysisProgress::Delta(index.to_string())),
+            });
+            assert!(sent.is_ok());
+        }
+        let sent = runner.sender.send(Completion {
+            job: 17,
+            progress_through: u64::try_from(total).unwrap_or(u64::MAX),
+            owner: JobOwner::Global,
+            outcome: Outcome::Abandoned,
+        });
+        assert!(sent.is_ok());
+
+        let mut progress = Vec::new();
+        for batch_number in 0..(total / MAX_PROGRESS_MESSAGES) {
+            let batch = runner.poll_progress();
+            assert_eq!(batch.len(), MAX_PROGRESS_MESSAGES);
+            progress.extend(batch);
+            let completions = runner.poll();
+            if batch_number + 1 == total / MAX_PROGRESS_MESSAGES {
+                assert_eq!(completions.len(), 1, "completion follows every delta");
+            } else {
+                assert!(
+                    completions.is_empty(),
+                    "completion cannot overtake queued progress: {completions:?}"
+                );
+            }
+        }
+        let labels: Vec<String> = progress
+            .into_iter()
+            .map(|progress| match progress.update {
+                ProgressUpdate::Analysis(AnalysisProgress::Delta(delta)) => delta,
+                other => panic!("expected analysis delta, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            (1..=total)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ir_08_a_full_progress_queue_backpressures_the_producer() {
+        let (mut runner, _forge) = runner_with(Duration::ZERO);
+        for index in 0..MAX_QUEUED_PROGRESS {
+            let sent = runner.progress_sender.send(Progress {
+                sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                job: 17,
+                owner: JobOwner::Global,
+                update: ProgressUpdate::Analysis(AnalysisProgress::Delta(index.to_string())),
+            });
+            assert!(sent.is_ok());
+        }
+
+        let sender = runner.progress_sender.clone();
+        let cancel = Cancel::new();
+        let sequence = Arc::new(AtomicU64::new(
+            u64::try_from(MAX_QUEUED_PROGRESS).unwrap_or(u64::MAX),
+        ));
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = started_sender.send(());
+                ProgressSink {
+                    sender: &sender,
+                    job: 17,
+                    owner: JobOwner::Global,
+                    cancel: &cancel,
+                    sequence,
+                }
+                .send(ProgressUpdate::Analysis(AnalysisProgress::Delta(
+                    "blocked".to_owned(),
+                )));
+                let _ = finished_sender.send(());
+            });
+            assert!(
+                started_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .is_ok()
+            );
+            assert!(
+                finished_receiver.try_recv().is_err(),
+                "the producer must wait"
+            );
+
+            let drained = runner.poll_progress();
+            assert_eq!(drained.len(), MAX_PROGRESS_MESSAGES);
+            assert!(
+                finished_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .is_ok(),
+                "making capacity available releases the producer"
+            );
+        });
     }
 
     #[test]

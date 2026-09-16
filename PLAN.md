@@ -367,6 +367,7 @@ Per DEP-1, nothing below is added until approved. Versions come from `cargo add`
 | — | `secrecy` | Zeroizing key material | **Not added.** Rejected in favour of keeping the only copy of a key in a `String` that is never `Debug`-printed, never logged, and cleared on drop of the picker state (see `credentials.rs`); revisit if that proves hard to hold to. |
 | M5 | `syntect` / `tree-sitter-*` | Syntax highlighting | **Deferred by DEC-4**; needs a new decision + approval |
 | IR-06 | `fs2` | Crash-releasing interprocess locks for durable chat and review-plan documents | **Approved by owner during PR #16 review.** Standard Rust has no stable cross-process file-lock API; `fs2` supplies small safe Unix/Windows wrappers without introducing unsafe code here. |
+| IR-08 | `nix` | Signal a runner-owned Unix process group after cancellation or timeout | **Approved by owner during IR-08.** `std::process::CommandExt::process_group` creates the group before exec; `nix` provides safe Unix group-signal wrappers. |
 
 ---
 
