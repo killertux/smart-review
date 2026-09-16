@@ -204,7 +204,13 @@ impl crate::ports::MutationStorePort for FakeMutationStore {
             .operations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if operations.contains_key(&operation.id) {
+        if operations.contains_key(&operation.id)
+            || operations.values().any(|existing| {
+                existing.repo == operation.repo
+                    && existing.pr == operation.pr
+                    && existing.state.needs_reconciliation()
+            })
+        {
             return Err(crate::ports::MutationStoreError::Conflict);
         }
         operations.insert(operation.id.clone(), operation.clone());

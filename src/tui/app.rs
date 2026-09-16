@@ -1452,6 +1452,15 @@ impl App {
                     Some(self.apply_thread_resolved(&thread_id, resolved))
                 }
             }
+            Outcome::MutationFailed {
+                message,
+                outcome_unknown,
+            } if self.is_current_job(job) => {
+                if outcome_unknown {
+                    self.drafts.unresolved_mutation = true;
+                }
+                self.apply_failure(job, &message)
+            }
             Outcome::MutationsRecovered { blocked, warning } if job == self.mutation_job => {
                 self.mutation_job = 0;
                 self.drafts.unresolved_mutation = blocked;
@@ -1475,6 +1484,7 @@ impl App {
             Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
+            | Outcome::MutationFailed { .. }
                 if job == self.chat.load_job
                     || job == self.chat.job
                     || job == self.cancelled_chat_job =>
@@ -1510,6 +1520,7 @@ impl App {
             | Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
+            | Outcome::MutationFailed { .. }
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
@@ -3947,6 +3958,7 @@ impl App {
             || job == self.drafts.job
             || job == self.drafts.post_job
             || job == self.discussion.job
+            || job == self.mutation_job
     }
 
     /// Records a job failure where the user will see it.

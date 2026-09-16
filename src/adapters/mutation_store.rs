@@ -99,7 +99,10 @@ impl FileMutationStore {
                 source,
             })?;
             let operation = Self::decode(path, &text)?;
-            if operation.repo == *repo && operation.pr == pr && operation.state.blocks_dispatch() {
+            if operation.repo == *repo
+                && operation.pr == pr
+                && operation.state.needs_reconciliation()
+            {
                 operations.push(operation);
             }
         }
@@ -300,7 +303,8 @@ mod tests {
     fn ir_07_an_unresolved_operation_blocks_a_different_dispatch_id() {
         let home = temp_home();
         let store = FileMutationStore::new(home.path());
-        let first = operation();
+        let mut first = operation();
+        first.mark_dispatching(from_unix_secs(1_700_000_001));
         store.begin(&first).expect("created");
         let mut second = operation();
         second.id = "op-2".to_owned();

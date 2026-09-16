@@ -443,6 +443,13 @@ pub enum Outcome {
     },
     /// The job failed, with the message to show.
     Failed(String),
+    /// A remote mutation failed; its delivery may require reconciliation (IR-07).
+    MutationFailed {
+        /// The user-facing failure reason.
+        message: String,
+        /// Whether GitHub may have received the mutation.
+        outcome_unknown: bool,
+    },
     /// The job was replaced or abandoned before it finished.
     Abandoned,
 }
@@ -748,6 +755,9 @@ impl Executor {
     /// A dry run clears nothing — nothing was sent (FR-6.5) — and the loop writes the
     /// recorded calls out where the user can read them.
     fn submit_review(&self, draft: &crate::domain::draft::Draft, cancel: &Cancel) -> Outcome {
+        if cancel.is_cancelled() {
+            return cancelled_before_dispatch();
+        }
         let mut operation = match self.prepare_mutation(
             draft.pr,
             draft.head_sha.clone(),
@@ -762,35 +772,40 @@ impl Executor {
             crate::application::drafts::Drafts::new(Arc::clone(&self.drafts), self.repo.clone());
         match service.publish(self.forge.as_ref(), draft, cancel) {
             Ok(posted) => {
-                self.record_success(
-                    &mut operation,
-                    posted.id,
-                    posted.url.clone(),
-                    posted.dry_run,
-                );
-                if !posted.dry_run
-                    && let Err(error) = service.remove_if_matches(draft)
-                {
-                    logging::log(
-                        Level::Warn,
-                        format!("the sent draft could not be cleared safely: {error}"),
-                    );
+                let cleanup = (!posted.dry_run)
+                    .then(|| service.remove_if_matches(draft))
+                    .transpose();
+                match cleanup {
+                    Ok(_) => self.record_success(
+                        &mut operation,
+                        posted.id,
+                        posted.url.clone(),
+                        posted.dry_run,
+                    ),
+                    Err(error) => self.record_failure(
+                        &mut operation,
+                        format!("GitHub accepted the review, but its draft could not be cleared safely: {error}"),
+                        true,
+                    ),
                 }
                 Outcome::ReviewPosted(Box::new(posted))
             }
             Err(error) => {
-                self.record_failure(
-                    &mut operation,
-                    error.to_string(),
-                    publish_failure_is_unknown(&error),
-                );
-                Outcome::Failed(error.to_string())
+                let outcome_unknown = publish_failure_is_unknown(&error);
+                self.record_failure(&mut operation, error.to_string(), outcome_unknown);
+                Outcome::MutationFailed {
+                    message: error.to_string(),
+                    outcome_unknown,
+                }
             }
         }
     }
 
     /// Posts a reply, through the service that validates it (FR-6.4).
     fn post_reply(&self, number: u64, comment_id: u64, body: &str, cancel: &Cancel) -> Outcome {
+        if cancel.is_cancelled() {
+            return cancelled_before_dispatch();
+        }
         let mut operation = match self.prepare_mutation(
             number,
             None,
@@ -814,18 +829,21 @@ impl Executor {
                 Outcome::CommentPosted(Box::new(posted))
             }
             Err(error) => {
-                self.record_failure(
-                    &mut operation,
-                    error.to_string(),
-                    reply_failure_is_unknown(&error),
-                );
-                Outcome::Failed(error.to_string())
+                let outcome_unknown = reply_failure_is_unknown(&error);
+                self.record_failure(&mut operation, error.to_string(), outcome_unknown);
+                Outcome::MutationFailed {
+                    message: error.to_string(),
+                    outcome_unknown,
+                }
             }
         }
     }
 
     /// Posts a comment on the pull request's conversation (FR-6.4).
     fn post_conversation(&self, number: u64, body: &str, cancel: &Cancel) -> Outcome {
+        if cancel.is_cancelled() {
+            return cancelled_before_dispatch();
+        }
         let mut operation = match self.prepare_mutation(
             number,
             None,
@@ -848,12 +866,12 @@ impl Executor {
                 Outcome::CommentPosted(Box::new(posted))
             }
             Err(error) => {
-                self.record_failure(
-                    &mut operation,
-                    error.to_string(),
-                    reply_failure_is_unknown(&error),
-                );
-                Outcome::Failed(error.to_string())
+                let outcome_unknown = reply_failure_is_unknown(&error);
+                self.record_failure(&mut operation, error.to_string(), outcome_unknown);
+                Outcome::MutationFailed {
+                    message: error.to_string(),
+                    outcome_unknown,
+                }
             }
         }
     }
@@ -866,6 +884,9 @@ impl Executor {
         resolved: bool,
         cancel: &Cancel,
     ) -> Outcome {
+        if cancel.is_cancelled() {
+            return cancelled_before_dispatch();
+        }
         let mut operation = match self.prepare_mutation(
             number,
             None,
@@ -887,12 +908,12 @@ impl Executor {
                 }
             }
             Err(error) => {
-                self.record_failure(
-                    &mut operation,
-                    error.to_string(),
-                    reply_failure_is_unknown(&error),
-                );
-                Outcome::Failed(error.to_string())
+                let outcome_unknown = reply_failure_is_unknown(&error);
+                self.record_failure(&mut operation, error.to_string(), outcome_unknown);
+                Outcome::MutationFailed {
+                    message: error.to_string(),
+                    outcome_unknown,
+                }
             }
         }
     }
@@ -915,12 +936,12 @@ impl Executor {
             kind,
             now,
         );
+        // Crossing this durable boundary means the worker may next invoke the forge.
+        // A queued operation is therefore never left on disk: a crash before this point
+        // is definitely unsent, while every persisted record blocks a blind retry.
+        operation.mark_dispatching(now);
         self.mutations.begin(&operation).map_err(|error| {
             format!("could not record this operation; it was not sent: {error}")
-        })?;
-        operation.mark_dispatching(now);
-        self.mutations.save(&operation).map_err(|error| {
-            format!("could not mark this operation ready to send; it was not sent: {error}")
         })?;
         Ok(operation)
     }
@@ -1150,6 +1171,13 @@ impl Executor {
 
 fn is_definite_forge_refusal(error: &crate::Error) -> bool {
     error.forge_delivery() == Some(crate::error::ForgeDelivery::Refused)
+}
+
+fn cancelled_before_dispatch() -> Outcome {
+    Outcome::MutationFailed {
+        message: "cancelled before the request was sent".to_owned(),
+        outcome_unknown: false,
+    }
 }
 
 fn publish_failure_is_unknown(error: &crate::application::drafts::PublishError) -> bool {

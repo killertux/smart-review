@@ -1022,18 +1022,15 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             app.notice(app::NoticeLevel::Info, "the draft is empty");
         }
         Effect::CancelPublish => {
-            runner.cancel(jobs::Slot::Review);
-            app.drafts.job = 0;
+            if app.drafts.post_job != 0 {
+                runner.cancel(jobs::Slot::Post);
+            } else if app.drafts.job != 0 {
+                runner.cancel(jobs::Slot::Review);
+            }
             app.drafts.armed = false;
-            app.drafts.unresolved_mutation = true;
-            app.drafts.status = crate::tui::drafts::DraftStatus::Failed {
-                reason:
-                    "the request may have reached GitHub; check the pull request before retrying"
-                        .to_owned(),
-            };
             app.notice(
                 app::NoticeLevel::Warn,
-                "the request may have reached GitHub; its outcome is unknown and retries are blocked",
+                "cancelling the request; its result will determine whether it can be retried",
             );
         }
         Effect::WriteDryRun => write_dry_run(app),

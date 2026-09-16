@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::adapters::fs::write_atomic;
+use crate::adapters::fs::{create_private_parents, write_atomic};
 use crate::domain::draft::Draft;
 use crate::domain::repo::RepoId;
 use crate::logging::{self, Level};
@@ -46,6 +46,48 @@ impl FileDraftStore {
     fn path(&self, repo: &RepoId, number: u64) -> PathBuf {
         self.repo_dir(repo).join(format!("pr-{number}.json"))
     }
+
+    fn lock(&self, repo: &RepoId, number: u64) -> Result<std::fs::File, DraftStoreError> {
+        use fs2::FileExt as _;
+
+        let directory = self.repo_dir(repo);
+        create_private_parents(&directory).map_err(|source| DraftStoreError::Io {
+            action: "create the draft directory",
+            path: directory.clone(),
+            source,
+        })?;
+        let path = directory.join(format!(".pr-{number}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| DraftStoreError::Io {
+                action: "open the draft lock",
+                path: path.clone(),
+                source,
+            })?;
+        file.lock_exclusive()
+            .map_err(|source| DraftStoreError::Io {
+                action: "lock the draft",
+                path,
+                source,
+            })?;
+        Ok(file)
+    }
+
+    fn remove_path(path: &Path) -> Result<(), DraftStoreError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(DraftStoreError::Io {
+                action: "remove the draft",
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
 }
 
 impl DraftStorePort for FileDraftStore {
@@ -71,6 +113,7 @@ impl DraftStorePort for FileDraftStore {
     }
 
     fn save(&self, repo: &RepoId, draft: &Draft) -> Result<(), DraftStoreError> {
+        let _lock = self.lock(repo, draft.pr)?;
         let path = self.path(repo, draft.pr);
         let text = draft
             .to_json()
@@ -87,25 +130,33 @@ impl DraftStorePort for FileDraftStore {
 
     fn remove(&self, repo: &RepoId, number: u64) -> Result<(), DraftStoreError> {
         let path = self.path(repo, number);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(DraftStoreError::Io {
-                action: "remove the draft",
-                path,
-                source,
-            }),
-        }
+        let _lock = self.lock(repo, number)?;
+        Self::remove_path(&path)
     }
 
     fn remove_if_matches(&self, repo: &RepoId, submitted: &Draft) -> Result<bool, DraftStoreError> {
-        match self.load(repo, submitted.pr)? {
-            Some(current) if current == *submitted => {
-                self.remove(repo, submitted.pr)?;
-                Ok(true)
+        let path = self.path(repo, submitted.pr);
+        let _lock = self.lock(repo, submitted.pr)?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(DraftStoreError::Io {
+                    action: "read the draft",
+                    path,
+                    source,
+                });
             }
-            Some(_) | None => Ok(false),
+        };
+        let current = Draft::from_json(&text).map_err(|error| DraftStoreError::Malformed {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+        if current != *submitted {
+            return Ok(false);
         }
+        Self::remove_path(&path)?;
+        Ok(true)
     }
 
     fn list(&self, repo: &RepoId) -> Result<Vec<Draft>, DraftStoreError> {
