@@ -1070,7 +1070,7 @@ fn start_analysis(app: &mut App, argument: &str) -> Effect {
         // The estimate has been shown and agreed to; send it (FR-4.6).
         if app.panel.confirmed || app.analysis_opt_in_recorded() {
             app.record_analysis_opt_in();
-            app.begin_analysis();
+            app.begin_analysis(false);
             app.panel.bundle = Some(Box::new(bundle));
             return Effect::RunAnalysis {
                 force: argument == "--force",
@@ -2020,6 +2020,7 @@ mod tests {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(7);
         app.apply_progress(crate::tui::jobs::Progress {
+            sequence: 0,
             owner: crate::tui::jobs::JobOwner::Global,
             job: 6,
             update: crate::tui::jobs::ProgressUpdate::Analysis(
@@ -2031,6 +2032,7 @@ mod tests {
             "a superseded run is dropped"
         );
         app.apply_progress(crate::tui::jobs::Progress {
+            sequence: 0,
             owner: crate::tui::jobs::JobOwner::Global,
             job: 7,
             update: crate::tui::jobs::ProgressUpdate::Analysis(
@@ -2045,31 +2047,45 @@ mod tests {
     }
 
     #[test]
-    fn ir_02_a_repair_preview_replaces_the_rejected_attempt() {
+    fn ir_08_a_repair_after_more_than_one_frame_keeps_its_exact_final_response() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(7);
-        for update in [
-            crate::application::analysis::Progress::Delta("REJECTED_SENTINEL".to_owned()),
-            crate::application::analysis::Progress::Reset("repairing".to_owned()),
-            crate::application::analysis::Progress::Delta("REPAIRED_SENTINEL".to_owned()),
-        ] {
+        let mut sequence = 0_u64;
+        let mut apply = |update| {
+            sequence += 1;
             app.apply_progress(crate::tui::jobs::Progress {
+                sequence,
                 owner: crate::tui::jobs::JobOwner::Global,
                 job: 7,
                 update: crate::tui::jobs::ProgressUpdate::Analysis(update),
             });
+        };
+        for _ in 0..65 {
+            apply(crate::application::analysis::Progress::Delta(
+                "rejected".to_owned(),
+            ));
         }
-        assert_eq!(app.analysis_stream(), "REPAIRED_SENTINEL");
+        apply(crate::application::analysis::Progress::Reset(
+            "repairing".to_owned(),
+        ));
+        let repaired = "REPAIRED_SENTINEL".repeat(65);
+        for _ in 0..65 {
+            apply(crate::application::analysis::Progress::Delta(
+                "REPAIRED_SENTINEL".to_owned(),
+            ));
+        }
+        assert_eq!(app.analysis_stream(), repaired);
 
         app.apply_analysis(crate::application::analysis::AnalysisRun::Ready(Box::new(
             crate::application::analysis::Analyzed {
+                raw: repaired.clone(),
                 analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
                 warnings: Vec::new(),
                 repaired: true,
                 usage: None,
             },
         )));
-        assert_eq!(app.stored_analysis_raw(), Some("REPAIRED_SENTINEL"));
+        assert_eq!(app.stored_analysis_raw(), Some(repaired.as_str()));
     }
 
     #[test]
@@ -2078,6 +2094,7 @@ mod tests {
         app.record_analysis_job(3);
         app.apply_analysis(crate::application::analysis::AnalysisRun::Ready(Box::new(
             crate::application::analysis::Analyzed {
+                raw: String::new(),
                 analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
                 warnings: vec!["one file was unclassified".to_owned()],
                 repaired: false,

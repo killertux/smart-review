@@ -91,8 +91,10 @@ fn panel_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         // While a run is in flight the panel shows what arrived, because the answer
         // streaming in is the progress indicator that costs nothing (FR-4.4).
         AnalysisState::Gathering
+        | AnalysisState::Queued
         | AnalysisState::Running { .. }
-        | AnalysisState::Streaming { .. } => running_lines(app, theme),
+        | AnalysisState::Streaming { .. }
+        | AnalysisState::Cancelling => running_lines(app, theme),
         // The one thing an analysis must never do is spend money without being asked
         // (FR-4.6), so this state gets a panel of its own rather than a line that
         // scrolls away.

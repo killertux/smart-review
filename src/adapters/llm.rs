@@ -93,7 +93,7 @@ impl LlmCrate {
         builder
             .build()
             .map(|provider| provider as Box<dyn ChatProvider>)
-            .map_err(|error| translate(&request.provider, &error))
+            .map_err(|error| translate(&request.provider, request.timeout_secs, &error))
     }
 
     /// The conversation as the crate's message types.
@@ -449,7 +449,7 @@ impl Attempt {
         match outcome {
             Ok(Ok(outcome)) => Self::Done(Box::new(outcome)),
             Ok(Err(error)) => Self::Failed(Failure {
-                error: translate(provider, &error),
+                error: translate(provider, timeout_secs, &error),
             }),
             Err(AsyncWaitError::Cancelled) => Self::Failed(Failure::plain(LlmError::Cancelled)),
             Err(AsyncWaitError::TimedOut) => Self::Failed(Failure::plain(LlmError::Timeout {
@@ -486,7 +486,7 @@ fn route(request: &ChatRequest) -> Result<(LLMBackend, Option<String>), LlmError
 }
 
 /// Turns a crate error into one the UI can act on.
-fn translate(provider: &str, error: &llm::error::LLMError) -> LlmError {
+fn translate(provider: &str, timeout_secs: u64, error: &llm::error::LLMError) -> LlmError {
     let text = error.to_string();
     let lowered = text.to_ascii_lowercase();
     if lowered.contains("caller cancelled the request") {
@@ -506,7 +506,7 @@ fn translate(provider: &str, error: &llm::error::LLMError) -> LlmError {
     if lowered.contains("timed out") || lowered.contains("timeout") {
         return LlmError::Timeout {
             provider: provider.to_owned(),
-            timeout_secs: 0,
+            timeout_secs,
         };
     }
     // Everything else is the provider refusing or misbehaving, which the user reads
@@ -802,6 +802,7 @@ mod tests {
     fn a_missing_key_is_reported_as_a_credential_problem() {
         let error = translate(
             "deepseek",
+            120,
             &llm::error::LLMError::AuthError("401 Unauthorized: invalid api key".to_owned()),
         );
         assert!(matches!(error, LlmError::Auth { .. }), "{error:?}");
@@ -812,6 +813,7 @@ mod tests {
     fn a_transport_failure_is_not_reported_as_a_bad_request() {
         let error = translate(
             "openrouter",
+            120,
             &llm::error::LLMError::HttpError(
                 "error sending request: connection refused".to_owned(),
             ),
@@ -820,9 +822,29 @@ mod tests {
     }
 
     #[test]
+    fn ir_08_a_provider_timeout_reports_the_configured_deadline() {
+        let error = translate(
+            "openrouter",
+            120,
+            &llm::error::LLMError::HttpError("request timed out".to_owned()),
+        );
+        assert!(
+            matches!(
+                error,
+                LlmError::Timeout {
+                    timeout_secs: 120,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn a_provider_error_keeps_the_providers_own_words() {
         let error = translate(
             "deepseek",
+            120,
             &llm::error::LLMError::ProviderError("model not found: gpt-9".to_owned()),
         );
         let message = error.to_string();
@@ -834,6 +856,7 @@ mod tests {
     fn only_the_first_line_of_a_long_provider_message_is_kept() {
         let error = translate(
             "openrouter",
+            120,
             &llm::error::LLMError::ResponseFormatError {
                 message: "no choices in response".to_owned(),
                 raw_response: "{\"a\": 1}\n{\"b\": 2}".to_owned(),

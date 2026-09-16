@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::Pid;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::logging::{self, Level};
 use crate::ports::Cancel;
@@ -538,11 +540,9 @@ impl ProcessRunner {
             }
         };
 
-        // A process can spawn helpers which inherit its process group. Linux launches
-        // each command through `setsid` *before* it execs the requested program, so
-        // cancellation and timeout can stop the runner-owned group without the race a
-        // parent-side `setpgid` has after `Command::spawn` (IR-08). On other platforms,
-        // `terminate` retains direct-child behaviour and the limitation is documented.
+        // A process can spawn helpers which inherit its process group. Unix creates a
+        // child-owned group before exec, so cancellation and timeout can stop that group
+        // without the parent-side race a post-spawn `setpgid` would have (IR-08).
         #[cfg(unix)]
         let group = starts_new_session.then(|| OwnedProcessGroup::from_child(&child));
 
@@ -659,34 +659,20 @@ impl ProcessRunner {
     }
 }
 
-/// Builds the process command, isolating it on Linux before it can spawn helpers.
+/// Builds the process command, isolating Unix children before they can spawn helpers.
 fn command_for(spec: &CommandSpec) -> (Command, bool) {
-    #[cfg(target_os = "linux")]
-    if (is_explicit_path(&spec.program) || program_is_on_path(&spec.program))
-        && let Some(setsid) = ["/usr/bin/setsid", "/bin/setsid"]
-            .into_iter()
-            .find(|path| Path::new(path).is_file())
-    {
-        let mut command = Command::new(setsid);
-        command.arg(&spec.program).args(&spec.args);
-        return (command, true);
-    }
-
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    #[cfg(unix)]
+    {
+        // `0` requests a new process group led by the child. This is set in the child
+        // before exec by the standard library, so every descendant belongs to a group
+        // that cannot include this application or its terminal.
+        command.process_group(0);
+        (command, true)
+    }
+    #[cfg(not(unix))]
     (command, false)
-}
-
-/// Whether a bare program name can be resolved before wrapping it with `setsid`.
-///
-/// The normal `Command` path deliberately leaves PATH resolution to the operating
-/// system. The wrapper needs this one narrow preflight so a missing program still
-/// reports [`ProcessError::NotFound`] rather than `setsid`'s exit status.
-#[cfg(target_os = "linux")]
-fn program_is_on_path(program: &Path) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| is_executable_file(&directory.join(program)))
-    })
 }
 
 /// A process group that belongs only to one child started by this runner.
@@ -696,7 +682,7 @@ struct OwnedProcessGroup(Pid);
 
 #[cfg(unix)]
 impl OwnedProcessGroup {
-    /// The Linux `setsid` launcher keeps its own pid as the session and group id.
+    /// A `process_group(0)` child keeps its own pid as the group id.
     fn from_child(child: &std::process::Child) -> Self {
         let raw = i32::try_from(child.id()).unwrap_or(i32::MAX);
         Self(Pid::from_raw(raw))

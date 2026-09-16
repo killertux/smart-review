@@ -539,7 +539,6 @@ fn apply_analysis_effect(
             let Some(request) = app.analysis_request() else {
                 return true;
             };
-            app.begin_analysis();
             let id = runner.submit_owned(
                 review_job_owner(app),
                 jobs::Job::RunAnalysis {
@@ -547,6 +546,7 @@ fn apply_analysis_effect(
                     bundle: Box::new(bundle),
                 },
             );
+            app.begin_analysis(runner.is_queued(id));
             app.record_analysis_job(id);
         }
 

@@ -127,6 +127,11 @@ impl ContextSource for AnalysisRequest {
 pub struct Analyzed {
     /// The document.
     pub analysis: Box<Analysis>,
+    /// The final provider text, capped by the same policy as the durable cache.
+    ///
+    /// The UI must take this authoritative value on completion rather than assembling
+    /// a possibly lagging progress preview (IR-08).
+    pub raw: String,
     /// What was corrected on the way, shown to the user so a plan that lost a file is
     /// never a silent loss (FR-4.1).
     pub warnings: Vec<String>,
@@ -336,6 +341,7 @@ impl<'a> Analyst<'a> {
 
         Ok(AnalysisRun::Ready(Box::new(Analyzed {
             analysis: Box::new(normalized.analysis),
+            raw: cap_raw(&raw),
             warnings,
             repaired,
             usage: usage.reported(),
