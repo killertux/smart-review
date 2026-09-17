@@ -360,12 +360,12 @@ run_tui() {
 # The keystrokes a chat run needs, as groups: `~` separates one group per wait, and
 # each group's wait is what proves the previous group landed.
 #
-#   OPEN     `:pr 141` and then Tab, which walks the review screen's three stops
+#   OPEN     `:pr 141` and then `5`, which selects the real Ask destination
 #   TYPE(x)  type a question without sending it
 #   SEND     press Enter
 #   BACK     Esc, which stops an answer if one is running and otherwise leaves the pane
 # ---------------------------------------------------------------------------
-OPEN=':pr 141\r~\t'
+OPEN=':pr 141\r~5'
 OPEN_WAIT='money\.rs~'
 # The exits are `:q` from the command line rather than `q`, because `q` is a letter in
 # the compose box — and a validator that cannot leave a pane cannot check it.
@@ -406,10 +406,10 @@ else
   bad "the compose box did not take the text"
   printf '%s\n' "$SCREEN" | tail -10
 fi
-if printf '%s' "$SCREEN" | grep -q "4 Chat"; then
-  ok "the tab bar shows the conversation is open"
+if printf '%s' "$SCREEN" | grep -Fq "[5 Ask]"; then
+  ok "the tab bar exposes Ask as the conversation destination"
 else
-  bad "the chat tab is not marked open"
+  bad "the Ask tab is not visible"
 fi
 if printf '%s' "$SCREEN" | grep -q "INSERT"; then
   ok "the status line says the keyboard is in insert mode"

@@ -1756,6 +1756,7 @@ pub fn job_for(
         | Effect::KeepPending
         | Effect::SaveState
         | Effect::CopyPath(_)
+        | Effect::OpenUrl(_)
         | Effect::EditComposer(_) => None,
     }
 }

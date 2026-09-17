@@ -367,6 +367,14 @@ Acceptance criteria:
 **FR-7.8 Layout & responsiveness** — MUST — M0
 Minimum supported size 80×24; below that show a single centered "terminal too small" panel. Panels collapse in priority order (comments → chat → analysis → file tree) as width shrinks; the diff pane is the last to go. Layout MUST reflow on `SIGWINCH` without losing cursor/scroll state.
 
+*Implementation note (IR-10):* an open pull request has five real destinations:
+**Overview**, **Files**, **Checks**, **Discussion** and **Ask**. Normal-mode `1`–`5`
+and the clickable tab labels select the same destination; digits remain text in every
+composer, search and command input. Files preserves its independent tree/diff state
+while another destination is selected. Checks identify each available run URL and
+Discussion keeps review bodies, resolved/outdated inline threads and top-level
+conversation readable even when an inline anchor is no longer current.
+
 ### FR-8 Configuration & persistence
 
 **FR-8.1 Directory layout** — MUST — M0

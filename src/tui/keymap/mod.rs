@@ -346,6 +346,16 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Normal), "G", "nav.bottom"),
     (Scope::In(Mode::Normal), "<Tab>", "pane.next"),
     (Scope::In(Mode::Normal), "<S-Tab>", "pane.prev"),
+    (Scope::In(Mode::Normal), "1", "review.tab_overview"),
+    (Scope::In(Mode::Normal), "2", "review.tab_files"),
+    (Scope::In(Mode::Normal), "3", "review.tab_checks"),
+    (Scope::In(Mode::Normal), "4", "review.tab_discussion"),
+    (Scope::In(Mode::Normal), "5", "review.tab_ask"),
+    (
+        Scope::In(Mode::Normal),
+        "f",
+        "review.cycle_discussion_filter",
+    ),
     // Enter opens whatever the cursor is on, which is a pull request in the list and
     // a file in the tree (FR-3.4).
     (Scope::In(Mode::Normal), "<Enter>", "nav.open"),

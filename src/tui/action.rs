@@ -459,6 +459,42 @@ pub const ACTIONS: &[ActionDef] = &[
         group: Group::Pane,
         hint: false,
     },
+    ActionDef {
+        id: "review.tab_overview",
+        description: "Open the pull request overview (1)",
+        group: Group::Pane,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.tab_files",
+        description: "Open changed files (2)",
+        group: Group::Pane,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.tab_checks",
+        description: "Open checks (3)",
+        group: Group::Pane,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.tab_discussion",
+        description: "Open reviews and discussion (4)",
+        group: Group::Pane,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.tab_ask",
+        description: "Open grounded chat (5)",
+        group: Group::Pane,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.cycle_discussion_filter",
+        description: "Cycle Discussion: all, open, resolved, outdated (f)",
+        group: Group::Review,
+        hint: false,
+    },
 ];
 
 /// Every action, in help order.
