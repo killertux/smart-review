@@ -34,17 +34,38 @@ pub struct AnalysisKey {
     pub pr: u64,
     /// The head commit the analysis describes.
     pub head_sha: String,
+    /// The base/merge-base revision used for the evidence, when available (IR-12).
+    pub base_sha: Option<String>,
+    /// The resolved context policy and inventory, without source bytes or secrets.
+    pub context_fingerprint: String,
+    /// Version of the cache-identity contract. Entries from an earlier version are
+    /// retained for diagnostics but never certified as current (IR-12).
+    pub identity_version: u8,
     /// The provider.
     pub provider: String,
     /// The model.
     pub model: String,
+    /// The provider endpoint selected from catalog metadata, never credentials.
+    pub endpoint: Option<String>,
     /// The thinking settings, if any (FR-4.8).
     pub thinking: Option<Thinking>,
+    /// Effective input allowance after model/window limits.
+    pub input_tokens: u32,
+    /// Effective completion allowance after model/window limits.
+    pub max_tokens: Option<u32>,
+    /// Effective temperature, rendered deterministically for cache identity.
+    pub temperature: Option<String>,
     /// The prompt version (FR-4.3).
     pub prompt_version: u32,
 }
 
 impl AnalysisKey {
+    /// Whether this entry predates the full IR-12 identity contract.
+    #[must_use]
+    pub const fn is_legacy(&self) -> bool {
+        self.identity_version < 1
+    }
+
     /// The key as one line, used to hash it and to explain a cache miss.
     ///
     /// The parts are separated by a byte that cannot appear in a repository name, a
@@ -57,13 +78,21 @@ impl AnalysisKey {
             None => "none".to_owned(),
         };
         format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
             self.repo,
             self.pr,
             self.head_sha,
+            self.base_sha.as_deref().unwrap_or("unavailable"),
+            self.context_fingerprint,
+            self.identity_version,
             self.provider,
             self.model,
+            self.endpoint.as_deref().unwrap_or("provider-default"),
             thinking,
+            self.input_tokens,
+            self.max_tokens
+                .map_or_else(|| "provider-default".to_owned(), |value| value.to_string()),
+            self.temperature.as_deref().unwrap_or("provider-default"),
             self.prompt_version
         )
     }
@@ -211,9 +240,16 @@ mod tests {
             repo: "github.com/acme/service".to_owned(),
             pr: 141,
             head_sha: "abc123".to_owned(),
+            base_sha: Some("base123".to_owned()),
+            context_fingerprint: "context".to_owned(),
+            identity_version: 1,
             provider: "deepseek".to_owned(),
             model: "deepseek-v4-pro".to_owned(),
+            endpoint: Some("https://api.deepseek.test/v1".to_owned()),
             thinking: None,
+            input_tokens: 12_000,
+            max_tokens: Some(4_000),
+            temperature: Some("0.2".to_owned()),
             prompt_version: 1,
         }
     }
@@ -243,6 +279,14 @@ mod tests {
             },
             AnalysisKey {
                 model: "deepseek-v4-lite".to_owned(),
+                ..base.clone()
+            },
+            AnalysisKey {
+                endpoint: Some("https://other.test/v1".to_owned()),
+                ..base.clone()
+            },
+            AnalysisKey {
+                max_tokens: Some(2_000),
                 ..base.clone()
             },
             AnalysisKey {

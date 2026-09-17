@@ -16,7 +16,7 @@
 //! never touches the terminal. The reducer sees only values.
 
 pub use crate::application::context::Checkout;
-use crate::application::context::ContextSource;
+use crate::application::context::{ContextSource, ContextSpec};
 use crate::domain::analysis::{
     Analysis, AnalysisUsage, Normalized, ParseFailure, PathIndex, Severity, normalize,
     repair_prompt, system_prompt, user_prompt,
@@ -70,14 +70,8 @@ pub struct AnalysisRequest {
     pub key: AnalysisKey,
     /// How to reach the provider, with the key and the thinking settings.
     pub chat: ChatRequest,
-    /// The pull request, for the metadata and commit blocks.
-    pub detail: Box<PullRequestDetail>,
-    /// The diff, already parsed. `None` when it could not be read.
-    pub patch: Option<Box<Patch>>,
-    /// Where the files can be read, when a worktree exists (FR-3.1).
-    pub checkout: Option<Checkout>,
-    /// The bundle budget (FR-4.6).
-    pub policy: BundlePolicy,
+    /// The complete shared context specification (IR-12).
+    pub context: ContextSpec,
     /// Full input allowance, distinct from the source bundle's reduced allowance.
     pub input_budget_tokens: u32,
 }
@@ -86,16 +80,7 @@ impl AnalysisRequest {
     /// The paths the diff changed, in the diff's own order.
     #[must_use]
     pub fn changed_paths(&self) -> Vec<String> {
-        self.patch
-            .as_ref()
-            .map(|patch| {
-                patch
-                    .files
-                    .iter()
-                    .filter_map(|file| file.path().map(ToString::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.context.changed_paths()
     }
 }
 
@@ -106,19 +91,23 @@ impl ContextSource for AnalysisRequest {
     }
 
     fn detail(&self) -> &PullRequestDetail {
-        &self.detail
+        self.context.detail()
     }
 
     fn patch(&self) -> Option<&Patch> {
-        self.patch.as_deref()
+        self.context.patch()
     }
 
     fn checkout(&self) -> Option<&Checkout> {
-        self.checkout.as_ref()
+        self.context.checkout()
     }
 
     fn policy(&self) -> &BundlePolicy {
-        &self.policy
+        self.context.policy()
+    }
+
+    fn added(&self) -> &[String] {
+        self.context.added()
     }
 }
 
@@ -242,11 +231,7 @@ impl<'a> Analyst<'a> {
         let system = system_prompt(conventions.as_deref());
         let prompt = user_prompt(&bundle.text);
         validate_input_budget(request, &system, &prompt)?;
-        let index = request
-            .patch
-            .as_deref()
-            .map_or_else(PathIndex::default, PathIndex::from_patch);
-
+        let index = path_index(request);
         let mut usage = UsageTotal::default();
         progress(Progress::Stage(format!("asking {}", request.chat.model)));
         let first = match self.ask(request, &system, &prompt, cancel, progress) {
@@ -425,7 +410,7 @@ impl<'a> Analyst<'a> {
         self.cache.get(key)
     }
 
-    /// An analysis for the same pull request made against an older commit (DEC-15).
+    /// An analysis for the same pull request made with incompatible provenance (IR-12).
     ///
     /// This is what makes "the head moved" sayable: the current key cannot match, so
     /// the entry has to be found by looking at the pull request rather than the key.
@@ -439,13 +424,21 @@ impl<'a> Analyst<'a> {
     ) -> Result<Option<StoredAnalysis>, crate::ports::analysis::AnalysisCacheError> {
         let entries = self.cache.list(self.repo, key.pr)?;
         Ok(entries.into_iter().find(|entry| {
-            entry.key.head_sha != key.head_sha
+            entry.key != *key
                 && entry.key.provider == key.provider
                 && entry.key.model == key.model
                 && entry.key.thinking == key.thinking
                 && entry.key.prompt_version == key.prompt_version
         }))
     }
+}
+
+fn path_index(request: &AnalysisRequest) -> PathIndex {
+    request
+        .context
+        .patch
+        .as_deref()
+        .map_or_else(PathIndex::default, PathIndex::from_patch)
 }
 
 /// Refuses a final serialized request that cannot fit the selected input allowance.
@@ -637,7 +630,7 @@ pub struct PanelModel {
     /// The inferred intent.
     pub intent: String,
     /// The risk areas, most serious first.
-    pub risks: Vec<(Severity, String, String)>,
+    pub risks: Vec<PanelRisk>,
     /// The questions worth asking the author.
     pub questions: Vec<String>,
 }
@@ -649,11 +642,7 @@ impl PanelModel {
         Self {
             summary: analysis.summary.clone(),
             intent: analysis.intent.clone(),
-            risks: analysis
-                .risk_areas
-                .iter()
-                .map(|risk| (risk.severity, risk.title.clone(), risk.why.clone()))
-                .collect(),
+            risks: analysis.risk_areas.iter().map(PanelRisk::of).collect(),
             questions: analysis.suggested_questions.clone(),
         }
     }
@@ -665,6 +654,33 @@ impl PanelModel {
             && self.intent.is_empty()
             && self.risks.is_empty()
             && self.questions.is_empty()
+    }
+}
+
+/// A validated analysis risk and the evidence paths that support it (IR-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelRisk {
+    /// Severity supplied by the normalized analysis.
+    pub severity: Severity,
+    /// Short reviewer-facing title.
+    pub title: String,
+    /// Why the model raised it.
+    pub why: String,
+    /// Canonical paths which survived normalization; safe for display/navigation.
+    pub files: Vec<String>,
+    /// False when every cited path was unknown or ambiguous.
+    pub supported: bool,
+}
+
+impl PanelRisk {
+    fn of(risk: &crate::domain::analysis::RiskArea) -> Self {
+        Self {
+            severity: risk.severity,
+            title: risk.title.clone(),
+            why: risk.why.clone(),
+            files: risk.files.clone(),
+            supported: risk.supported,
+        }
     }
 }
 
@@ -738,9 +754,16 @@ mod tests {
             repo: repo().key(),
             pr: 141,
             head_sha: "abc123".to_owned(),
+            base_sha: Some("base123".to_owned()),
+            context_fingerprint: "context".to_owned(),
+            identity_version: 1,
             provider: "deepseek".to_owned(),
             model: "deepseek-v4-pro".to_owned(),
+            endpoint: Some("https://api.deepseek.test/v1".to_owned()),
             thinking: None,
+            input_tokens: 12_000,
+            max_tokens: Some(4_000),
+            temperature: Some("0.2".to_owned()),
             prompt_version: crate::domain::analysis::PROMPT_VERSION,
         }
     }
@@ -770,14 +793,24 @@ mod tests {
                 crate::ports::secret::ApiKey::new("sk-test", crate::ports::secret::KeySource::File),
                 "placeholder",
             ),
-            detail: Box::new(sample_detail()),
-            patch: Some(Box::new(patch())),
-            checkout: Some(Checkout {
-                path: std::path::PathBuf::from("/tmp/ws"),
-                head_sha: "abc123".to_owned(),
-                base_sha: "base123".to_owned(),
-            }),
-            policy: BundlePolicy::default(),
+            context: ContextSpec {
+                detail: Box::new(sample_detail()),
+                patch: Some(Box::new(patch())),
+                checkout: Some(Checkout {
+                    path: std::path::PathBuf::from("/tmp/ws"),
+                    head_sha: "abc123".to_owned(),
+                    base_sha: "base123".to_owned(),
+                }),
+                policy: BundlePolicy::default(),
+                added: Vec::new(),
+                identity: crate::application::context::ContextIdentity {
+                    head_sha: "abc123".to_owned(),
+                    base_sha: Some("base123".to_owned()),
+                    changed_paths: vec!["src/money.rs".to_owned()],
+                    added: Vec::new(),
+                    policy: BundlePolicy::default(),
+                },
+            },
             input_budget_tokens: 100_000,
         }
     }
@@ -970,9 +1003,42 @@ mod tests {
     }
 
     #[test]
+    fn ir_12_analysis_includes_the_same_user_added_file_as_chat() {
+        let mut request = request();
+        request.context.added = vec!["docs/design.md".to_owned()];
+        request
+            .context
+            .identity
+            .added
+            .clone_from(&request.context.added);
+        let workspace = workspace(&[
+            ("src/money.rs", "fn money() {}"),
+            ("docs/design.md", "The design sentinel."),
+        ]);
+        let cache = FakeCache::default();
+        let llm = FakeLlm::answering(&[GOOD]);
+        let clock = FakeClock::new(1);
+        let repo = repo();
+        let analyst = Analyst::new(&workspace, &cache, &llm, &clock, &repo);
+
+        let (bundle, _) = analyst.gather(&request, &Cancel::new());
+
+        assert!(
+            bundle.text.contains("The design sentinel."),
+            "{}",
+            bundle.text
+        );
+        assert!(bundle.segments.iter().any(|segment| {
+            segment.kind == crate::domain::context::SegmentKind::UserFile
+                && segment.label == "docs/design.md"
+                && segment.included
+        }));
+    }
+
+    #[test]
     fn fr_4_6_the_final_fake_provider_request_excludes_secret_diff_content() {
         let mut request = request();
-        request.patch = Some(Box::new(crate::domain::diff::parse_patch(
+        request.context.patch = Some(Box::new(crate::domain::diff::parse_patch(
             "diff --git a/.env b/.env\n\
              --- a/.env\n\
              +++ b/.env\n\
@@ -1031,8 +1097,8 @@ mod tests {
             let _ = writeln!(patch_text, " context after {index}");
         }
         let mut request = request();
-        request.patch = Some(Box::new(crate::domain::diff::parse_patch(&patch_text)));
-        request.policy.max_context_tokens = 1_000;
+        request.context.patch = Some(Box::new(crate::domain::diff::parse_patch(&patch_text)));
+        request.context.policy.max_context_tokens = 1_000;
         let workspace = workspace(&[
             (".env", "REDUCED_PROVIDER_NEW_SECRET"),
             ("src/money.rs", "fn reduced_provider_allowed() {}"),
@@ -1085,7 +1151,7 @@ mod tests {
     #[test]
     fn fr_4_6_a_base_only_ignore_rule_excludes_deleted_content() {
         let mut request = request();
-        request.patch = Some(Box::new(crate::domain::diff::parse_patch(
+        request.context.patch = Some(Box::new(crate::domain::diff::parse_patch(
             "diff --git a/tracked.log b/tracked.log\n\
              deleted file mode 100644\n\
              --- a/tracked.log\n\
@@ -1117,7 +1183,7 @@ mod tests {
     #[test]
     fn without_a_workspace_the_bundle_says_so_instead_of_pretending() {
         let mut request = request();
-        request.checkout = None;
+        request.context.checkout = None;
         let (outcome, _, _) = run(&[GOOD], &[("src/money.rs", "fn money() {}")], &request);
         assert!(matches!(outcome, AnalysisRun::Ready(_)));
         let request = request;
@@ -1368,7 +1434,7 @@ mod tests {
         let panel = PanelModel::of(&ready.analysis);
         assert_eq!(panel.summary, "s");
         assert_eq!(panel.risks.len(), 1);
-        assert_eq!(panel.risks[0].0, Severity::High);
+        assert_eq!(panel.risks[0].severity, Severity::High);
         assert_eq!(panel.questions, ["Documented?"]);
         assert!(!panel.is_empty());
         assert!(PanelModel::default().is_empty());

@@ -400,9 +400,16 @@ pub enum Outcome {
         bundle: Box<crate::domain::context::Bundle>,
         /// What the caller wanted it for.
         intent: AnalysisIntent,
+        /// The exact context specification used to build it (IR-12).
+        identity: crate::application::context::ContextIdentity,
     },
-    /// The analysis finished, one way or another (FR-4.1).
-    Analyzed(Box<AnalysisRun>),
+    /// The analysis finished, one way or another, with its submitted provenance.
+    Analyzed {
+        /// The outcome from the provider/normalizer.
+        run: Box<AnalysisRun>,
+        /// Immutable cache identity captured before the job started (IR-12).
+        key: Box<crate::ports::AnalysisKey>,
+    },
     /// A pull request's sessions, and the one the caller asked to open (FR-5.1).
     ChatLoaded {
         /// The sessions that exist, newest first.
@@ -423,6 +430,8 @@ pub enum Outcome {
         session: Box<crate::domain::chat::Session>,
         /// The question that asked for it.
         question: String,
+        /// The exact context specification used to build the bundle (IR-12).
+        identity: crate::application::context::ContextIdentity,
     },
     /// A reply or a conversation comment was posted, or recorded by a dry run
     /// (FR-6.4, FR-6.5).
@@ -701,6 +710,7 @@ impl Executor {
                 Outcome::Context {
                     bundle: Box::new(bundle),
                     intent: *intent,
+                    identity: request.context.identity.clone(),
                 }
             }
             Job::RunAnalysis { request, bundle } => {
@@ -709,7 +719,10 @@ impl Executor {
                     sink.send(ProgressUpdate::Analysis(update));
                 };
                 match analyst.run(request, bundle, cancel, &mut report) {
-                    Ok(run) => Outcome::Analyzed(Box::new(run)),
+                    Ok(run) => Outcome::Analyzed {
+                        run: Box::new(run),
+                        key: Box::new(request.key.clone()),
+                    },
                     Err(error) => Outcome::Failed(error.to_string()),
                 }
             }
@@ -1101,6 +1114,7 @@ impl Executor {
                     bundle: Box::new(bundle),
                     session: session.clone(),
                     question: question.clone(),
+                    identity: spec.context.identity.clone(),
                 }
             }
             Job::AskChat { request } => {

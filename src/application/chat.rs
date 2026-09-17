@@ -18,7 +18,7 @@
 //! cancellation flag and the progress channel, because those are the parts that must
 //! not diverge (FR-5.3).
 
-use crate::application::context::{self, ContextSource};
+use crate::application::context::{self, ContextSource, ContextSpec};
 use crate::domain::chat::{
     Message, Reference, Role, Session, cost_of, references_in, replayable_history,
 };
@@ -99,54 +99,37 @@ pub struct ChatSpec {
     pub head_sha: String,
     /// How to reach the provider, with the key and the thinking settings.
     pub chat: ChatRequest,
-    /// The pull request, for the metadata and commit blocks.
-    pub detail: Box<PullRequestDetail>,
-    /// The diff, already parsed.
-    pub patch: Option<Box<Patch>>,
-    /// Where the files can be read.
-    pub checkout: Option<context::Checkout>,
-    /// The bundle budget (FR-4.6).
-    pub policy: BundlePolicy,
+    /// The complete shared context specification (IR-12).
+    pub context: ContextSpec,
     /// Full input allowance, separate from the source-bundle policy.
     pub input_budget_tokens: u32,
-    /// Files the user added with `:context add` (FR-5.3).
-    pub added: Vec<String>,
     /// What the catalog says this model costs, for the per-session estimate (FR-5.4).
     pub cost: Option<Cost>,
 }
 
 impl ContextSource for ChatSpec {
     fn changed_paths(&self) -> Vec<String> {
-        self.patch
-            .as_ref()
-            .map(|patch| {
-                patch
-                    .files
-                    .iter()
-                    .filter_map(|file| file.path().map(ToString::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.context.changed_paths()
     }
 
     fn detail(&self) -> &PullRequestDetail {
-        &self.detail
+        self.context.detail()
     }
 
     fn patch(&self) -> Option<&Patch> {
-        self.patch.as_deref()
+        self.context.patch()
     }
 
     fn checkout(&self) -> Option<&context::Checkout> {
-        self.checkout.as_ref()
+        self.context.checkout()
     }
 
     fn policy(&self) -> &BundlePolicy {
-        &self.policy
+        self.context.policy()
     }
 
     fn added(&self) -> &[String] {
-        &self.added
+        self.context.added()
     }
 }
 
@@ -264,7 +247,7 @@ impl<'a> Chatter<'a> {
         }
         let outcome = outcome?;
 
-        let index = spec.patch.as_deref().map_or_else(
+        let index = spec.context.patch.as_deref().map_or_else(
             crate::domain::analysis::PathIndex::default,
             crate::domain::analysis::PathIndex::from_patch,
         );
@@ -542,16 +525,25 @@ mod tests {
                 crate::ports::secret::ApiKey::new("sk-test", crate::ports::secret::KeySource::File),
                 String::new(),
             ),
-            detail: Box::new(crate::test_support::sample_detail()),
-            patch: Some(Box::new(patch())),
-            checkout: Some(context::Checkout {
-                path: std::path::PathBuf::from("/tmp/ws"),
-                head_sha: "abc123".to_owned(),
-                base_sha: "base123".to_owned(),
-            }),
-            policy: BundlePolicy::default(),
+            context: ContextSpec {
+                detail: Box::new(crate::test_support::sample_detail()),
+                patch: Some(Box::new(patch())),
+                checkout: Some(context::Checkout {
+                    path: std::path::PathBuf::from("/tmp/ws"),
+                    head_sha: "abc123".to_owned(),
+                    base_sha: "base123".to_owned(),
+                }),
+                policy: BundlePolicy::default(),
+                added: Vec::new(),
+                identity: crate::application::context::ContextIdentity {
+                    head_sha: "abc123".to_owned(),
+                    base_sha: Some("base123".to_owned()),
+                    changed_paths: vec!["src/money.rs".to_owned()],
+                    added: Vec::new(),
+                    policy: BundlePolicy::default(),
+                },
+            },
             input_budget_tokens: 100_000,
-            added: Vec::new(),
             cost: None,
         }
     }
@@ -747,7 +739,7 @@ mod tests {
         let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
         let cancel = Cancel::new();
         let mut spec = spec();
-        spec.added = vec!["docs/design.md".to_owned()];
+        spec.context.added = vec!["docs/design.md".to_owned()];
 
         let bundle = chatter.gather(&spec, &cancel);
         assert!(bundle.text.contains("# design"), "the file is sent");
@@ -780,7 +772,7 @@ mod tests {
         let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
         let cancel = Cancel::new();
         let mut spec = spec();
-        spec.patch = Some(Box::new(crate::domain::diff::parse_patch(
+        spec.context.patch = Some(Box::new(crate::domain::diff::parse_patch(
             "diff --git a/.env b/docs/design.md\n\
              similarity index 90%\n\
              rename from .env\n\
@@ -791,7 +783,7 @@ mod tests {
              -RENAMED_USER_FILE_OLD_SECRET\n\
              +RENAMED_USER_FILE_NEW_SECRET\n",
         )));
-        spec.added = vec!["docs/design.md".to_owned()];
+        spec.context.added = vec!["docs/design.md".to_owned()];
         let bundle = chatter.gather(&spec, &cancel);
         let mut progress = |_: Progress| {};
         chatter
@@ -833,7 +825,7 @@ mod tests {
         let repo = repo();
         let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
         let mut spec = spec();
-        spec.added = vec!["docs/design.md".to_owned()];
+        spec.context.added = vec!["docs/design.md".to_owned()];
 
         let bundle = chatter.gather(&spec, &Cancel::new());
 
@@ -860,7 +852,7 @@ mod tests {
         let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
         let cancel = Cancel::new();
         let mut spec = spec();
-        spec.added = vec!["docs/missing.md".to_owned()];
+        spec.context.added = vec!["docs/missing.md".to_owned()];
 
         let bundle = chatter.gather(&spec, &cancel);
         assert!(
@@ -1009,7 +1001,7 @@ mod tests {
         let chatter = Chatter::new(&workspace, &llm, &clock, &repo);
         let cancel = Cancel::new();
         let mut spec = spec();
-        spec.checkout = None;
+        spec.context.checkout = None;
         let bundle = chatter.gather(&spec, &cancel);
         assert!(
             !bundle.text.contains("fn cents"),

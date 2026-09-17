@@ -22,6 +22,139 @@ use crate::domain::pr::PullRequestDetail;
 use crate::ports::Cancel;
 use crate::ports::workspace::WorkspacePort;
 
+/// The immutable inputs that determine the context a provider can receive (IR-12).
+///
+/// This is deliberately smaller than a gathered [`Bundle`]: it is cheap to compare
+/// before reading repository bytes, while still changing whenever the revision, change
+/// set, user additions, or budget policy would produce a materially different bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextIdentity {
+    /// The PR revision whose content is read.
+    pub head_sha: String,
+    /// The base/merge-base revision used for old-side diff content, when local context
+    /// is available.
+    pub base_sha: Option<String>,
+    /// Canonical changed paths in patch order.
+    pub changed_paths: Vec<String>,
+    /// Extra head-revision files the user explicitly requested.
+    pub added: Vec<String>,
+    /// The policy controlling which content can fit.
+    pub policy: BundlePolicy,
+}
+
+/// The complete immutable input to context gathering (IR-12).
+///
+/// Analysis, chat, inspection and their estimates carry this exact object rather than
+/// independently rebuilding a near-identical collection of fields. `identity` is the
+/// cheap cache/prepared-bundle comparison; the remaining fields are the source data
+/// used only by the worker that resolves the bundle.
+#[derive(Debug, Clone)]
+pub struct ContextSpec {
+    /// The pull request metadata and commits.
+    pub detail: Box<PullRequestDetail>,
+    /// The canonical parsed change set.
+    pub patch: Option<Box<Patch>>,
+    /// The revisions and checkout from which source bytes are read.
+    pub checkout: Option<Checkout>,
+    /// The source-budget policy.
+    pub policy: BundlePolicy,
+    /// Extra head-revision files selected by the user.
+    pub added: Vec<String>,
+    /// The complete non-secret identity of these inputs.
+    pub identity: ContextIdentity,
+}
+
+impl ContextSpec {
+    /// The paths the canonical patch changed, in patch order.
+    #[must_use]
+    pub fn changed_paths(&self) -> Vec<String> {
+        self.patch
+            .as_ref()
+            .map(|patch| {
+                patch
+                    .files
+                    .iter()
+                    .filter_map(|file| file.path().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl ContextIdentity {
+    /// A stable, non-secret fingerprint for cache identity and prepared-bundle checks.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let mut parts = vec![
+            "context-v1".to_owned(),
+            self.head_sha.clone(),
+            self.base_sha
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            self.policy.max_context_tokens.to_string(),
+            self.policy.max_file_bytes.to_string(),
+            self.policy.reduced_context_lines.to_string(),
+        ];
+        parts.extend(
+            self.changed_paths
+                .iter()
+                .map(|path| format!("changed:{path}")),
+        );
+        let mut added = self.added.clone();
+        added.sort();
+        added.dedup();
+        parts.extend(added.into_iter().map(|path| format!("added:{path}")));
+        fingerprint(&parts.join("\u{1}"))
+    }
+}
+
+fn fingerprint(text: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn ir_12_context_identity_changes_for_additions_revisions_and_budget() {
+        let base = ContextIdentity {
+            head_sha: "head".to_owned(),
+            base_sha: Some("base".to_owned()),
+            changed_paths: vec!["src/main.rs".to_owned()],
+            added: vec!["docs/design.md".to_owned()],
+            policy: BundlePolicy::default(),
+        };
+        let variants = [
+            ContextIdentity {
+                added: vec!["docs/other.md".to_owned()],
+                ..base.clone()
+            },
+            ContextIdentity {
+                base_sha: Some("other-base".to_owned()),
+                ..base.clone()
+            },
+            ContextIdentity {
+                policy: BundlePolicy {
+                    max_context_tokens: 1,
+                    ..BundlePolicy::default()
+                },
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(base.fingerprint(), variant.fingerprint());
+        }
+    }
+}
+
 /// The convention files, in the priority the requirements give them (FR-4.6).
 ///
 /// The first one that exists is *the* conventions file: a repository that has an
@@ -59,6 +192,32 @@ pub trait ContextSource {
     /// Files the user added with `:context add` (FR-5.3).
     fn added(&self) -> &[String] {
         &[]
+    }
+}
+
+impl ContextSource for ContextSpec {
+    fn changed_paths(&self) -> Vec<String> {
+        self.changed_paths()
+    }
+
+    fn detail(&self) -> &PullRequestDetail {
+        &self.detail
+    }
+
+    fn patch(&self) -> Option<&Patch> {
+        self.patch.as_deref()
+    }
+
+    fn checkout(&self) -> Option<&Checkout> {
+        self.checkout.as_ref()
+    }
+
+    fn policy(&self) -> &BundlePolicy {
+        &self.policy
+    }
+
+    fn added(&self) -> &[String] {
+        &self.added
     }
 }
 

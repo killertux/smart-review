@@ -120,7 +120,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | [Merged — PR #20](https://github.com/killertux/smart-review/pull/20) |
 | [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | [Merged — PR #21](https://github.com/killertux/smart-review/pull/21) |
 | [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | In progress (`ir-11-executable-review-order`) |
-| [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | Not started |
+| [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | In progress (`ir-12-context-identity`) |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | Not started |
 | [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | Not started |
 | [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Not started |
@@ -1118,37 +1118,37 @@ AI references resolve to the right file and valid source coordinates.
 
 ### Implementation steps
 
-1. [ ] Replace divergent analysis/chat context inputs with a shared immutable
+1. [x] Replace divergent analysis/chat context inputs with a shared immutable
    `ContextSpec`: subject/revision, canonical change set, conventions policy,
    user additions/exclusions, budget policy and relevant versions.
-2. [ ] Make context inspection, estimate and dispatch consume the same resolved bundle/
+2. [x] Make context inspection, estimate and dispatch consume the same resolved bundle/
    manifest. User-added files must affect fresh analysis as well as chat. Changing
    additions, exclusions, model budget or revision invalidates incompatible prepared
    bundles immediately.
-3. [ ] Define whether presentation-only context/whitespace toggles alter LLM input.
+3. [x] Define whether presentation-only context/whitespace toggles alter LLM input.
    Recommended default: analysis uses the canonical review diff and explicit context
    controls, independently of visual whitespace hiding. State the choice in the UI
    and contract; if a control changes actual input, include it in context identity.
-4. [ ] Extend cache identity/provenance to include relevant base/head/merge-base,
+4. [x] Extend cache identity/provenance to include relevant base/head/merge-base,
    context-spec/manifest fingerprint, prompt/schema/policy versions, endpoint/model
    identity and effective generation settings. Never include API key values.
-5. [ ] Preserve fast cache reopening: compare immutable revision/object IDs and policy
+5. [x] Preserve fast cache reopening: compare immutable revision/object IDs and policy
    metadata before regathering all source bytes. A cache hit must remain free of paid
    provider calls. Use full stored identity verification in addition to a digest so
    a digest collision is a miss, not the wrong answer.
-6. [ ] Version/migrate cache entries conservatively: old unverified entries can be
+6. [x] Version/migrate cache entries conservatively: old unverified entries can be
    displayed as legacy/stale or ignored as disposable, never silently certified as
    current. Do not delete durable chat to invalidate analysis.
-7. [ ] Build exact canonical paths first, count all basenames, and create a basename
+7. [x] Build exact canonical paths first, count all basenames, and create a basename
    alias only when globally unambiguous. Keep rename aliases distinct from canonical
    paths and avoid stripping a real leading `a/` from an exact source path.
-8. [ ] Preserve valid hunk coordinates when reducing context. Split disjoint surviving
+8. [x] Preserve valid hunk coordinates when reducing context. Split disjoint surviving
    ranges into separate hunks or render explicit per-line coordinates; do not join
    separated lines under a fictitious contiguous header.
-9. [ ] Preserve evidence-path information in panel/view models. When normalization
+9. [x] Preserve evidence-path information in panel/view models. When normalization
    removes every cited path for a claim, mark that claim unsupported/diagnostic rather
    than presenting it as an evidenced actionable risk. Do not invent file references.
-10. [ ] Keep historical chat/analyzed provenance distinct from the current context
+10. [x] Keep historical chat/analyzed provenance distinct from the current context
     inventory. Explain stale analysis and offer an explicit rerun without auto-spending.
 
 ### Required regression cases
