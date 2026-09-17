@@ -275,6 +275,12 @@ fn render_checks(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
     let mut lines = Vec::new();
+    if app.detail_offline.is_some() {
+        lines.push(Line::from(Span::styled(
+            " Cached check data; refresh was unavailable. Press R to retry.",
+            theme.style(element::STATUS_ERROR),
+        )));
+    }
     if detail.checks.is_empty() {
         lines.push(Line::from(Span::styled(
             " No checks are configured or GitHub did not report any.",
@@ -337,6 +343,12 @@ fn render_discussion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
     let mut lines = Vec::new();
+    if app.detail_offline.is_some() {
+        lines.push(Line::from(Span::styled(
+            " Cached discussion data; refresh was unavailable. Press R to retry.",
+            theme.style(element::STATUS_ERROR),
+        )));
+    }
     if app.discussion.filter == crate::tui::discussion::DiscussionFilter::All {
         for review in &detail.reviews {
             lines.push(Line::from(Span::styled(

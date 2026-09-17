@@ -939,6 +939,8 @@ pub struct App {
     workspace_attempted_head: Option<String>,
     /// Why the shown diff came from the cache, when it did (DEC-14).
     pub(crate) diff_offline: Option<String>,
+    /// Provenance of the displayed PR detail, independent of the diff (IR-10).
+    pub(crate) detail_offline: Option<String>,
     /// The analysis panel's state (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
     pub(crate) panel: PanelState,
     /// The chat pane's state (FR-5.1).
@@ -1095,6 +1097,7 @@ impl App {
             workspace_job: 0,
             workspace_attempted_head: None,
             diff_offline: None,
+            detail_offline: None,
             panel: PanelState::default(),
             chat: crate::tui::chat::ChatState::default(),
             chat_bundle: None,
@@ -1330,6 +1333,7 @@ impl App {
         self.opening = None;
         self.diff_loading = false;
         self.diff_offline = None;
+        self.detail_offline = None;
         self.diff_source = DiffSource::Forge;
         self.workspace = None;
         self.workspace_job = 0;
@@ -1394,6 +1398,9 @@ impl App {
                 self.focus_target = FocusTarget::ChatInput;
             }
             ReviewTab::Files | ReviewTab::Overview | ReviewTab::Checks | ReviewTab::Discussion => {
+                if tab == ReviewTab::Files {
+                    self.chat.close();
+                }
                 self.focus = Pane::Diff;
                 self.focus_target = FocusTarget::Diff;
             }
@@ -3933,7 +3940,7 @@ impl App {
 
     /// Stores a detail and says what was opened (FR-2.4).
     fn apply_detail(&mut self, outcome: FetchOutcome<PullRequestDetail>) {
-        self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
+        self.detail_offline = outcome.offline_reason().map(|_| "offline".to_owned());
         let detail = outcome.into_value();
         self.update_review_revision(&detail);
         self.notice(
@@ -4381,7 +4388,11 @@ impl App {
             }
             Pane::Diff => {
                 if self.review_tab != ReviewTab::Files {
-                    self.scroll_tab(isize::try_from(delta * 3).unwrap_or(0));
+                    if self.review_tab == ReviewTab::Checks {
+                        self.move_check_cursor(isize::try_from(delta * 3).unwrap_or(0));
+                    } else {
+                        self.scroll_tab(isize::try_from(delta * 3).unwrap_or(0));
+                    }
                     return;
                 }
                 if let Some(view) = self.review.as_mut() {
@@ -4441,6 +4452,9 @@ impl App {
                 }
             }
             Pane::Diff => {
+                if self.review_tab != ReviewTab::Files {
+                    return;
+                }
                 let Some(layout) = self.geometry.review else {
                     return;
                 };

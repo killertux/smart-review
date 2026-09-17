@@ -212,7 +212,13 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "app.refresh" => {
             // `R` means "ask again for whatever I am looking at".
             if app.review.is_some() {
-                Effect::ReloadDiff
+                if app.review_tab() == crate::tui::app::ReviewTab::Files {
+                    Effect::ReloadDiff
+                } else {
+                    app.detail.as_ref().map_or(Effect::None, |detail| {
+                        Effect::OpenPullRequest(detail.summary.number)
+                    })
+                }
             } else if app.environment.is_none() {
                 Effect::DetectEnvironment
             } else {
@@ -335,7 +341,7 @@ fn dispatch_chat(app: &mut App, id: &str) -> Effect {
             }
             // Otherwise `Esc` leaves the pane, which is what it means everywhere else.
             app.chat.close();
-            set_focus(app, crate::tui::app::Pane::Diff);
+            app.select_review_tab(crate::tui::app::ReviewTab::Files);
             Effect::None
         }
         "chat.list" => {
@@ -382,6 +388,12 @@ fn unimplemented_action(app: &mut App, id: &str) -> Effect {
 /// The list, search and filter actions.
 fn dispatch_list(app: &mut App, id: &str) -> Effect {
     match id {
+        "nav.half_down" | "nav.page_down" | "nav.half_up" | "nav.page_up"
+            if app.review.is_some() && app.review_tab() != crate::tui::app::ReviewTab::Files =>
+        {
+            page_non_file_tab(app, id);
+            Effect::None
+        }
         "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
             if app.review.is_some() && app.review_tab() == crate::tui::app::ReviewTab::Checks {
                 let delta = match id {
@@ -479,6 +491,21 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
             }
         }
         other => unimplemented_action(app, other),
+    }
+}
+
+fn page_non_file_tab(app: &mut App, id: &str) {
+    let direction = if matches!(id, "nav.half_down" | "nav.page_down") {
+        1
+    } else {
+        -1
+    };
+    match app.review_tab() {
+        crate::tui::app::ReviewTab::Checks => app.move_check_cursor(direction),
+        crate::tui::app::ReviewTab::Overview | crate::tui::app::ReviewTab::Discussion => {
+            app.scroll_tab(direction * 10);
+        }
+        crate::tui::app::ReviewTab::Ask | crate::tui::app::ReviewTab::Files => {}
     }
 }
 
@@ -916,6 +943,15 @@ impl Stop {
 }
 
 fn switch_pane(app: &mut App, forward: bool) -> Effect {
+    if app.review.is_some() {
+        match app.review_tab() {
+            crate::tui::app::ReviewTab::Ask => return set_focus(app, crate::tui::app::Pane::Chat),
+            crate::tui::app::ReviewTab::Overview
+            | crate::tui::app::ReviewTab::Checks
+            | crate::tui::app::ReviewTab::Discussion => return Effect::None,
+            crate::tui::app::ReviewTab::Files => {}
+        }
+    }
     if let Some(view) = app.review.as_mut() {
         let current = match (app.focus_target, app.focus, view.tree_focused) {
             (crate::tui::app::FocusTarget::CommentComposer, _, _) => Stop::Composer,
