@@ -127,6 +127,13 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 /// complete it (FR-7.3).
 #[allow(clippy::too_many_lines)]
 pub fn dispatch(app: &mut App, id: &str) -> Effect {
+    if app.review.is_some()
+        && app.review_tab() != crate::tui::app::ReviewTab::Files
+        && files_only_action(id)
+    {
+        app.notice(NoticeLevel::Warn, "select Files to use that diff action");
+        return Effect::None;
+    }
     match id {
         "app.quit" => {
             app.quit();
@@ -263,6 +270,27 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
     }
+}
+
+fn files_only_action(id: &str) -> bool {
+    matches!(
+        id,
+        "review.comment_line"
+            | "review.range"
+            | "review.reply"
+            | "review.edit_composer"
+            | "review.toggle_resolved"
+            | "diff.next_hunk"
+            | "diff.prev_hunk"
+            | "diff.next_file"
+            | "diff.prev_file"
+            | "diff.toggle_hunk"
+            | "diff.toggle_split"
+            | "diff.cycle_context"
+            | "diff.toggle_whitespace"
+            | "diff.toggle_order"
+            | "review.copy_path"
+    )
 }
 
 /// Selects a real pull-request tab without manufacturing a second view state.
@@ -965,6 +993,11 @@ fn switch_pane(app: &mut App, forward: bool) -> Effect {
             current.prev()
         };
         if stop == Stop::Composer && !app.drafts.is_composing() {
+            stop = if forward { stop.next() } else { stop.prev() };
+        }
+        // Chat is its own Ask destination. The Files cycle contains only surfaces
+        // rendered by Files, so Tab can never create the retired embedded pane.
+        if stop == Stop::Chat {
             stop = if forward { stop.next() } else { stop.prev() };
         }
         return focus_stop(app, stop);
