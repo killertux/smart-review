@@ -35,8 +35,11 @@ impl RepoId {
         let name = name.strip_suffix(".git").unwrap_or(name);
         Self {
             host: host.trim().to_ascii_lowercase(),
-            owner: owner.trim().to_owned(),
-            name: name.trim().to_owned(),
+            // GitHub repository paths are case-insensitive. Normalising every
+            // component gives cache and app-owned Git storage one identity for a
+            // remote regardless of how a local clone happened to capitalise it.
+            owner: owner.trim().to_ascii_lowercase(),
+            name: name.trim().to_ascii_lowercase(),
         }
     }
 
@@ -152,6 +155,21 @@ impl RepoId {
         format!("{}-{}", self.owner, self.name)
     }
 
+    /// An unambiguous, filesystem-safe key for app-owned storage (IR-13).
+    ///
+    /// Each component is hexadecimal UTF-8, so `a-b/c` cannot collide with
+    /// `a/b-c`, and callers never need to recover an identity by splitting a
+    /// human-friendly directory name.
+    #[must_use]
+    pub fn storage_key(&self) -> String {
+        format!(
+            "h-{}--o-{}--r-{}",
+            hex_component(&self.host),
+            hex_component(&self.owner),
+            hex_component(&self.name)
+        )
+    }
+
     /// `host/owner/name`, the cache partitioning key (FR-1.3).
     #[must_use]
     pub fn key(&self) -> String {
@@ -169,6 +187,16 @@ impl RepoId {
     pub fn is_github(&self) -> bool {
         self.host.eq_ignore_ascii_case("github.com")
     }
+}
+
+fn hex_component(component: &str) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(component.len() * 2);
+    for byte in component.bytes() {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 impl fmt::Display for RepoId {
@@ -197,6 +225,16 @@ mod tests {
         let id = RepoId::parse("GitHub.COM/acme/service.git").unwrap();
         assert_eq!(id.host(), "github.com");
         assert_eq!(id.name(), "service");
+    }
+
+    #[test]
+    fn ir_13_storage_identity_is_case_normalized_and_collision_free() {
+        let mixed = RepoId::new("GitHub.COM", "Acme", "Service");
+        assert_eq!(mixed, RepoId::new("github.com", "acme", "service"));
+        assert_ne!(
+            RepoId::new("github.com", "a-b", "c").storage_key(),
+            RepoId::new("github.com", "a", "b-c").storage_key()
+        );
     }
 
     #[test]

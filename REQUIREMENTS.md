@@ -153,9 +153,9 @@ Acceptance criteria:
 **FR-3.1 PR workspace** — MUST — M2 — *DEC-1 `[DECIDED]`: managed git worktree*
 The app MUST materialize the PR head on disk in an app-owned git worktree so the LLM and the user can read whole files, without ever modifying the user's working tree.
 Acceptance criteria:
-- [ ] Workspace path is `<SMART_REVIEW_HOME>/worktrees/<owner>-<repo>/pr-<N>`.
-- [ ] Creation uses, in order: reuse existing valid workspace for the same head SHA → `git fetch origin <baseRefName> refs/pull/<N>/head` → `git worktree add --detach <path> <fetched-head-sha>`.
-- [ ] The user's working tree, index, HEAD and branches are never modified; a dirty working tree is never a precondition for using the app.
+- [ ] Workspace path is `<SMART_REVIEW_HOME>/worktrees/checkouts/<encoded-repository-id>/pr-<N>`, with the matching bare object store under `worktrees/git/<encoded-repository-id>/repo.git`. The encoded identity includes host, owner and repository unambiguously.
+- [ ] Creation uses, in order: reuse an existing valid checkout only after resolving the current base/head refs in the app-owned object store → fetch the base and `refs/pull/<N>/head` into explicit app-owned refs → calculate the merge base there → `git worktree add --detach <path> <fetched-head-sha>` from that store.
+- [ ] The user's working tree, index, HEAD, branches, refs and `.git` bookkeeping are never modified; a dirty working tree is never a precondition for using the app.
 - [ ] Fork PRs work through the same `refs/pull/<N>/head` path.
 - [ ] Workspaces are listed/removed by `:workspace clean [--all]`; removal runs `git worktree remove` and prunes. On failure the user is told exactly which path to delete manually.
 - [ ] A missing/expired workspace is recreated transparently on demand.

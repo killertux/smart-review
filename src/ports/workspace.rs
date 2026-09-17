@@ -72,6 +72,16 @@ pub enum WorkspaceError {
 
     #[error("the work was cancelled")]
     Cancelled,
+
+    #[error(
+        "legacy workspace at {path} is linked to a user repository; remove it manually with `git -C {owner_path} worktree remove --force {path}`"
+    )]
+    LegacyWorkspace {
+        /// The legacy path that must not be removed automatically.
+        path: PathBuf,
+        /// The user repository that owns its Git bookkeeping.
+        owner_path: PathBuf,
+    },
 }
 
 /// A pull request to materialise locally (FR-3.1).
@@ -81,6 +91,9 @@ pub struct WorkspaceRequest {
     pub repo: RepoId,
     /// The remote to fetch from, usually `origin`.
     pub remote: String,
+    /// The URL resolved for `remote` while detecting the repository. It is an
+    /// immutable job input rather than a later read of source-clone config (IR-13).
+    pub remote_url: Option<String>,
     /// The pull request number.
     pub number: u64,
     /// The base branch the pull request targets.
@@ -293,6 +306,7 @@ mod tests {
         let request = WorkspaceRequest {
             repo: RepoId::new("github.com", "acme", "service"),
             remote: "origin".to_owned(),
+            remote_url: Some("https://github.com/acme/service.git".to_owned()),
             number: 7,
             base: "main".to_owned(),
             head_sha: "bbbb".to_owned(),

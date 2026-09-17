@@ -78,6 +78,10 @@ M1 and M2.
 The rule of thumb: a port exists when there is a second implementation (a test
 fake) or a real alternative. Empty abstractions are not written "for later".
 
+`WorkspacePort` owns an app-private bare Git object store and its detached managed
+worktrees; it may read the source clone only to resolve the selected remote URL. It
+never fetches, updates refs, or registers a worktree in that source clone (IR-13).
+
 `WorkspacePort` also evaluates repository ignore rules for context assembly. That
 repository-aware check stays outside `domain`; the resulting path decisions are passed
 to the pure bundle builder and govern full and reduced diff hunks, full file bodies and

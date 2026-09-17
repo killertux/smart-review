@@ -343,7 +343,9 @@ PY
 
 EXTRA_ARGS="--path $REPO/clone" run_tui "$HOME_WS" '\r~q' 'src\.rs~' "$FAKE" "$TMP/ws.log" >"$TMP/ws.screen"
 
-WORKTREE="$HOME_WS/worktrees/acme-service/pr-142"
+STORE_KEY="h-6769746875622e636f6d--o-61636d65--r-73657276696365"
+WORKTREE="$HOME_WS/worktrees/checkouts/$STORE_KEY/pr-142"
+STORE="$HOME_WS/worktrees/git/$STORE_KEY/repo.git"
 if [ -d "$WORKTREE" ]; then
   ok "a worktree is created under SMART_REVIEW_HOME"
 else
@@ -354,8 +356,8 @@ if [ -f "$WORKTREE/src.rs" ] && grep -q 'pub fn two' "$WORKTREE/src.rs"; then
 else
   bad "the worktree does not hold the pull request's code"
 fi
-if git -C "$REPO/clone" rev-parse --verify --quiet refs/smart-review/acme-service/pr-142/head >/dev/null; then
-  ok "the fetched head is kept in a namespaced ref"
+if git -C "$STORE" rev-parse --verify --quiet "refs/smart-review/$STORE_KEY/pr-142/head" >/dev/null; then
+  ok "the fetched head is kept in the app-owned namespaced ref"
 else
   bad "the head ref was not created"
 fi
@@ -370,6 +372,11 @@ else
   bad "the user's working tree was touched"
   git -C "$REPO/clone" status --porcelain
 fi
+if [ ! -e "$REPO/clone/.git/worktrees" ]; then
+  ok "the source clone has no app worktree bookkeeping"
+else
+  bad "the app wrote worktree bookkeeping into the source clone"
+fi
 if grep -q 'from the worktree' "$HOME_WS/logs/smart-review.log" 2>/dev/null; then
   ok "the diff is read from the worktree"
 else
@@ -382,8 +389,8 @@ else
   bad "the review screen never showed the worktree's diff"
 fi
 
-# Cleaning from a different directory still works: the worktree resolves to the
-# repository that owns it, and the ref was deleted before the worktree that located it.
+# Cleaning from a different directory still works because the app-owned object store
+# owns both the worktree registration and its refs.
 #
 # It asks first (FR-6.5): the removal is local and irreversible, so the command opens a
 # confirmation and the *second* key is the one that does it. The default answer is

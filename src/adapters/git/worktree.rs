@@ -9,21 +9,17 @@
 //!
 //! # What is never touched
 //!
-//! The user's working tree, index, `HEAD` and branches. Every command here either
-//! reads, writes inside [`GitCli::worktrees_root`], or updates remote-tracking
-//! refs — which is what any `git fetch` does. `worktree add --detach` writes
-//! booking-keeping under the repository's `.git/worktrees`, which DEC-1 explicitly
-//! covers: it is the mechanism by which the code is materialised without moving the
-//! user's checkout.
+//! The user's working tree, index, `HEAD`, branches and `.git`. Fetches, refs and
+//! worktree bookkeeping live in an app-owned bare object store below
+//! [`GitCli::worktrees_root`].
 //!
 //! # Why an explicit ref for the pull request head
 //!
-//! FR-3.1 names `git fetch origin <base> refs/pull/<N>/head`. Both refs are fetched
-//! in one command, but mapped to explicit destinations rather than left in
+//! Both refs are fetched into explicit destinations rather than left in
 //! `FETCH_HEAD`: with two refspecs `FETCH_HEAD` holds two lines and picking the
 //! right one out of it depends on argument order, which is exactly the kind of
 //! fragile parse that breaks silently. The head is fetched into
-//! `refs/smart-review/<owner>-<repo>/pr-<N>/head`, which is namespaced, never
+//! `refs/smart-review/<encoded-repository-id>/pr-<N>/head`, which is namespaced, never
 //! appears in `git branch`, and is deleted by
 //! [`GitCli::remove_workspace`].
 
@@ -117,17 +113,33 @@ impl GitCli {
         }
     }
 
+    /// The directory holding this repository's app-owned object store.
+    #[must_use]
+    pub(crate) fn store_path(&self, repo: &RepoId) -> Option<PathBuf> {
+        self.worktrees_root
+            .as_ref()
+            .map(|root| root.join("git").join(repo.storage_key()).join("repo.git"))
+    }
+
     /// The directory a pull request's worktree lives in (FR-3.1).
     #[must_use]
     pub(crate) fn worktree_path(&self, repo: &RepoId, number: u64) -> Option<PathBuf> {
-        self.worktrees_root
-            .as_ref()
-            .map(|root| root.join(repo.dir_name()).join(format!("pr-{number}")))
+        self.worktrees_root.as_ref().map(|root| {
+            root.join("checkouts")
+                .join(repo.storage_key())
+                .join(format!("pr-{number}"))
+        })
     }
 
     /// The ref the pull request's head is fetched into.
     fn head_ref(repo: &RepoId, number: u64) -> String {
-        format!("refs/smart-review/{}/pr-{number}/head", repo.dir_name())
+        format!("refs/smart-review/{}/pr-{number}/head", repo.storage_key())
+    }
+
+    /// The fetched base reference for a PR. It is separate from the mutable local
+    /// branch name and belongs to the same request snapshot as the head (IR-13).
+    fn base_ref(repo: &RepoId, number: u64) -> String {
+        format!("refs/smart-review/{}/pr-{number}/base", repo.storage_key())
     }
 
     /// Whether an existing worktree already holds `head_sha` (FR-3.1: reuse first).
@@ -155,12 +167,65 @@ impl GitCli {
                 WorkspaceError::Failed("no worktree directory is configured".to_owned())
             })?;
 
-        // 1. Reuse: a worktree holding the same head commit is the code we want, and
-        //    nothing has to be fetched to know that.
+        let store = self.store_path(&request.repo).ok_or_else(|| {
+            WorkspaceError::Failed("no worktree directory is configured".to_owned())
+        })?;
+        self.ensure_store(&store, &request.repo, cancel)?;
+
+        // Fetch both immutable request refs before considering reuse. A local branch
+        // can be stale and the PR can keep its head while changing base; neither must
+        // affect the resulting merge base (IR-13).
+        let base_ref = Self::base_ref(&request.repo, request.number);
+        let head_ref = Self::head_ref(&request.repo, request.number);
+        let base_refspec = format!("+refs/heads/{}:{base_ref}", request.base);
+        let head_refspec = format!("+refs/pull/{}/head:{head_ref}", request.number);
+        let fallback_remote_url;
+        let remote_url = if let Some(url) = request.remote_url.as_deref() {
+            url
+        } else {
+            // Older in-memory callers and local-path fixture remotes cannot be
+            // represented as forge repository URLs during detection. This read is
+            // intentionally the only fallback: it reads config only, never updates
+            // the source clone, and normal jobs carry the captured URL (IR-13).
+            fallback_remote_url = self.remote_url(&request.remote, cancel)?;
+            &fallback_remote_url
+        };
+        self.run_checked_in(
+            &store,
+            &[
+                "fetch",
+                "--no-tags",
+                remote_url,
+                &base_refspec,
+                &head_refspec,
+            ],
+            cancel,
+        )
+        .map_err(|error| match error {
+            WorkspaceError::Failed(detail) => WorkspaceError::Fetch(detail),
+            other => other,
+        })?;
+        let head_sha = self.rev_parse_in(&store, &format!("{head_ref}^{{commit}}"), cancel)?;
+        if head_sha != request.head_sha {
+            return Err(WorkspaceError::Fetch(format!(
+                "pull request #{} resolved to {head_sha}, expected {} — refresh the pull request and retry",
+                request.number, request.head_sha
+            )));
+        }
+        let base_sha = self
+            .merge_base(&store, &base_ref, &head_ref, cancel)?
+            .ok_or_else(|| {
+                WorkspaceError::NoMergeBase(format!(
+                    "{} and {} share no history",
+                    request.base, head_sha
+                ))
+            })?;
+
+        // Reuse only after the base/head request snapshot was resolved in the app's
+        // object store.
         if path.is_dir()
             && let Some(head) = self.existing_head(&path)
             && head == request.head_sha
-            && let Some(base_sha) = self.merge_base(&path, &request.base, &head, cancel)?
         {
             logging::log(
                 Level::Debug,
@@ -181,7 +246,7 @@ impl GitCli {
                 Level::Debug,
                 format!("replacing the stale worktree at {}", path.display()),
             );
-            self.drop_worktree(&path, cancel)?;
+            self.drop_worktree(&store, &path, cancel)?;
         }
 
         if let Some(parent) = path.parent() {
@@ -190,55 +255,13 @@ impl GitCli {
             })?;
         }
 
-        // 3. Fetch the base branch and the pull request head (FR-3.1).
-        let head_ref = Self::head_ref(&request.repo, request.number);
-        let base_refspec = format!(
-            "+refs/heads/{}:refs/remotes/{}/{}",
-            request.base, request.remote, request.base
-        );
-        let head_refspec = format!("+refs/pull/{}/head:{head_ref}", request.number);
-        self.run_checked(
-            &[
-                "fetch",
-                "--no-tags",
-                &request.remote,
-                &base_refspec,
-                &head_refspec,
-            ],
-            cancel,
-        )
-        .map_err(|error| match error {
-            WorkspaceError::Failed(detail) => WorkspaceError::Fetch(detail),
-            other => other,
-        })?;
-
-        let head_sha = self
-            .rev_parse(&format!("{head_ref}^{{commit}}"), cancel)
-            .map_err(|error| match error {
-                WorkspaceError::Failed(detail) => WorkspaceError::Fetch(detail),
-                other => other,
-            })?;
-
-        // 4. Detached at the fetched head: no branch is created or moved.
+        // Detached at the fetched head: no branch is created or moved.
         let path_arg = path.to_string_lossy().into_owned();
-        self.run_checked(
+        self.run_checked_in(
+            &store,
             &["worktree", "add", "--detach", &path_arg, &head_sha],
             cancel,
         )?;
-
-        let base_sha = self
-            .merge_base(
-                &path,
-                &format!("{}/{}", request.remote, request.base),
-                &head_sha,
-                cancel,
-            )?
-            .ok_or_else(|| {
-                WorkspaceError::NoMergeBase(format!(
-                    "{} and {} share no history",
-                    request.base, head_sha
-                ))
-            })?;
 
         logging::log(
             Level::Info,
@@ -258,6 +281,47 @@ impl GitCli {
         })
     }
 
+    fn ensure_store(
+        &self,
+        store: &Path,
+        repo: &RepoId,
+        cancel: &Cancel,
+    ) -> Result<(), WorkspaceError> {
+        if store.is_dir() {
+            return Ok(());
+        }
+        let parent = store.parent().ok_or_else(|| {
+            WorkspaceError::Failed(format!(
+                "could not determine parent for {}",
+                store.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            WorkspaceError::Failed(format!("could not create {}: {error}", parent.display()))
+        })?;
+        let store_arg = store.to_string_lossy().into_owned();
+        self.run_checked(&["init", "--bare", &store_arg], cancel)?;
+        let metadata = parent.join("identity.json");
+        let bytes = serde_json::to_vec(repo).map_err(|error| {
+            WorkspaceError::Failed(format!("could not encode repository identity: {error}"))
+        })?;
+        std::fs::write(&metadata, bytes).map_err(|error| {
+            WorkspaceError::Failed(format!("could not write {}: {error}", metadata.display()))
+        })
+    }
+
+    fn remote_url(&self, remote: &str, cancel: &Cancel) -> Result<String, WorkspaceError> {
+        let source = self.cwd.as_deref().ok_or_else(|| {
+            WorkspaceError::Fetch(format!(
+                "the URL for remote {remote} was unavailable; reopen the pull request from a detected clone"
+            ))
+        })?;
+        Ok(self
+            .run_checked_in(source, &["remote", "get-url", remote], cancel)?
+            .trim()
+            .to_owned())
+    }
+
     /// `git merge-base`, as an option because unrelated histories are a state.
     fn merge_base(
         &self,
@@ -272,10 +336,34 @@ impl GitCli {
             .filter(|sha| !sha.is_empty()))
     }
 
-    /// `git rev-parse`, as a hard failure because callers always need the answer.
-    fn rev_parse(&self, rev: &str, cancel: &Cancel) -> Result<String, WorkspaceError> {
-        let stdout = self.run_checked(&["rev-parse", rev], cancel)?;
-        Ok(stdout.trim().to_owned())
+    fn run_checked_in(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        cancel: &Cancel,
+    ) -> Result<String, WorkspaceError> {
+        let spec = CommandSpec::new(&self.program)
+            .args(args)
+            .current_dir(dir)
+            .timeout(SLOW_TIMEOUT);
+        let (ok, stdout, stderr) = self.run_in_spec(&spec, cancel)?;
+        if ok {
+            Ok(stdout)
+        } else {
+            Err(Self::failure(args, &stderr))
+        }
+    }
+
+    fn rev_parse_in(
+        &self,
+        dir: &Path,
+        rev: &str,
+        cancel: &Cancel,
+    ) -> Result<String, WorkspaceError> {
+        Ok(self
+            .run_checked_in(dir, &["rev-parse", rev], cancel)?
+            .trim()
+            .to_owned())
     }
 
     /// Diffs a materialised pull request (FR-3.2).
@@ -300,23 +388,13 @@ impl GitCli {
             })
     }
 
-    /// The directory to run repository-wide commands from.
-    ///
-    /// A managed worktree resolves to the repository that owns it (its `.git` file
-    /// points at that repository's git directory), so running *inside* the worktree
-    /// is what makes `:workspace clean` work no matter which directory the app was
-    /// started in. Without this, cleaning a worktree from another checkout fails with
-    /// "not a working tree" — which is exactly what the validator caught.
-    fn repo_dir(&self, path: &Path) -> PathBuf {
-        if path.is_dir() {
-            return path.to_path_buf();
-        }
-        self.cwd.clone().unwrap_or_else(|| PathBuf::from("."))
-    }
-
-    /// Removes a worktree and its fetched head ref (FR-3.1).
-    pub(crate) fn drop_worktree(&self, path: &Path, cancel: &Cancel) -> Result<(), WorkspaceError> {
-        let dir = self.repo_dir(path);
+    /// Removes a worktree from the app-owned object store (FR-3.1).
+    pub(crate) fn drop_worktree(
+        &self,
+        store: &Path,
+        path: &Path,
+        cancel: &Cancel,
+    ) -> Result<(), WorkspaceError> {
         if path.is_dir() {
             let path_arg = path.to_string_lossy().into_owned();
             // Destructive, so `--dry-run` records it instead of removing anything
@@ -324,7 +402,7 @@ impl GitCli {
             // what would be deleted is the point of a dry run.
             let spec = CommandSpec::new(&self.program)
                 .args(["worktree", "remove", "--force", &path_arg])
-                .current_dir(&dir)
+                .current_dir(store)
                 .mutating();
             let (_, _, stderr) = self.run_in_spec(&spec, cancel)?;
             if path.exists() {
@@ -345,31 +423,41 @@ impl GitCli {
         }
         let spec = CommandSpec::new(&self.program)
             .args(["worktree", "prune"])
-            .current_dir(&dir)
+            .current_dir(store)
             .mutating();
         let _ = self.run_in_spec(&spec, cancel);
         Ok(())
     }
 
-    /// Deletes the fetched head ref for a pull request, if it exists.
+    /// Deletes the fetched refs for a pull request, if they exist.
     ///
     /// Best effort by design: the worktree is already gone at this point, and a ref
     /// that could not be deleted is untidy rather than wrong.
-    pub(crate) fn delete_head_ref(&self, repo: &RepoId, number: u64, cancel: &Cancel) {
-        let dir = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+    pub(crate) fn delete_head_ref(
+        &self,
+        store: &Path,
+        repo: &RepoId,
+        number: u64,
+        cancel: &Cancel,
+    ) {
         // Deleting a ref is destructive, so a dry run records it (FR-6.5).
         let spec = CommandSpec::new(&self.program)
             .args(["update-ref", "-d", &Self::head_ref(repo, number)])
-            .current_dir(&dir)
+            .current_dir(store)
+            .mutating();
+        let _ = self.run_in_spec(&spec, cancel);
+        let spec = CommandSpec::new(&self.program)
+            .args(["update-ref", "-d", &Self::base_ref(repo, number)])
+            .current_dir(store)
             .mutating();
         let _ = self.run_in_spec(&spec, cancel);
     }
 
     /// Every managed worktree, newest names last (FR-3.1).
     pub(crate) fn list_workspaces(&self) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
-        let root = self.worktrees_root()?;
+        let root = self.worktrees_root()?.join("checkouts");
         let mut entries = Vec::new();
-        let repos = match std::fs::read_dir(root) {
+        let repos = match std::fs::read_dir(&root) {
             Ok(entries) => entries,
             // A root that does not exist yet means nothing has been materialised,
             // which is an empty answer rather than an error.
@@ -382,7 +470,17 @@ impl GitCli {
             }
         };
         for repo_dir in repos.flatten() {
-            let repo_name = repo_dir.file_name().to_string_lossy().into_owned();
+            let metadata = self
+                .worktrees_root()?
+                .join("git")
+                .join(repo_dir.file_name())
+                .join("identity.json");
+            let Ok(bytes) = std::fs::read(&metadata) else {
+                continue;
+            };
+            let Ok(repo) = serde_json::from_slice::<RepoId>(&bytes) else {
+                continue;
+            };
             let Ok(inner) = std::fs::read_dir(repo_dir.path()) else {
                 continue;
             };
@@ -392,11 +490,8 @@ impl GitCli {
                     continue;
                 };
                 let path = entry.path();
-                let repo = parse_dir_name(&repo_name).ok_or_else(|| {
-                    WorkspaceError::Failed(format!("{repo_name} is not a managed worktree name"))
-                })?;
                 entries.push(WorkspaceEntry {
-                    repo,
+                    repo: repo.clone(),
                     number,
                     age_secs: age_secs(&path),
                     path,
@@ -405,8 +500,8 @@ impl GitCli {
         }
         entries.sort_by(|a, b| {
             a.repo
-                .dir_name()
-                .cmp(&b.repo.dir_name())
+                .key()
+                .cmp(&b.repo.key())
                 .then(a.number.cmp(&b.number))
         });
         Ok(entries)
@@ -441,20 +536,6 @@ pub(crate) fn diff_arguments(base: &str, head: &str, options: DiffOptions) -> Ve
 #[must_use]
 pub(crate) fn parse_pr_dir(name: &str) -> Option<u64> {
     name.strip_prefix("pr-")?.parse().ok()
-}
-
-/// `acme-service` → a repository id.
-///
-/// The host is unknown from the directory name alone, and the directory name is
-/// what FR-3.1 specifies, so the host is filled in as GitHub: v1 supports nothing
-/// else (FR-1.1), and guessing further would be inventing an identity.
-#[must_use]
-pub(crate) fn parse_dir_name(name: &str) -> Option<RepoId> {
-    let (owner, repo) = name.split_once('-')?;
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(RepoId::new("github.com", owner, repo))
 }
 
 /// How long ago a worktree was last used, from its modification time.
@@ -506,10 +587,11 @@ mod tests {
     /// `base` is the *branch name*, because that is what FR-3.1 fetches
     /// (`baseRefName`); the merge base is git's answer to be worked out, not
     /// something the caller supplies.
-    fn request(head: &str) -> WorkspaceRequest {
+    fn request(fixture: &GitFixture, head: &str) -> WorkspaceRequest {
         WorkspaceRequest {
             repo: repo_id(),
             remote: "origin".to_owned(),
+            remote_url: Some(fixture.origin.to_string_lossy().into_owned()),
             number: 7,
             base: "main".to_owned(),
             head_sha: head.to_owned(),
@@ -522,12 +604,18 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let before_head = fixture.head_sha();
+        let before_refs = fixture.git(&["show-ref"]);
 
         let workspace = git
-            .ensure(&request(&head), &Cancel::new())
+            .ensure(&request(&fixture, &head), &Cancel::new())
             .expect("the workspace is created");
 
-        assert_eq!(workspace.path, root.join("acme-service").join("pr-7"));
+        assert_eq!(
+            workspace.path,
+            root.join("checkouts")
+                .join(repo_id().storage_key())
+                .join("pr-7")
+        );
         assert_eq!(workspace.head_sha, head, "detached at the fetched head");
         assert_eq!(
             workspace.base_sha, base,
@@ -545,6 +633,11 @@ mod tests {
         // FR-3.1: the user's working tree, index, HEAD and branches are untouched.
         assert_eq!(fixture.head_sha(), before_head, "HEAD did not move");
         assert_eq!(fixture.status(), "", "the working tree is still clean");
+        assert_eq!(fixture.git(&["show-ref"]), before_refs, "no refs moved");
+        assert!(
+            !fixture.clone.join(".git/worktrees").exists(),
+            "worktree bookkeeping belongs to the app-owned object store"
+        );
         let branches = fixture.git(&["branch", "--format=%(refname:short)"]);
         assert_eq!(branches.trim(), "main", "no branch was created: {branches}");
     }
@@ -556,9 +649,13 @@ mod tests {
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
 
-        let first = git.ensure(&request(&head), &cancel).expect("created");
+        let first = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
         assert!(!first.reused);
-        let second = git.ensure(&request(&head), &cancel).expect("reused");
+        let second = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("reused");
         assert!(second.reused, "the same head SHA must not be fetched again");
         assert_eq!(second.path, first.path);
         assert_eq!(second.head_sha, head);
@@ -570,14 +667,18 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        let first = git.ensure(&request(&head), &cancel).expect("created");
+        let first = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
 
         let newer = fixture.publish_pull_request(7, |f| {
             f.commit("src/lib.rs", "pub fn three() {}\n", "add three")
         });
         assert_ne!(newer, head);
 
-        let second = git.ensure(&request(&newer), &cancel).expect("replaced");
+        let second = git
+            .ensure(&request(&fixture, &newer), &cancel)
+            .expect("replaced");
         assert!(!second.reused, "a moved head is not a reuse");
         assert_eq!(second.head_sha, newer, "the newest head is what is on disk");
         assert_eq!(second.path, first.path, "and it lives in the same place");
@@ -591,7 +692,9 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        let workspace = git.ensure(&request(&head), &cancel).expect("created");
+        let workspace = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
 
         // Put an untracked file in the worktree: `git worktree add` would refuse a
         // directory it cannot claim, and the requirement says the user never has to
@@ -601,7 +704,7 @@ mod tests {
             f.commit("src/lib.rs", "pub fn four() {}\n", "add four")
         });
         let replaced = git
-            .ensure(&request(&newer), &cancel)
+            .ensure(&request(&fixture, &newer), &cancel)
             .expect("replaces the stale worktree");
         assert_eq!(replaced.head_sha, newer);
         assert!(
@@ -616,7 +719,9 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        let workspace = git.ensure(&request(&head), &cancel).expect("created");
+        let workspace = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
 
         let diff = git
             .diff(
@@ -644,7 +749,9 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        let workspace = git.ensure(&request(&head), &cancel).expect("created");
+        let workspace = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
         let diff_with = |options: DiffOptions| {
             git.diff(
                 &DiffRequest {
@@ -681,7 +788,9 @@ mod tests {
                 "reindent one and add three",
             )
         });
-        let workspace = git.ensure(&request(&noisy), &cancel).expect("created");
+        let workspace = git
+            .ensure(&request(&fixture, &noisy), &cancel)
+            .expect("created");
         let no_context = |ignore_whitespace| DiffOptions {
             context: 0,
             ignore_whitespace,
@@ -728,7 +837,9 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        let workspace = git.ensure(&request(&head), &cancel).expect("created");
+        let workspace = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
 
         // The fixture published the head where GitHub would.
         let refs = GitFixture::git_in(&fixture.origin, &["for-each-ref", "--format=%(refname)"]);
@@ -769,7 +880,9 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        git.ensure(&request(&head), &cancel).expect("created");
+        let mut request = request(&fixture, &head);
+        request.number = 9;
+        git.ensure(&request, &cancel).expect("created");
 
         let read = git
             .read_file(&fixture.clone, &head, "logo.png", &cancel)
@@ -783,7 +896,8 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        git.ensure(&request(&head), &cancel).expect("created");
+        git.ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
 
         let files = git
             .list_files(&fixture.clone, &head, &cancel)
@@ -873,7 +987,9 @@ mod tests {
         let root = fixture.path().join("worktrees");
         let git = adapter(&fixture, &root);
         let cancel = Cancel::new();
-        let workspace = git.ensure(&request(&head), &cancel).expect("created");
+        let workspace = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
 
         let entries = git.list().expect("worktrees are listed");
         assert_eq!(entries.len(), 1);
@@ -886,13 +1002,72 @@ mod tests {
         assert!(!workspace.path.exists(), "the directory is gone");
         assert!(git.list().expect("listed again").is_empty());
 
-        // The user's checkout is still intact, and git no longer lists the worktree.
+        // The user's checkout is still intact. Its Git directory never knew about
+        // this worktree in the first place.
         assert!(fixture.clone.join("src/lib.rs").exists());
         assert_eq!(fixture.status(), "");
-        let worktrees = fixture.git(&["worktree", "list", "--porcelain"]);
         assert!(
-            !worktrees.contains("pr-7"),
-            "git's bookkeeping was pruned: {worktrees}"
+            !fixture.clone.join(".git/worktrees").exists(),
+            "the source clone has no app worktree bookkeeping"
+        );
+    }
+
+    #[test]
+    fn ir_13_reuse_resolves_the_merge_base_from_the_app_store_not_stale_source_refs() {
+        let (fixture, base, head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let git = adapter(&fixture, &root);
+        let source_refs = fixture.git(&["show-ref"]);
+        let cancel = Cancel::new();
+
+        let fresh = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("fresh workspace");
+        assert_eq!(fresh.base_sha, base);
+
+        // Advance the remote base from another clone. The source clone is deliberately
+        // not fetched, so an implementation using `origin/main` there would be stale.
+        let writer = fixture.path().join("writer");
+        let origin = fixture.origin.to_string_lossy().into_owned();
+        let writer_arg = writer.to_string_lossy().into_owned();
+        let _ = GitFixture::git_in(fixture.path(), &["clone", "--quiet", &origin, &writer_arg]);
+        GitFixture::git_in(&writer, &["config", "user.email", "t@example.com"]);
+        GitFixture::git_in(&writer, &["config", "user.name", "Test"]);
+        std::fs::write(writer.join("base-only.txt"), "new base").expect("writes base");
+        GitFixture::git_in(&writer, &["add", "--", "base-only.txt"]);
+        GitFixture::git_in(&writer, &["commit", "--quiet", "-m", "advance main"]);
+        GitFixture::git_in(&writer, &["push", "--quiet", "origin", "main"]);
+
+        let reused = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect("reused workspace");
+        assert!(reused.reused);
+        assert_eq!(reused.base_sha, fresh.base_sha);
+        assert_eq!(
+            fixture.git(&["show-ref"]),
+            source_refs,
+            "source refs are unchanged"
+        );
+    }
+
+    #[test]
+    fn ir_13_legacy_worktrees_are_not_removed_through_the_source_clone() {
+        let (fixture, _base, _head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let legacy = root.join(repo_id().dir_name()).join("pr-7");
+        std::fs::create_dir_all(&legacy).expect("creates legacy path");
+        let git = adapter(&fixture, &root);
+
+        let error = git
+            .remove(&repo_id(), 7, &Cancel::new())
+            .expect_err("legacy is refused");
+        assert!(
+            matches!(error, WorkspaceError::LegacyWorkspace { .. }),
+            "{error:?}"
+        );
+        assert!(
+            legacy.exists(),
+            "legacy data is left for explicit owner cleanup"
         );
     }
 
@@ -907,7 +1082,7 @@ mod tests {
     fn without_a_worktree_root_the_adapter_says_so_rather_than_inventing_a_path() {
         let git = GitCli::new();
         let error = git
-            .ensure(&request("deadbeef"), &Cancel::new())
+            .ensure(&request(&GitFixture::new(), "deadbeef"), &Cancel::new())
             .expect_err("no root is configured");
         assert!(matches!(error, WorkspaceError::Failed(_)), "{error:?}");
         assert!(error.to_string().contains("worktree directory"), "{error}");
@@ -957,26 +1132,25 @@ mod tests {
     }
 
     #[test]
-    fn worktree_directory_names_round_trip() {
+    fn worktree_directory_names_are_not_used_as_repository_identity() {
         assert_eq!(parse_pr_dir("pr-7"), Some(7));
         assert_eq!(parse_pr_dir("pr-"), None);
         assert_eq!(parse_pr_dir("7"), None);
         assert_eq!(parse_pr_dir("pr-abc"), None);
 
-        let repo = parse_dir_name("acme-service").expect("a name");
-        assert_eq!(repo.owner(), "acme");
-        assert_eq!(repo.name(), "service");
-        assert_eq!(repo.dir_name(), "acme-service");
-        assert_eq!(parse_dir_name("nohyphen"), None);
-        assert_eq!(parse_dir_name("-leading"), None);
-        assert_eq!(parse_dir_name("trailing-"), None);
+        let a = RepoId::new("github.com", "a-b", "c");
+        let b = RepoId::new("github.com", "a", "b-c");
+        assert_ne!(a.storage_key(), b.storage_key());
     }
 
     #[test]
     fn the_head_ref_is_namespaced_and_per_pull_request() {
         let repo = RepoId::new("github.com", "acme", "service");
         let seven = GitCli::head_ref(&repo, 7);
-        assert_eq!(seven, "refs/smart-review/acme-service/pr-7/head");
+        assert_eq!(
+            seven,
+            "refs/smart-review/h-6769746875622e636f6d--o-61636d65--r-73657276696365/pr-7/head"
+        );
         assert_ne!(seven, GitCli::head_ref(&repo, 8));
     }
 }
