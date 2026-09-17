@@ -1,6 +1,6 @@
  smart-review v0.1.0 config: built-in defaults                                                   acme/service
  #141 WIP refactor o… [1 Overview] [2 Files] [3 Checks] [4 Discussion] [5 Ask]
-┌ path order (3) ────────────────┐┌ 3 files +2 −1 · unified · ctx 3 ─────────────────────────────────────────┐
+┌ path order · patch (3) ────────┐┌ 3 files +2 −1 · unified · ctx 3 ─────────────────────────────────────────┐
 │ ▾ docs (1)                     ││── M src/domain/invoice.rs                                                │
 │    B logo.png                  ││@@ -12,4 +14,5 @@ impl Invoice {                                          │
 │ ▾ scripts (1)                  ││   12   14      pub fn total(&self) -> Money {                            │

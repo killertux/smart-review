@@ -19,8 +19,6 @@
 //!
 //! Pure: no IO, no terminal, no diff model (NFR-5.2).
 
-use std::collections::VecDeque;
-
 use serde::{Deserialize, Serialize};
 
 use crate::domain::analysis::{Analysis, PlanGroup, UNCLASSIFIED};
@@ -315,21 +313,27 @@ impl Plan {
             return (0..canonical_paths.len()).collect();
         }
 
-        let mut available: std::collections::BTreeMap<&str, VecDeque<usize>> =
-            std::collections::BTreeMap::new();
-        for (index, path) in canonical_paths.iter().enumerate() {
-            available.entry(path).or_default().push_back(index);
-        }
+        let mut claimed = vec![false; canonical_paths.len()];
         let mut order = Vec::with_capacity(canonical_paths.len());
         for path in self.groups.iter().flat_map(|group| &group.files) {
-            if let Some(index) = available
-                .get_mut(path.as_str())
-                .and_then(VecDeque::pop_front)
+            if let Some(index) =
+                canonical_paths
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, candidate)| {
+                        (!claimed[index] && candidate == path).then_some(index)
+                    })
             {
+                claimed[index] = true;
                 order.push(index);
             }
         }
-        order.extend(available.into_values().flatten());
+        order.extend(
+            claimed
+                .iter()
+                .enumerate()
+                .filter_map(|(index, claimed)| (!claimed).then_some(index)),
+        );
         order
     }
 
@@ -640,6 +644,19 @@ mod tests {
             plan.effective_order(OrderMode::Recommended, &paths),
             vec![1, 2, 0],
             "each immutable patch entry is read once, even when paths repeat"
+        );
+    }
+
+    #[test]
+    fn effective_order_appends_omitted_files_in_their_original_patch_sequence() {
+        let mut plan = plan();
+        plan.groups[0].files = vec!["m.rs".to_owned()];
+        let paths = vec!["z.rs".to_owned(), "a.rs".to_owned(), "m.rs".to_owned()];
+
+        assert_eq!(
+            plan.effective_order(OrderMode::Recommended, &paths),
+            vec![2, 0, 1],
+            "unplanned entries remain in patch order, not lexical path order"
         );
     }
 

@@ -144,7 +144,7 @@ mod tests {
             .unwrap();
         let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
 
-        assert!(rendered.contains("path order (0)"), "{rendered}");
+        assert!(rendered.contains("path order · patch (0)"), "{rendered}");
         assert!(
             !rendered.contains("[is:open]"),
             "the list is not drawn behind the review screen: {rendered}"

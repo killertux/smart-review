@@ -1060,7 +1060,7 @@ index 1a2b3c4..5d6e7f8 100644
         let rendered = draw(&mut app, 120, 30);
         // The pane names the order it is in, which is what the toggle changes
         // (FR-3.5).
-        assert!(rendered.contains("path order (1)"), "{rendered}");
+        assert!(rendered.contains("path order · patch (1)"), "{rendered}");
         assert!(rendered.contains("invoice.rs"), "{rendered}");
         assert!(rendered.contains("unified"), "{rendered}");
         assert!(

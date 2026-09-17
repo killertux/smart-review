@@ -155,6 +155,8 @@ pub enum TreeKind {
     Rationale {
         /// The explanation.
         text: String,
+        /// The plan group this explanation belongs to.
+        group: String,
     },
     /// A directory, with the files underneath it.
     Directory {
@@ -261,6 +263,10 @@ pub struct DiffView {
     pub folded_hunks: BTreeSet<(usize, usize)>,
     /// Which directories are folded, by path.
     pub folded_dirs: BTreeSet<String>,
+    /// Which review-plan groups are folded, by their plan identity.
+    folded_groups: BTreeSet<String>,
+    /// Rationale groups expanded into readable physical tree rows.
+    expanded_rationales: BTreeSet<String>,
     /// Whether the tree has the cursor rather than the diff.
     pub tree_focused: bool,
     /// The cursor inside the tree.
@@ -301,6 +307,15 @@ struct FileOrders {
     recommended: Vec<usize>,
     path_positions: Vec<usize>,
     recommended_positions: Vec<usize>,
+    recommended_groups: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeAnchor {
+    File(usize),
+    Group(String),
+    Directory(String),
+    Rationale(String),
 }
 
 impl FileOrders {
@@ -319,11 +334,16 @@ impl FileOrders {
             || path_order.clone(),
             |plan| plan.effective_order(crate::domain::plan::OrderMode::Recommended, &paths),
         );
+        let recommended_groups = plan.map_or_else(
+            || vec![None; paths.len()],
+            |plan| group_assignments(plan, &paths),
+        );
         Self {
             path_positions: position_map(&path_order, paths.len()),
             recommended_positions: position_map(&recommended, paths.len()),
             path: path_order,
             recommended,
+            recommended_groups,
         }
     }
 
@@ -344,6 +364,20 @@ impl FileOrders {
             .copied()
             .filter(|position| *position > 0)
     }
+}
+
+fn group_assignments(plan: &crate::domain::plan::Plan, paths: &[String]) -> Vec<Option<usize>> {
+    let mut assignments = vec![None; paths.len()];
+    for (group_index, group) in plan.groups.iter().enumerate() {
+        for planned_path in &group.files {
+            if let Some(index) = paths.iter().enumerate().find_map(|(index, candidate)| {
+                (assignments[index].is_none() && candidate == planned_path).then_some(index)
+            }) {
+                assignments[index] = Some(group_index);
+            }
+        }
+    }
+    assignments
 }
 
 fn position_map(order: &[usize], file_count: usize) -> Vec<usize> {
@@ -382,6 +416,8 @@ impl DiffView {
             viewport: 0,
             folded_hunks: BTreeSet::new(),
             folded_dirs: BTreeSet::new(),
+            folded_groups: BTreeSet::new(),
+            expanded_rationales: BTreeSet::new(),
             tree_focused: false,
             tree_cursor: 0,
             tree_scroll: 0,
@@ -431,6 +467,7 @@ impl DiffView {
     /// fold changes rather than per frame.
     pub fn rebuild(&mut self) {
         let anchor = self.current().cloned();
+        let tree_anchor = self.tree_anchor();
         self.rows = flatten(
             &self.patch,
             self.file_orders.files(self.order),
@@ -442,9 +479,7 @@ impl DiffView {
         self.split_index = index;
         self.tree = self.build_tree();
         self.restore_cursor(anchor);
-        if self.tree_cursor >= self.tree.len() {
-            self.tree_cursor = self.tree.len().saturating_sub(1);
-        }
+        self.restore_tree_cursor(tree_anchor);
     }
 
     /// The thread under the cursor, when the cursor is on a discussion row (FR-6.4).
@@ -524,10 +559,9 @@ impl DiffView {
 
     /// Rebuilds the tree alone, which is all an order change needs.
     pub fn rebuild_tree(&mut self) {
+        let anchor = self.tree_anchor();
         self.tree = self.build_tree();
-        if self.tree_cursor >= self.tree.len() {
-            self.tree_cursor = self.tree.len().saturating_sub(1);
-        }
+        self.restore_tree_cursor(anchor);
     }
 
     /// Recomputes the two file sequences only when the patch or plan changes.
@@ -548,13 +582,36 @@ impl DiffView {
             })
         {
             self.cursor = position;
-            self.focus_file(anchor.file);
             return;
         }
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
-        if let Some(file) = self.current_file() {
-            self.focus_file(file);
+    }
+
+    fn tree_anchor(&self) -> Option<TreeAnchor> {
+        match self.tree.get(self.tree_cursor)?.kind.clone() {
+            TreeKind::File { index } => Some(TreeAnchor::File(index)),
+            TreeKind::Group { name, .. } => Some(TreeAnchor::Group(name)),
+            TreeKind::Directory { path, .. } => Some(TreeAnchor::Directory(path)),
+            TreeKind::Rationale { group, .. } => Some(TreeAnchor::Rationale(group)),
         }
+    }
+
+    fn restore_tree_cursor(&mut self, anchor: Option<TreeAnchor>) {
+        if let Some(anchor) = anchor
+            && let Some(index) = self.tree.iter().position(|row| match (&anchor, &row.kind) {
+                (TreeAnchor::File(wanted), TreeKind::File { index }) => wanted == index,
+                (TreeAnchor::Group(wanted), TreeKind::Group { name, .. }) => wanted == name,
+                (TreeAnchor::Directory(wanted), TreeKind::Directory { path, .. }) => wanted == path,
+                (TreeAnchor::Rationale(wanted), TreeKind::Rationale { group, .. }) => {
+                    wanted == group
+                }
+                _ => false,
+            })
+        {
+            self.tree_cursor = index;
+            return;
+        }
+        self.tree_cursor = self.tree_cursor.min(self.tree.len().saturating_sub(1));
     }
 
     /// Moves the tree cursor to a file, wherever it is in the current tree.
@@ -577,7 +634,9 @@ impl DiffView {
                 plan,
                 &self.patch,
                 self.file_orders.files(self.order),
-                &self.folded_dirs,
+                &self.file_orders.recommended_groups,
+                &self.folded_groups,
+                &self.expanded_rationales,
             );
         }
         build_tree(&self.patch, &self.folded_dirs)
@@ -605,9 +664,12 @@ impl DiffView {
         ))
     }
 
-    /// The visible origin of the recommended order (IR-11).
+    /// The visible origin of the order currently being read (IR-11).
     #[must_use]
     pub fn order_provenance(&self) -> Option<&'static str> {
+        if self.order == crate::domain::plan::OrderMode::Path {
+            return Some("patch");
+        }
         let plan = self.plan.as_ref()?;
         Some(match (plan.source, plan.overridden) {
             (crate::domain::plan::PlanSource::Analysis, false) => "AI",
@@ -905,15 +967,18 @@ impl DiffView {
             // detail, and the reader may want only the shape (FR-4.2).
             TreeKind::Group { name, folded, .. } => {
                 if folded {
-                    self.folded_dirs.remove(&name);
+                    self.folded_groups.remove(&name);
                 } else {
-                    self.folded_dirs.insert(name);
+                    self.folded_groups.insert(name);
                 }
                 self.rebuild_tree();
             }
-            // The rationale is not a thing to act on; pressing Enter on it does
-            // nothing rather than something surprising.
-            TreeKind::Rationale { .. } => {}
+            TreeKind::Rationale { group, .. } => {
+                if !self.expanded_rationales.remove(&group) {
+                    self.expanded_rationales.insert(group);
+                }
+                self.rebuild_tree();
+            }
             TreeKind::File { index } => {
                 self.tree_focused = false;
                 self.goto_file(index);
@@ -979,22 +1044,16 @@ fn build_plan_tree(
     plan: &crate::domain::plan::Plan,
     patch: &Patch,
     ordered: &[usize],
+    assignments: &[Option<usize>],
     folded: &BTreeSet<String>,
+    expanded: &BTreeSet<String>,
 ) -> Vec<TreeRow> {
     let mut rows = Vec::new();
-    let mut claimed = BTreeSet::new();
-    for group in &plan.groups {
+    for (group_index, group) in plan.groups.iter().enumerate() {
         let present: Vec<usize> = ordered
             .iter()
             .copied()
-            .filter(|index| {
-                !claimed.contains(index)
-                    && patch
-                        .files
-                        .get(*index)
-                        .and_then(|file| file.path())
-                        .is_some_and(|path| group.files.iter().any(|file| file == path.as_str()))
-            })
+            .filter(|index| assignments.get(*index) == Some(&Some(group_index)))
             .collect();
         if present.is_empty() {
             continue;
@@ -1012,16 +1071,17 @@ fn build_plan_tree(
             },
         });
         if !group.rationale.trim().is_empty() && !is_folded {
-            rows.push(TreeRow {
+            let labels = rationale_rows(&group.rationale, expanded.contains(&group.group));
+            rows.extend(labels.into_iter().map(|label| TreeRow {
                 depth: 0,
-                label: group.rationale.clone(),
+                label: label.clone(),
                 kind: TreeKind::Rationale {
-                    text: group.rationale.clone(),
+                    text: label,
+                    group: group.group.clone(),
                 },
-            });
+            }));
         }
         if is_folded {
-            claimed.extend(present);
             continue;
         }
         for index in present {
@@ -1036,13 +1096,12 @@ fn build_plan_tree(
                 label,
                 kind: TreeKind::File { index },
             });
-            claimed.insert(index);
         }
     }
     let unclassified: Vec<usize> = ordered
         .iter()
         .copied()
-        .filter(|index| !claimed.contains(index))
+        .filter(|index| assignments.get(*index) == Some(&None))
         .collect();
     if !unclassified.is_empty() {
         rows.push(TreeRow {
@@ -1060,6 +1119,7 @@ fn build_plan_tree(
             label: "not placed by this plan; shown in patch order".to_owned(),
             kind: TreeKind::Rationale {
                 text: "not placed by this plan; shown in patch order".to_owned(),
+                group: "unclassified".to_owned(),
             },
         });
         rows.extend(unclassified.into_iter().map(|index| TreeRow {
@@ -1076,6 +1136,35 @@ fn file_name(patch: &Patch, index: usize) -> String {
         let full = file.path().map_or_else(String::new, RelPath::to_string);
         full.rsplit('/').next().unwrap_or(full.as_str()).to_owned()
     })
+}
+
+/// Renders a rationale as one compact prompt or readable physical tree rows.
+fn rationale_rows(text: &str, expanded: bool) -> Vec<String> {
+    const WIDTH: usize = 24;
+    if !expanded {
+        return vec![format!(
+            "{} (Enter to expand)",
+            crate::tui::text::truncate(text, WIDTH)
+        )];
+    }
+    let mut rows = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + word.chars().count() + 1 > WIDTH {
+            rows.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        rows.push(line);
+    }
+    if rows.is_empty() {
+        rows.push("(empty rationale)".to_owned());
+    }
+    rows
 }
 
 /// Flattens a patch into drawable rows.
@@ -2067,6 +2156,36 @@ Binary files /dev/null and b/docs/logo.png differ
             .collect();
         assert_eq!(headers, vec![0, 1, 2]);
         assert_eq!(view.order_provenance(), Some("manual override"));
+    }
+
+    #[test]
+    fn ir_11_plan_rebuild_keeps_the_independent_tree_group_selected() {
+        let mut view = view();
+        let mut plan = conflicting_plan();
+        view.set_plan(Some(plan.clone()));
+        view.tree_focused = true;
+        view.tree_cursor = view
+            .tree
+            .iter()
+            .position(|row| matches!(&row.kind, TreeKind::Group { name, .. } if name == "docs"))
+            .unwrap();
+
+        assert!(plan.move_group("domain", -1));
+        view.set_plan(Some(plan));
+
+        assert!(matches!(
+            view.current_tree_row().map(|row| &row.kind),
+            Some(TreeKind::Group { name, .. }) if name == "docs"
+        ));
+    }
+
+    #[test]
+    fn ir_11_provenance_names_the_active_projection_not_a_dormant_plan() {
+        let mut view = view();
+        view.set_plan(Some(conflicting_plan()));
+        assert_eq!(view.order_provenance(), Some("AI"));
+        view.set_order(crate::domain::plan::OrderMode::Path);
+        assert_eq!(view.order_provenance(), Some("patch"));
     }
 
     #[test]
