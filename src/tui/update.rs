@@ -2084,7 +2084,10 @@ mod tests {
             },
             &crate::domain::context::BundlePolicy::default(),
         );
-        let effect = app.apply_context(bundle, AnalysisIntent::Estimate);
+        let identity = app
+            .current_analysis_context_identity()
+            .expect("a context identity");
+        let effect = app.apply_context(bundle, AnalysisIntent::Estimate, identity);
         assert!(effect.is_none(), "nothing is sent on the first press");
         assert!(app.panel.confirmed);
         let notice = app.latest_notice().expect("a notice").text.clone();
@@ -2111,7 +2114,9 @@ mod tests {
             },
             &crate::domain::context::BundlePolicy::default(),
         )));
-        app.panel.bundle_for = Some((141, "abc123".to_owned()));
+        app.panel.bundle_for = app
+            .current_analysis_context_identity()
+            .map(|identity| (141, identity));
         let effect = dispatch(&mut app, "app.analyze_panel");
         assert!(
             matches!(effect, Effect::RunAnalysis { force: false }),
@@ -2130,7 +2135,11 @@ mod tests {
             &crate::domain::context::BundlePolicy::default(),
         )));
         // The head moved since the bundle was gathered (FR-4.3).
-        app.panel.bundle_for = Some((141, "anedotheraaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()));
+        let mut stale = app
+            .current_analysis_context_identity()
+            .expect("a context identity");
+        stale.head_sha = "anedotheraaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        app.panel.bundle_for = Some((141, stale));
         let effect = dispatch(&mut app, "app.analyze_panel");
         assert!(
             matches!(effect, Effect::GatherContext(AnalysisIntent::Estimate)),

@@ -539,6 +539,9 @@ fn apply_analysis_effect(
         Effect::RunAnalysis { force } => {
             // Without a bundle there is nothing the user agreed to send, so the run
             // starts by gathering one (FR-4.6).
+            let Some(request) = app.analysis_request() else {
+                return true;
+            };
             let Some(bundle) = app.take_context_bundle_for_current_head() else {
                 pending_effects.push(Effect::GatherContext(AnalysisIntent::Estimate));
                 return true;
@@ -548,9 +551,6 @@ fn apply_analysis_effect(
                 // replaces the entry (FR-4.3).
                 app.forget_analysis();
             }
-            let Some(request) = app.analysis_request() else {
-                return true;
-            };
             let id = runner.submit_owned(
                 review_job_owner(app),
                 jobs::Job::RunAnalysis {

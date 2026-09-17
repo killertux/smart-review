@@ -77,8 +77,16 @@ pub struct RiskArea {
     /// The files it concerns, already restricted to files in the diff.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Whether at least one cited file survived normalization. A false value keeps the
+    /// model's diagnostic visible without presenting it as evidenced actionable risk.
+    #[serde(default = "supported_by_default")]
+    pub supported: bool,
     /// Why it is a risk.
     pub why: String,
+}
+
+const fn supported_by_default() -> bool {
+    true
 }
 
 /// One step of the review plan (FR-4.2).
@@ -279,7 +287,7 @@ struct RawNote {
 #[derive(Debug, Clone, Default)]
 pub struct PathIndex {
     paths: BTreeSet<String>,
-    aliases: BTreeMap<String, String>,
+    aliases: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl PathIndex {
@@ -293,18 +301,12 @@ impl PathIndex {
             let Some(canonical) = file.path().map(ToString::to_string) else {
                 continue;
             };
-            index.paths.insert(canonical.clone());
-            index
-                .aliases
-                .entry(canonical.clone())
-                .or_insert_with(|| canonical.clone());
-            let name = canonical
-                .rsplit('/')
-                .next()
-                .unwrap_or(&canonical)
-                .to_owned();
+            index.paths.insert(canonical);
+        }
+        for canonical in &index.paths {
+            let name = canonical.rsplit('/').next().unwrap_or(canonical).to_owned();
             // A bare file name is only an alias when it is unambiguous, otherwise
-            // `mod.rs` would attach notes to whichever `mod.rs` came last.
+            // `mod.rs` would attach notes to whichever one was indexed first.
             if index
                 .paths
                 .iter()
@@ -315,12 +317,18 @@ impl PathIndex {
                 index
                     .aliases
                     .entry(name)
-                    .or_insert_with(|| canonical.clone());
+                    .or_default()
+                    .insert(canonical.clone());
             }
+        }
+        for file in &patch.files {
+            let Some(canonical) = file.path().map(ToString::to_string) else {
+                continue;
+            };
             if let Some(old) = &file.old_path {
                 let old = old.as_str().to_owned();
                 if old != canonical {
-                    index.aliases.insert(old, canonical.clone());
+                    index.aliases.entry(old).or_default().insert(canonical);
                 }
             }
         }
@@ -332,8 +340,7 @@ impl PathIndex {
     pub fn from_paths(paths: impl IntoIterator<Item = String>) -> Self {
         let mut index = Self::default();
         for path in paths {
-            index.paths.insert(path.clone());
-            index.aliases.insert(path.clone(), path);
+            index.paths.insert(path);
         }
         index
     }
@@ -358,20 +365,35 @@ impl PathIndex {
     /// Resolves a path the model wrote to the canonical path in the diff.
     ///
     /// Tolerates the shapes a model produces that are not wrong, only untidy: a
-    /// leading `./` or `/`, a `a/` prefix copied from the patch, backslashes from a
+    /// leading `./` or `/`, backslashes from a
     /// Windows-shaped example, and surrounding whitespace or backticks.
     #[must_use]
     pub fn resolve(&self, raw: &str) -> Option<String> {
         let cleaned = tidy_path(raw);
-        if let Some(canonical) = self.aliases.get(&cleaned) {
-            return Some(canonical.clone());
-        }
         // A path the diff knows exactly, after tidying only.
         if self.paths.contains(&cleaned) {
             return Some(cleaned);
         }
+        if let Some(canonical) = unique_alias(&self.aliases, &cleaned) {
+            return Some(canonical);
+        }
+        // Interpret `a/` as a patch-header prefix only after trying it literally: an
+        // exact source path can itself begin with `a/`.
+        if let Some(without_patch_prefix) = cleaned.strip_prefix("a/") {
+            if self.paths.contains(without_patch_prefix) {
+                return Some(without_patch_prefix.to_owned());
+            }
+            return unique_alias(&self.aliases, without_patch_prefix);
+        }
         None
     }
+}
+
+fn unique_alias(aliases: &BTreeMap<String, BTreeSet<String>>, path: &str) -> Option<String> {
+    let candidates = aliases.get(path)?;
+    (candidates.len() == 1)
+        .then(|| candidates.iter().next().cloned())
+        .flatten()
 }
 
 /// Tidies a path for matching, without inventing one.
@@ -385,7 +407,6 @@ pub fn tidy_path(raw: &str) -> String {
         .replace('\\', "/");
     let without_prefix = trimmed
         .strip_prefix("./")
-        .or_else(|| trimmed.strip_prefix("a/"))
         .or_else(|| trimmed.strip_prefix("/"))
         .unwrap_or(&trimmed);
     without_prefix.trim_end_matches('/').to_owned()
@@ -810,6 +831,7 @@ fn normalize_risks(
         out.push(RiskArea {
             title,
             severity,
+            supported: risk.files.is_empty() || !files.is_empty(),
             files,
             why: risk.why.unwrap_or_default().trim().to_owned(),
         });
@@ -1430,6 +1452,18 @@ mod tests {
             index.resolve("src/b/mod.rs").as_deref(),
             Some("src/b/mod.rs")
         );
+    }
+
+    #[test]
+    fn ir_12_path_resolution_keeps_exact_a_prefixes_and_rejects_duplicate_basenames() {
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/a/config.rs b/a/config.rs\n--- a/a/config.rs\n+++ b/a/config.rs\n@@ -1 +1 @@\n-old\n+new\n\
+             diff --git a/src/config.rs b/src/config.rs\n--- a/src/config.rs\n+++ b/src/config.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let index = PathIndex::from_patch(&patch);
+
+        assert_eq!(index.resolve("a/config.rs").as_deref(), Some("a/config.rs"));
+        assert_eq!(index.resolve("config.rs"), None);
     }
 
     #[test]

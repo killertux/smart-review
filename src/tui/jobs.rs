@@ -400,6 +400,8 @@ pub enum Outcome {
         bundle: Box<crate::domain::context::Bundle>,
         /// What the caller wanted it for.
         intent: AnalysisIntent,
+        /// The exact context specification used to build it (IR-12).
+        identity: crate::application::context::ContextIdentity,
     },
     /// The analysis finished, one way or another (FR-4.1).
     Analyzed(Box<AnalysisRun>),
@@ -423,6 +425,8 @@ pub enum Outcome {
         session: Box<crate::domain::chat::Session>,
         /// The question that asked for it.
         question: String,
+        /// The exact context specification used to build the bundle (IR-12).
+        identity: crate::application::context::ContextIdentity,
     },
     /// A reply or a conversation comment was posted, or recorded by a dry run
     /// (FR-6.4, FR-6.5).
@@ -701,6 +705,7 @@ impl Executor {
                 Outcome::Context {
                     bundle: Box::new(bundle),
                     intent: *intent,
+                    identity: request.context.identity.clone(),
                 }
             }
             Job::RunAnalysis { request, bundle } => {
@@ -1101,6 +1106,7 @@ impl Executor {
                     bundle: Box::new(bundle),
                     session: session.clone(),
                     question: question.clone(),
+                    identity: spec.context.identity.clone(),
                 }
             }
             Job::AskChat { request } => {

@@ -169,10 +169,10 @@ fn running_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         lines.extend(section(theme, "Why", &preview.intent));
     }
     if !preview.risks.is_empty() {
-        let risks: Vec<(Severity, String, String)> = preview
+        let risks: Vec<(Severity, String, String, bool)> = preview
             .risks
             .iter()
-            .map(|risk| (risk.severity, risk.title.clone(), risk.why.clone()))
+            .map(|risk| (risk.severity, risk.title.clone(), risk.why.clone(), true))
             .collect();
         lines.extend(risk_lines(theme, &risks));
     }
@@ -375,18 +375,29 @@ fn section(theme: &Theme, title: &str, body: &str) -> Vec<Line<'static>> {
 }
 
 /// The risk areas, most serious first (FR-4.1).
-fn risk_lines(theme: &Theme, risks: &[(Severity, String, String)]) -> Vec<Line<'static>> {
+fn risk_lines(theme: &Theme, risks: &[(Severity, String, String, bool)]) -> Vec<Line<'static>> {
     if risks.is_empty() {
         return Vec::new();
     }
     let mut lines = vec![Line::default(), heading(theme, "Risks")];
-    for (severity, title, why) in risks {
+    for (severity, title, why, supported) in risks {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:<6} ", severity.label()),
                 Severity::style(*severity, theme),
             ),
-            Span::styled(title.clone(), theme.style(element::FG)),
+            Span::styled(
+                if *supported {
+                    title.clone()
+                } else {
+                    format!("{title} (unsupported: cited files are not in this change)")
+                },
+                if *supported {
+                    theme.style(element::FG)
+                } else {
+                    theme.style(element::NOTICE_WARN)
+                },
+            ),
         ]));
         for line in wrap_paragraph(why, 88) {
             lines.push(Line::from(Span::styled(
@@ -500,6 +511,12 @@ pub fn render_context(frame: &mut Frame<'_>, area: Rect, app: &App) {
             lines.push(Line::from(Span::styled(
                 format!(" {}", bundle.summary()),
                 theme.style(element::ACCENT),
+            )));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                " LLM input uses the canonical review diff; visible whitespace and context-line toggles do not change this inventory."
+                    .to_owned(),
+                theme.style(element::MUTED),
             )));
             lines.push(Line::default());
             for segment in &bundle.segments {

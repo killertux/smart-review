@@ -74,10 +74,24 @@ struct StoredKey {
     repo: String,
     pr: u64,
     head_sha: String,
+    #[serde(default)]
+    base_sha: Option<String>,
+    #[serde(default)]
+    context_fingerprint: String,
+    #[serde(default)]
+    identity_version: u8,
     provider: String,
     model: String,
+    #[serde(default)]
+    endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<crate::domain::model::Thinking>,
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<String>,
     prompt_version: u32,
 }
 
@@ -87,9 +101,16 @@ impl StoredKey {
             repo: key.repo.clone(),
             pr: key.pr,
             head_sha: key.head_sha.clone(),
+            base_sha: key.base_sha.clone(),
+            context_fingerprint: key.context_fingerprint.clone(),
+            identity_version: key.identity_version,
             provider: key.provider.clone(),
             model: key.model.clone(),
+            endpoint: key.endpoint.clone(),
             thinking: key.thinking.clone(),
+            input_tokens: key.input_tokens,
+            max_tokens: key.max_tokens,
+            temperature: key.temperature.clone(),
             prompt_version: key.prompt_version,
         }
     }
@@ -98,9 +119,16 @@ impl StoredKey {
         self.repo == key.repo
             && self.pr == key.pr
             && self.head_sha == key.head_sha
+            && self.base_sha == key.base_sha
+            && self.context_fingerprint == key.context_fingerprint
+            && self.identity_version == key.identity_version
             && self.provider == key.provider
             && self.model == key.model
+            && self.endpoint == key.endpoint
             && self.thinking == key.thinking
+            && self.input_tokens == key.input_tokens
+            && self.max_tokens == key.max_tokens
+            && self.temperature == key.temperature
             && self.prompt_version == key.prompt_version
     }
 
@@ -109,9 +137,16 @@ impl StoredKey {
             repo: self.repo,
             pr: self.pr,
             head_sha: self.head_sha,
+            base_sha: self.base_sha,
+            context_fingerprint: self.context_fingerprint,
+            identity_version: self.identity_version,
             provider: self.provider,
             model: self.model,
+            endpoint: self.endpoint,
             thinking: self.thinking,
+            input_tokens: self.input_tokens,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
             prompt_version: self.prompt_version,
         }
     }
@@ -598,9 +633,16 @@ mod tests {
             repo: "github.com/acme/service".to_owned(),
             pr: 141,
             head_sha: "abc123".to_owned(),
+            base_sha: Some("base123".to_owned()),
+            context_fingerprint: "context".to_owned(),
+            identity_version: 1,
             provider: "deepseek".to_owned(),
             model: "deepseek-v4-pro".to_owned(),
+            endpoint: Some("https://api.deepseek.test/v1".to_owned()),
             thinking: None,
+            input_tokens: 12_000,
+            max_tokens: Some(4_000),
+            temperature: Some("0.2".to_owned()),
             prompt_version: 1,
         }
     }
@@ -666,6 +708,46 @@ mod tests {
             ..key.clone()
         };
         assert!(cache.get(&other).expect("reads").is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ir_12_a_legacy_identity_is_listed_but_never_a_current_cache_hit() {
+        let (cache, root) = cache();
+        let key = key();
+        let path = cache.path_for(&key);
+        let legacy = StoredKey {
+            repo: key.repo.clone(),
+            pr: key.pr,
+            head_sha: key.head_sha.clone(),
+            base_sha: key.base_sha.clone(),
+            context_fingerprint: key.context_fingerprint.clone(),
+            identity_version: 0,
+            provider: key.provider.clone(),
+            model: key.model.clone(),
+            endpoint: None,
+            thinking: key.thinking.clone(),
+            input_tokens: 0,
+            max_tokens: None,
+            temperature: None,
+            prompt_version: key.prompt_version,
+        };
+        let document = Document {
+            key: legacy,
+            analysis: analysis(&key.head_sha),
+            raw: String::new(),
+            warnings: Vec::new(),
+            repaired: false,
+            stored_at: 1,
+        };
+        DiskAnalysisCache::write(
+            &path,
+            &serde_json::to_string(&document).expect("serialises"),
+        )
+        .expect("writes");
+        assert!(cache.get(&key).expect("reads").is_none());
+        let listed = cache.list(&repo(), key.pr).expect("lists");
+        assert!(listed[0].key.is_legacy());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -916,9 +998,9 @@ mod tests {
     fn the_digest_is_reproducible_across_processes() {
         // An analysis written by an earlier run has to be found by a later one, which is
         // only true if the digest depends on nothing but the key. The literal is the
-        // guarantee: change the hashing and this test fails on purpose, because every
-        // existing cache entry would stop being found.
-        assert_eq!(key().digest(), "b36e57269e6f7234");
+        // guarantee: changing the identity contract intentionally changes this value;
+        // older entries remain only as legacy diagnostics.
+        assert_eq!(key().digest(), "86dc666dcfbb9e64");
     }
 
     #[test]
@@ -929,7 +1011,7 @@ mod tests {
             path,
             PathBuf::from(
                 "/home/someone/.smart-review/cache/analysis/github.com/acme/service/pr-141/\
-                 b36e57269e6f7234.json"
+                  86dc666dcfbb9e64.json"
             )
         );
     }
