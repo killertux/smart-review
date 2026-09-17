@@ -152,6 +152,45 @@ pub enum CheckState {
     Unknown,
 }
 
+/// The forge-reported execution lifecycle of a check run (IR-10).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckLifecycle {
+    /// The run has not started.
+    Queued,
+    /// The run is executing.
+    Running,
+    /// The run reached a conclusion.
+    Completed,
+    /// The forge did not provide a recognisable lifecycle.
+    #[default]
+    Unknown,
+}
+
+impl CheckLifecycle {
+    /// Maps GitHub's check-run status without losing queued versus running.
+    #[must_use]
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or_default().to_ascii_uppercase().as_str() {
+            "QUEUED" | "REQUESTED" | "WAITING" | "PENDING" => Self::Queued,
+            "IN_PROGRESS" | "RUNNING" => Self::Running,
+            "COMPLETED" | "SUCCESS" | "FAILURE" | "ERROR" => Self::Completed,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// User-facing label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 impl CheckState {
     /// Maps `gh`'s `conclusion` field for a check run.
     #[must_use]
@@ -208,6 +247,12 @@ pub struct CheckRun {
     pub name: String,
     /// Its state.
     pub state: CheckState,
+    /// Execution lifecycle, retained separately from its final state.
+    #[serde(default)]
+    pub lifecycle: CheckLifecycle,
+    /// Forge conclusion such as `CANCELLED`, retained for the Checks tab.
+    #[serde(default)]
+    pub conclusion: Option<String>,
     /// Where to read it.
     pub url: Option<String>,
     /// A one-line description, when GitHub provides one.
@@ -639,18 +684,24 @@ mod tests {
             CheckRun {
                 name: "a".to_owned(),
                 state: CheckState::Success,
+                lifecycle: CheckLifecycle::Completed,
+                conclusion: None,
                 url: None,
                 description: None,
             },
             CheckRun {
                 name: "b".to_owned(),
                 state: CheckState::Pending,
+                lifecycle: CheckLifecycle::Queued,
+                conclusion: None,
                 url: None,
                 description: None,
             },
             CheckRun {
                 name: "c".to_owned(),
                 state: CheckState::Failure,
+                lifecycle: CheckLifecycle::Completed,
+                conclusion: None,
                 url: None,
                 description: None,
             },
@@ -668,12 +719,16 @@ mod tests {
             CheckRun {
                 name: "a".to_owned(),
                 state: CheckState::Success,
+                lifecycle: CheckLifecycle::Completed,
+                conclusion: None,
                 url: None,
                 description: None,
             },
             CheckRun {
                 name: "b".to_owned(),
                 state: CheckState::Pending,
+                lifecycle: CheckLifecycle::Queued,
+                conclusion: None,
                 url: None,
                 description: None,
             },
@@ -695,6 +750,8 @@ mod tests {
         let runs = vec![CheckRun {
             name: "a".to_owned(),
             state: CheckState::Unknown,
+            lifecycle: CheckLifecycle::Unknown,
+            conclusion: None,
             url: None,
             description: None,
         }];

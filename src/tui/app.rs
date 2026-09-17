@@ -8849,12 +8849,16 @@ mod tests {
             crate::domain::pr::CheckRun {
                 name: "unit tests".to_owned(),
                 state: crate::domain::pr::CheckState::Failure,
+                lifecycle: crate::domain::pr::CheckLifecycle::Completed,
+                conclusion: Some("FAILURE".to_owned()),
                 url: Some("https://example.test/runs/1".to_owned()),
                 description: Some("one test failed".to_owned()),
             },
             crate::domain::pr::CheckRun {
                 name: "lint".to_owned(),
                 state: crate::domain::pr::CheckState::Success,
+                lifecycle: crate::domain::pr::CheckLifecycle::Completed,
+                conclusion: Some("SUCCESS".to_owned()),
                 url: None,
                 description: None,
             },

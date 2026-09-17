@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::domain::pr::{
-    CheckRun, CheckState, CheckSummary, Commit, PrState, PullRequestDetail, PullRequestSummary,
-    Review, ReviewComment, ReviewDecision, ReviewState,
+    CheckLifecycle, CheckRun, CheckState, CheckSummary, Commit, PrState, PullRequestDetail,
+    PullRequestSummary, Review, ReviewComment, ReviewDecision, ReviewState,
 };
 use crate::domain::time::Timestamp;
 
@@ -106,6 +106,12 @@ impl GhRollupItem {
                 .or(self.context)
                 .unwrap_or_else(|| "unnamed check".to_owned()),
             state,
+            lifecycle: if is_check_run {
+                CheckLifecycle::parse(self.status.as_deref())
+            } else {
+                CheckLifecycle::Completed
+            },
+            conclusion: self.conclusion,
             url: self.details_url.or(self.target_url),
             description: self.description.filter(|text| !text.is_empty()),
         }

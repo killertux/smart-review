@@ -296,13 +296,18 @@ fn render_checks(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 CheckState::Skipped => "−",
                 CheckState::Unknown => "?",
             };
-            let state = match check.state {
-                CheckState::Success => "success",
-                CheckState::Failure => "failed",
-                CheckState::Pending => "running or queued",
-                CheckState::Neutral => "neutral",
-                CheckState::Skipped => "skipped",
-                CheckState::Unknown => "unknown",
+            let state = match check.lifecycle {
+                crate::domain::pr::CheckLifecycle::Queued => "queued",
+                crate::domain::pr::CheckLifecycle::Running => "running",
+                crate::domain::pr::CheckLifecycle::Completed
+                | crate::domain::pr::CheckLifecycle::Unknown => match check.state {
+                    CheckState::Success => "success",
+                    CheckState::Failure => "failed",
+                    CheckState::Pending => "pending",
+                    CheckState::Neutral => "neutral",
+                    CheckState::Skipped => "skipped",
+                    CheckState::Unknown => "unknown",
+                },
             };
             lines.push(Line::from(Span::styled(
                 format!(" {marker} {} — {state}", check.name),
@@ -317,6 +322,12 @@ fn render_checks(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if let Some(description) = &check.description {
                 lines.push(Line::from(Span::styled(
                     format!("     {description}"),
+                    theme.style(element::MUTED),
+                )));
+            }
+            if let Some(conclusion) = &check.conclusion {
+                lines.push(Line::from(Span::styled(
+                    format!("     conclusion: {conclusion}"),
                     theme.style(element::MUTED),
                 )));
             }
