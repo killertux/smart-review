@@ -19,7 +19,7 @@
 //!
 //! Pure: no IO, no terminal, no diff model (NFR-5.2).
 
-use std::collections::BTreeSet;
+use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
@@ -296,46 +296,61 @@ impl Plan {
     /// diff's own path list so nothing can be lost between the two.
     #[must_use]
     pub fn files(&self, mode: OrderMode, path_order: &[String]) -> Vec<String> {
-        match mode {
-            OrderMode::Path => path_order.to_vec(),
-            OrderMode::Recommended => {
-                let placed: BTreeSet<&str> = self
-                    .groups
-                    .iter()
-                    .flat_map(|group| group.files.iter().map(String::as_str))
-                    .collect();
-                // Files the plan does not know about (a plan derived from an older
-                // analysis, say) are appended rather than dropped: the ordered view is
-                // a view of the diff, not a subset of it.
-                let mut files: Vec<String> = self
-                    .groups
-                    .iter()
-                    .flat_map(|group| group.files.iter().cloned())
-                    .collect();
-                files.extend(
-                    path_order
-                        .iter()
-                        .filter(|path| !placed.contains(path.as_str()))
-                        .cloned(),
-                );
-                files
+        self.effective_order(mode, path_order)
+            .into_iter()
+            .filter_map(|index| path_order.get(index).cloned())
+            .collect()
+    }
+
+    /// Stable indexes into `canonical_paths`, in the order a reader should see them.
+    ///
+    /// A path is presentation data, not a file identity: a malformed model answer may
+    /// repeat it, and a patch can contain more than one entry with the same displayed
+    /// path. This projection consumes each canonical index at most once, then appends
+    /// every unclaimed index in patch order. Callers can consequently keep cursors and
+    /// folds keyed by the immutable patch index (IR-11).
+    #[must_use]
+    pub fn effective_order(&self, mode: OrderMode, canonical_paths: &[String]) -> Vec<usize> {
+        if mode == OrderMode::Path {
+            return (0..canonical_paths.len()).collect();
+        }
+
+        let mut available: std::collections::BTreeMap<&str, VecDeque<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, path) in canonical_paths.iter().enumerate() {
+            available.entry(path).or_default().push_back(index);
+        }
+        let mut order = Vec::with_capacity(canonical_paths.len());
+        for path in self.groups.iter().flat_map(|group| &group.files) {
+            if let Some(index) = available
+                .get_mut(path.as_str())
+                .and_then(VecDeque::pop_front)
+            {
+                order.push(index);
             }
         }
+        order.extend(available.into_values().flatten());
+        order
     }
 
     /// The 1-based position of a path in the given mode.
     #[must_use]
     pub fn position_of(&self, path: &str, mode: OrderMode, path_order: &[String]) -> Option<usize> {
-        self.files(mode, path_order)
+        self.effective_order(mode, path_order)
             .iter()
-            .position(|candidate| candidate == path)
+            .position(|index| {
+                path_order
+                    .get(*index)
+                    .is_some_and(|candidate| candidate == path)
+            })
             .map(|index| index + 1)
     }
 
     /// How many files the plan covers, ignoring the mode.
     #[must_use]
     pub fn len(&self, path_order: &[String]) -> usize {
-        self.files(OrderMode::Recommended, path_order).len()
+        self.effective_order(OrderMode::Recommended, path_order)
+            .len()
     }
 
     /// Whether there is nothing to show.
@@ -497,6 +512,8 @@ fn is_config(lower: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::domain::analysis::{Normalized, PathIndex};
 
@@ -603,6 +620,27 @@ mod tests {
         assert_eq!(files.len(), order.len(), "{files:?}");
         let unique: BTreeSet<&String> = files.iter().collect();
         assert_eq!(unique.len(), order.len(), "no file twice: {files:?}");
+    }
+
+    #[test]
+    fn effective_order_uses_canonical_indexes_for_duplicate_and_unknown_entries() {
+        let mut plan = plan();
+        plan.groups[0].files = vec![
+            "src/domain/money.rs".to_owned(),
+            "src/domain/money.rs".to_owned(),
+            "missing.rs".to_owned(),
+        ];
+        let paths = vec![
+            "src/application/billing.rs".to_owned(),
+            "src/domain/money.rs".to_owned(),
+            "src/domain/money.rs".to_owned(),
+        ];
+
+        assert_eq!(
+            plan.effective_order(OrderMode::Recommended, &paths),
+            vec![1, 2, 0],
+            "each immutable patch entry is read once, even when paths repeat"
+        );
     }
 
     #[test]

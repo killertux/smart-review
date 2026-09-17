@@ -118,8 +118,8 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | In progress (`ir-07-remote-mutations`) |
 | [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | In progress (`ir-08-cancellation-progress`) |
 | [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | [Merged — PR #20](https://github.com/killertux/smart-review/pull/20) |
-| [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | In progress (`ir-10-real-pr-tabs`) |
-| [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | Not started |
+| [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | [Merged — PR #21](https://github.com/killertux/smart-review/pull/21) |
+| [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | In progress (`ir-11-executable-review-order`) |
 | [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | Not started |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | Not started |
 | [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | Not started |
@@ -1054,24 +1054,24 @@ order never loses files or changes the selected file unnecessarily.
 
 ### Implementation steps
 
-1. [ ] Add the application→domain→TUI patch/recommended-order regression. Assert the
+1. [x] Add the application→domain→TUI patch/recommended-order regression. Assert the
    next file after domain is application, including hunk movement across the boundary.
-2. [ ] Introduce stable canonical file IDs plus an effective-order projection. Keep the
+2. [x] Introduce stable canonical file IDs plus an effective-order projection. Keep the
    underlying parsed diff immutable. Do not use current tree row numbers as file IDs.
-3. [ ] Make every relevant navigation path consume the projection. Define behavior at
+3. [x] Make every relevant navigation path consume the projection. Define behavior at
    first/last files and folded/empty/binary files; apply it symmetrically forward/back.
-4. [ ] Ensure ordinary diff rows across file boundaries follow the selected order, or
+4. [x] Ensure ordinary diff rows across file boundaries follow the selected order, or
    deliberately scope the diff to one file with explicit next/previous navigation.
    Choose the existing architecture's least disruptive option and document it; the
    user must never see tree order disagree with the next file they read.
-5. [ ] Preserve current path and source-side/line anchor on order toggle/plan arrival.
+5. [x] Preserve current path and source-side/line anchor on order toggle/plan arrival.
    Reconcile folds and independent tree/diff cursor state by stable IDs.
-6. [ ] Guarantee every changed file appears exactly once, including LLM omissions,
+6. [x] Guarantee every changed file appears exactly once, including LLM omissions,
    invalid/duplicate plan entries and newly changed files after refresh.
-7. [ ] Preserve manual group order and file placement when compatible. Show AI,
+7. [x] Preserve manual group order and file placement when compatible. Show AI,
    heuristic and user override provenance distinctly. Use unclassified as a visible
    fallback, not a hidden filter.
-8. [ ] Cache file-position maps for both orders rather than reconstructing complete
+8. [x] Cache file-position maps for both orders rather than reconstructing complete
    path lists every status render. Make group rationale expandable/readable.
 
 ### Required regression cases

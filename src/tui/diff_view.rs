@@ -288,6 +288,72 @@ pub struct DiffView {
     /// The review plan, when there is one. The heuristic plan is present as soon as a
     /// patch is, so the recommended order always works (FR-3.5, DEC-10).
     pub plan: Option<crate::domain::plan::Plan>,
+    /// Cached canonical file projections and 1-based position maps for both orders.
+    /// The patch remains immutable; all reading surfaces consume these stable indexes
+    /// instead of deriving an order from transient tree rows (IR-11).
+    file_orders: FileOrders,
+}
+
+/// Effective file sequences for the two reading modes.
+#[derive(Debug, Clone, Default)]
+struct FileOrders {
+    path: Vec<usize>,
+    recommended: Vec<usize>,
+    path_positions: Vec<usize>,
+    recommended_positions: Vec<usize>,
+}
+
+impl FileOrders {
+    fn new(patch: &Patch, plan: Option<&crate::domain::plan::Plan>) -> Self {
+        let paths: Vec<String> = patch
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                file.path()
+                    .map_or_else(|| format!("(unknown {index})"), RelPath::to_string)
+            })
+            .collect();
+        let path_order: Vec<usize> = (0..paths.len()).collect();
+        let recommended = plan.map_or_else(
+            || path_order.clone(),
+            |plan| plan.effective_order(crate::domain::plan::OrderMode::Recommended, &paths),
+        );
+        Self {
+            path_positions: position_map(&path_order, paths.len()),
+            recommended_positions: position_map(&recommended, paths.len()),
+            path: path_order,
+            recommended,
+        }
+    }
+
+    fn files(&self, order: crate::domain::plan::OrderMode) -> &[usize] {
+        match order {
+            crate::domain::plan::OrderMode::Path => &self.path,
+            crate::domain::plan::OrderMode::Recommended => &self.recommended,
+        }
+    }
+
+    fn position(&self, order: crate::domain::plan::OrderMode, file: usize) -> Option<usize> {
+        let positions = match order {
+            crate::domain::plan::OrderMode::Path => &self.path_positions,
+            crate::domain::plan::OrderMode::Recommended => &self.recommended_positions,
+        };
+        positions
+            .get(file)
+            .copied()
+            .filter(|position| *position > 0)
+    }
+}
+
+fn position_map(order: &[usize], file_count: usize) -> Vec<usize> {
+    let mut positions = vec![0; file_count];
+    for (position, file) in order.iter().copied().enumerate() {
+        if let Some(slot) = positions.get_mut(file) {
+            *slot = position + 1;
+        }
+    }
+    positions
 }
 
 impl DiffView {
@@ -326,7 +392,9 @@ impl DiffView {
             order: crate::domain::plan::OrderMode::Path,
             plan: None,
             comments: Vec::new(),
+            file_orders: FileOrders::default(),
         };
+        view.refresh_file_orders();
         view.rebuild();
         view
     }
@@ -362,12 +430,18 @@ impl DiffView {
     /// This is the only place that walks the patch, and it runs when the patch or a
     /// fold changes rather than per frame.
     pub fn rebuild(&mut self) {
-        self.rows = flatten(&self.patch, &self.folded_hunks, &self.comments);
+        let anchor = self.current().cloned();
+        self.rows = flatten(
+            &self.patch,
+            self.file_orders.files(self.order),
+            &self.folded_hunks,
+            &self.comments,
+        );
         let (split, index) = build_split(&self.rows);
         self.split_rows = split;
         self.split_index = index;
         self.tree = self.build_tree();
-        self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+        self.restore_cursor(anchor);
         if self.tree_cursor >= self.tree.len() {
             self.tree_cursor = self.tree.len().saturating_sub(1);
         }
@@ -427,7 +501,8 @@ impl DiffView {
         if self.plan.is_some() && self.order == crate::domain::plan::OrderMode::Path {
             self.order = crate::domain::plan::OrderMode::Recommended;
         }
-        self.rebuild_tree();
+        self.refresh_file_orders();
+        self.rebuild();
     }
 
     /// Switches between the recommended and path orders, keeping the current file.
@@ -438,12 +513,8 @@ impl DiffView {
         if self.order == order {
             return;
         }
-        let file = self.current_file();
         self.order = order;
-        self.rebuild_tree();
-        if let Some(file) = file {
-            self.focus_file(file);
-        }
+        self.rebuild();
     }
 
     /// Toggles between the two orders (FR-3.5, `o`).
@@ -456,6 +527,33 @@ impl DiffView {
         self.tree = self.build_tree();
         if self.tree_cursor >= self.tree.len() {
             self.tree_cursor = self.tree.len().saturating_sub(1);
+        }
+    }
+
+    /// Recomputes the two file sequences only when the patch or plan changes.
+    fn refresh_file_orders(&mut self) {
+        self.file_orders = FileOrders::new(&self.patch, self.plan.as_ref());
+    }
+
+    /// Restores the exact source row after a rebuild changed its display position.
+    fn restore_cursor(&mut self, anchor: Option<DiffRow>) {
+        if let Some(anchor) = anchor
+            && let Some(position) = self.rows.iter().position(|row| {
+                row.file == anchor.file
+                    && row.kind == anchor.kind
+                    && row.hunk == anchor.hunk
+                    && row.old_line == anchor.old_line
+                    && row.new_line == anchor.new_line
+                    && row.text == anchor.text
+            })
+        {
+            self.cursor = position;
+            self.focus_file(anchor.file);
+            return;
+        }
+        self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+        if let Some(file) = self.current_file() {
+            self.focus_file(file);
         }
     }
 
@@ -475,7 +573,12 @@ impl DiffView {
         if self.order == crate::domain::plan::OrderMode::Recommended
             && let Some(plan) = &self.plan
         {
-            return build_plan_tree(plan, &self.patch, &self.folded_dirs);
+            return build_plan_tree(
+                plan,
+                &self.patch,
+                self.file_orders.files(self.order),
+                &self.folded_dirs,
+            );
         }
         build_tree(&self.patch, &self.folded_dirs)
     }
@@ -486,15 +589,17 @@ impl DiffView {
     /// they are reading is seventh by path and second by plan before pressing anything.
     #[must_use]
     pub fn order_positions(&self) -> Option<String> {
-        let plan = self.plan.as_ref()?;
-        let path = self.current_path()?.to_string();
-        let paths = self.paths();
-        let recommended =
-            plan.position_of(&path, crate::domain::plan::OrderMode::Recommended, &paths)?;
-        let by_path = plan.position_of(&path, crate::domain::plan::OrderMode::Path, &paths)?;
+        self.plan.as_ref()?;
+        let file = self.current_file()?;
+        let recommended = self
+            .file_orders
+            .position(crate::domain::plan::OrderMode::Recommended, file)?;
+        let by_path = self
+            .file_orders
+            .position(crate::domain::plan::OrderMode::Path, file)?;
         // Short, because the tree pane's title is 34 columns wide and a position that
         // is cut off is a position nobody can read (FR-3.5).
-        let total = plan.len(&paths);
+        let total = self.file_orders.recommended.len();
         Some(format!(
             "{recommended}/{total} plan · {by_path}/{total} path"
         ))
@@ -862,20 +967,23 @@ impl DiffView {
 fn build_plan_tree(
     plan: &crate::domain::plan::Plan,
     patch: &Patch,
+    ordered: &[usize],
     folded: &BTreeSet<String>,
 ) -> Vec<TreeRow> {
-    let by_path: std::collections::BTreeMap<&str, usize> = patch
-        .files
-        .iter()
-        .enumerate()
-        .filter_map(|(index, file)| Some((file.path()?.as_str(), index)))
-        .collect();
     let mut rows = Vec::new();
+    let mut claimed = BTreeSet::new();
     for group in &plan.groups {
-        let present: Vec<usize> = group
-            .files
+        let present: Vec<usize> = ordered
             .iter()
-            .filter_map(|path| by_path.get(path.as_str()).copied())
+            .copied()
+            .filter(|index| {
+                !claimed.contains(index)
+                    && patch
+                        .files
+                        .get(*index)
+                        .and_then(|file| file.path())
+                        .is_some_and(|path| group.files.iter().any(|file| file == path.as_str()))
+            })
             .collect();
         if present.is_empty() {
             continue;
@@ -902,6 +1010,7 @@ fn build_plan_tree(
             });
         }
         if is_folded {
+            claimed.extend(present);
             continue;
         }
         for index in present {
@@ -916,20 +1025,62 @@ fn build_plan_tree(
                 label,
                 kind: TreeKind::File { index },
             });
+            claimed.insert(index);
         }
     }
+    let unclassified: Vec<usize> = ordered
+        .iter()
+        .copied()
+        .filter(|index| !claimed.contains(index))
+        .collect();
+    if !unclassified.is_empty() {
+        rows.push(TreeRow {
+            depth: 0,
+            label: "unclassified".to_owned(),
+            kind: TreeKind::Group {
+                name: "unclassified".to_owned(),
+                order: u32::try_from(plan.groups.len() + 1).unwrap_or(u32::MAX),
+                files: unclassified.len(),
+                folded: false,
+            },
+        });
+        rows.push(TreeRow {
+            depth: 0,
+            label: "not placed by this plan; shown in patch order".to_owned(),
+            kind: TreeKind::Rationale {
+                text: "not placed by this plan; shown in patch order".to_owned(),
+            },
+        });
+        rows.extend(unclassified.into_iter().map(|index| TreeRow {
+            depth: 1,
+            label: file_name(patch, index),
+            kind: TreeKind::File { index },
+        }));
+    }
     rows
+}
+
+fn file_name(patch: &Patch, index: usize) -> String {
+    patch.files.get(index).map_or_else(String::new, |file| {
+        let full = file.path().map_or_else(String::new, RelPath::to_string);
+        full.rsplit('/').next().unwrap_or(full.as_str()).to_owned()
+    })
 }
 
 /// Flattens a patch into drawable rows.
 fn flatten(
     patch: &Patch,
+    order: &[usize],
     folded: &BTreeSet<(usize, usize)>,
     comments: &[crate::domain::pr::ReviewComment],
 ) -> Vec<DiffRow> {
     let threads = threads_by_line(patch, comments);
     let mut rows = Vec::new();
-    for (file_index, file) in patch.files.iter().enumerate() {
+    for file_index in order {
+        let Some(file) = patch.files.get(*file_index) else {
+            continue;
+        };
+        let file_index = *file_index;
         rows.push(DiffRow {
             kind: RowKind::FileHeader,
             file: file_index,
@@ -1600,7 +1751,9 @@ mod discussion_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::analysis::PlanGroup;
     use crate::domain::diff::parse_patch;
+    use crate::domain::plan::{Plan, PlanSource};
 
     const PATCH: &str = "\
 diff --git a/src/domain/invoice.rs b/src/domain/invoice.rs
@@ -1628,6 +1781,29 @@ Binary files /dev/null and b/docs/logo.png differ
 
     fn view() -> DiffView {
         DiffView::new(parse_patch(PATCH))
+    }
+
+    fn conflicting_plan() -> Plan {
+        Plan {
+            document_revision: 0,
+            head_sha: "head1".to_owned(),
+            source: PlanSource::Analysis,
+            groups: vec![
+                PlanGroup {
+                    order: 1,
+                    group: "docs".to_owned(),
+                    rationale: "start with intent".to_owned(),
+                    files: vec!["README.md".to_owned()],
+                },
+                PlanGroup {
+                    order: 2,
+                    group: "domain".to_owned(),
+                    rationale: "then the implementation".to_owned(),
+                    files: vec!["src/domain/invoice.rs".to_owned()],
+                },
+            ],
+            overridden: false,
+        }
     }
 
     #[test]
@@ -1774,6 +1950,95 @@ Binary files /dev/null and b/docs/logo.png differ
             Some(&TreeKind::File { index: 1 }),
             "the file is still selected after toggling back"
         );
+    }
+
+    #[test]
+    fn ir_11_every_reading_motion_uses_the_recommended_file_projection() {
+        let mut view = view();
+        view.set_plan(Some(conflicting_plan()));
+
+        let headers: Vec<usize> = view
+            .rows
+            .iter()
+            .filter(|row| row.is_file_start())
+            .map(|row| row.file)
+            .collect();
+        assert_eq!(headers, vec![1, 0, 2], "rows agree with the plan tree");
+
+        view.goto_file(1);
+        view.move_hunk(true);
+        assert_eq!(view.current_file(), Some(1), "README is read first");
+        view.move_hunk(true);
+        assert_eq!(view.current_file(), Some(0), "then the domain file");
+
+        view.goto_file(1);
+        view.move_file(true);
+        assert_eq!(view.current_file(), Some(0), "next file follows the plan");
+        view.move_file(false);
+        assert_eq!(
+            view.current_file(),
+            Some(1),
+            "previous file reverses the plan"
+        );
+
+        view.goto_file(1);
+        view.move_by(1);
+        assert_eq!(view.current_file(), Some(1));
+        view.move_to(true);
+        assert_eq!(
+            view.current_file(),
+            Some(2),
+            "ordinary scrolling reaches the final file"
+        );
+    }
+
+    #[test]
+    fn ir_11_a_plan_arriving_preserves_the_exact_source_line() {
+        let mut view = view();
+        view.goto_file(0);
+        let line = view
+            .rows
+            .iter()
+            .position(|row| row.file == 0 && row.new_line == Some(15))
+            .unwrap();
+        view.select_row(line);
+
+        view.set_plan(Some(conflicting_plan()));
+
+        assert_eq!(view.current_file(), Some(0));
+        assert_eq!(view.current().and_then(|row| row.new_line), Some(15));
+        assert_eq!(view.current().and_then(|row| row.old_line), None);
+        assert_eq!(
+            view.tree.get(view.tree_cursor).map(|row| &row.kind),
+            Some(&TreeKind::File { index: 0 })
+        );
+    }
+
+    #[test]
+    fn ir_11_unknown_or_duplicate_plan_paths_do_not_hide_or_duplicate_changed_files() {
+        let mut plan = conflicting_plan();
+        plan.groups[0]
+            .files
+            .extend(["README.md".to_owned(), "missing.rs".to_owned()]);
+        let mut view = view();
+        view.set_plan(Some(plan));
+
+        let tree_files: Vec<usize> = view
+            .tree
+            .iter()
+            .filter_map(|row| match row.kind {
+                TreeKind::File { index } => Some(index),
+                _ => None,
+            })
+            .collect();
+        let row_files: Vec<usize> = view
+            .rows
+            .iter()
+            .filter(|row| row.is_file_start())
+            .map(|row| row.file)
+            .collect();
+        assert_eq!(tree_files, vec![1, 0, 2]);
+        assert_eq!(row_files, tree_files);
     }
 
     #[test]
