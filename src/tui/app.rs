@@ -1998,6 +1998,7 @@ impl App {
     fn on_draft_input_key(&mut self, combo: KeyCombo) -> Effect {
         if combo.code == KeyCode::Esc {
             self.drafts.cancel_composer();
+            self.focus_target = FocusTarget::Diff;
             // Leaving the composer returns to what is behind it: the conversation panel
             // is a popup and takes its keys back, and with no overlay there is normal
             // mode. Setting this to `Normal` unconditionally left the panel open and
@@ -2286,6 +2287,7 @@ impl App {
                     self.drafts.anchor_to(&head);
                 }
                 self.mode = Mode::Normal;
+                self.focus_target = FocusTarget::Diff;
                 let count = self.drafts.draft.comments.len();
                 self.notice(
                     NoticeLevel::Info,
@@ -4368,7 +4370,8 @@ impl App {
         self.geometry.review = self.review.is_some().then(|| {
             crate::tui::components::review::layout(body, self.chat.open, self.drafts.is_composing())
         });
-        if self.focus_target == FocusTarget::CommentComposer
+        if self.overlay != Overlay::Conversation
+            && self.focus_target == FocusTarget::CommentComposer
             && self
                 .geometry
                 .review
@@ -5829,6 +5832,13 @@ impl App {
             return;
         }
 
+        if self.overlay == Overlay::Conversation
+            && self.discussion.needs_visibility_sync()
+            && let Some(offset) = crate::tui::components::conversation::selected_offset(area, self)
+        {
+            self.discussion.set_visible(offset);
+        }
+
         let palette_rows = if self.mode == Mode::Command {
             u16::try_from(PALETTE_ROWS).unwrap_or(0)
         } else {
@@ -6608,6 +6618,21 @@ mod tests {
             }
         }
         panic!("`{needle}` is not on screen");
+    }
+
+    /// The displayed column of an ASCII marker.
+    fn column_of(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        row: u16,
+        needle: &str,
+    ) -> u16 {
+        let buffer = terminal.backend().buffer();
+        let mut line = String::new();
+        for x in buffer.area().left()..buffer.area().right() {
+            line.push_str(buffer[(x, row)].symbol());
+        }
+        let offset = line.find(needle).expect("marker on row");
+        u16::try_from(offset).unwrap_or(u16::MAX)
     }
 
     /// Draws a frame so the pane geometry the mouse arithmetic needs is real.
@@ -8444,6 +8469,60 @@ mod tests {
     }
 
     #[test]
+    fn ir_09_discussion_composer_keeps_focus_when_the_background_is_constrained() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        app.show_chat();
+        app.open_conversation();
+        app.start_conversation_comment();
+        frame(&mut app, 80, 24);
+
+        assert_eq!(app.focus_target, FocusTarget::CommentComposer);
+        press(&mut app, "X");
+        assert_eq!(
+            app.drafts
+                .composer
+                .as_ref()
+                .map(|composer| composer.input.text()),
+            Some("X")
+        );
+    }
+
+    #[test]
+    fn ir_09_discussion_keeps_the_selected_wrapped_body_visible_and_scrollable() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        let conversation = &mut app.detail.as_mut().expect("detail").conversation;
+        let template = conversation.first().expect("comment").clone();
+        for id in 2..=8 {
+            conversation.push(crate::domain::pr::ConversationComment {
+                id,
+                author: "alice".to_owned(),
+                body: format!(
+                    "newest body {id}: this deliberately long comment wraps across several rows in the narrow conversation panel"
+                ),
+                created_at: template.created_at,
+                url: None,
+            });
+        }
+        app.open_conversation();
+        let _terminal = drawn(&mut app, 100, 30);
+        assert!(app.discussion.scroll > 0);
+
+        let before = app.discussion.scroll;
+        app.on_mouse(wheel(50, 15, false));
+        assert!(app.discussion.scroll < before, "wheel moves immediately");
+    }
+
+    #[test]
+    fn ir_09_closing_a_composer_does_not_leave_a_phantom_tab_stop() {
+        let (_dir, mut app) = review_app();
+        app.review.as_mut().expect("review").select_row(2);
+        app.start_comment();
+        press(&mut app, "<Esc>");
+        press(&mut app, "<S-Tab>");
+        assert!(app.review.as_ref().expect("review").tree_focused);
+    }
+
+    #[test]
     fn ir_09_split_click_uses_the_displayed_side_and_source_row() {
         let (_dir, mut app) = review_app();
         let patch = crate::domain::diff::parse_patch(
@@ -8473,6 +8552,30 @@ mod tests {
                 .and_then(|line| line.new_line),
             Some(1),
             "the new half selects the added source line"
+        );
+    }
+
+    #[test]
+    fn ir_09_split_click_uses_the_displayed_divider_not_the_geometric_midpoint() {
+        let (_dir, mut app) = review_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-x\n+RIGHT_MARK\n",
+        );
+        app.set_review(DiffView::new(patch));
+        app.review.as_mut().expect("review").split = true;
+        let terminal = drawn(&mut app, 160, 40);
+        let row = row_of(&terminal, "RIGHT_MARK");
+        let column = column_of(&terminal, row, "RIGHT_MARK");
+        let diff = app.geometry.review.expect("review layout").diff;
+        assert!(column > diff.x + diff.width / 2);
+
+        app.on_mouse(click(column, row));
+        assert_eq!(
+            app.review
+                .as_ref()
+                .and_then(DiffView::current)
+                .and_then(|line| line.new_line),
+            Some(1)
         );
     }
 

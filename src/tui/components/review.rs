@@ -483,11 +483,15 @@ fn split_line(
         return unified_line(theme, full, selected, width, view, drafts);
     }
 
-    let half = usize::from(width).saturating_sub(3) / 2;
+    let left_width = usize::from(width.saturating_sub(1)) / 2;
+    let right_width = usize::from(width).saturating_sub(left_width + 1);
     let selected = row.contains(view.selected_unified());
     let mut spans = Vec::with_capacity(6);
 
-    for (left_side, line) in [(true, row.left.as_ref()), (false, row.right.as_ref())] {
+    for (left_side, line, cell_width) in [
+        (true, row.left.as_ref(), left_width),
+        (false, row.right.as_ref(), right_width),
+    ] {
         if !left_side {
             spans.push(Span::styled("│".to_owned(), theme.style(element::BORDER)));
         }
@@ -500,14 +504,15 @@ fn split_line(
                 } else {
                     line.new_line
                 };
+                let gutter = format!(
+                    "{} ",
+                    text::pad_left(
+                        &number.map_or_else(String::new, |number| number.to_string()),
+                        5
+                    )
+                );
                 spans.push(Span::styled(
-                    format!(
-                        "{} ",
-                        text::pad_left(
-                            &number.map_or_else(String::new, |number| number.to_string()),
-                            5
-                        )
-                    ),
+                    gutter,
                     if selected {
                         theme.style(element::SELECTION)
                     } else {
@@ -515,7 +520,7 @@ fn split_line(
                     },
                 ));
                 spans.push(Span::styled(
-                    format!("{} ", text::truncate(&line.content, half.saturating_sub(8))),
+                    text::pad(&line.content, cell_width.saturating_sub(6)),
                     body_style_for(theme, line.kind, selected),
                 ));
             }
@@ -523,7 +528,7 @@ fn split_line(
                 // An empty cell, which is how a one-sided change reads beside its
                 // counterpart.
                 spans.push(Span::styled(
-                    " ".repeat(half.saturating_sub(1)),
+                    " ".repeat(cell_width),
                     theme.style(element::BG),
                 ));
             }

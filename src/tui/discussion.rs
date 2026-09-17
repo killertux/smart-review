@@ -18,8 +18,10 @@ pub struct DiscussionState {
     pub panel: bool,
     /// The comment the cursor is on, one-based, as the panel numbers them.
     pub cursor: usize,
-    /// How far the panel is scrolled from the bottom.
+    /// How far the panel is scrolled from the top.
     pub scroll: usize,
+    /// The cursor for which `scroll` was last made visible.
+    visible_cursor: usize,
     /// The job id of the resolve in flight.
     ///
     /// Its own field rather than shared with the draft or the chat: three things can be
@@ -37,6 +39,7 @@ impl DiscussionState {
         self.panel = true;
         self.cursor = count.max(1);
         self.scroll = 0;
+        self.visible_cursor = 0;
     }
 
     /// Forgets the panel, keeping nothing.
@@ -44,6 +47,7 @@ impl DiscussionState {
         self.panel = false;
         self.cursor = 1;
         self.scroll = 0;
+        self.visible_cursor = 0;
     }
 
     /// Moves the cursor, keeping it inside the list.
@@ -66,6 +70,18 @@ impl DiscussionState {
     #[must_use]
     pub fn index(&self) -> Option<usize> {
         self.cursor.checked_sub(1)
+    }
+
+    /// Whether a cursor movement needs its wrapped comment brought into view.
+    #[must_use]
+    pub const fn needs_visibility_sync(&self) -> bool {
+        self.cursor != self.visible_cursor
+    }
+
+    /// Records that the current cursor is visible at the supplied offset.
+    pub fn set_visible(&mut self, offset: usize) {
+        self.scroll = offset;
+        self.visible_cursor = self.cursor;
     }
 }
 

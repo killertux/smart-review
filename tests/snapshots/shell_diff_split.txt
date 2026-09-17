@@ -3,11 +3,11 @@
 ┌ path order (3) ────────────────┐┌ 3 files +2 −1 · split · ctx 3 ───────────────────────────────────────────────────────────────────────────────────┐
 │ ▾ docs (1)                     ││── M src/domain/invoice.rs                                                                                        │
 │    B logo.png                  ││@@ -12,4 +14,5 @@ impl Invoice {                                                                                  │
-│ ▾ scripts (1)                  ││   12     pub fn total(&self) -> Money { │   14     pub fn total(&self) -> Money {                                │
-│    M build.sh                  ││   13         self.lines.sum() │   15         let gross = self.lines.sum();                                       │
-│ ▾ src (1)                      ││                                                      │   16         gross - self.discount                        │
-│   ▾ domain (1)                 ││   14     } │   17     }                                                                                          │
-│     ·M invoice.rs       +2 −1  ││   15 } │   18 }                                                                                                  │
+│ ▾ scripts (1)                  ││   12     pub fn total(&self) -> Money {                │   14     pub fn total(&self) -> Money {                 │
+│    M build.sh                  ││   13         self.lines.sum()                          │   15         let gross = self.lines.sum();              │
+│ ▾ src (1)                      ││                                                        │   16         gross - self.discount                      │
+│   ▾ domain (1)                 ││   14     }                                             │   17     }                                              │
+│     ·M invoice.rs       +2 −1  ││   15 }                                                 │   18 }                                                  │
 │                                ││── A docs/logo.png                                                                                                │
 │                                ││   binary file, not shown                                                                                         │
 │                                ││── M scripts/build.sh                                                                                             │

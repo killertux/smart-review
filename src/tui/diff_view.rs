@@ -528,11 +528,11 @@ impl DiffView {
         let Some(row) = self.split_rows.get(start.saturating_add(visible_row)) else {
             return;
         };
-        let midpoint = area.x.saturating_add(area.width / 2);
-        let source = if column < midpoint {
-            row.left_unified
-        } else {
-            row.right_unified
+        let divider = area.x.saturating_add(area.width.saturating_sub(1) / 2);
+        let source = match column.cmp(&divider) {
+            std::cmp::Ordering::Less => row.left_unified,
+            std::cmp::Ordering::Greater => row.right_unified,
+            std::cmp::Ordering::Equal => None,
         }
         .or_else(|| row.full.as_ref().map(|_| row.unified));
         if let Some(source) = source {

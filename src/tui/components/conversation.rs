@@ -62,17 +62,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         theme,
         body.width.saturating_sub(2),
     );
-    let selected = lines.iter().position(|line| {
-        line.spans
-            .first()
-            .is_some_and(|span| span.content.as_ref().contains('▸'))
-    });
-    let offset = selected.map_or_else(
-        || components::clamp_offset(app.discussion().scroll, height, lines.len()),
-        |selected| {
-            components::ensure_visible(selected, app.discussion().scroll, height, lines.len())
-        },
-    );
+    let offset = components::clamp_offset(app.discussion().scroll, height, lines.len());
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
 
     let footer = Line::from(Span::styled(
@@ -92,6 +82,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let (Some(area), Some(composer)) = (composer_area, app.drafts().composer.as_ref()) {
         super::drafts::render_composer(frame, area, app, composer);
     }
+}
+
+/// The offset that places the selected comment header and its body at the top of the panel.
+#[must_use]
+pub(crate) fn selected_offset(area: Rect, app: &App) -> Option<usize> {
+    let area = centered(area, PANEL_PERCENT_X, PANEL_PERCENT_Y);
+    let composing = app
+        .drafts()
+        .composer
+        .as_ref()
+        .is_some_and(|composer| !composer.target.is_staged());
+    let (body, _) = composer_split(area, composing);
+    let lines = lines(
+        app.conversation(),
+        app.discussion().index(),
+        app.now(),
+        &app.theme,
+        body.width.saturating_sub(2),
+    );
+    lines.iter().position(|line| {
+        line.spans
+            .first()
+            .is_some_and(|span| span.content.as_ref().contains('▸'))
+    })
 }
 
 /// What the panel's footer says the keys do.
