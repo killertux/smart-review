@@ -826,6 +826,8 @@ enum Stop {
     Tree,
     /// The diff text.
     Diff,
+    /// The visible line-comment composer.
+    Composer,
     /// The conversation.
     Chat,
 }
@@ -835,7 +837,8 @@ impl Stop {
     const fn next(self) -> Self {
         match self {
             Self::Tree => Self::Diff,
-            Self::Diff => Self::Chat,
+            Self::Diff => Self::Composer,
+            Self::Composer => Self::Chat,
             Self::Chat => Self::Tree,
         }
     }
@@ -844,24 +847,29 @@ impl Stop {
     const fn prev(self) -> Self {
         match self {
             Self::Tree => Self::Chat,
+            Self::Chat => Self::Composer,
+            Self::Composer => Self::Diff,
             Self::Diff => Self::Tree,
-            Self::Chat => Self::Diff,
         }
     }
 }
 
 fn switch_pane(app: &mut App, forward: bool) -> Effect {
     if let Some(view) = app.review.as_mut() {
-        let current = match (app.focus, view.tree_focused) {
-            (crate::tui::app::Pane::Chat, _) => Stop::Chat,
-            (_, true) => Stop::Tree,
+        let current = match (app.focus_target, app.focus, view.tree_focused) {
+            (crate::tui::app::FocusTarget::CommentComposer, _, _) => Stop::Composer,
+            (_, crate::tui::app::Pane::Chat, _) => Stop::Chat,
+            (_, _, true) => Stop::Tree,
             _ => Stop::Diff,
         };
-        let stop = if forward {
+        let mut stop = if forward {
             current.next()
         } else {
             current.prev()
         };
+        if stop == Stop::Composer && !app.drafts.is_composing() {
+            stop = if forward { stop.next() } else { stop.prev() };
+        }
         return focus_stop(app, stop);
     }
     let pane = if forward {
@@ -894,6 +902,15 @@ fn focus_stop(app: &mut App, stop: Stop) -> Effect {
             }
             set_focus(app, crate::tui::app::Pane::Diff)
         }
+        Stop::Composer => {
+            if !app.drafts.is_composing() {
+                return focus_stop(app, Stop::Tree);
+            }
+            app.focus = crate::tui::app::Pane::Diff;
+            app.focus_target = crate::tui::app::FocusTarget::CommentComposer;
+            app.mode = crate::tui::keymap::Mode::Insert;
+            Effect::SaveState
+        }
         Stop::Chat => {
             // A focus that lands on a pane which is not drawn would leave the keyboard
             // in a place with nothing to type into.
@@ -911,6 +928,11 @@ fn focus_stop(app: &mut App, stop: Stop) -> Effect {
 
 fn set_focus(app: &mut App, pane: crate::tui::app::Pane) -> Effect {
     app.focus = pane;
+    app.focus_target = if pane == crate::tui::app::Pane::Chat {
+        crate::tui::app::FocusTarget::ChatInput
+    } else {
+        crate::tui::app::FocusTarget::Diff
+    };
     app.state.focus = Some(pane.label().to_owned());
     // The chat compose box is a text-entry surface, so focusing it switches the app to
     // insert mode and leaving it switches back: the status line then says which of the

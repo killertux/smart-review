@@ -116,6 +116,14 @@ impl SplitRow {
     pub fn covers(&self, cursor: usize, next_unified: usize) -> bool {
         cursor >= self.unified && cursor < next_unified
     }
+
+    /// Whether this rendered row contains the selected source row (IR-09).
+    #[must_use]
+    pub fn contains(&self, source: usize) -> bool {
+        self.unified == source
+            || self.left_unified == Some(source)
+            || self.right_unified == Some(source)
+    }
 }
 
 /// A row of the file tree.
@@ -522,9 +530,9 @@ impl DiffView {
         };
         let midpoint = area.x.saturating_add(area.width / 2);
         let source = if column < midpoint {
-            row.left_unified.or(row.right_unified)
+            row.left_unified
         } else {
-            row.right_unified.or(row.left_unified)
+            row.right_unified
         }
         .or_else(|| row.full.as_ref().map(|_| row.unified));
         if let Some(source) = source {
@@ -1282,14 +1290,14 @@ fn anchor_of(comment: &crate::domain::pr::ReviewComment) -> Option<(&str, bool, 
 
 fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
     let mut split: Vec<SplitRow> = Vec::with_capacity(rows.len());
-    let mut index = Vec::with_capacity(rows.len());
+    let mut index = vec![0; rows.len()];
 
     let mut position = 0;
     while position < rows.len() {
         let row = &rows[position];
 
         if row.kind != RowKind::Line {
-            index.push(split.len());
+            index[position] = split.len();
             split.push(SplitRow {
                 full: Some(row.clone()),
                 left: None,
@@ -1308,12 +1316,10 @@ fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
         let mut additions: Vec<DiffLine> = Vec::new();
         let start = position;
         while position < rows.len() && rows[position].line_kind == Some(LineKind::Delete) {
-            index.push(split.len());
             deletions.push(as_line(&rows[position]));
             position += 1;
         }
         while position < rows.len() && rows[position].line_kind == Some(LineKind::Add) {
-            index.push(split.len());
             additions.push(as_line(&rows[position]));
             position += 1;
         }
@@ -1321,7 +1327,7 @@ fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
         if deletions.is_empty() && additions.is_empty() {
             // A context line keeps both sides.
             let line = as_line(row);
-            index.push(split.len());
+            index[position] = split.len();
             split.push(SplitRow {
                 full: None,
                 left: Some(line.clone()),
@@ -1339,12 +1345,19 @@ fn build_split(rows: &[DiffRow]) -> (Vec<SplitRow>, Vec<usize>) {
         for slot in 0..deletions.len().max(additions.len()) {
             let left_unified = (slot < deletions.len()).then_some(start + slot);
             let right_unified = (slot < additions.len()).then_some(start + deletions.len() + slot);
+            let split_index = split.len();
+            if let Some(source) = left_unified {
+                index[source] = split_index;
+            }
+            if let Some(source) = right_unified {
+                index[source] = split_index;
+            }
             split.push(SplitRow {
                 full: None,
                 left: deletions.get(slot).cloned(),
                 right: additions.get(slot).cloned(),
                 file: row.file,
-                unified: start,
+                unified: left_unified.or(right_unified).unwrap_or(start),
                 left_unified,
                 right_unified,
             });

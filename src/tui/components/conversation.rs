@@ -62,7 +62,17 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         theme,
         body.width.saturating_sub(2),
     );
-    let offset = components::clamp_offset(app.discussion().scroll, height, lines.len());
+    let selected = lines.iter().position(|line| {
+        line.spans
+            .first()
+            .is_some_and(|span| span.content.as_ref().contains('▸'))
+    });
+    let offset = selected.map_or_else(
+        || components::clamp_offset(app.discussion().scroll, height, lines.len()),
+        |selected| {
+            components::ensure_visible(selected, app.discussion().scroll, height, lines.len())
+        },
+    );
     let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
 
     let footer = Line::from(Span::styled(

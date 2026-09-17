@@ -320,6 +320,18 @@ pub enum Pane {
     Chat,
 }
 
+/// The concrete surface that receives review input (IR-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusTarget {
+    /// The diff text.
+    #[default]
+    Diff,
+    /// The inline line-comment composer.
+    CommentComposer,
+    /// The chat compose box.
+    ChatInput,
+}
+
 impl Pane {
     /// The next pane, in the order `Tab` walks them.
     ///
@@ -905,6 +917,8 @@ pub struct App {
     pub(crate) mutation_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
+    /// The visible review input target, distinct from its containing pane (IR-09).
+    pub(crate) focus_target: FocusTarget,
     /// The last doctor report, delivered by a job (FR-9.3).
     pub(crate) checks: Vec<Check>,
     /// Whether a doctor job is in flight.
@@ -1051,6 +1065,7 @@ impl App {
             help_filter: None,
             help_scroll: 0,
             focus,
+            focus_target: FocusTarget::Diff,
             checks: Vec::new(),
             doctor_running: false,
             doctor_job: 0,
@@ -1933,6 +1948,7 @@ impl App {
         }
         self.mode = Mode::Insert;
         self.focus = Pane::Diff;
+        self.focus_target = FocusTarget::CommentComposer;
         Effect::None
     }
 
@@ -1956,16 +1972,20 @@ impl App {
         Effect::None
     }
 
-    /// Whether the comment composer has the keyboard (FR-6.2).
+    /// Whether a comment composer is open (FR-6.2).
     #[must_use]
     pub fn draft_is_composing(&self) -> bool {
         // The conversation panel is the one overlay a compose box may sit inside: the
         // panel is where you read what was said, and `c` in it writes the next thing
         // (FR-6.4). Every other overlay is a different question being asked.
         self.drafts.is_composing()
-            && self.focus == Pane::Diff
             && matches!(self.overlay, Overlay::None | Overlay::Conversation)
             && self.pending.is_empty()
+    }
+
+    /// Whether the open comment composer is the current keyboard target (IR-09).
+    fn draft_has_focus(&self) -> bool {
+        self.draft_is_composing() && self.focus_target == FocusTarget::CommentComposer
     }
 
     /// A key pressed while the comment composer has the keyboard (FR-6.2).
@@ -2335,6 +2355,7 @@ impl App {
             .compose_reply(anchor, thread.root, thread.thread.clone());
         self.mode = Mode::Insert;
         self.focus = Pane::Diff;
+        self.focus_target = FocusTarget::CommentComposer;
         Effect::None
     }
 
@@ -2351,6 +2372,7 @@ impl App {
         self.open_overlay(Overlay::Conversation);
         self.drafts.compose_conversation();
         self.mode = Mode::Insert;
+        self.focus_target = FocusTarget::CommentComposer;
         Effect::None
     }
 
@@ -4177,6 +4199,9 @@ impl App {
     /// The wheel scrolls whatever the pointer is over, and a click focuses the pane
     /// and moves the selection to the row under the pointer.
     pub fn on_mouse(&mut self, event: event::MouseEvent) -> Effect {
+        if self.geometry.width == 0 {
+            return Effect::None;
+        }
         match event.kind {
             event::MouseEventKind::ScrollDown => {
                 self.scroll_at(event.column, event.row, 1);
@@ -4264,6 +4289,14 @@ impl App {
                 let Some(layout) = self.geometry.review else {
                     return;
                 };
+                if layout
+                    .composer
+                    .is_some_and(|composer| composer.contains((column, row).into()))
+                {
+                    self.focus_target = FocusTarget::CommentComposer;
+                    self.mode = Mode::Insert;
+                    return;
+                }
                 let split_available =
                     self.terminal_width() >= crate::tui::components::review::SPLIT_MIN_WIDTH;
                 if let Some(view) = self.review.as_mut() {
@@ -4280,6 +4313,7 @@ impl App {
                             view.activate_tree();
                         }
                     } else if let Some(offset) = row_in(layout.diff, row) {
+                        self.focus_target = FocusTarget::Diff;
                         let split = view.split && split_available;
                         let index = view.scroll + offset;
                         if split {
@@ -4295,6 +4329,7 @@ impl App {
             // box, which is the only thing there that can be edited.
             Pane::Chat => {
                 self.chat.scroll = 0;
+                self.focus_target = FocusTarget::ChatInput;
             }
         }
     }
@@ -4312,7 +4347,10 @@ impl App {
                 return Some(Pane::Chat);
             }
             return (layout.tree.contains((column, row).into())
-                || layout.diff.contains((column, row).into()))
+                || layout.diff.contains((column, row).into())
+                || layout
+                    .composer
+                    .is_some_and(|composer| composer.contains((column, row).into())))
             .then_some(Pane::Diff);
         }
         self.geometry
@@ -4754,7 +4792,7 @@ impl App {
             // The comment composer comes first: both it and the chat compose box are
             // insert-mode text entry, and only one of them can be the thing the user is
             // looking at (FR-6.2).
-            Mode::Insert if self.draft_is_composing() => self.on_draft_input_key(combo),
+            Mode::Insert if self.draft_has_focus() => self.on_draft_input_key(combo),
             Mode::Insert if self.chat_is_composing() => self.on_chat_input_key(combo),
             Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
@@ -4773,6 +4811,7 @@ impl App {
             return;
         }
         if self.focus == Pane::Chat {
+            self.focus_target = FocusTarget::ChatInput;
             self.mode = Mode::Insert;
         } else if self.mode == Mode::Insert {
             self.mode = Mode::Normal;
@@ -4788,7 +4827,7 @@ impl App {
     pub fn chat_is_composing(&self) -> bool {
         self.review.is_some()
             && self.chat.open
-            && self.focus == Pane::Chat
+            && self.focus_target == FocusTarget::ChatInput
             && self.overlay == Overlay::None
             && self.pending.is_empty()
     }
@@ -5774,6 +5813,7 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         if layout::is_too_small(area) {
+            self.geometry = Geometry::default();
             components::panes::render_too_small(frame, area, &self.theme);
             return;
         }
@@ -8346,6 +8386,34 @@ mod tests {
             Some("X"),
             "the comment keeps its own text while chat owns the keyboard"
         );
+
+        frame(&mut app, 160, 40);
+        let composer = app
+            .geometry
+            .review
+            .expect("review layout")
+            .composer
+            .expect("visible composer");
+        app.on_mouse(click(composer.x + 2, composer.y + 2));
+        press(&mut app, "Z");
+        assert_eq!(app.chat.input.text(), "Y");
+        assert_eq!(
+            app.drafts
+                .composer
+                .as_ref()
+                .map(|composer| composer.input.text()),
+            Some("XZ")
+        );
+    }
+
+    #[test]
+    fn ir_09_a_too_small_frame_disables_stale_mouse_geometry() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+        let before = app.review.as_ref().expect("review").cursor;
+        frame(&mut app, 79, 23);
+        app.on_mouse(wheel(60, 12, true));
+        assert_eq!(app.review.as_ref().expect("review").cursor, before);
     }
 
     #[test]

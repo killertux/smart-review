@@ -484,7 +484,7 @@ fn split_line(
     }
 
     let half = usize::from(width).saturating_sub(3) / 2;
-    let selected = row.covers(view.selected_unified(), view.selected_unified() + 1);
+    let selected = row.contains(view.selected_unified());
     let mut spans = Vec::with_capacity(6);
 
     for (left_side, line) in [(true, row.left.as_ref()), (false, row.right.as_ref())] {
