@@ -87,7 +87,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         }
         ReviewTab::Checks => render_checks(frame, layout.content, app),
-        ReviewTab::Discussion => render_discussion(frame, layout.content, app),
+        ReviewTab::Discussion => {
+            let (discussion, composer) =
+                super::drafts::composer_split(layout.content, app.drafts().is_composing());
+            render_discussion(frame, discussion, app);
+            if let Some(composer) = composer
+                && let Some(draft) = app.drafts().composer.as_ref()
+            {
+                super::drafts::render_composer(frame, composer, app, draft);
+            }
+        }
         ReviewTab::Ask => super::chat::render(frame, layout.content, app),
     }
 }

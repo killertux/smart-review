@@ -102,7 +102,7 @@ pub enum Target {
     /// thread read failed, in which case the reply still works and resolving does not.
     Thread {
         /// Where the thread is, for the label.
-        anchor: Anchor,
+        anchor: Option<Anchor>,
         /// The comment being answered.
         root: u64,
         /// GitHub's thread id, when it is known.
@@ -122,7 +122,10 @@ impl Target {
     pub fn title(&self) -> String {
         match self {
             Self::Line(anchor) => format!("comment on {}", anchor.label()),
-            Self::Thread { anchor, .. } => format!("reply on {}", anchor.label()),
+            Self::Thread { anchor, .. } => anchor.as_ref().map_or_else(
+                || "reply on an outdated thread".to_owned(),
+                |anchor| format!("reply on {}", anchor.label()),
+            ),
             Self::Conversation => "comment on the pull request's conversation".to_owned(),
         }
     }
@@ -132,7 +135,10 @@ impl Target {
     pub fn label(&self) -> String {
         match self {
             Self::Line(anchor) => anchor.label(),
-            Self::Thread { anchor, .. } => format!("reply on {}", anchor.label()),
+            Self::Thread { anchor, .. } => anchor.as_ref().map_or_else(
+                || "an outdated thread".to_owned(),
+                |anchor| format!("reply on {}", anchor.label()),
+            ),
             Self::Conversation => "the pull request's conversation".to_owned(),
         }
     }
@@ -141,7 +147,8 @@ impl Target {
     #[must_use]
     pub fn anchor(&self) -> Option<&Anchor> {
         match self {
-            Self::Line(anchor) | Self::Thread { anchor, .. } => Some(anchor),
+            Self::Line(anchor) => Some(anchor),
+            Self::Thread { anchor, .. } => anchor.as_ref(),
             Self::Conversation => None,
         }
     }
@@ -409,7 +416,7 @@ impl DraftState {
     }
 
     /// Opens the composer to answer a comment that is already there (FR-6.4).
-    pub fn compose_reply(&mut self, anchor: Anchor, root: u64, thread: Option<String>) {
+    pub fn compose_reply(&mut self, anchor: Option<Anchor>, root: u64, thread: Option<String>) {
         self.compose_target(Target::Thread {
             anchor,
             root,

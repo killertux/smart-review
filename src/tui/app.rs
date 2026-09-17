@@ -1509,13 +1509,23 @@ impl App {
             .selected_root
             .and_then(|id| roots.iter().position(|root| *root == id))
         else {
-            self.discussion.selected_root = roots.first().copied();
+            self.discussion.selected_root = if delta.is_negative() {
+                roots.first().copied()
+            } else {
+                roots.last().copied()
+            };
             return;
         };
         let last = isize::try_from(roots.len().saturating_sub(1)).unwrap_or(0);
-        let next = usize::try_from((isize::try_from(current).unwrap_or(0) + delta).clamp(0, last))
-            .unwrap_or(0);
+        let next = usize::try_from(
+            isize::try_from(current)
+                .unwrap_or(0)
+                .saturating_add(delta)
+                .clamp(0, last),
+        )
+        .unwrap_or(0);
         self.discussion.selected_root = roots.get(next).copied();
+        self.tab_scroll = self.tab_scroll.max(next);
     }
 
     /// The selected visible Discussion thread, retaining its stable root id on refresh.
@@ -2646,29 +2656,24 @@ impl App {
                 self.notice(NoticeLevel::Warn, "select a discussion thread to answer it");
                 return Effect::None;
             };
-            let Some(line) = comment.line.and_then(|line| u32::try_from(line).ok()) else {
-                self.notice(
-                    NoticeLevel::Warn,
-                    "this thread has no replyable line anchor",
-                );
-                return Effect::None;
-            };
-            let side = if comment
-                .side
-                .as_deref()
-                .is_some_and(|side| side.eq_ignore_ascii_case("LEFT"))
-            {
-                crate::domain::draft::Side::Old
-            } else {
-                crate::domain::draft::Side::New
-            };
-            let anchor = crate::tui::drafts::Anchor {
-                path: comment.path,
-                side,
-                line,
-                start_line: None,
-                head_sha: self.review.as_ref().and_then(|view| view.head_sha.clone()),
-            };
+            let anchor = comment
+                .line
+                .and_then(|line| u32::try_from(line).ok())
+                .map(|line| crate::tui::drafts::Anchor {
+                    path: comment.path,
+                    side: if comment
+                        .side
+                        .as_deref()
+                        .is_some_and(|side| side.eq_ignore_ascii_case("LEFT"))
+                    {
+                        crate::domain::draft::Side::Old
+                    } else {
+                        crate::domain::draft::Side::New
+                    },
+                    line,
+                    start_line: None,
+                    head_sha: self.review.as_ref().and_then(|view| view.head_sha.clone()),
+                });
             self.drafts
                 .compose_reply(anchor, comment.id, comment.thread_id);
             self.mode = Mode::Insert;
@@ -2688,7 +2693,7 @@ impl App {
             return Effect::None;
         };
         self.drafts
-            .compose_reply(anchor, thread.root, thread.thread.clone());
+            .compose_reply(Some(anchor), thread.root, thread.thread.clone());
         self.mode = Mode::Insert;
         self.focus = Pane::Diff;
         self.focus_target = FocusTarget::CommentComposer;
@@ -4157,6 +4162,11 @@ impl App {
             ),
         );
         self.detail = Some(detail);
+        if !reload_patch
+            && let (Some(view), Some(detail)) = (self.review.as_mut(), self.detail.as_ref())
+        {
+            view.set_comments(&detail.comments);
+        }
         if let Some((name, url)) = selected_check
             && let Some(detail) = self.detail.as_ref()
             && let Some(index) = detail

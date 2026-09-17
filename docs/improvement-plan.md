@@ -118,7 +118,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | In progress (`ir-07-remote-mutations`) |
 | [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | In progress (`ir-08-cancellation-progress`) |
 | [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | [Merged — PR #20](https://github.com/killertux/smart-review/pull/20) |
-| [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | Complete |
+| [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | In progress (`ir-10-real-pr-tabs`) |
 | [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | Not started |
 | [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | Not started |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | Not started |
@@ -980,33 +980,33 @@ obvious keyboard/mouse navigation. Counts refer to the data they label.
 
 ### Implementation steps
 
-1. [x] Implement the §3.5 tab model and actual selected state. Derive header labels,
+1. [ ] Implement the §3.5 tab model and actual selected state. Derive header labels,
    counts, keyboard actions, click rectangles and help from the same definitions.
-2. [x] Bind normal-mode 1–5 and expose tab actions in the registry/palette. Preserve
+2. [ ] Bind normal-mode 1–5 and expose tab actions in the registry/palette. Preserve
    typing of digits in every text-entry mode. Remove the fake unavailable header
    states and wrong Analysis approval/request-changes count.
-3. [x] Overview: title/author/state/base/head, author description, commits/summary metadata,
+3. [ ] Overview: title/author/state/base/head, author description, commits/summary metadata,
    review decision, checks/discussion overview, and analysis/setup/progress state.
    Keep author text clearly separate from later AI-generated inference.
-4. [x] Files: existing corrected tree/diff/composer workflow. Preserve cursor, folds,
+4. [ ] Files: existing corrected tree/diff/composer workflow. Preserve cursor, folds,
    order and scroll while the user visits another tab.
-5. [x] Checks: render names, queued/running/completed state, conclusion and available
+5. [ ] Checks: render names, queued/running/completed state, conclusion and available
    run URLs. Do not treat an empty check list as success. Show unavailable/stale data
    distinctly and retain readable cached data during refresh.
-6. [x] Open selected run/details URLs via a runtime effect and fakeable external-link
+6. [ ] Open selected run/details URLs via a runtime effect and fakeable external-link
    boundary. Use argv arrays and validate supported URL schemes. Opening a browser
    must not perform IO in a renderer or break terminal restoration.
-7. [x] Discussion: combine reachable lists for review bodies, inline threads and PR
+7. [ ] Discussion: combine reachable lists for review bodies, inline threads and PR
    conversation. Provide All/Open/Resolved/Outdated filters with honest counts and
    explicit empty states. Preserve parent/reply grouping.
-8. [x] Keep outdated threads readable even when no current diff anchor exists. Jump to
+8. [ ] Keep outdated threads readable even when no current diff anchor exists. Jump to
    code only for a valid current mapping; otherwise explain why that jump is unavailable.
    Never attach the comment to a nearby surviving line.
-9. [x] Route reply/resolve/comment actions to the IR-07 lifecycle. Refresh results
+9. [ ] Route reply/resolve/comment actions to the IR-07 lifecycle. Refresh results
    in-place and keep active selection stable.
-10. [x] Ask: expose chat transcript/input as the real tab. Existing leader shortcuts
+10. [ ] Ask: expose chat transcript/input as the real tab. Existing leader shortcuts
     select/focus the appropriate destination instead of creating an unrelated state.
-11. [x] Implement an 80×24 layout with full-width active content and a collapsible file
+11. [ ] Implement an 80×24 layout with full-width active content and a collapsible file
     list; do not squeeze all panels simultaneously. Update generated docs and snapshots.
 
 ### Required regression cases

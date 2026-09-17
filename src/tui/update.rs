@@ -134,6 +134,13 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         app.notice(NoticeLevel::Warn, "select Files to use that diff action");
         return Effect::None;
     }
+    if app.review.is_some() && !tab_allows_action(app.review_tab(), id) {
+        app.notice(
+            NoticeLevel::Warn,
+            "that action is unavailable in this pull-request tab",
+        );
+        return Effect::None;
+    }
     match id {
         "app.quit" => {
             app.quit();
@@ -270,6 +277,18 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             );
             Effect::None
         }
+    }
+}
+
+fn tab_allows_action(tab: crate::tui::app::ReviewTab, id: &str) -> bool {
+    match id {
+        "review.reply" | "review.toggle_resolved" => matches!(
+            tab,
+            crate::tui::app::ReviewTab::Files | crate::tui::app::ReviewTab::Discussion
+        ),
+        "review.cycle_discussion_filter" => tab == crate::tui::app::ReviewTab::Discussion,
+        "search.next" | "search.prev" => tab == crate::tui::app::ReviewTab::Files,
+        _ => true,
     }
 }
 
@@ -546,7 +565,7 @@ fn move_discussion_selection(app: &mut App, id: &str) {
     match id {
         "nav.up" => app.move_discussion_selection(-1),
         "nav.down" => app.move_discussion_selection(1),
-        "nav.top" => app.discussion.selected_root = None,
+        "nav.top" => app.move_discussion_selection(isize::MIN),
         "nav.bottom" => app.move_discussion_selection(isize::MAX),
         _ => {}
     }
@@ -744,6 +763,10 @@ fn open_selected(app: &mut App) -> Effect {
             NoticeLevel::Warn,
             "the selected check has an unsupported URL",
         );
+        return Effect::None;
+    }
+    if app.review.is_some() && app.review_tab() != crate::tui::app::ReviewTab::Files {
+        app.notice(NoticeLevel::Warn, "this tab has no item to open");
         return Effect::None;
     }
     if let Some(view) = app.review.as_mut() {
@@ -1486,6 +1509,7 @@ fn chat_command(app: &mut App, argument: &str) -> Effect {
             Effect::None
         }
         "new" => {
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             app.notice(
                 NoticeLevel::Info,
                 "starting a new conversation; the old ones stay in `:chat list`".to_owned(),
@@ -1503,6 +1527,7 @@ fn chat_command(app: &mut App, argument: &str) -> Effect {
                 app.list_chats();
                 return Effect::None;
             }
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             Effect::OpenChat(rest)
         }
         "export" => Effect::ExportChat(if rest.is_empty() {
@@ -1510,7 +1535,10 @@ fn chat_command(app: &mut App, argument: &str) -> Effect {
         } else {
             rest
         }),
-        "retry" => Effect::RetryChat,
+        "retry" => {
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
+            Effect::RetryChat
+        }
         other => {
             app.command_error(format!(
                 "{other} is not a chat command; use new, list, open <id>, export [md|json] or retry"
