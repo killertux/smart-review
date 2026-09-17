@@ -605,6 +605,17 @@ impl DiffView {
         ))
     }
 
+    /// The visible origin of the recommended order (IR-11).
+    #[must_use]
+    pub fn order_provenance(&self) -> Option<&'static str> {
+        let plan = self.plan.as_ref()?;
+        Some(match (plan.source, plan.overridden) {
+            (crate::domain::plan::PlanSource::Analysis, false) => "AI",
+            (crate::domain::plan::PlanSource::Heuristic, false) => "rules",
+            (_, true) => "manual override",
+        })
+    }
+
     /// The split row that shows the cursor, and the rows after it.
     ///
     /// The renderer walks this instead of the unified rows when the side-by-side
@@ -2039,6 +2050,23 @@ Binary files /dev/null and b/docs/logo.png differ
             .collect();
         assert_eq!(tree_files, vec![1, 0, 2]);
         assert_eq!(row_files, tree_files);
+    }
+
+    #[test]
+    fn ir_11_manual_group_changes_rebuild_the_same_effective_row_order() {
+        let mut view = view();
+        let mut plan = conflicting_plan();
+        assert!(plan.move_group("domain", -1));
+        view.set_plan(Some(plan));
+
+        let headers: Vec<usize> = view
+            .rows
+            .iter()
+            .filter(|row| row.is_file_start())
+            .map(|row| row.file)
+            .collect();
+        assert_eq!(headers, vec![0, 1, 2]);
+        assert_eq!(view.order_provenance(), Some("manual override"));
     }
 
     #[test]

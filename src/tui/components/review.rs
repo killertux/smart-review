@@ -530,7 +530,15 @@ fn render_tree(frame: &mut Frame<'_>, area: Rect, app: &App, view: &DiffView) {
 /// show them without cutting them off, and a title that says half of something is
 /// worse than a title that says one thing.
 fn tree_title(view: &DiffView) -> String {
-    format!("{} ({})", view.order.label(), view.patch.stats().files)
+    let provenance = view
+        .order_provenance()
+        .map_or_else(String::new, |source| format!(" · {source}"));
+    format!(
+        "{}{} ({})",
+        view.order.label(),
+        provenance,
+        view.patch.stats().files
+    )
 }
 
 /// One tree row.
@@ -1092,6 +1100,7 @@ index 1a2b3c4..5d6e7f8 100644
         assert!(rendered.contains("rules first"), "{rendered}");
         assert!(rendered.contains("plan ·"), "{rendered}");
         assert!(rendered.contains("path"), "{rendered}");
+        assert!(rendered.contains("AI"), "{rendered}");
     }
 
     #[test]
