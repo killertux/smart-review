@@ -893,6 +893,12 @@ pub struct App {
     pub(crate) detail: Option<PullRequestDetail>,
     /// The review view, present when a pull request is open (FR-3.3).
     pub(crate) review: Option<DiffView>,
+    /// The patch used for LLM context. It is retained independently of the displayed
+    /// diff, whose whitespace/context controls are presentation-only (IR-12).
+    context_patch: Option<Box<crate::domain::diff::Patch>>,
+    /// Job that fetches the presentation-independent patch, when local display options
+    /// differ from the canonical review diff (IR-12).
+    pub(crate) context_patch_job: u64,
     /// The currently selected pull-request destination (IR-10).
     pub(crate) review_tab: ReviewTab,
     /// Selected check row in the Checks tab (IR-10).
@@ -1077,6 +1083,8 @@ impl App {
             next_review_generation: 1,
             detail: None,
             review: None,
+            context_patch: None,
+            context_patch_job: 0,
             review_tab: ReviewTab::default(),
             check_cursor: 0,
             check_scroll: 0,
@@ -1257,6 +1265,9 @@ impl App {
         // and the diff are both in hand.
         view.set_comments(&detail.comments);
         self.detail = Some(detail);
+        if opening {
+            self.load_context_files();
+        }
         self.review = Some(view);
         if opening {
             // Files remains the opening destination: it preserves the established
@@ -1326,6 +1337,8 @@ impl App {
         self.review_session = None;
         self.detail = None;
         self.review = None;
+        self.context_patch = None;
+        self.context_patch_job = 0;
         self.review_tab = ReviewTab::default();
         self.check_cursor = 0;
         self.check_scroll = 0;
@@ -1720,7 +1733,16 @@ impl App {
                 outcome,
                 source,
                 head_sha,
-            } if job == self.patch_job => Some(self.apply_patch(*outcome, source, head_sha)),
+            } if job == self.patch_job => {
+                if job == self.context_patch_job {
+                    self.apply_context_patch(outcome.value().clone());
+                }
+                Some(self.apply_patch(*outcome, source, head_sha))
+            }
+            Outcome::Patch { outcome, .. } if job == self.context_patch_job => {
+                self.apply_context_patch(outcome.into_value());
+                Some(Effect::LoadAnalysis)
+            }
             Outcome::Catalog(load) if job == self.catalog_job => {
                 self.apply_catalog(*load);
                 None
@@ -1803,7 +1825,7 @@ impl App {
             // ones hide.
             Outcome::Stored { .. }
             | Outcome::Context { .. }
-            | Outcome::Analyzed(_)
+            | Outcome::Analyzed { .. }
             | Outcome::Abandoned
                 if job == self.panel.stored_job
                     || job == self.panel.context_job
@@ -1849,7 +1871,7 @@ impl App {
             | Outcome::MutationsRecovered { .. }
             | Outcome::Stored { .. }
             | Outcome::Context { .. }
-            | Outcome::Analyzed(_)
+            | Outcome::Analyzed { .. }
             | Outcome::ChatLoaded { .. }
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
@@ -1922,6 +1944,7 @@ impl App {
         if !self.chat.added.iter().any(|added| added == trimmed) {
             self.chat.added.push(trimmed.to_owned());
         }
+        self.invalidate_context_views();
         Ok(format!(
             "added {trimmed} to the context of this pull request ({} file(s) in total; \
              every question will include it)",
@@ -1939,7 +1962,16 @@ impl App {
         if self.chat.added.len() == before {
             return Err(format!("{path} was not in the context"));
         }
+        self.invalidate_context_views();
         Ok(format!("removed {path} from the context"))
+    }
+
+    /// Drops prepared manifests after a user changes the shared context input (IR-12).
+    fn invalidate_context_views(&mut self) {
+        self.panel.bundle = None;
+        self.panel.bundle_for = None;
+        self.chat_bundle = None;
+        self.chat_bundle_for = None;
     }
 
     /// Whether the checkout at head has a path, which is what `:context add` checks
@@ -1989,14 +2021,7 @@ impl App {
         // the same pull request, so the long analysis timeout would only hold a dead
         // connection open.
         chat.timeout_secs = CHAT_TIMEOUT_SECS;
-        let policy = crate::domain::context::BundlePolicy {
-            max_context_tokens: crate::application::models::context_budget_after_framing(
-                &resolved.settings,
-                crate::application::chat::system_prompt("").len(),
-            ),
-            max_file_bytes: self.config.llm.max_file_bytes,
-            ..crate::domain::context::BundlePolicy::default()
-        };
+        let policy = self.context_policy(resolved);
         let spec = crate::application::chat::ChatSpec {
             repo: self
                 .environment
@@ -2005,17 +2030,7 @@ impl App {
             pr: detail.summary.number,
             head_sha: detail.summary.head_sha.clone(),
             chat,
-            context: crate::application::context::ContextSpec {
-                detail: Box::new(detail.clone()),
-                patch: self
-                    .review
-                    .as_ref()
-                    .map(|view| Box::new(view.patch.clone())),
-                checkout: self.checkout(),
-                policy,
-                added: self.chat.added.clone(),
-                identity: self.context_identity(&policy),
-            },
+            context: self.context_spec(detail, policy),
             input_budget_tokens: resolved.settings.input_tokens,
             cost: model.and_then(|model| model.cost.clone()),
         };
@@ -3362,7 +3377,7 @@ impl App {
                 }
                 self.apply_context(*bundle, intent, identity)
             }
-            Outcome::Analyzed(run) if job == self.panel.job => {
+            Outcome::Analyzed { run, key } if job == self.panel.job => {
                 self.panel.job = 0;
                 if self.panel.state == AnalysisState::Cancelling {
                     if let crate::application::analysis::AnalysisRun::Cancelled { raw } = *run {
@@ -3372,7 +3387,7 @@ impl App {
                     self.panel.state = AnalysisState::Cancelled;
                     return None;
                 }
-                self.apply_analysis(*run);
+                self.apply_analysis(*run, *key);
                 None
             }
             Outcome::Abandoned
@@ -3544,29 +3559,16 @@ impl App {
     }
 
     /// Applies a finished run, whichever way it went (FR-4.1, FR-4.4).
-    pub fn apply_analysis(&mut self, run: crate::application::analysis::AnalysisRun) {
+    pub fn apply_analysis(
+        &mut self,
+        run: crate::application::analysis::AnalysisRun,
+        key: crate::ports::AnalysisKey,
+    ) {
         use crate::application::analysis::AnalysisRun;
         match run {
             AnalysisRun::Ready(ready) => {
                 let stored = crate::ports::StoredAnalysis {
-                    key: self
-                        .analysis_key()
-                        .unwrap_or_else(|| crate::ports::AnalysisKey {
-                            repo: String::new(),
-                            pr: self.detail.as_ref().map_or(0, |d| d.summary.number),
-                            head_sha: String::new(),
-                            base_sha: None,
-                            context_fingerprint: String::new(),
-                            identity_version: 1,
-                            provider: String::new(),
-                            model: String::new(),
-                            endpoint: None,
-                            thinking: None,
-                            input_tokens: 0,
-                            max_tokens: None,
-                            temperature: None,
-                            prompt_version: crate::domain::analysis::PROMPT_VERSION,
-                        }),
+                    key,
                     analysis: (*ready.analysis).clone(),
                     raw: ready.raw.clone(),
                     // The document is already in the cache (the use case stored it);
@@ -3693,17 +3695,12 @@ impl App {
             repo: environment.repo.key(),
             pr: detail.summary.number,
             head_sha: detail.summary.head_sha.clone(),
-            base_sha: self.checkout().map(|checkout| checkout.base_sha),
+            base_sha: self
+                .checkout()
+                .map(|checkout| checkout.base_sha)
+                .or_else(|| detail.base_sha.clone()),
             context_fingerprint: self
-                .context_identity(&BundlePolicy {
-                    max_context_tokens: crate::application::models::context_budget_after_framing(
-                        &resolved.settings,
-                        crate::domain::analysis::system_prompt(None).len()
-                            + crate::domain::analysis::user_prompt("").len(),
-                    ),
-                    max_file_bytes: self.config.llm.max_file_bytes,
-                    ..BundlePolicy::default()
-                })
+                .context_identity(&self.context_policy(resolved))
                 .fingerprint(),
             identity_version: 1,
             provider: resolved.provider.clone(),
@@ -3870,29 +3867,11 @@ impl App {
             .ok()
             .flatten()?;
         let chat = crate::application::models::analysis_chat(resolved, secret);
-        let policy = BundlePolicy {
-            max_context_tokens: crate::application::models::context_budget_after_framing(
-                &resolved.settings,
-                crate::domain::analysis::system_prompt(None).len()
-                    + crate::domain::analysis::user_prompt("").len(),
-            ),
-            max_file_bytes: self.config.llm.max_file_bytes,
-            ..BundlePolicy::default()
-        };
+        let policy = self.context_policy(resolved);
         Some(crate::application::analysis::AnalysisRequest {
             key,
             chat,
-            context: crate::application::context::ContextSpec {
-                detail: Box::new(detail.clone()),
-                patch: self
-                    .review
-                    .as_ref()
-                    .map(|view| Box::new(view.patch.clone())),
-                checkout: self.checkout(),
-                policy,
-                added: self.chat.added.clone(),
-                identity: self.context_identity(&policy),
-            },
+            context: self.context_spec(detail, policy),
             input_budget_tokens: resolved.settings.input_tokens,
         })
     }
@@ -3910,8 +3889,8 @@ impl App {
             .as_ref()
             .map(|detail| detail.summary.head_sha.clone())
             .unwrap_or_default();
-        let changed_paths = self.review.as_ref().map_or_else(Vec::new, |view| {
-            view.patch
+        let changed_paths = self.context_patch.as_ref().map_or_else(Vec::new, |patch| {
+            patch
                 .files
                 .iter()
                 .filter_map(|file| file.path().map(ToString::to_string))
@@ -3919,10 +3898,49 @@ impl App {
         });
         crate::application::context::ContextIdentity {
             head_sha,
-            base_sha: self.checkout().map(|checkout| checkout.base_sha),
+            base_sha: self
+                .checkout()
+                .map(|checkout| checkout.base_sha)
+                .or_else(|| {
+                    self.detail
+                        .as_ref()
+                        .and_then(|detail| detail.base_sha.clone())
+                }),
             changed_paths,
             added: self.chat.added.clone(),
             policy: *policy,
+        }
+    }
+
+    fn context_policy(
+        &self,
+        resolved: &crate::application::models::ResolvedSelection,
+    ) -> BundlePolicy {
+        BundlePolicy {
+            // One conservative source budget makes analysis, chat and inspection share
+            // an identical bundle; task prompts/history are budgeted afterwards.
+            max_context_tokens: crate::application::models::context_budget_after_framing(
+                &resolved.settings,
+                crate::domain::analysis::system_prompt(None).len()
+                    + crate::domain::analysis::user_prompt("").len(),
+            ),
+            max_file_bytes: self.config.llm.max_file_bytes,
+            ..BundlePolicy::default()
+        }
+    }
+
+    fn context_spec(
+        &self,
+        detail: &PullRequestDetail,
+        policy: BundlePolicy,
+    ) -> crate::application::context::ContextSpec {
+        crate::application::context::ContextSpec {
+            detail: Box::new(detail.clone()),
+            patch: self.context_patch.clone(),
+            checkout: self.checkout(),
+            policy,
+            added: self.chat.added.clone(),
+            identity: self.context_identity(&policy),
         }
     }
 
@@ -4215,16 +4233,13 @@ impl App {
         Some(label)
     }
 
-    /// Whether the analysis on screen describes an older commit than the pull request
-    /// is at (DEC-15).
+    /// Whether the analysis on screen has incompatible current provenance (IR-12).
     #[must_use]
     pub fn analysis_is_stale(&self) -> bool {
         let Some(stored) = self.panel.analysis.as_ref() else {
             return false;
         };
-        self.detail
-            .as_ref()
-            .is_some_and(|detail| detail.summary.head_sha != stored.analysis.head_sha)
+        self.analysis_key().is_none_or(|key| key != stored.key)
     }
 
     /// Stores a detail and says what was opened (FR-2.4).
@@ -4302,6 +4317,8 @@ impl App {
         self.workspace_job = 0;
         self.workspace_attempted_head = None;
         self.patch_job = 0;
+        self.context_patch = None;
+        self.context_patch_job = 0;
         self.panel = PanelState::default();
         self.chat_bundle = None;
         self.chat_bundle_for = None;
@@ -4423,6 +4440,18 @@ impl App {
         } else {
             Effect::None
         }
+    }
+
+    /// Records the parsed canonical patch after its own background request (IR-12).
+    pub(crate) fn apply_context_patch(&mut self, patch: crate::domain::diff::Patch) {
+        self.context_patch = Some(Box::new(patch));
+        self.context_patch_job = 0;
+    }
+
+    /// Whether a complete presentation-independent patch is ready for cache lookup.
+    #[must_use]
+    pub(crate) const fn has_context_patch(&self) -> bool {
+        self.context_patch.is_some()
     }
 
     /// Notes that a pull request is being opened, which the indicator shows.
@@ -7814,8 +7843,8 @@ mod tests {
             progress_through: 0,
             job: 7,
             owner: crate::tui::jobs::JobOwner::Global,
-            outcome: crate::tui::jobs::Outcome::Analyzed(Box::new(
-                crate::application::analysis::AnalysisRun::Ready(Box::new(
+            outcome: crate::tui::jobs::Outcome::Analyzed {
+                run: Box::new(crate::application::analysis::AnalysisRun::Ready(Box::new(
                     crate::application::analysis::Analyzed {
                         raw: "late success".to_owned(),
                         analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
@@ -7823,8 +7852,9 @@ mod tests {
                         repaired: false,
                         usage: None,
                     },
-                )),
-            )),
+                ))),
+                key: Box::new(crate::test_support::stored_analysis("abc123").key),
+            },
         });
         assert_eq!(app.panel.state, AnalysisState::Cancelled);
         assert!(app.panel.analysis.is_none(), "late success is discarded");

@@ -455,18 +455,36 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
             head_sha: head_sha.clone(),
             options,
         },
-        _ => Job::Patch { number, head_sha },
+        _ => Job::Patch {
+            number,
+            head_sha: head_sha.clone(),
+        },
     };
     let id = runner.submit_owned(review_job_owner(app), job);
     app.patch_job = id;
+    app.context_patch_job = id;
+    if let (Some(workspace), true) = (&app.workspace, app.workspace_ready())
+        && options != crate::ports::workspace::DiffOptions::default()
+    {
+        app.context_patch_job = runner.submit_owned(
+            review_job_owner(app),
+            Job::LocalPatch {
+                request: Box::new(crate::ports::workspace::DiffRequest {
+                    path: workspace.path.clone(),
+                    base_sha: workspace.base_sha.clone(),
+                    head_sha: workspace.head_sha.clone(),
+                    options: crate::ports::workspace::DiffOptions::default(),
+                }),
+                number,
+                head_sha: head_sha.clone(),
+                options: crate::ports::workspace::DiffOptions::default(),
+            },
+        );
+    }
     app.diff_loading = true;
     // The second step of the same wait: fetching a large diff is the slow half.
     app.advance_opening();
 
-    // The analysis cache is checked on the same occasion: a diff is reloaded when a
-    // pull request opens and when its context changes, and both are moments when the
-    // head may have moved (FR-4.3).
-    pending_effects.push(Effect::LoadAnalysis);
     // The conversation from the last run is read on the same occasion, so `<leader>c`
     // shows what was said rather than an empty box (FR-5.1).
     pending_effects.push(Effect::LoadChat);
@@ -1003,6 +1021,15 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             let number = app.detail.as_ref().map(|detail| detail.summary.number)?;
             let (draft, warning) = service.load(number, app.now());
             app.apply_loaded_draft(number, draft, warning);
+            if app.has_context_patch()
+                && let Some(key) = app.analysis_key()
+            {
+                let id = runner.submit_owned(
+                    review_job_owner(app),
+                    jobs::Job::LoadAnalysis { key: Box::new(key) },
+                );
+                app.record_stored_job(id);
+            }
             return Some(Effect::LoadMutations);
         }
         Effect::SaveDraft | Effect::SaveDraftAndReload => {

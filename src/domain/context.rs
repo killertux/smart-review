@@ -848,14 +848,15 @@ fn render_patch_filtered(
                 let body = &hunk.lines[start..end];
                 // The header is recomputed from this contiguous surviving range, so
                 // the numbers a model quotes back are valid source coordinates.
+                let (old_cursor, new_cursor) = hunk_range_cursors(hunk, start);
                 let old_start = body
                     .iter()
                     .find_map(|line| line.old_line)
-                    .unwrap_or(hunk.old_start);
+                    .unwrap_or(old_cursor);
                 let new_start = body
                     .iter()
                     .find_map(|line| line.new_line)
-                    .unwrap_or(hunk.new_start);
+                    .unwrap_or(new_cursor);
                 let old_count = body.iter().filter(|line| line.old_line.is_some()).count();
                 let new_count = body.iter().filter(|line| line.new_line.is_some()).count();
                 let _ = writeln!(
@@ -875,6 +876,24 @@ fn render_patch_filtered(
         }
     }
     out
+}
+
+/// The old/new source positions immediately before a reduced hunk range.
+///
+/// A pure insertion has no old-line number and a pure deletion has no new-line number;
+/// using the original hunk start for either fabricates a coordinate after a sparse gap.
+fn hunk_range_cursors(hunk: &crate::domain::diff::Hunk, start: usize) -> (u32, u32) {
+    let mut old = hunk.old_start;
+    let mut new = hunk.new_start;
+    for line in &hunk.lines[..start] {
+        if let Some(line) = line.old_line {
+            old = line.saturating_add(1);
+        }
+        if let Some(line) = line.new_line {
+            new = line.saturating_add(1);
+        }
+    }
+    (old, new)
 }
 
 /// The strictest decision for a patch file. A rename is allowed only when both its old
@@ -1348,6 +1367,23 @@ mod tests {
         assert_eq!(rendered.matches("@@ ").count(), 2, "{rendered}");
         assert!(rendered.contains("@@ -2,1 +2,1 @@"), "{rendered}");
         assert!(rendered.contains("@@ -7,1 +7,1 @@"), "{rendered}");
+    }
+
+    #[test]
+    fn ir_12_sparse_pure_insertions_and_deletions_keep_both_source_cursors() {
+        let additions = parse_patch(
+            "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,6 @@\n line 1\n+two\n line 2\n line 3\n+four\n line 4\n",
+        );
+        let rendered = render_patch(&additions, Some(0));
+        assert!(rendered.contains("@@ -2,0 +2,1 @@"), "{rendered}");
+        assert!(rendered.contains("@@ -4,0 +5,1 @@"), "{rendered}");
+
+        let deletions = parse_patch(
+            "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,6 +1,4 @@\n line 1\n-two\n line 2\n line 3\n-four\n line 4\n",
+        );
+        let rendered = render_patch(&deletions, Some(0));
+        assert!(rendered.contains("@@ -2,1 +2,0 @@"), "{rendered}");
+        assert!(rendered.contains("@@ -5,1 +4,0 @@"), "{rendered}");
     }
 
     #[test]

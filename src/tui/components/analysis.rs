@@ -169,10 +169,16 @@ fn running_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         lines.extend(section(theme, "Why", &preview.intent));
     }
     if !preview.risks.is_empty() {
-        let risks: Vec<(Severity, String, String, bool)> = preview
+        let risks: Vec<crate::application::analysis::PanelRisk> = preview
             .risks
             .iter()
-            .map(|risk| (risk.severity, risk.title.clone(), risk.why.clone(), true))
+            .map(|risk| crate::application::analysis::PanelRisk {
+                severity: risk.severity,
+                title: risk.title.clone(),
+                why: risk.why.clone(),
+                files: Vec::new(),
+                supported: true,
+            })
             .collect();
         lines.extend(risk_lines(theme, &risks));
     }
@@ -375,31 +381,41 @@ fn section(theme: &Theme, title: &str, body: &str) -> Vec<Line<'static>> {
 }
 
 /// The risk areas, most serious first (FR-4.1).
-fn risk_lines(theme: &Theme, risks: &[(Severity, String, String, bool)]) -> Vec<Line<'static>> {
+fn risk_lines(
+    theme: &Theme,
+    risks: &[crate::application::analysis::PanelRisk],
+) -> Vec<Line<'static>> {
     if risks.is_empty() {
         return Vec::new();
     }
     let mut lines = vec![Line::default(), heading(theme, "Risks")];
-    for (severity, title, why, supported) in risks {
+    for risk in risks {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  {:<6} ", severity.label()),
-                Severity::style(*severity, theme),
+                format!("  {:<6} ", risk.severity.label()),
+                Severity::style(risk.severity, theme),
             ),
             Span::styled(
-                if *supported {
-                    title.clone()
+                if risk.supported {
+                    if risk.files.is_empty() {
+                        risk.title.clone()
+                    } else {
+                        format!("{} [{}]", risk.title, risk.files.join(", "))
+                    }
                 } else {
-                    format!("{title} (unsupported: cited files are not in this change)")
+                    format!(
+                        "{} (unsupported: cited files are not in this change)",
+                        risk.title
+                    )
                 },
-                if *supported {
+                if risk.supported {
                     theme.style(element::FG)
                 } else {
                     theme.style(element::NOTICE_WARN)
                 },
             ),
         ]));
-        for line in wrap_paragraph(why, 88) {
+        for line in wrap_paragraph(&risk.why, 88) {
             lines.push(Line::from(Span::styled(
                 format!("          {line}"),
                 theme.style(element::MUTED),

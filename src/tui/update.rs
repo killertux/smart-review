@@ -2242,15 +2242,18 @@ mod tests {
         }
         assert_eq!(app.analysis_stream(), repaired);
 
-        app.apply_analysis(crate::application::analysis::AnalysisRun::Ready(Box::new(
-            crate::application::analysis::Analyzed {
-                raw: repaired.clone(),
-                analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
-                warnings: Vec::new(),
-                repaired: true,
-                usage: None,
-            },
-        )));
+        app.apply_analysis(
+            crate::application::analysis::AnalysisRun::Ready(Box::new(
+                crate::application::analysis::Analyzed {
+                    raw: repaired.clone(),
+                    analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
+                    warnings: Vec::new(),
+                    repaired: true,
+                    usage: None,
+                },
+            )),
+            crate::test_support::stored_analysis("abc123").key,
+        );
         assert_eq!(app.stored_analysis_raw(), Some(repaired.as_str()));
     }
 
@@ -2258,15 +2261,18 @@ mod tests {
     fn a_ready_analysis_orders_the_review_and_fills_the_panel() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(3);
-        app.apply_analysis(crate::application::analysis::AnalysisRun::Ready(Box::new(
-            crate::application::analysis::Analyzed {
-                raw: String::new(),
-                analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
-                warnings: vec!["one file was unclassified".to_owned()],
-                repaired: false,
-                usage: None,
-            },
-        )));
+        app.apply_analysis(
+            crate::application::analysis::AnalysisRun::Ready(Box::new(
+                crate::application::analysis::Analyzed {
+                    raw: String::new(),
+                    analysis: Box::new(crate::test_support::stored_analysis("abc123").analysis),
+                    warnings: vec!["one file was unclassified".to_owned()],
+                    repaired: false,
+                    usage: None,
+                },
+            )),
+            crate::test_support::stored_analysis("abc123").key,
+        );
 
         // FR-4.2: the tree is grouped by the plan, in the recommended order.
         let view = app.review.as_ref().expect("the review is open");
@@ -2292,14 +2298,17 @@ mod tests {
     fn an_unusable_answer_keeps_its_text_and_says_why() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(3);
-        app.apply_analysis(crate::application::analysis::AnalysisRun::Unparsed(
-            Box::new(crate::application::analysis::Unparsed {
-                raw: "I could not do that.".to_owned(),
-                reason: "the answer contained no JSON object".to_owned(),
-                repaired: true,
-                usage: None,
-            }),
-        ));
+        app.apply_analysis(
+            crate::application::analysis::AnalysisRun::Unparsed(Box::new(
+                crate::application::analysis::Unparsed {
+                    raw: "I could not do that.".to_owned(),
+                    reason: "the answer contained no JSON object".to_owned(),
+                    repaired: true,
+                    usage: None,
+                },
+            )),
+            crate::test_support::stored_analysis("abc123").key,
+        );
         // FR-4.1: the text is kept and shown, never silently dropped.
         let (reason, raw) = app.raw_answer().expect("the raw text");
         assert!(reason.contains("no JSON object"), "{reason}");
@@ -2315,9 +2324,10 @@ mod tests {
     fn a_cancelled_run_says_so_without_pretending_it_failed() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(3);
-        app.apply_analysis(crate::application::analysis::AnalysisRun::Cancelled {
-            raw: String::new(),
-        });
+        app.apply_analysis(
+            crate::application::analysis::AnalysisRun::Cancelled { raw: String::new() },
+            crate::test_support::stored_analysis("abc123").key,
+        );
         assert_eq!(
             app.analysis_state(),
             &crate::tui::app::AnalysisState::Cancelled

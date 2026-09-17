@@ -630,7 +630,7 @@ pub struct PanelModel {
     /// The inferred intent.
     pub intent: String,
     /// The risk areas, most serious first.
-    pub risks: Vec<(Severity, String, String, bool)>,
+    pub risks: Vec<PanelRisk>,
     /// The questions worth asking the author.
     pub questions: Vec<String>,
 }
@@ -642,18 +642,7 @@ impl PanelModel {
         Self {
             summary: analysis.summary.clone(),
             intent: analysis.intent.clone(),
-            risks: analysis
-                .risk_areas
-                .iter()
-                .map(|risk| {
-                    (
-                        risk.severity,
-                        risk.title.clone(),
-                        risk.why.clone(),
-                        risk.supported,
-                    )
-                })
-                .collect(),
+            risks: analysis.risk_areas.iter().map(PanelRisk::of).collect(),
             questions: analysis.suggested_questions.clone(),
         }
     }
@@ -665,6 +654,33 @@ impl PanelModel {
             && self.intent.is_empty()
             && self.risks.is_empty()
             && self.questions.is_empty()
+    }
+}
+
+/// A validated analysis risk and the evidence paths that support it (IR-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelRisk {
+    /// Severity supplied by the normalized analysis.
+    pub severity: Severity,
+    /// Short reviewer-facing title.
+    pub title: String,
+    /// Why the model raised it.
+    pub why: String,
+    /// Canonical paths which survived normalization; safe for display/navigation.
+    pub files: Vec<String>,
+    /// False when every cited path was unknown or ambiguous.
+    pub supported: bool,
+}
+
+impl PanelRisk {
+    fn of(risk: &crate::domain::analysis::RiskArea) -> Self {
+        Self {
+            severity: risk.severity,
+            title: risk.title.clone(),
+            why: risk.why.clone(),
+            files: risk.files.clone(),
+            supported: risk.supported,
+        }
     }
 }
 
@@ -1418,7 +1434,7 @@ mod tests {
         let panel = PanelModel::of(&ready.analysis);
         assert_eq!(panel.summary, "s");
         assert_eq!(panel.risks.len(), 1);
-        assert_eq!(panel.risks[0].0, Severity::High);
+        assert_eq!(panel.risks[0].severity, Severity::High);
         assert_eq!(panel.questions, ["Documented?"]);
         assert!(!panel.is_empty());
         assert!(PanelModel::default().is_empty());

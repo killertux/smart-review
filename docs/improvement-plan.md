@@ -120,7 +120,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | [Merged — PR #20](https://github.com/killertux/smart-review/pull/20) |
 | [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | [Merged — PR #21](https://github.com/killertux/smart-review/pull/21) |
 | [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | In progress (`ir-11-executable-review-order`) |
-| [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | Implemented |
+| [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | In progress (`ir-12-context-identity`) |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | Not started |
 | [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | Not started |
 | [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Not started |
