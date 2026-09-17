@@ -320,6 +320,18 @@ pub enum Pane {
     Chat,
 }
 
+/// The concrete surface that receives review input (IR-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusTarget {
+    /// The diff text.
+    #[default]
+    Diff,
+    /// The inline line-comment composer.
+    CommentComposer,
+    /// The chat compose box.
+    ChatInput,
+}
+
 impl Pane {
     /// The next pane, in the order `Tab` walks them.
     ///
@@ -379,14 +391,8 @@ struct Geometry {
     filter_bar: ratatui::layout::Rect,
     /// The list pane.
     list: ratatui::layout::Rect,
-    /// The whole body, for the bounds a click has to fall inside.
-    body: ratatui::layout::Rect,
-    /// The first row of the review panes, below the tab bar.
-    review_top: u16,
-    /// The width of the file tree, which separates the two review panes.
-    tree_width: u16,
-    /// The chat pane, when it is open (FR-5.1).
-    chat: Option<ratatui::layout::Rect>,
+    /// The review rectangles, when a pull request is open (IR-09).
+    review: Option<crate::tui::components::review::ReviewLayout>,
 }
 
 /// The popup that currently owns the screen, if any.
@@ -911,6 +917,8 @@ pub struct App {
     pub(crate) mutation_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
+    /// The visible review input target, distinct from its containing pane (IR-09).
+    pub(crate) focus_target: FocusTarget,
     /// The last doctor report, delivered by a job (FR-9.3).
     pub(crate) checks: Vec<Check>,
     /// Whether a doctor job is in flight.
@@ -1057,6 +1065,7 @@ impl App {
             help_filter: None,
             help_scroll: 0,
             focus,
+            focus_target: FocusTarget::Diff,
             checks: Vec::new(),
             doctor_running: false,
             doctor_job: 0,
@@ -1939,6 +1948,7 @@ impl App {
         }
         self.mode = Mode::Insert;
         self.focus = Pane::Diff;
+        self.focus_target = FocusTarget::CommentComposer;
         Effect::None
     }
 
@@ -1962,7 +1972,7 @@ impl App {
         Effect::None
     }
 
-    /// Whether the comment composer has the keyboard (FR-6.2).
+    /// Whether a comment composer is open (FR-6.2).
     #[must_use]
     pub fn draft_is_composing(&self) -> bool {
         // The conversation panel is the one overlay a compose box may sit inside: the
@@ -1971,6 +1981,11 @@ impl App {
         self.drafts.is_composing()
             && matches!(self.overlay, Overlay::None | Overlay::Conversation)
             && self.pending.is_empty()
+    }
+
+    /// Whether the open comment composer is the current keyboard target (IR-09).
+    fn draft_has_focus(&self) -> bool {
+        self.draft_is_composing() && self.focus_target == FocusTarget::CommentComposer
     }
 
     /// A key pressed while the comment composer has the keyboard (FR-6.2).
@@ -1983,6 +1998,7 @@ impl App {
     fn on_draft_input_key(&mut self, combo: KeyCombo) -> Effect {
         if combo.code == KeyCode::Esc {
             self.drafts.cancel_composer();
+            self.focus_target = FocusTarget::Diff;
             // Leaving the composer returns to what is behind it: the conversation panel
             // is a popup and takes its keys back, and with no overlay there is normal
             // mode. Setting this to `Normal` unconditionally left the panel open and
@@ -2271,6 +2287,7 @@ impl App {
                     self.drafts.anchor_to(&head);
                 }
                 self.mode = Mode::Normal;
+                self.focus_target = FocusTarget::Diff;
                 let count = self.drafts.draft.comments.len();
                 self.notice(
                     NoticeLevel::Info,
@@ -2340,6 +2357,7 @@ impl App {
             .compose_reply(anchor, thread.root, thread.thread.clone());
         self.mode = Mode::Insert;
         self.focus = Pane::Diff;
+        self.focus_target = FocusTarget::CommentComposer;
         Effect::None
     }
 
@@ -2356,6 +2374,7 @@ impl App {
         self.open_overlay(Overlay::Conversation);
         self.drafts.compose_conversation();
         self.mode = Mode::Insert;
+        self.focus_target = FocusTarget::CommentComposer;
         Effect::None
     }
 
@@ -4182,6 +4201,9 @@ impl App {
     /// The wheel scrolls whatever the pointer is over, and a click focuses the pane
     /// and moves the selection to the row under the pointer.
     pub fn on_mouse(&mut self, event: event::MouseEvent) -> Effect {
+        if self.geometry.width == 0 {
+            return Effect::None;
+        }
         match event.kind {
             event::MouseEventKind::ScrollDown => {
                 self.scroll_at(event.column, event.row, 1);
@@ -4201,6 +4223,10 @@ impl App {
 
     /// Scrolls the pane under the pointer.
     fn scroll_at(&mut self, column: u16, row: u16, delta: i32) {
+        if self.overlay_owns_pointer(column, row) {
+            self.scroll_overlay(delta);
+            return;
+        }
         // Three rows a notch, and it scrolls the *text*: a wheel is for moving what you
         // are reading. Moving the selection instead reads as the wheel being broken —
         // or backwards — because the text only budges once the selection reaches the
@@ -4213,9 +4239,11 @@ impl App {
             }
             Pane::Diff => {
                 if let Some(view) = self.review.as_mut() {
-                    // The tree and the diff share the region; the tree is the narrow
-                    // one on the left.
-                    if column < self.geometry.tree_width {
+                    if self
+                        .geometry
+                        .review
+                        .is_some_and(|layout| layout.tree.contains((column, row).into()))
+                    {
                         view.scroll_tree_by(delta * 3);
                     } else {
                         view.tree_focused = false;
@@ -4238,6 +4266,9 @@ impl App {
 
     /// Focuses the pane under the pointer and moves its cursor to the row clicked.
     fn click_at(&mut self, column: u16, row: u16) {
+        if self.overlay_owns_pointer(column, row) {
+            return;
+        }
         let Some(pane) = self.pane_at(column, row) else {
             return;
         };
@@ -4257,15 +4288,23 @@ impl App {
                 }
             }
             Pane::Diff => {
-                // The visible row under the pointer, turned into an absolute index by
-                // the offset the frame drew with. Passing the offset itself to
-                // `move_by`/`move_tree` (both of which are *relative*) is what made
-                // clicks land somewhere else entirely once anything had scrolled.
-                let Some(offset) = self.review_row(row) else {
+                let Some(layout) = self.geometry.review else {
                     return;
                 };
+                if layout
+                    .composer
+                    .is_some_and(|composer| composer.contains((column, row).into()))
+                {
+                    self.focus_target = FocusTarget::CommentComposer;
+                    self.mode = Mode::Insert;
+                    return;
+                }
+                let split_available =
+                    self.terminal_width() >= crate::tui::components::review::SPLIT_MIN_WIDTH;
                 if let Some(view) = self.review.as_mut() {
-                    if column < self.geometry.tree_width {
+                    if layout.tree.contains((column, row).into())
+                        && let Some(offset) = row_in(layout.tree, row)
+                    {
                         let index = view.tree_scroll + offset;
                         // Only a row that exists: clicking the empty space below the
                         // last file must not open it.
@@ -4275,9 +4314,13 @@ impl App {
                             // does: opening a file, or folding a folder (FR-7.5).
                             view.activate_tree();
                         }
-                    } else {
+                    } else if let Some(offset) = row_in(layout.diff, row) {
+                        self.focus_target = FocusTarget::Diff;
+                        let split = view.split && split_available;
                         let index = view.scroll + offset;
-                        if index < view.rows.len() {
+                        if split {
+                            view.select_split_row(offset, column, layout.diff);
+                        } else if index < view.rows.len() {
                             view.tree_focused = false;
                             view.select_row(index);
                         }
@@ -4288,19 +4331,9 @@ impl App {
             // box, which is the only thing there that can be edited.
             Pane::Chat => {
                 self.chat.scroll = 0;
+                self.focus_target = FocusTarget::ChatInput;
             }
         }
-    }
-
-    /// The row of a review pane a terminal row is over, as an offset into the visible
-    /// rows, or `None` when it is over a border, the tab bar, or nothing.
-    fn review_row(&self, row: u16) -> Option<usize> {
-        let first = self.geometry.review_top.saturating_add(1);
-        let last = self.geometry.body.bottom().saturating_sub(2);
-        if row < first || row > last {
-            return None;
-        }
-        Some(usize::from(row - first))
     }
 
     /// Which pane a terminal coordinate is in, if any.
@@ -4309,14 +4342,18 @@ impl App {
     /// must not move a cursor somewhere the user did not point at.
     fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
         if self.review.is_some() {
-            // The chat pane, when it is open, is below the review panes; the tree and
-            // the diff share the rest.
-            if let Some(chat) = self.geometry.chat
+            let layout = self.geometry.review?;
+            if let Some(chat) = layout.chat
                 && chat.contains(ratatui::layout::Position::from((column, row)))
             {
                 return Some(Pane::Chat);
             }
-            return (row >= self.geometry.review_top).then_some(Pane::Diff);
+            return (layout.tree.contains((column, row).into())
+                || layout.diff.contains((column, row).into())
+                || layout
+                    .composer
+                    .is_some_and(|composer| composer.contains((column, row).into())))
+            .then_some(Pane::Diff);
         }
         self.geometry
             .list
@@ -4330,15 +4367,21 @@ impl App {
     /// only: the render path still performs no IO.
     fn record_geometry(&mut self, body: ratatui::layout::Rect) {
         self.geometry.width = body.width;
-        self.geometry.body = body;
-        self.geometry.tree_width = crate::tui::components::review::TREE_WIDTH;
-        self.geometry.review_top = body.y + 1;
-        // The chat split comes from the same function the renderer uses, for the same
-        // reason the list's does (FR-7.5).
-        let (review_area, chat) =
-            crate::tui::components::chat::chat_split(body, self.review.is_some() && self.chat.open);
-        self.geometry.chat = chat;
-        self.geometry.review_top = review_area.y + 1;
+        self.geometry.review = self.review.is_some().then(|| {
+            crate::tui::components::review::layout(body, self.chat.open, self.drafts.is_composing())
+        });
+        if self.overlay != Overlay::Conversation
+            && self.focus_target == FocusTarget::CommentComposer
+            && self
+                .geometry
+                .review
+                .is_some_and(|layout| layout.composer.is_none())
+        {
+            // A composer that did not fit this frame cannot own invisible input. Its
+            // draft remains open and is available again when the layout has room.
+            self.focus_target = FocusTarget::Diff;
+            self.sync_mode_to_focus();
+        }
         // The filter bar sits above the list; the pane below it is the one the mouse
         // is tested against, and the same rectangle the renderer draws into.
         let (filter_bar, list) = components::panes::body_split(body);
@@ -4352,9 +4395,18 @@ impl App {
     /// The renderer and the mouse both read the result, so the row a click maps to is
     /// the row that was drawn there.
     fn sync_scroll(&mut self) {
-        let inner = self.review_body_height();
         if let Some(view) = self.review.as_mut() {
-            view.prepare(inner, inner);
+            let layout = self.geometry.review.unwrap_or_else(|| {
+                crate::tui::components::review::layout(
+                    self.geometry.list,
+                    self.chat.open,
+                    self.drafts.is_composing(),
+                )
+            });
+            view.prepare(
+                layout.diff.height.saturating_sub(2),
+                layout.tree.height.saturating_sub(2),
+            );
         }
         let height = crate::tui::components::pr_list::layout(self.geometry.list).height;
         let position = self.list.cursor_position().unwrap_or(0);
@@ -4373,13 +4425,42 @@ impl App {
     }
 
     /// How tall the review panes' row area is.
-    fn review_body_height(&self) -> u16 {
-        // The body, less the tab row, less the two borders.
-        self.geometry
-            .list
-            .height
-            .saturating_add(crate::tui::components::filter_bar::HEIGHT)
-            .saturating_sub(3)
+    pub(crate) fn review_layout(&self) -> Option<crate::tui::components::review::ReviewLayout> {
+        self.geometry.review
+    }
+
+    /// Whether a surface above the review owns this pointer event (IR-09).
+    ///
+    /// Modal overlays deliberately consume gestures outside their visible card too: a
+    /// wheel over the dimmed background must not mutate the hidden diff underneath.
+    fn overlay_owns_pointer(&self, _column: u16, _row: u16) -> bool {
+        self.picker.is_some() || self.overlay != Overlay::None
+    }
+
+    /// Scrolls the topmost scrollable overlay, never the obscured review (IR-09).
+    fn scroll_overlay(&mut self, delta: i32) {
+        let step = usize::try_from(delta.unsigned_abs() * 3).unwrap_or(3);
+        let down = |offset: &mut usize| {
+            if delta > 0 {
+                *offset = offset.saturating_add(step);
+            } else {
+                *offset = offset.saturating_sub(step);
+            }
+        };
+        match self.overlay {
+            Overlay::Help => down(&mut self.help_scroll),
+            Overlay::Analysis => down(&mut self.panel.scroll),
+            Overlay::Conversation => down(&mut self.discussion.scroll),
+            Overlay::None
+            | Overlay::Leader
+            | Overlay::Doctor
+            | Overlay::ThemePicker
+            | Overlay::Context
+            | Overlay::RawAnswer
+            | Overlay::Draft
+            | Overlay::Publish
+            | Overlay::Confirm => {}
+        }
     }
 
     /// Replaces the open comment composer's text after `$EDITOR` exits.
@@ -4725,7 +4806,7 @@ impl App {
             // The comment composer comes first: both it and the chat compose box are
             // insert-mode text entry, and only one of them can be the thing the user is
             // looking at (FR-6.2).
-            Mode::Insert if self.draft_is_composing() => self.on_draft_input_key(combo),
+            Mode::Insert if self.draft_has_focus() => self.on_draft_input_key(combo),
             Mode::Insert if self.chat_is_composing() => self.on_chat_input_key(combo),
             Mode::Normal | Mode::Insert | Mode::Visual => self.on_normal_key(combo),
         }
@@ -4744,6 +4825,7 @@ impl App {
             return;
         }
         if self.focus == Pane::Chat {
+            self.focus_target = FocusTarget::ChatInput;
             self.mode = Mode::Insert;
         } else if self.mode == Mode::Insert {
             self.mode = Mode::Normal;
@@ -4759,7 +4841,7 @@ impl App {
     pub fn chat_is_composing(&self) -> bool {
         self.review.is_some()
             && self.chat.open
-            && self.focus == Pane::Chat
+            && self.focus_target == FocusTarget::ChatInput
             && self.overlay == Overlay::None
             && self.pending.is_empty()
     }
@@ -5745,8 +5827,16 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
         if layout::is_too_small(area) {
+            self.geometry = Geometry::default();
             components::panes::render_too_small(frame, area, &self.theme);
             return;
+        }
+
+        if self.overlay == Overlay::Conversation
+            && self.discussion.needs_visibility_sync()
+            && let Some(offset) = crate::tui::components::conversation::selected_offset(area, self)
+        {
+            self.discussion.set_visible(offset);
         }
 
         let palette_rows = if self.mode == Mode::Command {
@@ -5789,6 +5879,13 @@ fn expiry_for(level: NoticeLevel) -> Option<Instant> {
         NoticeLevel::Error => None,
         NoticeLevel::Info | NoticeLevel::Warn => Some(Instant::now() + NOTICE_LIFETIME),
     }
+}
+
+/// The visible text-row offset at `row`, excluding a bordered pane's frame (IR-09).
+fn row_in(area: ratatui::layout::Rect, row: u16) -> Option<usize> {
+    let first = area.y.saturating_add(1);
+    let last = area.bottom().saturating_sub(1);
+    (row >= first && row < last).then(|| usize::from(row - first))
 }
 
 fn clamp_cursor(current: usize, delta: i32, count: usize) -> usize {
@@ -6523,6 +6620,21 @@ mod tests {
         panic!("`{needle}` is not on screen");
     }
 
+    /// The displayed column of an ASCII marker.
+    fn column_of(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        row: u16,
+        needle: &str,
+    ) -> u16 {
+        let buffer = terminal.backend().buffer();
+        let mut line = String::new();
+        for x in buffer.area().left()..buffer.area().right() {
+            line.push_str(buffer[(x, row)].symbol());
+        }
+        let offset = line.find(needle).expect("marker on row");
+        u16::try_from(offset).unwrap_or(u16::MAX)
+    }
+
     /// Draws a frame so the pane geometry the mouse arithmetic needs is real.
     fn frame(app: &mut App, width: u16, height: u16) {
         let _ = drawn(app, width, height);
@@ -6669,11 +6781,12 @@ mod tests {
         frame(&mut app, 120, 30);
         assert_eq!(app.review.as_ref().unwrap().scroll, 0);
 
-        app.on_mouse(wheel(60, app.geometry.review_top + 4, true));
+        let diff = app.geometry.review.expect("review layout").diff;
+        app.on_mouse(wheel(60, diff.y + 4, true));
         let after = app.review.as_ref().unwrap().scroll;
         assert!(after > 0, "the wheel moves the diff text");
 
-        app.on_mouse(wheel(60, app.geometry.review_top + 4, false));
+        app.on_mouse(wheel(60, diff.y + 4, false));
         assert!(
             app.review.as_ref().unwrap().scroll < after,
             "and moves it back"
@@ -6687,7 +6800,8 @@ mod tests {
         let before = app.review.as_ref().unwrap().current_path().cloned();
 
         // Far below the two-line tree, inside the pane's rectangle.
-        app.on_mouse(click(5, app.geometry.review_top + 12));
+        let tree = app.geometry.review.expect("review layout").tree;
+        app.on_mouse(click(5, tree.y + 12));
         assert_eq!(
             app.review.as_ref().unwrap().current_path().cloned(),
             before,
@@ -6734,7 +6848,8 @@ mod tests {
         let (_dir, mut app) = review_app();
         frame(&mut app, 120, 30);
 
-        app.on_mouse(click(5, app.geometry.review_top + 1));
+        let tree = app.geometry.review.expect("review layout").tree;
+        app.on_mouse(click(5, tree.y + 1));
         let view = app.review.as_ref().unwrap();
         assert!(view.tree_focused, "the tree has the cursor");
         assert!(view.folded_dirs.contains("src"), "the folder folded");
@@ -8276,10 +8391,247 @@ mod tests {
         let (_dir, mut app) = review_app();
         frame(&mut app, 120, 30);
 
-        app.on_mouse(click(80, app.geometry.review_top + 3));
+        let diff = app.geometry.review.expect("review layout").diff;
+        let row = diff.y + 3;
+        let expected = {
+            let view = app.review.as_ref().expect("review");
+            view.scroll + row_in(diff, row).expect("diff content row")
+        };
+        app.on_mouse(click(80, row));
         let view = app.review.as_ref().unwrap();
         assert!(!view.tree_focused);
-        assert_eq!(view.cursor, 2, "the row under the pointer");
+        assert_eq!(view.cursor, expected, "the row drawn under the pointer");
+    }
+
+    #[test]
+    fn ir_09_typing_follows_the_focused_composer_not_an_open_one() {
+        let (_dir, mut app, _store) = chat_app();
+        app.review.as_mut().expect("review").select_row(2);
+        app.start_comment();
+        press(&mut app, "X");
+        press(&mut app, "<Tab>");
+        assert_eq!(app.focus(), Pane::Chat);
+        press(&mut app, "Y");
+
+        assert_eq!(app.chat.input.text(), "Y");
+        assert_eq!(
+            app.drafts
+                .composer
+                .as_ref()
+                .map(|composer| composer.input.text()),
+            Some("X"),
+            "the comment keeps its own text while chat owns the keyboard"
+        );
+
+        frame(&mut app, 160, 40);
+        let composer = app
+            .geometry
+            .review
+            .expect("review layout")
+            .composer
+            .expect("visible composer");
+        app.on_mouse(click(composer.x + 2, composer.y + 2));
+        press(&mut app, "Z");
+        assert_eq!(app.chat.input.text(), "Y");
+        assert_eq!(
+            app.drafts
+                .composer
+                .as_ref()
+                .map(|composer| composer.input.text()),
+            Some("XZ")
+        );
+    }
+
+    #[test]
+    fn ir_09_a_too_small_frame_disables_stale_mouse_geometry() {
+        let (_dir, mut app) = review_app();
+        frame(&mut app, 120, 30);
+        let before = app.review.as_ref().expect("review").cursor;
+        frame(&mut app, 79, 23);
+        app.on_mouse(wheel(60, 12, true));
+        assert_eq!(app.review.as_ref().expect("review").cursor, before);
+    }
+
+    #[test]
+    fn ir_09_a_hidden_composer_cannot_keep_the_keyboard() {
+        let (_dir, mut app, _store) = chat_app();
+        app.review.as_mut().expect("review").select_row(2);
+        app.start_comment();
+        app.chat.open = true;
+        frame(&mut app, 80, 24);
+        assert!(
+            app.geometry
+                .review
+                .is_some_and(|layout| layout.composer.is_none())
+        );
+        assert_eq!(app.focus_target, FocusTarget::Diff);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ir_09_discussion_composer_keeps_focus_when_the_background_is_constrained() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        app.show_chat();
+        app.open_conversation();
+        app.start_conversation_comment();
+        frame(&mut app, 80, 24);
+
+        assert_eq!(app.focus_target, FocusTarget::CommentComposer);
+        press(&mut app, "X");
+        assert_eq!(
+            app.drafts
+                .composer
+                .as_ref()
+                .map(|composer| composer.input.text()),
+            Some("X")
+        );
+    }
+
+    #[test]
+    fn ir_09_discussion_keeps_the_selected_wrapped_body_visible_and_scrollable() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        let conversation = &mut app.detail.as_mut().expect("detail").conversation;
+        let template = conversation.first().expect("comment").clone();
+        for id in 2..=8 {
+            conversation.push(crate::domain::pr::ConversationComment {
+                id,
+                author: "alice".to_owned(),
+                body: format!(
+                    "newest body {id}: this deliberately long comment wraps across several rows in the narrow conversation panel"
+                ),
+                created_at: template.created_at,
+                url: None,
+            });
+        }
+        app.open_conversation();
+        let _terminal = drawn(&mut app, 100, 30);
+        assert!(app.discussion.scroll > 0);
+
+        let before = app.discussion.scroll;
+        app.on_mouse(wheel(50, 15, false));
+        assert!(app.discussion.scroll < before, "wheel moves immediately");
+    }
+
+    #[test]
+    fn ir_09_closing_a_composer_does_not_leave_a_phantom_tab_stop() {
+        let (_dir, mut app) = review_app();
+        app.review.as_mut().expect("review").select_row(2);
+        app.start_comment();
+        press(&mut app, "<Esc>");
+        press(&mut app, "<S-Tab>");
+        assert!(app.review.as_ref().expect("review").tree_focused);
+    }
+
+    #[test]
+    fn ir_09_split_click_uses_the_displayed_side_and_source_row() {
+        let (_dir, mut app) = review_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-DELETE_MARK\n+ADD_MARK\n",
+        );
+        app.set_review(DiffView::new(patch));
+        app.review.as_mut().expect("review").split = true;
+        let terminal = drawn(&mut app, 160, 40);
+        let row = row_of(&terminal, "DELETE_MARK");
+        let diff = app.geometry.review.expect("review layout").diff;
+        assert_eq!(row_in(diff, row), Some(2));
+
+        app.on_mouse(click(diff.x + 2, row));
+        assert_eq!(
+            app.review
+                .as_ref()
+                .and_then(DiffView::current)
+                .and_then(|line| line.old_line),
+            Some(1),
+            "the old half selects the deleted source line"
+        );
+        app.on_mouse(click(diff.x + diff.width.saturating_sub(2), row));
+        assert_eq!(
+            app.review
+                .as_ref()
+                .and_then(DiffView::current)
+                .and_then(|line| line.new_line),
+            Some(1),
+            "the new half selects the added source line"
+        );
+    }
+
+    #[test]
+    fn ir_09_split_click_uses_the_displayed_divider_not_the_geometric_midpoint() {
+        let (_dir, mut app) = review_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-x\n+RIGHT_MARK\n",
+        );
+        app.set_review(DiffView::new(patch));
+        app.review.as_mut().expect("review").split = true;
+        let terminal = drawn(&mut app, 160, 40);
+        let row = row_of(&terminal, "RIGHT_MARK");
+        let column = column_of(&terminal, row, "RIGHT_MARK");
+        let diff = app.geometry.review.expect("review layout").diff;
+        assert!(column > diff.x + diff.width / 2);
+
+        app.on_mouse(click(column, row));
+        assert_eq!(
+            app.review
+                .as_ref()
+                .and_then(DiffView::current)
+                .and_then(|line| line.new_line),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ir_09_an_empty_split_cell_does_not_select_its_opposite_side() {
+        let (_dir, mut app) = review_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1,2 @@\n-DELETE_MARK\n+ADD_ONE\n+ADD_TWO\n",
+        );
+        app.set_review(DiffView::new(patch));
+        app.review.as_mut().expect("review").split = true;
+        let terminal = drawn(&mut app, 160, 40);
+        let row = row_of(&terminal, "ADD_TWO");
+        let diff = app.geometry.review.expect("review layout").diff;
+        let before = app.review.as_ref().expect("review").cursor;
+
+        app.on_mouse(click(diff.x + 2, row));
+
+        assert_eq!(app.review.as_ref().expect("review").cursor, before);
+    }
+
+    #[test]
+    fn ir_09_chat_and_composer_height_keep_the_selected_diff_line_visible() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app, _store) = chat_app();
+        let patch = crate::domain::diff::parse_patch(include_str!(
+            "../../tests/fixtures/gh/pr-diff-large.patch"
+        ));
+        app.set_review(DiffView::new(patch));
+        app.show_chat();
+        app.review.as_mut().expect("review").select_row(23);
+        app.start_comment();
+        frame(&mut app, 160, 40);
+
+        let view = app.review.as_ref().expect("review");
+        let layout = app.geometry.review.expect("review layout");
+        let visible = view.visible_rows(layout.diff.height.saturating_sub(2));
+        assert!(visible.contains(&view.cursor));
+    }
+
+    #[test]
+    fn ir_09_an_overlay_wheel_never_scrolls_the_hidden_diff() {
+        use crate::tui::diff_view::DiffView;
+
+        let (_dir, mut app) = review_app();
+        let patch = crate::domain::diff::parse_patch(include_str!(
+            "../../tests/fixtures/gh/pr-diff-large.patch"
+        ));
+        app.set_review(DiffView::new(patch));
+        frame(&mut app, 120, 30);
+        app.open_overlay(Overlay::Help);
+        let before = app.review.as_ref().expect("review").scroll;
+        app.on_mouse(wheel(60, 12, true));
+        assert_eq!(app.review.as_ref().expect("review").scroll, before);
+        assert!(app.help_scroll > 0);
     }
 
     #[test]

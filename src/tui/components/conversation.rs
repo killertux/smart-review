@@ -84,6 +84,30 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
+/// The offset that places the selected comment header and its body at the top of the panel.
+#[must_use]
+pub(crate) fn selected_offset(area: Rect, app: &App) -> Option<usize> {
+    let area = centered(area, PANEL_PERCENT_X, PANEL_PERCENT_Y);
+    let composing = app
+        .drafts()
+        .composer
+        .as_ref()
+        .is_some_and(|composer| !composer.target.is_staged());
+    let (body, _) = composer_split(area, composing);
+    let lines = lines(
+        app.conversation(),
+        app.discussion().index(),
+        app.now(),
+        &app.theme,
+        body.width.saturating_sub(2),
+    );
+    lines.iter().position(|line| {
+        line.spans
+            .first()
+            .is_some_and(|span| span.content.as_ref().contains('▸'))
+    })
+}
+
 /// What the panel's footer says the keys do.
 fn footer_hint(app: &App, count: usize) -> String {
     if app.draft_is_composing() {
