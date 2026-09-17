@@ -4368,6 +4368,17 @@ impl App {
         self.geometry.review = self.review.is_some().then(|| {
             crate::tui::components::review::layout(body, self.chat.open, self.drafts.is_composing())
         });
+        if self.focus_target == FocusTarget::CommentComposer
+            && self
+                .geometry
+                .review
+                .is_some_and(|layout| layout.composer.is_none())
+        {
+            // A composer that did not fit this frame cannot own invisible input. Its
+            // draft remains open and is available again when the layout has room.
+            self.focus_target = FocusTarget::Diff;
+            self.sync_mode_to_focus();
+        }
         // The filter bar sits above the list; the pane below it is the one the mouse
         // is tested against, and the same rectangle the renderer draws into.
         let (filter_bar, list) = components::panes::body_split(body);
@@ -8417,6 +8428,22 @@ mod tests {
     }
 
     #[test]
+    fn ir_09_a_hidden_composer_cannot_keep_the_keyboard() {
+        let (_dir, mut app, _store) = chat_app();
+        app.review.as_mut().expect("review").select_row(2);
+        app.start_comment();
+        app.chat.open = true;
+        frame(&mut app, 80, 24);
+        assert!(
+            app.geometry
+                .review
+                .is_some_and(|layout| layout.composer.is_none())
+        );
+        assert_eq!(app.focus_target, FocusTarget::Diff);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
     fn ir_09_split_click_uses_the_displayed_side_and_source_row() {
         let (_dir, mut app) = review_app();
         let patch = crate::domain::diff::parse_patch(
@@ -8447,6 +8474,24 @@ mod tests {
             Some(1),
             "the new half selects the added source line"
         );
+    }
+
+    #[test]
+    fn ir_09_an_empty_split_cell_does_not_select_its_opposite_side() {
+        let (_dir, mut app) = review_app();
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/one.rs b/src/one.rs\n--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1,2 @@\n-DELETE_MARK\n+ADD_ONE\n+ADD_TWO\n",
+        );
+        app.set_review(DiffView::new(patch));
+        app.review.as_mut().expect("review").split = true;
+        let terminal = drawn(&mut app, 160, 40);
+        let row = row_of(&terminal, "ADD_TWO");
+        let diff = app.geometry.review.expect("review layout").diff;
+        let before = app.review.as_ref().expect("review").cursor;
+
+        app.on_mouse(click(diff.x + 2, row));
+
+        assert_eq!(app.review.as_ref().expect("review").cursor, before);
     }
 
     #[test]
