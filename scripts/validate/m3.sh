@@ -360,12 +360,12 @@ run_tui() {
 # The keystrokes a chat run needs, as groups: `~` separates one group per wait, and
 # each group's wait is what proves the previous group landed.
 #
-#   OPEN     `:pr 141` and then Tab, which walks the review screen's three stops
+#   OPEN     `:pr 141` and then `5`, which selects the real Ask destination
 #   TYPE(x)  type a question without sending it
 #   SEND     press Enter
 #   BACK     Esc, which stops an answer if one is running and otherwise leaves the pane
 # ---------------------------------------------------------------------------
-OPEN=':pr 141\r~\t'
+OPEN=':pr 141\r~5'
 OPEN_WAIT='money\.rs~'
 # The exits are `:q` from the command line rather than `q`, because `q` is a letter in
 # the compose box — and a validator that cannot leave a pane cannot check it.

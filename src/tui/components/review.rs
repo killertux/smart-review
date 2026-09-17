@@ -71,13 +71,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let layout = app.review_layout().unwrap_or_else(|| {
-        layout(
-            area,
-            app.chat_state().is_some(),
-            app.drafts().is_composing(),
-        )
-    });
+    let layout = app
+        .review_layout()
+        .unwrap_or_else(|| layout(area, false, app.drafts().is_composing()));
     render_tabs(frame, layout.tabs, app);
     match app.review_tab() {
         ReviewTab::Overview => render_overview(frame, layout.content, app),
@@ -88,9 +84,6 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 && let Some(composer) = app.drafts().composer.as_ref()
             {
                 super::drafts::render_composer(frame, composer_area, app, composer);
-            }
-            if let Some(chat) = layout.chat {
-                super::chat::render(frame, chat, app);
             }
         }
         ReviewTab::Checks => render_checks(frame, layout.content, app),
@@ -287,7 +280,7 @@ fn render_checks(frame: &mut Frame<'_>, area: Rect, app: &App) {
             theme.style(element::MUTED),
         )));
     } else {
-        for (index, check) in detail.checks.iter().enumerate().skip(app.check_scroll) {
+        for (index, check) in detail.checks.iter().enumerate() {
             let marker = match check.state {
                 CheckState::Success => "✓",
                 CheckState::Failure => "✗",
@@ -342,7 +335,8 @@ fn render_checks(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::new().borders(Borders::ALL).title(" checks "))
-            .style(theme.style(element::BG)),
+            .style(theme.style(element::BG))
+            .scroll((u16::try_from(app.check_scroll).unwrap_or(u16::MAX), 0)),
         area,
     );
 }
@@ -390,9 +384,20 @@ fn render_discussion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         lines.push(Line::from(Span::styled(
             format!(" thread · {state} · {}", comment.path),
-            theme.style(element::TITLE),
+            if app.discussion.selected_root == Some(comment.id) {
+                theme.style(element::SELECTION)
+            } else {
+                theme.style(element::TITLE)
+            },
         )));
-        append_thread(&mut lines, &detail.comments, comment, theme, 1);
+        append_thread(
+            &mut lines,
+            &detail.comments,
+            comment,
+            theme,
+            1,
+            usize::from(area.width.saturating_sub(6)),
+        );
     }
     if app.discussion.filter == crate::tui::discussion::DiscussionFilter::All {
         for comment in &detail.conversation {
@@ -414,11 +419,14 @@ fn render_discussion(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     }
     let scroll = app.tab_scroll.min(lines.len().saturating_sub(1));
+    let visible_threads = root_comments(&detail.comments)
+        .filter(|comment| matches_filter(app, comment))
+        .count();
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::new().borders(Borders::ALL).title(format!(
-                " discussion · {} · f: cycle all/open/resolved/outdated ",
-                app.discussion.filter.label()
+                " discussion · {} ({visible_threads}) · f: cycle all/open/resolved/outdated · Enter: jump ",
+                app.discussion.filter.label(),
             )))
             .style(theme.style(element::BG))
             .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
@@ -451,17 +459,30 @@ fn append_thread(
     comment: &ReviewComment,
     theme: &Theme,
     depth: usize,
+    width: usize,
 ) {
     let indent = "  ".repeat(depth);
     lines.push(Line::from(Span::styled(
-        format!(" {indent}{}: {}", comment.author, comment.body),
-        theme.style(element::FG),
+        format!(" {indent}{}:", comment.author),
+        theme.style(element::MUTED),
     )));
+    lines.extend(crate::tui::markdown::render(
+        &comment.body,
+        width.max(1),
+        theme,
+    ));
     for reply in comments
         .iter()
         .filter(|reply| reply.in_reply_to == Some(comment.id))
     {
-        append_thread(lines, comments, reply, theme, depth.saturating_add(1));
+        append_thread(
+            lines,
+            comments,
+            reply,
+            theme,
+            depth.saturating_add(1),
+            width,
+        );
     }
 }
 

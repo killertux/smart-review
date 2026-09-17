@@ -169,6 +169,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "review.remove" => app.remove_staged(),
         "review.cycle_discussion_filter" => {
             app.discussion.cycle_filter();
+            app.discussion.selected_root = None;
             app.notice(
                 NoticeLevel::Info,
                 format!("discussion: {}", app.discussion.filter.label()),
@@ -277,9 +278,7 @@ fn files_only_action(id: &str) -> bool {
         id,
         "review.comment_line"
             | "review.range"
-            | "review.reply"
             | "review.edit_composer"
-            | "review.toggle_resolved"
             | "diff.next_hunk"
             | "diff.prev_hunk"
             | "diff.next_file"
@@ -373,6 +372,7 @@ fn dispatch_chat(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "chat.list" => {
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             app.list_chats();
             Effect::None
         }
@@ -424,32 +424,14 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
         }
         "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
             if app.review.is_some() && app.review_tab() == crate::tui::app::ReviewTab::Checks {
-                let delta = match id {
-                    "nav.up" => -1,
-                    "nav.down" => 1,
-                    "nav.top" => isize::MIN,
-                    _ => isize::MAX,
-                };
-                if matches!(id, "nav.top" | "nav.bottom") {
-                    app.check_cursor = if id == "nav.top" {
-                        0
-                    } else {
-                        app.detail
-                            .as_ref()
-                            .map_or(0, |detail| detail.checks.len().saturating_sub(1))
-                    };
-                    app.check_scroll = app.check_cursor;
-                } else {
-                    app.move_check_cursor(delta);
-                }
+                move_check_selection(app, id);
                 return Effect::None;
             }
-            if app.review.is_some()
-                && matches!(
-                    app.review_tab(),
-                    crate::tui::app::ReviewTab::Overview | crate::tui::app::ReviewTab::Discussion
-                )
-            {
+            if app.review.is_some() && app.review_tab() == crate::tui::app::ReviewTab::Discussion {
+                move_discussion_selection(app, id);
+                return Effect::None;
+            }
+            if app.review.is_some() && app.review_tab() == crate::tui::app::ReviewTab::Overview {
                 match id {
                     "nav.up" => app.scroll_tab(-1),
                     "nav.down" => app.scroll_tab(1),
@@ -522,6 +504,25 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
     }
 }
 
+fn move_check_selection(app: &mut App, id: &str) {
+    if matches!(id, "nav.top" | "nav.bottom") {
+        app.check_cursor = if id == "nav.top" {
+            0
+        } else {
+            app.detail
+                .as_ref()
+                .map_or(0, |detail| detail.checks.len().saturating_sub(1))
+        };
+        app.check_scroll = app
+            .check_row_starts()
+            .get(app.check_cursor)
+            .copied()
+            .unwrap_or(0);
+    } else {
+        app.move_check_cursor(if id == "nav.up" { -1 } else { 1 });
+    }
+}
+
 fn page_non_file_tab(app: &mut App, id: &str) {
     let direction = if matches!(id, "nav.half_down" | "nav.page_down") {
         1
@@ -529,11 +530,25 @@ fn page_non_file_tab(app: &mut App, id: &str) {
         -1
     };
     match app.review_tab() {
-        crate::tui::app::ReviewTab::Checks => app.move_check_cursor(direction),
-        crate::tui::app::ReviewTab::Overview | crate::tui::app::ReviewTab::Discussion => {
+        crate::tui::app::ReviewTab::Checks => {
+            let step = if id.starts_with("nav.page") { 10 } else { 5 };
+            app.move_check_cursor(direction * step);
+        }
+        crate::tui::app::ReviewTab::Overview => {
             app.scroll_tab(direction * 10);
         }
+        crate::tui::app::ReviewTab::Discussion => app.move_discussion_selection(direction * 10),
         crate::tui::app::ReviewTab::Ask | crate::tui::app::ReviewTab::Files => {}
+    }
+}
+
+fn move_discussion_selection(app: &mut App, id: &str) {
+    match id {
+        "nav.up" => app.move_discussion_selection(-1),
+        "nav.down" => app.move_discussion_selection(1),
+        "nav.top" => app.discussion.selected_root = None,
+        "nav.bottom" => app.move_discussion_selection(isize::MAX),
+        _ => {}
     }
 }
 
@@ -713,6 +728,10 @@ fn set_sort(app: &mut App, argument: &str) -> Effect {
 
 /// Opens whatever the cursor is on: a pull request in the list, a file in the tree.
 fn open_selected(app: &mut App) -> Effect {
+    if app.review_tab() == crate::tui::app::ReviewTab::Discussion {
+        app.jump_to_discussion_thread();
+        return Effect::None;
+    }
     if app.review_tab() == crate::tui::app::ReviewTab::Checks {
         let Some(url) = app.selected_check_url() else {
             app.notice(NoticeLevel::Warn, "the selected check has no run URL");
@@ -931,11 +950,10 @@ fn toggle_whitespace(app: &mut App) -> Effect {
 
 /// Moves the focus on. Inside a review that means the tree and the diff in turn
 /// (FR-3.3: the two panes keep independent cursors and `Tab` moves between them).
-/// The three places `Tab` can stop inside a review screen.
+/// The Files places `Tab` can stop inside a review screen.
 ///
-/// A cycle of three rather than two `Pane`s, because the file tree and the diff text are
-/// two stops inside *one* pane: modelling them as a pair of booleans alongside a separate
-/// chat pane is what made the first version of this skip the chat pane entirely.
+/// The tree and diff are independent stops inside one pane; the optional composer is a
+/// third stop only while it is rendered. Ask owns chat separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
     /// The file tree.
@@ -944,30 +962,6 @@ enum Stop {
     Diff,
     /// The visible line-comment composer.
     Composer,
-    /// The conversation.
-    Chat,
-}
-
-impl Stop {
-    /// The next stop, which is the order the screen reads in.
-    const fn next(self) -> Self {
-        match self {
-            Self::Tree => Self::Diff,
-            Self::Diff => Self::Composer,
-            Self::Composer => Self::Chat,
-            Self::Chat => Self::Tree,
-        }
-    }
-
-    /// The previous stop.
-    const fn prev(self) -> Self {
-        match self {
-            Self::Tree => Self::Chat,
-            Self::Chat => Self::Composer,
-            Self::Composer => Self::Diff,
-            Self::Diff => Self::Tree,
-        }
-    }
 }
 
 fn switch_pane(app: &mut App, forward: bool) -> Effect {
@@ -981,25 +975,18 @@ fn switch_pane(app: &mut App, forward: bool) -> Effect {
         }
     }
     if let Some(view) = app.review.as_mut() {
-        let current = match (app.focus_target, app.focus, view.tree_focused) {
-            (crate::tui::app::FocusTarget::CommentComposer, _, _) => Stop::Composer,
-            (_, crate::tui::app::Pane::Chat, _) => Stop::Chat,
-            (_, _, true) => Stop::Tree,
-            _ => Stop::Diff,
+        let stop = match (
+            forward,
+            app.focus_target,
+            view.tree_focused,
+            app.drafts.is_composing(),
+        ) {
+            (_, crate::tui::app::FocusTarget::CommentComposer, _, _)
+            | (true, _, true, _)
+            | (false, _, true, false) => Stop::Diff,
+            (false, _, true, true) | (true, _, false, true) => Stop::Composer,
+            (true, _, false, false) | (false, _, false, _) => Stop::Tree,
         };
-        let mut stop = if forward {
-            current.next()
-        } else {
-            current.prev()
-        };
-        if stop == Stop::Composer && !app.drafts.is_composing() {
-            stop = if forward { stop.next() } else { stop.prev() };
-        }
-        // Chat is its own Ask destination. The Files cycle contains only surfaces
-        // rendered by Files, so Tab can never create the retired embedded pane.
-        if stop == Stop::Chat {
-            stop = if forward { stop.next() } else { stop.prev() };
-        }
         return focus_stop(app, stop);
     }
     let pane = if forward {
@@ -1040,18 +1027,6 @@ fn focus_stop(app: &mut App, stop: Stop) -> Effect {
             app.focus_target = crate::tui::app::FocusTarget::CommentComposer;
             app.mode = crate::tui::keymap::Mode::Insert;
             Effect::SaveState
-        }
-        Stop::Chat => {
-            // A focus that lands on a pane which is not drawn would leave the keyboard
-            // in a place with nothing to type into.
-            let was_open = app.chat.open;
-            app.show_chat();
-            let effect = set_focus(app, crate::tui::app::Pane::Chat);
-            if was_open || app.chat.session.is_some() {
-                effect
-            } else {
-                Effect::LoadChat
-            }
         }
     }
 }
@@ -1507,7 +1482,7 @@ fn chat_command(app: &mut App, argument: &str) -> Effect {
     let rest = words.collect::<Vec<_>>().join(" ");
     match subcommand {
         "" | "show" => {
-            app.show_chat();
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             Effect::None
         }
         "new" => {
@@ -1518,11 +1493,13 @@ fn chat_command(app: &mut App, argument: &str) -> Effect {
             Effect::NewChat
         }
         "list" => {
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             app.list_chats();
             Effect::None
         }
         "open" => {
             if rest.is_empty() {
+                app.select_review_tab(crate::tui::app::ReviewTab::Ask);
                 app.list_chats();
                 return Effect::None;
             }

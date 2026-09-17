@@ -56,6 +56,8 @@ pub struct DiscussionState {
     pub panel: bool,
     /// The comment the cursor is on, one-based, as the panel numbers them.
     pub cursor: usize,
+    /// Root comment selected in the full Discussion destination (IR-10).
+    pub selected_root: Option<u64>,
     /// How far the panel is scrolled from the top.
     pub scroll: usize,
     /// Which inline-thread state is displayed in the Discussion tab.

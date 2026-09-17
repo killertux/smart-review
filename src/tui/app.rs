@@ -1421,13 +1421,163 @@ impl App {
         let height = self.geometry.review.map_or(1, |layout| {
             usize::from(layout.content.height.saturating_sub(2))
         });
-        self.check_scroll =
-            components::ensure_visible(self.check_cursor, self.check_scroll, height, count);
+        let starts = self.check_row_starts();
+        let start = starts.get(self.check_cursor).copied().unwrap_or(0);
+        let end = starts
+            .get(self.check_cursor.saturating_add(1))
+            .copied()
+            .unwrap_or_else(|| self.check_row_count());
+        if start < self.check_scroll {
+            self.check_scroll = start;
+        } else if end > self.check_scroll.saturating_add(height) {
+            self.check_scroll = end.saturating_sub(height);
+        }
+    }
+
+    /// Physical row offsets for the variable-height check records (IR-10).
+    #[must_use]
+    pub(crate) fn check_row_starts(&self) -> Vec<usize> {
+        let mut row = usize::from(self.detail_offline.is_some());
+        self.detail.as_ref().map_or_else(Vec::new, |detail| {
+            detail
+                .checks
+                .iter()
+                .map(|check| {
+                    let start = row;
+                    row = row.saturating_add(
+                        1 + usize::from(check.description.is_some())
+                            + usize::from(check.conclusion.is_some())
+                            + usize::from(check.url.is_some()),
+                    );
+                    start
+                })
+                .collect()
+        })
+    }
+
+    /// Number of physical rows rendered by the Checks destination.
+    #[must_use]
+    pub(crate) fn check_row_count(&self) -> usize {
+        self.check_row_starts().last().map_or_else(
+            || usize::from(self.detail_offline.is_some()) + 1,
+            |start| {
+                self.detail
+                    .as_ref()
+                    .and_then(|detail| detail.checks.last())
+                    .map_or(*start, |check| {
+                        start
+                            + 1
+                            + usize::from(check.description.is_some())
+                            + usize::from(check.conclusion.is_some())
+                            + usize::from(check.url.is_some())
+                    })
+            },
+        )
     }
 
     /// Scrolls visible non-file tab content without moving the hidden diff cursor.
     pub(crate) fn scroll_tab(&mut self, delta: isize) {
         self.tab_scroll = self.tab_scroll.saturating_add_signed(delta);
+    }
+
+    /// Moves selection among visible Discussion thread roots (IR-10).
+    pub(crate) fn move_discussion_selection(&mut self, delta: isize) {
+        let roots: Vec<u64> = self.detail.as_ref().map_or_else(Vec::new, |detail| {
+            detail
+                .comments
+                .iter()
+                .filter(|comment| {
+                    (comment.in_reply_to.is_none()
+                        || !detail
+                            .comments
+                            .iter()
+                            .any(|other| other.id == comment.in_reply_to.unwrap_or_default()))
+                        && match self.discussion.filter {
+                            crate::tui::discussion::DiscussionFilter::All => true,
+                            crate::tui::discussion::DiscussionFilter::Open => {
+                                !comment.resolved && !comment.outdated
+                            }
+                            crate::tui::discussion::DiscussionFilter::Resolved => comment.resolved,
+                            crate::tui::discussion::DiscussionFilter::Outdated => comment.outdated,
+                        }
+                })
+                .map(|comment| comment.id)
+                .collect()
+        });
+        let Some(current) = self
+            .discussion
+            .selected_root
+            .and_then(|id| roots.iter().position(|root| *root == id))
+        else {
+            self.discussion.selected_root = roots.first().copied();
+            return;
+        };
+        let last = isize::try_from(roots.len().saturating_sub(1)).unwrap_or(0);
+        let next = usize::try_from((isize::try_from(current).unwrap_or(0) + delta).clamp(0, last))
+            .unwrap_or(0);
+        self.discussion.selected_root = roots.get(next).copied();
+    }
+
+    /// The selected visible Discussion thread, retaining its stable root id on refresh.
+    #[must_use]
+    fn selected_discussion_comment(&self) -> Option<crate::domain::pr::ReviewComment> {
+        let id = self.discussion.selected_root?;
+        self.detail
+            .as_ref()?
+            .comments
+            .iter()
+            .find(|comment| comment.id == id)
+            .cloned()
+    }
+
+    /// Jumps from a Discussion thread to exactly its current diff anchor (IR-10).
+    pub(crate) fn jump_to_discussion_thread(&mut self) {
+        let Some(comment) = self.selected_discussion_comment() else {
+            self.notice(
+                NoticeLevel::Warn,
+                "select a discussion thread before jumping to code",
+            );
+            return;
+        };
+        let Some(line) = comment.line.and_then(|line| u32::try_from(line).ok()) else {
+            self.notice(
+                NoticeLevel::Warn,
+                "this thread has no current diff anchor; it remains readable here",
+            );
+            return;
+        };
+        let old_side = comment
+            .side
+            .as_deref()
+            .is_some_and(|side| side.eq_ignore_ascii_case("LEFT"));
+        let Some(view) = self.review.as_mut() else {
+            self.notice(
+                NoticeLevel::Warn,
+                "the Files view is not available for this thread",
+            );
+            return;
+        };
+        let row = view.rows.iter().position(|row| {
+            view.patch
+                .files
+                .get(row.file)
+                .and_then(|file| file.path())
+                .is_some_and(|path| path.as_str() == comment.path)
+                && if old_side {
+                    row.old_line == Some(line)
+                } else {
+                    row.new_line == Some(line)
+                }
+        });
+        if let Some(row) = row {
+            view.select_row(row);
+            self.select_review_tab(ReviewTab::Files);
+        } else {
+            self.notice(
+                NoticeLevel::Warn,
+                "this thread's anchor is no longer in the current diff; it remains readable here",
+            );
+        }
     }
 
     /// URL for the check selected in the Checks tab, if GitHub supplied one.
@@ -1553,8 +1703,8 @@ impl App {
                 None
             }
             Outcome::Detail(outcome) if job == self.detail_job => {
-                self.apply_detail(*outcome);
-                Some(Effect::ReloadDiff)
+                let reload_patch = self.apply_detail(*outcome);
+                reload_patch.then_some(Effect::ReloadDiff)
             }
             Outcome::Patch {
                 outcome,
@@ -2491,6 +2641,41 @@ impl App {
 
     /// Opens the composer to answer the thread under the cursor (FR-6.4).
     pub(crate) fn start_reply(&mut self) -> Effect {
+        if self.review_tab == ReviewTab::Discussion {
+            let Some(comment) = self.selected_discussion_comment() else {
+                self.notice(NoticeLevel::Warn, "select a discussion thread to answer it");
+                return Effect::None;
+            };
+            let Some(line) = comment.line.and_then(|line| u32::try_from(line).ok()) else {
+                self.notice(
+                    NoticeLevel::Warn,
+                    "this thread has no replyable line anchor",
+                );
+                return Effect::None;
+            };
+            let side = if comment
+                .side
+                .as_deref()
+                .is_some_and(|side| side.eq_ignore_ascii_case("LEFT"))
+            {
+                crate::domain::draft::Side::Old
+            } else {
+                crate::domain::draft::Side::New
+            };
+            let anchor = crate::tui::drafts::Anchor {
+                path: comment.path,
+                side,
+                line,
+                start_line: None,
+                head_sha: self.review.as_ref().and_then(|view| view.head_sha.clone()),
+            };
+            self.drafts
+                .compose_reply(anchor, comment.id, comment.thread_id);
+            self.mode = Mode::Insert;
+            self.focus = Pane::Diff;
+            self.focus_target = FocusTarget::CommentComposer;
+            return Effect::None;
+        }
         let Some(thread) = self.review.as_ref().and_then(DiffView::current_thread) else {
             self.notice(
                 NoticeLevel::Warn,
@@ -2618,14 +2803,23 @@ impl App {
             self.notice(NoticeLevel::Warn, "open a pull request first");
             return Effect::None;
         };
-        let Some(thread) = self.review.as_ref().and_then(DiffView::current_thread) else {
+        let selected = if self.review_tab == ReviewTab::Discussion {
+            self.selected_discussion_comment()
+                .map(|comment| (comment.thread_id, comment.resolved))
+        } else {
+            self.review
+                .as_ref()
+                .and_then(DiffView::current_thread)
+                .map(|thread| (thread.thread, thread.resolved))
+        };
+        let Some((thread, resolved)) = selected else {
             self.notice(
                 NoticeLevel::Warn,
                 "put the cursor on a comment to resolve its thread",
             );
             return Effect::None;
         };
-        let Some(id) = thread.thread.clone() else {
+        let Some(id) = thread.clone() else {
             self.notice(
                 NoticeLevel::Warn,
                 "GitHub's thread ids could not be read for this pull request, so its threads \
@@ -2633,13 +2827,13 @@ impl App {
             );
             return Effect::None;
         };
-        let verb = if thread.resolved { "reopen" } else { "resolve" };
+        let verb = if resolved { "reopen" } else { "resolve" };
         self.ask(
             format!("{verb} this thread on GitHub?"),
             Effect::ResolveThread {
                 number,
                 thread_id: id,
-                resolved: !thread.resolved,
+                resolved: !resolved,
             },
         );
         Effect::None
@@ -3939,9 +4133,19 @@ impl App {
     }
 
     /// Stores a detail and says what was opened (FR-2.4).
-    fn apply_detail(&mut self, outcome: FetchOutcome<PullRequestDetail>) {
+    fn apply_detail(&mut self, outcome: FetchOutcome<PullRequestDetail>) -> bool {
         self.detail_offline = outcome.offline_reason().map(|_| "offline".to_owned());
         let detail = outcome.into_value();
+        let reload_patch = self.detail.as_ref().is_none_or(|previous| {
+            previous.summary.head_sha != detail.summary.head_sha
+                || previous.base_sha != detail.base_sha
+        });
+        let selected_check = self.detail.as_ref().and_then(|previous| {
+            previous
+                .checks
+                .get(self.check_cursor)
+                .map(|check| (check.name.clone(), check.url.clone()))
+        });
         self.update_review_revision(&detail);
         self.notice(
             NoticeLevel::Info,
@@ -3953,6 +4157,23 @@ impl App {
             ),
         );
         self.detail = Some(detail);
+        if let Some((name, url)) = selected_check
+            && let Some(detail) = self.detail.as_ref()
+            && let Some(index) = detail
+                .checks
+                .iter()
+                .position(|check| check.name == name && check.url == url)
+        {
+            self.check_cursor = index;
+        }
+        let count = self.detail.as_ref().map_or(0, |detail| detail.checks.len());
+        self.check_cursor = self.check_cursor.min(count.saturating_sub(1));
+        self.check_scroll = self
+            .check_scroll
+            .min(self.check_row_count().saturating_sub(1));
+        self.discussion.selected_root =
+            self.selected_discussion_comment().map(|comment| comment.id);
+        reload_patch
     }
 
     /// Advances the session when a refresh resolves a different PR revision (IR-05).
@@ -4545,7 +4766,7 @@ impl App {
     fn record_geometry(&mut self, body: ratatui::layout::Rect) {
         self.geometry.width = body.width;
         self.geometry.review = self.review.is_some().then(|| {
-            crate::tui::components::review::layout(body, self.chat.open, self.drafts.is_composing())
+            crate::tui::components::review::layout(body, false, self.drafts.is_composing())
         });
         if self.overlay != Overlay::Conversation
             && self.focus_target == FocusTarget::CommentComposer
@@ -4576,7 +4797,7 @@ impl App {
             let layout = self.geometry.review.unwrap_or_else(|| {
                 crate::tui::components::review::layout(
                     self.geometry.list,
-                    self.chat.open,
+                    false,
                     self.drafts.is_composing(),
                 )
             });
@@ -7273,12 +7494,12 @@ mod tests {
 
     #[test]
     fn a_late_diff_does_not_pull_the_keyboard_out_of_the_compose_box() {
-        // The order the validator produced: open a pull request, Tab to the chat pane,
+        // Open the Ask destination, then let the worktree's local diff arrive.
         // and *then* let the worktree's local diff arrive. `apply_patch` calls
         // `open_review`, which used to re-focus the diff pane — so the next characters
         // typed became key bindings instead of words.
         let (_dir, mut app, _store) = chat_app();
-        press(&mut app, "<Tab>");
+        app.select_review_tab(ReviewTab::Ask);
         assert_eq!(app.focus(), Pane::Chat);
         app.diff_loading = true;
 
@@ -8586,7 +8807,7 @@ mod tests {
         app.review.as_mut().expect("review").select_row(2);
         app.start_comment();
         press(&mut app, "X");
-        press(&mut app, "<Tab>");
+        app.select_review_tab(ReviewTab::Ask);
         assert_eq!(app.focus(), Pane::Chat);
         press(&mut app, "Y");
 
@@ -8600,6 +8821,7 @@ mod tests {
             "the comment keeps its own text while chat owns the keyboard"
         );
 
+        app.select_review_tab(ReviewTab::Files);
         frame(&mut app, 160, 40);
         let composer = app
             .geometry
@@ -8634,15 +8856,15 @@ mod tests {
         let (_dir, mut app, _store) = chat_app();
         app.review.as_mut().expect("review").select_row(2);
         app.start_comment();
-        app.chat.open = true;
+        app.select_review_tab(ReviewTab::Ask);
         frame(&mut app, 80, 24);
         assert!(
             app.geometry
                 .review
-                .is_some_and(|layout| layout.composer.is_none())
+                .is_some_and(|layout| layout.composer.is_some())
         );
-        assert_eq!(app.focus_target, FocusTarget::Diff);
-        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus_target, FocusTarget::ChatInput);
+        assert_eq!(app.mode, Mode::Insert);
     }
 
     #[test]
@@ -8925,10 +9147,9 @@ mod tests {
     }
 
     #[test]
-    fn tab_walks_the_three_stops_of_a_review_screen() {
-        // The diff text, the conversation, then the tree: the first version of this cycle
-        // could not reach the chat pane at all, which is the kind of bug a test that only
-        // checks "the focus changed" passes straight through.
+    fn tab_walks_only_the_visible_files_stops() {
+        // Ask is a destination, not a hidden third Files pane. Tab stays among the
+        // Files surfaces so it cannot put text into an invisible chat box.
         let (_dir, mut app, _store) = chat_app();
         assert_eq!(app.focus(), Pane::Diff);
         assert!(
@@ -8936,33 +9157,29 @@ mod tests {
             "a review opens on the diff text"
         );
 
-        let effect = press(&mut app, "<Tab>");
-        assert_eq!(app.focus(), Pane::Chat, "second stop: the conversation");
-        assert!(app.chat.open);
-        assert_eq!(app.mode(), Mode::Insert);
-        assert_eq!(
-            effect,
-            Effect::LoadChat,
-            "a conversation is loaded on arrival"
-        );
+        press(&mut app, "<Tab>");
+        assert_eq!(app.focus(), Pane::Diff, "second stop: the tree");
+        assert!(app.review.as_ref().expect("review").tree_focused);
+        assert_eq!(app.mode(), Mode::Normal);
 
         press(&mut app, "<Tab>");
         assert_eq!(app.focus(), Pane::Diff);
-        assert!(app.review.as_ref().expect("review").tree_focused);
+        assert!(!app.review.as_ref().expect("review").tree_focused);
 
         press(&mut app, "<Tab>");
         assert_eq!(app.focus(), Pane::Diff);
         assert!(
-            !app.review.as_ref().expect("review").tree_focused,
+            app.review.as_ref().expect("review").tree_focused,
             "and around"
         );
 
         // Backwards is the same cycle in reverse, and the pane is already open so
         // arriving at it asks for nothing.
         press(&mut app, "<S-Tab>");
-        assert!(app.review.as_ref().expect("review").tree_focused);
+        assert!(!app.review.as_ref().expect("review").tree_focused);
         assert_eq!(press(&mut app, "<S-Tab>"), Effect::SaveState);
-        assert_eq!(app.focus(), Pane::Chat);
+        assert_eq!(app.focus(), Pane::Diff);
+        assert!(app.review.as_ref().expect("review").tree_focused);
     }
 
     #[test]
