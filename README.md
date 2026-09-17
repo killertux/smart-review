@@ -48,13 +48,14 @@ Inside the app:
 | `/` | filter what has been fetched (client side, as you type) |
 | `n` / `N` | next / previous match |
 | `<Tab>` / `<S-Tab>` | tree ↔ diff |
+| `1`–`5` | select Overview, Files, Checks, Discussion, or Ask |
 | `]c` / `[c` | next / previous hunk |
 | `}` / `{` | next / previous file |
 | `za` | fold the hunk (or the whole file, from its banner) |
 | `y` | copy the current file path (OSC 52) |
 | `<leader>m` | choose the provider, model and thinking settings |
 | `<leader>a` | analyse the pull request, or open the analysis |
-| `<leader>c` | talk about the pull request (`Tab` reaches the pane too) |
+| `<leader>c` | open Ask, the grounded chat destination |
 | `Enter` | send the question (`Alt-Enter` or `Ctrl-J` adds a line) |
 | `<C-r>` | repeat the last question |
 | `Esc` | stop the answer that is arriving, then leave the pane |
@@ -69,6 +70,7 @@ Inside the app:
 | `<leader>ra` / `rc` / `rm` | stage an approval / request changes / a comment with no verdict |
 | `<leader>rx` | throw the staged review away (it asks first) |
 | `o` | switch between the recommended and path orders |
+| `f` (Discussion) | cycle all, open, resolved, and outdated inline threads |
 | `J` / `K` | move the selected review-plan group |
 | `<leader>dc` | cycle the diff context: 3, 10, 0 lines |
 | `<leader>dw` | ignore whitespace-only changes |

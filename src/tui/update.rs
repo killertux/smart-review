@@ -160,6 +160,14 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "review.comment_conversation" => app.start_conversation_comment(),
         "review.publish" => app.open_publish(),
         "review.remove" => app.remove_staged(),
+        "review.cycle_discussion_filter" => {
+            app.discussion.cycle_filter();
+            app.notice(
+                NoticeLevel::Info,
+                format!("discussion: {}", app.discussion.filter.label()),
+            );
+            Effect::None
+        }
         "app.analyze_panel" => {
             // `<leader>a` opens what is there and runs what is not: a user who has an
             // analysis wants to read it, and a user who has none wants one.
@@ -214,6 +222,11 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         }
         "pane.next" => switch_pane(app, true),
         "pane.prev" => switch_pane(app, false),
+        "review.tab_overview" => select_tab(app, crate::tui::app::ReviewTab::Overview),
+        "review.tab_files" => select_tab(app, crate::tui::app::ReviewTab::Files),
+        "review.tab_checks" => select_tab(app, crate::tui::app::ReviewTab::Checks),
+        "review.tab_discussion" => select_tab(app, crate::tui::app::ReviewTab::Discussion),
+        "review.tab_ask" => select_tab(app, crate::tui::app::ReviewTab::Ask),
         // The groups live in their own functions so that no single match has to hold
         // the whole command surface.
         other if other.starts_with("chat.") => dispatch_chat(app, other),
@@ -244,6 +257,12 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
     }
+}
+
+/// Selects a real pull-request tab without manufacturing a second view state.
+fn select_tab(app: &mut App, tab: crate::tui::app::ReviewTab) -> Effect {
+    app.select_review_tab(tab);
+    Effect::None
 }
 
 /// Changes the focused pane and remembers it (FR-8.5).
@@ -292,18 +311,10 @@ fn dispatch_chat(app: &mut App, id: &str) -> Effect {
             // `<leader>c` opens what is there and loads what is not: a user with a
             // conversation wants to read it, and a user with none wants somewhere to
             // type. The load is what finds the conversation from the last run (FR-5.1).
-            if app.chat_state().is_some() {
-                app.chat.close();
-                app.mode = crate::tui::keymap::Mode::Normal;
-                return Effect::None;
-            }
-            app.show_chat();
+            let was_loaded = app.chat.session.is_some();
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             let effect = set_focus(app, crate::tui::app::Pane::Chat);
-            if app.chat.session.is_some() {
-                effect
-            } else {
-                Effect::LoadChat
-            }
+            if was_loaded { effect } else { Effect::LoadChat }
         }
         "chat.send" => Effect::AskChat,
         "chat.newline" => {
@@ -372,6 +383,42 @@ fn unimplemented_action(app: &mut App, id: &str) -> Effect {
 fn dispatch_list(app: &mut App, id: &str) -> Effect {
     match id {
         "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
+            if app.review.is_some() && app.review_tab() == crate::tui::app::ReviewTab::Checks {
+                let delta = match id {
+                    "nav.up" => -1,
+                    "nav.down" => 1,
+                    "nav.top" => isize::MIN,
+                    _ => isize::MAX,
+                };
+                if matches!(id, "nav.top" | "nav.bottom") {
+                    app.check_cursor = if id == "nav.top" {
+                        0
+                    } else {
+                        app.detail
+                            .as_ref()
+                            .map_or(0, |detail| detail.checks.len().saturating_sub(1))
+                    };
+                    app.check_scroll = app.check_cursor;
+                } else {
+                    app.move_check_cursor(delta);
+                }
+                return Effect::None;
+            }
+            if app.review.is_some()
+                && matches!(
+                    app.review_tab(),
+                    crate::tui::app::ReviewTab::Overview | crate::tui::app::ReviewTab::Discussion
+                )
+            {
+                match id {
+                    "nav.up" => app.scroll_tab(-1),
+                    "nav.down" => app.scroll_tab(1),
+                    "nav.top" => app.tab_scroll = 0,
+                    "nav.bottom" => app.tab_scroll = usize::MAX,
+                    _ => {}
+                }
+                return Effect::None;
+            }
             // `move_current` routes to whichever pane has the cursor: the list, or the
             // tree/diff of an open review. Calling the list directly here is what left
             // `j`/`k` moving a cursor nothing drew.
@@ -611,6 +658,20 @@ fn set_sort(app: &mut App, argument: &str) -> Effect {
 
 /// Opens whatever the cursor is on: a pull request in the list, a file in the tree.
 fn open_selected(app: &mut App) -> Effect {
+    if app.review_tab() == crate::tui::app::ReviewTab::Checks {
+        let Some(url) = app.selected_check_url() else {
+            app.notice(NoticeLevel::Warn, "the selected check has no run URL");
+            return Effect::None;
+        };
+        if url.starts_with("https://") || url.starts_with("http://") {
+            return Effect::OpenUrl(url.to_owned());
+        }
+        app.notice(
+            NoticeLevel::Warn,
+            "the selected check has an unsupported URL",
+        );
+        return Effect::None;
+    }
     if let Some(view) = app.review.as_mut() {
         if view.tree_focused {
             view.activate_tree();

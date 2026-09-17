@@ -20,6 +20,7 @@ pub mod discussion;
 pub mod drafts;
 pub(crate) mod editor;
 pub mod event;
+pub mod external_link;
 pub mod input;
 pub mod jobs;
 pub mod keymap;
@@ -350,6 +351,17 @@ pub(crate) fn apply(
                 Err(error) => app.notice(
                     app::NoticeLevel::Warn,
                     format!("could not copy {path}: {error}"),
+                ),
+            }
+        }
+
+        Effect::OpenUrl(url) => {
+            match external_link::open_web_url(&external_link::SystemExternalLink, &url) {
+                Ok(true) => app.notice(app::NoticeLevel::Info, "opened the selected check run"),
+                Ok(false) => app.notice(app::NoticeLevel::Warn, "refused to open a non-web URL"),
+                Err(error) => app.notice(
+                    app::NoticeLevel::Warn,
+                    format!("could not open the check run: {error}; copy its URL from GitHub"),
                 ),
             }
         }

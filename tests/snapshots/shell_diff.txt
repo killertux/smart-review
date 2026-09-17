@@ -1,5 +1,5 @@
  smart-review v0.1.0 config: built-in defaults                                                   acme/service
- #141 WIP refactor of billing domain [1 Diff] 2 Checks (0) 3 Reviews (0) 4 Chat 5 Analysis (0, 0) · no comment
+ #141 WIP refactor o… [1 Overview] [2 Files] [3 Checks] [4 Discussion] [5 Ask]
 ┌ path order (3) ────────────────┐┌ 3 files +2 −1 · unified · ctx 3 ─────────────────────────────────────────┐
 │ ▾ docs (1)                     ││── M src/domain/invoice.rs                                                │
 │    B logo.png                  ││@@ -12,4 +14,5 @@ impl Invoice {                                          │

@@ -44,6 +44,11 @@ These are the compiled-in defaults. Add overrides to `${SMART_REVIEW_HOME:-~/.sm
 | --- | --- | --- | --- |
 | `pane.next` | `<Tab>`<br>`<Tab>` | `normal`<br>`insert` | Focus the next pane |
 | `pane.prev` | `<S-Tab>`<br>`<S-Tab>` | `normal`<br>`insert` | Focus the previous pane |
+| `review.tab_overview` | `1` | `normal` | Open the pull request overview (1) |
+| `review.tab_files` | `2` | `normal` | Open changed files (2) |
+| `review.tab_checks` | `3` | `normal` | Open checks (3) |
+| `review.tab_discussion` | `4` | `normal` | Open reviews and discussion (4) |
+| `review.tab_ask` | `5` | `normal` | Open grounded chat (5) |
 
 ## Search
 
@@ -109,6 +114,7 @@ These are the compiled-in defaults. Add overrides to `${SMART_REVIEW_HOME:-~/.sm
 | `review.drafts` | `<leader>rd` | `normal` | Show the staged comments (<leader>rd) |
 | `review.publish` | `<leader>rr` | `normal` | Publish the staged review (<leader>rr) |
 | `review.remove` | `x` | `popup` | Remove the selected staged comment (x) |
+| `review.cycle_discussion_filter` | `f` | `normal` | Cycle Discussion: all, open, resolved, outdated (f) |
 
 ## Override example
 

@@ -94,6 +94,8 @@ pub enum Effect {
     ReloadDiff,
     /// Put a path on the clipboard through the terminal (FR-3.4).
     CopyPath(String),
+    /// Open a user-visible HTTPS link outside the terminal (IR-10).
+    OpenUrl(String),
     /// Hand the open comment composer to `$EDITOR` (FR-6.2).
     ///
     /// The text is frozen in the effect so the reducer remains free of process and
@@ -269,6 +271,7 @@ fn effect_name(effect: &Effect) -> String {
         Effect::ResolveThread { resolved, .. } => format!("resolve-thread({resolved})"),
         Effect::ReloadDiff => "reload-diff".to_owned(),
         Effect::CopyPath(_) => "copy-path".to_owned(),
+        Effect::OpenUrl(_) => "open-url".to_owned(),
         // A comment is user prose, so it must not enter logs through an effect name.
         Effect::EditComposer(_) => "edit-composer".to_owned(),
         Effect::SetMouse(enabled) => format!("set-mouse({enabled})"),
@@ -318,6 +321,60 @@ pub enum Pane {
     Diff,
     /// The chat pane (M3, FR-5.1).
     Chat,
+}
+
+/// A destination within an open pull request (IR-10).
+///
+/// These are deliberately separate from [`Pane`]: a tab selects what is on screen,
+/// while a pane says where keys go within that screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewTab {
+    /// Pull request metadata, author description, and analysis status.
+    #[default]
+    Overview,
+    /// The file tree and diff.
+    Files,
+    /// Check runs supplied by the forge.
+    Checks,
+    /// Reviews, inline threads, and the top-level conversation.
+    Discussion,
+    /// The grounded chat transcript and input.
+    Ask,
+}
+
+impl ReviewTab {
+    /// All tabs in their visible order.
+    pub const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::Files,
+        Self::Checks,
+        Self::Discussion,
+        Self::Ask,
+    ];
+
+    /// The numeric normal-mode shortcut.
+    #[must_use]
+    pub const fn number(self) -> u8 {
+        match self {
+            Self::Overview => 1,
+            Self::Files => 2,
+            Self::Checks => 3,
+            Self::Discussion => 4,
+            Self::Ask => 5,
+        }
+    }
+
+    /// The short visible label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Files => "Files",
+            Self::Checks => "Checks",
+            Self::Discussion => "Discussion",
+            Self::Ask => "Ask",
+        }
+    }
 }
 
 /// The concrete surface that receives review input (IR-09).
@@ -836,6 +893,14 @@ pub struct App {
     pub(crate) detail: Option<PullRequestDetail>,
     /// The review view, present when a pull request is open (FR-3.3).
     pub(crate) review: Option<DiffView>,
+    /// The currently selected pull-request destination (IR-10).
+    pub(crate) review_tab: ReviewTab,
+    /// Selected check row in the Checks tab (IR-10).
+    pub(crate) check_cursor: usize,
+    /// First check row shown in the Checks tab (IR-10).
+    pub(crate) check_scroll: usize,
+    /// First wrapped row shown by a scrollable non-file tab (IR-10).
+    pub(crate) tab_scroll: usize,
     /// The pull request being opened, if one is (FR-7.6).
     opening: Option<Opening>,
     /// Advances the opening spinner; driven by the loop's tick.
@@ -1010,6 +1075,10 @@ impl App {
             next_review_generation: 1,
             detail: None,
             review: None,
+            review_tab: ReviewTab::default(),
+            check_cursor: 0,
+            check_scroll: 0,
+            tab_scroll: 0,
             opening: None,
             spinner: 0,
             diff_loading: false,
@@ -1187,6 +1256,11 @@ impl App {
         self.detail = Some(detail);
         self.review = Some(view);
         if opening {
+            // Files remains the opening destination: it preserves the established
+            // review workflow while the numbered Overview tab is one key away.
+            self.review_tab = ReviewTab::Files;
+        }
+        if opening {
             self.focus = Pane::Diff;
             self.sync_mode_to_focus();
         }
@@ -1249,6 +1323,10 @@ impl App {
         self.review_session = None;
         self.detail = None;
         self.review = None;
+        self.review_tab = ReviewTab::default();
+        self.check_cursor = 0;
+        self.check_scroll = 0;
+        self.tab_scroll = 0;
         self.opening = None;
         self.diff_loading = false;
         self.diff_offline = None;
@@ -1296,9 +1374,73 @@ impl App {
         self.review.as_ref()
     }
 
+    /// The active destination within the open pull request (IR-10).
+    #[must_use]
+    pub const fn review_tab(&self) -> ReviewTab {
+        self.review_tab
+    }
+
+    /// Selects a pull-request destination without resetting its local view state.
+    pub(crate) fn select_review_tab(&mut self, tab: ReviewTab) {
+        if self.review.is_none() {
+            self.notice(NoticeLevel::Warn, "open a pull request first");
+            return;
+        }
+        self.review_tab = tab;
+        match tab {
+            ReviewTab::Ask => {
+                self.show_chat();
+                self.focus = Pane::Chat;
+                self.focus_target = FocusTarget::ChatInput;
+            }
+            ReviewTab::Files | ReviewTab::Overview | ReviewTab::Checks | ReviewTab::Discussion => {
+                self.focus = Pane::Diff;
+                self.focus_target = FocusTarget::Diff;
+            }
+        }
+        self.sync_mode_to_focus();
+    }
+
+    /// Moves the Checks tab selection without touching the hidden diff cursor.
+    pub(crate) fn move_check_cursor(&mut self, delta: isize) {
+        let count = self.detail.as_ref().map_or(0, |detail| detail.checks.len());
+        if count == 0 {
+            self.check_cursor = 0;
+            return;
+        }
+        let current = isize::try_from(self.check_cursor).unwrap_or(0);
+        let last = isize::try_from(count.saturating_sub(1)).unwrap_or(isize::MAX);
+        self.check_cursor = usize::try_from((current + delta).clamp(0, last)).unwrap_or(0);
+        let height = self.geometry.review.map_or(1, |layout| {
+            usize::from(layout.content.height.saturating_sub(2))
+        });
+        self.check_scroll =
+            components::ensure_visible(self.check_cursor, self.check_scroll, height, count);
+    }
+
+    /// Scrolls visible non-file tab content without moving the hidden diff cursor.
+    pub(crate) fn scroll_tab(&mut self, delta: isize) {
+        self.tab_scroll = self.tab_scroll.saturating_add_signed(delta);
+    }
+
+    /// URL for the check selected in the Checks tab, if GitHub supplied one.
+    #[must_use]
+    pub(crate) fn selected_check_url(&self) -> Option<&str> {
+        self.detail
+            .as_ref()?
+            .checks
+            .get(self.check_cursor)?
+            .url
+            .as_deref()
+    }
+
     /// Replaces the review view, keeping the detail it belongs to.
     pub fn set_review(&mut self, view: DiffView) {
+        let opening = self.review.is_none();
         self.review = Some(view);
+        if opening {
+            self.review_tab = ReviewTab::Files;
+        }
     }
 
     /// The open review view for editing, if any.
@@ -4238,6 +4380,10 @@ impl App {
                 self.focus = Pane::PullRequests;
             }
             Pane::Diff => {
+                if self.review_tab != ReviewTab::Files {
+                    self.scroll_tab(isize::try_from(delta * 3).unwrap_or(0));
+                    return;
+                }
                 if let Some(view) = self.review.as_mut() {
                     if self
                         .geometry
@@ -4267,6 +4413,13 @@ impl App {
     /// Focuses the pane under the pointer and moves its cursor to the row clicked.
     fn click_at(&mut self, column: u16, row: u16) {
         if self.overlay_owns_pointer(column, row) {
+            return;
+        }
+        if let Some(layout) = self.geometry.review
+            && layout.tabs.contains((column, row).into())
+            && let Some(tab) = crate::tui::components::review::tab_at(layout.tabs, self, column)
+        {
+            self.select_review_tab(tab);
             return;
         }
         let Some(pane) = self.pane_at(column, row) else {
@@ -4343,6 +4496,16 @@ impl App {
     fn pane_at(&self, column: u16, row: u16) -> Option<Pane> {
         if self.review.is_some() {
             let layout = self.geometry.review?;
+            if self.review_tab != ReviewTab::Files {
+                return layout
+                    .content
+                    .contains(ratatui::layout::Position::from((column, row)))
+                    .then_some(if self.review_tab == ReviewTab::Ask {
+                        Pane::Chat
+                    } else {
+                        Pane::Diff
+                    });
+            }
             if let Some(chat) = layout.chat
                 && chat.contains(ratatui::layout::Position::from((column, row)))
             {
@@ -8632,6 +8795,115 @@ mod tests {
         app.on_mouse(wheel(60, 12, true));
         assert_eq!(app.review.as_ref().expect("review").scroll, before);
         assert!(app.help_scroll > 0);
+    }
+
+    #[test]
+    fn ir_10_numeric_actions_and_tab_clicks_select_the_same_real_destinations() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        press(&mut app, "1");
+        assert_eq!(app.review_tab(), ReviewTab::Overview);
+        press(&mut app, "2");
+        assert_eq!(app.review_tab(), ReviewTab::Files);
+        press(&mut app, "3");
+        assert_eq!(app.review_tab(), ReviewTab::Checks);
+        press(&mut app, "4");
+        assert_eq!(app.review_tab(), ReviewTab::Discussion);
+        press(&mut app, "5");
+        assert_eq!(app.review_tab(), ReviewTab::Ask);
+        assert_eq!(app.focus(), Pane::Chat);
+
+        let terminal = drawn(&mut app, 160, 40);
+        let row = row_of(&terminal, "[2 Files");
+        let column = column_of(&terminal, row, "[2 Files") + 2;
+        app.on_mouse(click(column, row));
+        assert_eq!(app.review_tab(), ReviewTab::Files);
+    }
+
+    #[test]
+    fn ir_10_digits_in_a_composer_do_not_switch_tabs() {
+        let (_dir, mut app, _store) = chat_app();
+        app.select_review_tab(ReviewTab::Ask);
+        press(&mut app, "5");
+        assert_eq!(app.review_tab(), ReviewTab::Ask);
+        assert_eq!(app.chat.input.text(), "5");
+    }
+
+    #[test]
+    fn ir_10_checks_are_readable_and_enter_returns_the_selected_run_link_effect() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        app.detail.as_mut().expect("detail").checks = vec![
+            crate::domain::pr::CheckRun {
+                name: "unit tests".to_owned(),
+                state: crate::domain::pr::CheckState::Failure,
+                url: Some("https://example.test/runs/1".to_owned()),
+                description: Some("one test failed".to_owned()),
+            },
+            crate::domain::pr::CheckRun {
+                name: "lint".to_owned(),
+                state: crate::domain::pr::CheckState::Success,
+                url: None,
+                description: None,
+            },
+        ];
+        press(&mut app, "3");
+        let terminal = drawn(&mut app, 100, 30);
+        assert!(row_of(&terminal, "unit tests") < 30);
+        let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
+        assert!(
+            rendered.contains("https://example.test/runs/1"),
+            "{rendered}"
+        );
+        assert_eq!(
+            press(&mut app, "<Enter>"),
+            Effect::OpenUrl("https://example.test/runs/1".to_owned())
+        );
+        press(&mut app, "j");
+        assert_eq!(app.check_cursor, 1);
+        assert_eq!(press(&mut app, "<Enter>"), Effect::None);
+    }
+
+    #[test]
+    fn ir_10_discussion_keeps_review_bodies_orphans_and_outdated_threads_reachable() {
+        let (_dir, mut app) = discussion_app(false, Some("PRRT_1"));
+        let detail = app.detail.as_mut().expect("detail");
+        detail.reviews.push(crate::domain::pr::Review {
+            author: "reviewer".to_owned(),
+            state: crate::domain::pr::ReviewState::Commented,
+            body: "review body without inline comments".to_owned(),
+            submitted_at: None,
+        });
+        let mut orphan = detail.comments.first().expect("comment").clone();
+        orphan.id = 99;
+        orphan.in_reply_to = Some(404);
+        orphan.body = "orphan reply stays visible".to_owned();
+        orphan.outdated = true;
+        orphan.resolved = false;
+        detail.comments.push(orphan);
+        let mut resolved = detail.comments.first().expect("comment").clone();
+        resolved.id = 100;
+        resolved.in_reply_to = None;
+        resolved.body = "resolved thread stays visible".to_owned();
+        resolved.outdated = false;
+        resolved.resolved = true;
+        detail.comments.push(resolved);
+        press(&mut app, "4");
+        let terminal = drawn(&mut app, 100, 30);
+        assert!(row_of(&terminal, "review body without") < 30);
+        assert!(row_of(&terminal, "this came out of") < 30);
+        assert!(row_of(&terminal, "resolved thread stays") < 30);
+        press(&mut app, "f");
+        press(&mut app, "f");
+        let terminal = drawn(&mut app, 100, 30);
+        let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("resolved thread stays"), "{rendered}");
+        press(&mut app, "f");
+        assert_eq!(
+            app.discussion.filter,
+            crate::tui::discussion::DiscussionFilter::Outdated
+        );
+        let terminal = drawn(&mut app, 100, 30);
+        let rendered = crate::tui::test_support::buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("orphan reply stays"), "{rendered}");
     }
 
     #[test]

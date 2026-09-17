@@ -117,8 +117,8 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-06](#ir-06-make-user-storage-atomic-durable-and-recoverable) | P1 foundation | Atomic writes, durable chat, recoverable indexes | IR-05 | L | [Open — PR #16](https://github.com/killertux/smart-review/pull/16) |
 | [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | In progress (`ir-07-remote-mutations`) |
 | [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | In progress (`ir-08-cancellation-progress`) |
-| [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | In progress (`ir-09-layout-focus-hit-testing`) |
-| [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | Not started |
+| [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | [Merged — PR #20](https://github.com/killertux/smart-review/pull/20) |
+| [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | In progress (`ir-10-real-pr-tabs`) |
 | [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | Not started |
 | [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | Not started |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | Not started |

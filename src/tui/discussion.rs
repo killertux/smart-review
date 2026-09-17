@@ -11,6 +11,44 @@
 //! thread that is already there, or the conversation. A second text box would be a
 //! second place for `Enter` to mean something different.
 
+/// The thread state shown in the Discussion tab (IR-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscussionFilter {
+    /// Every record.
+    #[default]
+    All,
+    /// Current unresolved threads.
+    Open,
+    /// Resolved threads.
+    Resolved,
+    /// Threads whose anchor is no longer current.
+    Outdated,
+}
+
+impl DiscussionFilter {
+    /// Label shown in the tab title.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+            Self::Outdated => "outdated",
+        }
+    }
+
+    /// The next visible filter.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Open,
+            Self::Open => Self::Resolved,
+            Self::Resolved => Self::Outdated,
+            Self::Outdated => Self::All,
+        }
+    }
+}
+
 /// What the conversation panel is doing (FR-6.4).
 #[derive(Debug, Clone, Default)]
 pub struct DiscussionState {
@@ -20,6 +58,8 @@ pub struct DiscussionState {
     pub cursor: usize,
     /// How far the panel is scrolled from the top.
     pub scroll: usize,
+    /// Which inline-thread state is displayed in the Discussion tab.
+    pub filter: DiscussionFilter,
     /// The cursor for which `scroll` was last made visible.
     visible_cursor: usize,
     /// The job id of the resolve in flight.
@@ -82,6 +122,11 @@ impl DiscussionState {
     pub fn set_visible(&mut self, offset: usize) {
         self.scroll = offset;
         self.visible_cursor = self.cursor;
+    }
+
+    /// Advances the Discussion tab's filter.
+    pub fn cycle_filter(&mut self) {
+        self.filter = self.filter.next();
     }
 }
 

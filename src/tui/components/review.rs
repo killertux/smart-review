@@ -13,7 +13,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::domain::diff::{FileStatus, LineKind};
-use crate::tui::app::{App, Pane};
+use crate::domain::pr::{CheckState, ReviewComment};
+use crate::tui::app::{App, Pane, ReviewTab};
 use crate::tui::components::border_style;
 use crate::tui::diff_view::{DiffRow, DiffView, RowKind, SplitRow, TreeKind, TreeRow};
 use crate::tui::text;
@@ -34,6 +35,8 @@ pub const TREE_WIDTH: u16 = 34;
 pub struct ReviewLayout {
     /// The numbered tab row.
     pub tabs: Rect,
+    /// Full-width content below the tabs, used by non-file destinations.
+    pub content: Rect,
     /// The file tree.
     pub tree: Rect,
     /// The visible diff rows.
@@ -54,6 +57,7 @@ pub fn layout(area: Rect, chat_open: bool, composing: bool) -> ReviewLayout {
     let (diff, composer) = super::drafts::composer_split(columns[1], composing);
     ReviewLayout {
         tabs: rows[0],
+        content: rows[1],
         tree: columns[0],
         diff,
         composer,
@@ -75,15 +79,23 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
     });
     render_tabs(frame, layout.tabs, app);
-    render_tree(frame, layout.tree, app, view);
-    render_diff(frame, layout.diff, app, view);
-    if let Some(composer_area) = layout.composer
-        && let Some(composer) = app.drafts().composer.as_ref()
-    {
-        super::drafts::render_composer(frame, composer_area, app, composer);
-    }
-    if let Some(chat) = layout.chat {
-        super::chat::render(frame, chat, app);
+    match app.review_tab() {
+        ReviewTab::Overview => render_overview(frame, layout.content, app),
+        ReviewTab::Files => {
+            render_tree(frame, layout.tree, app, view);
+            render_diff(frame, layout.diff, app, view);
+            if let Some(composer_area) = layout.composer
+                && let Some(composer) = app.drafts().composer.as_ref()
+            {
+                super::drafts::render_composer(frame, composer_area, app, composer);
+            }
+            if let Some(chat) = layout.chat {
+                super::chat::render(frame, chat, app);
+            }
+        }
+        ReviewTab::Checks => render_checks(frame, layout.content, app),
+        ReviewTab::Discussion => render_discussion(frame, layout.content, app),
+        ReviewTab::Ask => super::chat::render(frame, layout.content, app),
     }
 }
 
@@ -93,59 +105,27 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(detail) = app.detail.as_ref() else {
         return;
     };
+    let compact = area.width < 120;
+    let title_width = if compact { 15 } else { 60 };
     let mut spans = vec![
         Span::styled(
             format!(" #{} ", detail.summary.number),
             theme.style(element::TITLE),
         ),
         Span::styled(
-            format!("{} ", text::truncate(&detail.summary.title, 60)),
+            format!("{} ", text::truncate(&detail.summary.title, title_width)),
             theme.style(element::FG),
         ),
-        Span::styled("[1 Diff] ".to_owned(), theme.style(element::SELECTION)),
     ];
-
-    // The tabs that are not built yet are shown greyed rather than hidden, so the
-    // shape of the screen does not change under the user in M2.
-    let approvals = detail.review_counts();
-    for (label, available) in [
-        (format!("2 Checks ({}) ", detail.checks.len()), false),
-        (format!("3 Reviews ({}) ", detail.reviews.len()), false),
-        (
-            match app.chat_state() {
-                Some(chat) => format!(
-                    "4 Chat ({}) ",
-                    chat.session
-                        .as_ref()
-                        .map_or(0, crate::domain::chat::Session::turns)
-                ),
-                None => "4 Chat ".to_owned(),
-            },
-            app.chat_state().is_some(),
-        ),
-        (
-            format!("5 Analysis ({}, {}) ", approvals.0, approvals.1),
-            false,
-        ),
-    ] {
+    for tab in ReviewTab::ALL {
+        let label = tab_label(app, tab, !compact);
         spans.push(Span::styled(
             label,
-            if available {
-                theme.style(element::FG)
+            if tab == app.review_tab() {
+                theme.style(element::SELECTION)
             } else {
-                theme.style(element::MUTED)
+                theme.style(element::FG)
             },
-        ));
-    }
-    if detail.comments.is_empty() {
-        spans.push(Span::styled(
-            "· no comments".to_owned(),
-            theme.style(element::MUTED),
-        ));
-    } else {
-        spans.push(Span::styled(
-            format!("· {} comments", detail.comments.len()),
-            theme.style(element::COMMENT_MARKER),
         ));
     }
 
@@ -154,6 +134,312 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(Line::from(spans)).style(theme.style(element::BG)),
         area,
     );
+}
+
+/// Finds the tab label rendered under a pointer column (IR-10).
+#[must_use]
+pub fn tab_at(area: Rect, app: &App, column: u16) -> Option<ReviewTab> {
+    let detail = app.detail.as_ref()?;
+    let compact = area.width < 120;
+    let title_width = if compact { 15 } else { 60 };
+    let prefix = format!(
+        " #{} {} ",
+        detail.summary.number,
+        text::truncate(&detail.summary.title, title_width)
+    );
+    let mut x = area
+        .x
+        .saturating_add(u16::try_from(text::width(&prefix)).unwrap_or(u16::MAX));
+    for tab in ReviewTab::ALL {
+        let label = tab_label(app, tab, !compact);
+        let end = x.saturating_add(u16::try_from(text::width(&label)).unwrap_or(u16::MAX));
+        if (x..end).contains(&column) {
+            return Some(tab);
+        }
+        x = end;
+    }
+    None
+}
+
+/// The rendered label and click extent for a tab.
+fn tab_label(app: &App, tab: ReviewTab, show_count: bool) -> String {
+    match (show_count, tab_count(app, tab)) {
+        (true, Some(count)) => format!("[{} {} ({count})] ", tab.number(), tab.label()),
+        _ => format!("[{} {}] ", tab.number(), tab.label()),
+    }
+}
+
+/// Count shown beside each tab; each number labels the data available at that destination.
+fn tab_count(app: &App, tab: ReviewTab) -> Option<usize> {
+    let detail = app.detail.as_ref()?;
+    match tab {
+        ReviewTab::Overview => None,
+        ReviewTab::Files => {
+            Some(usize::try_from(detail.summary.changed_files).unwrap_or(usize::MAX))
+        }
+        ReviewTab::Checks => Some(detail.checks.len()),
+        ReviewTab::Discussion => {
+            Some(detail.reviews.len() + detail.comments.len() + detail.conversation.len())
+        }
+        ReviewTab::Ask => app
+            .chat_state()
+            .and_then(|chat| chat.session.as_ref())
+            .map(crate::domain::chat::Session::turns),
+    }
+}
+
+/// Renders the author-supplied pull-request brief separately from analysis (IR-10).
+fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(detail) = app.detail.as_ref() else {
+        return;
+    };
+    let theme = &app.theme;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(" {} ", detail.summary.title),
+            theme.style(element::TITLE),
+        )),
+        Line::from(format!(
+            " author: {} · {} → {} · {}",
+            detail.summary.author,
+            detail.summary.head_ref,
+            detail.summary.base_ref,
+            detail.summary.state.label()
+        )),
+        Line::from(format!(
+            " {} commit(s) · {} changed file(s) · {} check(s) · {} discussion item(s)",
+            detail.commits.len(),
+            detail.summary.changed_files,
+            detail.checks.len(),
+            detail.reviews.len() + detail.comments.len() + detail.conversation.len(),
+        )),
+        Line::from(format!(
+            " review decision: {} · checks: {}",
+            detail
+                .summary
+                .review_decision
+                .map_or("not reported", crate::domain::pr::ReviewDecision::label),
+            detail.summary.checks.label(),
+        )),
+        Line::default(),
+        Line::from(Span::styled(
+            " Author description",
+            theme.style(element::TITLE),
+        )),
+    ];
+    if detail.body.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No description was provided.",
+            theme.style(element::MUTED),
+        )));
+    } else {
+        lines.extend(crate::tui::markdown::render(
+            &detail.body,
+            usize::from(area.width.saturating_sub(2)),
+            theme,
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " Analysis",
+        theme.style(element::TITLE),
+    )));
+    let analysis = if app.analysis_state().is_running() {
+        " Analysis is running; press Esc to cancel."
+    } else if app.analysis_panel().is_some() {
+        " Analysis is available; press <leader>a to read it."
+    } else if app.active_model.is_some() {
+        " No analysis yet; press <leader>a to generate one."
+    } else {
+        " Select a model with <leader>m before generating analysis."
+    };
+    lines.push(Line::from(Span::styled(
+        analysis,
+        theme.style(element::MUTED),
+    )));
+    let scroll = app.tab_scroll.min(lines.len().saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::new().borders(Borders::ALL).title(" overview "))
+            .style(theme.style(element::BG))
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Renders the forge's individual check records, including a truthful empty state.
+fn render_checks(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let Some(detail) = app.detail.as_ref() else {
+        return;
+    };
+    let mut lines = Vec::new();
+    if detail.checks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No checks are configured or GitHub did not report any.",
+            theme.style(element::MUTED),
+        )));
+    } else {
+        for (index, check) in detail.checks.iter().enumerate().skip(app.check_scroll) {
+            let marker = match check.state {
+                CheckState::Success => "✓",
+                CheckState::Failure => "✗",
+                CheckState::Pending => "…",
+                CheckState::Neutral => "•",
+                CheckState::Skipped => "−",
+                CheckState::Unknown => "?",
+            };
+            let state = match check.state {
+                CheckState::Success => "success",
+                CheckState::Failure => "failed",
+                CheckState::Pending => "running or queued",
+                CheckState::Neutral => "neutral",
+                CheckState::Skipped => "skipped",
+                CheckState::Unknown => "unknown",
+            };
+            lines.push(Line::from(Span::styled(
+                format!(" {marker} {} — {state}", check.name),
+                if index == app.check_cursor {
+                    theme.style(element::SELECTION)
+                } else if check.state.is_failure() {
+                    theme.style(element::STATUS_ERROR)
+                } else {
+                    theme.style(element::FG)
+                },
+            )));
+            if let Some(description) = &check.description {
+                lines.push(Line::from(Span::styled(
+                    format!("     {description}"),
+                    theme.style(element::MUTED),
+                )));
+            }
+            if let Some(url) = &check.url {
+                lines.push(Line::from(Span::styled(
+                    format!("     {url} · Enter opens this run in the browser."),
+                    theme.style(element::MUTED),
+                )));
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::new().borders(Borders::ALL).title(" checks "))
+            .style(theme.style(element::BG)),
+        area,
+    );
+}
+
+/// Renders every remote discussion record, including comments with no current diff row.
+fn render_discussion(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let Some(detail) = app.detail.as_ref() else {
+        return;
+    };
+    let mut lines = Vec::new();
+    if app.discussion.filter == crate::tui::discussion::DiscussionFilter::All {
+        for review in &detail.reviews {
+            lines.push(Line::from(Span::styled(
+                format!(" review · {} · {}", review.author, review.state.label()),
+                theme.style(element::TITLE),
+            )));
+            if review.body.trim().is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   (no review body)",
+                    theme.style(element::MUTED),
+                )));
+            } else {
+                lines.extend(crate::tui::markdown::render(
+                    &review.body,
+                    usize::from(area.width.saturating_sub(4)),
+                    theme,
+                ));
+            }
+        }
+    }
+    for comment in root_comments(&detail.comments).filter(|comment| matches_filter(app, comment)) {
+        let state = if comment.outdated {
+            "outdated"
+        } else if comment.resolved {
+            "resolved"
+        } else {
+            "open"
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" thread · {state} · {}", comment.path),
+            theme.style(element::TITLE),
+        )));
+        append_thread(&mut lines, &detail.comments, comment, theme, 1);
+    }
+    if app.discussion.filter == crate::tui::discussion::DiscussionFilter::All {
+        for comment in &detail.conversation {
+            lines.push(Line::from(Span::styled(
+                format!(" conversation · {}", comment.author),
+                theme.style(element::TITLE),
+            )));
+            lines.extend(crate::tui::markdown::render(
+                &comment.body,
+                usize::from(area.width.saturating_sub(4)),
+                theme,
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No discussion items match this filter.",
+            theme.style(element::MUTED),
+        )));
+    }
+    let scroll = app.tab_scroll.min(lines.len().saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::new().borders(Borders::ALL).title(format!(
+                " discussion · {} · f: cycle all/open/resolved/outdated ",
+                app.discussion.filter.label()
+            )))
+            .style(theme.style(element::BG))
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+fn matches_filter(app: &App, comment: &ReviewComment) -> bool {
+    match app.discussion.filter {
+        crate::tui::discussion::DiscussionFilter::All => true,
+        crate::tui::discussion::DiscussionFilter::Open => !comment.resolved && !comment.outdated,
+        crate::tui::discussion::DiscussionFilter::Resolved => comment.resolved,
+        crate::tui::discussion::DiscussionFilter::Outdated => comment.outdated,
+    }
+}
+
+fn root_comments(comments: &[ReviewComment]) -> impl Iterator<Item = &ReviewComment> {
+    comments.iter().filter(|comment| {
+        comment.in_reply_to.is_none()
+            || !comments
+                .iter()
+                .any(|candidate| Some(candidate.id) == comment.in_reply_to)
+    })
+}
+
+fn append_thread(
+    lines: &mut Vec<Line<'static>>,
+    comments: &[ReviewComment],
+    comment: &ReviewComment,
+    theme: &Theme,
+    depth: usize,
+) {
+    let indent = "  ".repeat(depth);
+    lines.push(Line::from(Span::styled(
+        format!(" {indent}{}: {}", comment.author, comment.body),
+        theme.style(element::FG),
+    )));
+    for reply in comments
+        .iter()
+        .filter(|reply| reply.in_reply_to == Some(comment.id))
+    {
+        append_thread(lines, comments, reply, theme, depth.saturating_add(1));
+    }
 }
 
 /// The file tree with per-file stats and folder grouping (FR-3.3).
@@ -764,12 +1050,29 @@ index 1a2b3c4..5d6e7f8 100644
     }
 
     #[test]
-    fn the_tabs_name_the_pull_request_and_grey_out_what_is_not_built() {
+    fn ir_10_tabs_name_real_pull_request_destinations() {
         let (_dir, mut app) = app_with_patch();
         let rendered = draw(&mut app, 140, 30);
-        assert!(rendered.contains("[1 Diff]"), "{rendered}");
-        assert!(rendered.contains("2 Checks"), "{rendered}");
-        assert!(rendered.contains("5 Analysis"), "{rendered}");
+        assert!(rendered.contains("[1 Overview]"), "{rendered}");
+        assert!(rendered.contains("[2 Files"), "{rendered}");
+        assert!(rendered.contains("[3 Checks"), "{rendered}");
+        assert!(rendered.contains("[4 Discussion"), "{rendered}");
+        assert!(rendered.contains("[5 Ask]"), "{rendered}");
+    }
+
+    #[test]
+    fn ir_10_compact_tabs_keep_every_destination_visible_at_80_columns() {
+        let (_dir, mut app) = app_with_patch();
+        let rendered = draw(&mut app, 80, 24);
+        for label in [
+            "[1 Overview]",
+            "[2 Files]",
+            "[3 Checks]",
+            "[4 Discussion]",
+            "[5 Ask]",
+        ] {
+            assert!(rendered.contains(label), "missing {label}: {rendered}");
+        }
     }
 
     #[test]
