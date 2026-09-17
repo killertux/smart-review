@@ -406,10 +406,10 @@ else
   bad "the compose box did not take the text"
   printf '%s\n' "$SCREEN" | tail -10
 fi
-if printf '%s' "$SCREEN" | grep -q "4 Chat"; then
-  ok "the tab bar shows the conversation is open"
+if printf '%s' "$SCREEN" | grep -Fq "[5 Ask]"; then
+  ok "the tab bar exposes Ask as the conversation destination"
 else
-  bad "the chat tab is not marked open"
+  bad "the Ask tab is not visible"
 fi
 if printf '%s' "$SCREEN" | grep -q "INSERT"; then
   ok "the status line says the keyboard is in insert mode"
