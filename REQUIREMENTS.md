@@ -775,7 +775,7 @@ Default bindings (all remappable; the generated [`docs/keymaps.md`](docs/keymaps
 **NFR-4.1 Resilience** — network failures, `gh` rate limits, malformed JSON, expired tokens and missing workspaces produce retry-able, explained states. Drafts and chat history are never lost to a crash (atomic writes).
 **NFR-4.2 Terminal integrity** — the terminal is restored on normal exit, error exit, panic and SIGINT/SIGTERM.
 **NFR-5.1 Maintainability** — `cargo fmt` clean; `cargo clippy -- -D warnings` clean; no file over ~800 lines without justification; domain/application unit-test coverage of branches that encode requirements.
-**NFR-5.2 Testability** — ports have fakes; time and randomness injected; no test performs network IO or requires `gh` (adapter contract tests are opt-in behind a feature/env var).
+**NFR-5.2 Testability** — ports have fakes; time and randomness injected; no test performs network IO or requires `gh` (adapter contract tests are opt-in behind a feature/env var). The PTY scenario driver MUST fail on an unmet ready/step wait, an unexpected child exit, mismatched steps or its global deadline; each step's wait observes cells redrawn after that step rather than stale text from an earlier frame. CI runs the shared Rust gates and build once, then runs milestone validators in explicit `--scenarios-only` mode against that binary.
 **NFR-5.3 Observability** — tracing spans per job (`job id`, kind, duration, result); log level from config.
 
 ---

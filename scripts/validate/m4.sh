@@ -20,6 +20,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/validate/common.sh"
+validation_mode "$@" || exit $?
 
 PASS=0
 FAIL=0
@@ -27,7 +29,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m4.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 
@@ -129,7 +131,19 @@ case "$1:$2" in
           printf '{"message":"Validation Failed","errors":[{"message":"Can not approve your own pull request"}]}\n' >&2
           exit 1
         fi
-        sleep "$(cat "$here/review_delay" 2>/dev/null || echo 0)"
+        release_marker=$(cat "$here/review_release_marker" 2>/dev/null)
+        if [ -n "$release_marker" ]; then
+          : >"$here/review-held"
+          attempts=0
+          while [ ! -f "$release_marker" ] && [ "$attempts" -lt 500 ]; do
+            sleep 0.01
+            attempts=$((attempts + 1))
+          done
+          if [ ! -f "$release_marker" ]; then
+            printf 'fake gh: timed out waiting for review release marker\n' >&2
+            exit 1
+          fi
+        fi
         printf '{"id": 4242, "html_url": "https://example.invalid/review/4242"}'
         ;;
       *) printf '[]' ;;
@@ -143,7 +157,7 @@ GH
 chmod +x "$FAKE/gh"
 printf '%s' "$FIXTURES" >"$FAKE/fixtures"
 printf '0' >"$FAKE/fail_review"
-printf '0' >"$FAKE/review_delay"
+: >"$FAKE/review_release_marker"
 cp "$TMP/diff.patch" "$FAKE/diff.patch"
 python3 - "$FIXTURES/pr-view.json" "$FAKE/view.json" "$PR_SHA" <<'PY'
 import json, sys
@@ -198,6 +212,17 @@ print(sum(1 for call in calls if needle in call))
 PY
 }
 
+# Prove that the assertion used below distinguishes one dispatch from two. This is a
+# synthetic fake-forge ledger only; no application or network process is started.
+records_duplicate_review_dispatch() {
+  : >"$FAKE/argv.txt"
+  for _ in 1 2; do
+    printf '%s\n' api -X POST repos/acme/service/pulls/141/reviews >>"$FAKE/argv.txt"
+    printf '\037\n' >>"$FAKE/argv.txt"
+  done
+  [ "$(count_calls 'pulls/141/reviews')" = "2" ]
+}
+
 # Runs a python assertion against a file, and says whether it held.
 check_json() {
   python3 - "$@" 2>"$TMP/check.log"
@@ -216,16 +241,28 @@ run_tui() {
   local home="$1" keys="$2" waits="$3" log="$4"
   local driver_code=0
   shift 4
-  PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
-    python3 "$ROOT/scripts/validate/drive.py" \
-      --cols 160 --rows 40 --log "$log" \
-      --timeout 90 --step-timeout 12 --settle 0.1 \
-      --ready "Add retry to the webhook dispatcher" \
-      --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+  if [ -n "${DRIVE_STEP_NOTIFY:-}" ]; then
+    PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
+      python3 "$ROOT/scripts/validate/drive.py" \
+        --cols 160 --rows 40 --log "$log" \
+        --timeout 90 --step-timeout 12 --settle 0.1 \
+        --step-notify "$DRIVE_STEP_NOTIFY" \
+        --ready "Add retry to the webhook dispatcher" \
+        --keys "$keys" --waits "$waits" -- \
+        "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+  else
+    PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
+      python3 "$ROOT/scripts/validate/drive.py" \
+        --cols 160 --rows 40 --log "$log" \
+        --timeout 90 --step-timeout 12 --settle 0.1 \
+        --ready "Add retry to the webhook dispatcher" \
+        --keys "$keys" --waits "$waits" -- \
+        "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+  fi
   if [ "$driver_code" -ne 0 ]; then
     touch "$TMP/driver.failed"
   fi
+  return "$driver_code"
 }
 
 shown() {
@@ -287,7 +324,7 @@ fi
 FRAMES="$TMP/three.log"
 SCREEN="$(run_tui "$HOME_ONE" \
   "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rd" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~M src/domain/money~comment on~2 comments staged~staged comments \\(2\\)" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~staged comments \\(2\\)" \
   "$FRAMES")"
 if shown "$FRAMES" "staged comments \\(2\\)"; then
   ok "two comments are staged and listed"
@@ -341,7 +378,7 @@ home_for "$HOME_TWO"
 FRAMES="$TMP/publish.log"
 SCREEN="$(run_tui "$HOME_TWO" \
   "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r~\r" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~M src/domain/money~comment on~2 comments staged~publish review~approve —~Enter again~review posted" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~Enter again~review posted" \
   "$FRAMES")"
 if shown "$FRAMES" "approve — this unblocks the pull request"; then
   ok "the modal names the verdict it is about to give"
@@ -469,22 +506,35 @@ else
 fi
 
 step "8/8 the second Enter sends once"
+if records_duplicate_review_dispatch; then
+  ok "the call ledger detects a deliberately duplicated review dispatch"
+else
+  bad "the call ledger would miss a duplicated review dispatch"
+fi
 HOME_SLOW="$TMP/home-slow"
 home_for "$HOME_SLOW"
-printf '2' >"$FAKE/review_delay"
+REVIEW_STEPS="$FAKE/review-steps"
+mkdir -p "$REVIEW_STEPS"
+printf '%s' "$REVIEW_STEPS/step-9.sent" >"$FAKE/review_release_marker"
+rm -f "$FAKE/review-held" "$REVIEW_STEPS/step-9.sent"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/slow.log"
-SCREEN="$(run_tui "$HOME_SLOW" \
+SCREEN="$(DRIVE_STEP_NOTIFY="$REVIEW_STEPS" run_tui "$HOME_SLOW" \
   "$OPEN~$LINES~c~one review only please\r~ rr~a~\r~\r~\r~q" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~review posted~~" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~sending~review posted~" \
   "$FRAMES")"
+if [ -f "$FAKE/review-held" ]; then
+  ok "the fake held the accepted review while the extra Enter was sent"
+else
+  bad "the review response was not held in flight"
+fi
 POSTS="$(count_calls 'pulls/141/reviews')"
 if [ "$POSTS" = "1" ]; then
   ok "pressing Enter again while it was in flight posted nothing more"
 else
   bad "in-flight Enter posted the review $POSTS times"
 fi
-printf '0' >"$FAKE/review_delay"
+: >"$FAKE/review_release_marker"
 
 if [ -f "$TMP/driver.failed" ]; then
   bad "one or more PTY steps did not reach their expected screen state"

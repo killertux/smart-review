@@ -23,6 +23,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/validate/common.sh"
+validation_mode "$@" || exit $?
 
 PASS=0
 FAIL=0
@@ -30,7 +32,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m5.XXXXXX")"
 BIN="target/debug/smart-review"
 
 cleanup() {
@@ -297,6 +299,7 @@ run_tui() {
   local key_groups="${keys//[!~]/}" wait_groups="${waits//[!~]/}"
   if [ "${#key_groups}" != "${#wait_groups}" ]; then
     bad "this step's keys and waits are not the same length: $(( ${#key_groups} + 1 )) key groups, $(( ${#wait_groups} + 1 )) waits"
+    return 2
   fi
   PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
     python3 "$ROOT/scripts/validate/drive.py" \
@@ -308,6 +311,7 @@ run_tui() {
   if [ "$driver_code" -ne 0 ]; then
     touch "$TMP/driver.failed"
   fi
+  return "$driver_code"
 }
 
 shown() {
@@ -479,8 +483,8 @@ step "8/12 a failed reply keeps the words in the modal"
 printf '1' >"$FAKE/fail_reply"
 FRAMES="$TMP/reply-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$ON_THREAD~r~this must not be lost\r~\r~\r~\r~q" \
-  "from the worktree~M src/domain/money~▸ carol~reply on src/domain/money.rs:2~post · #141~this must not be lost~comment is still here~" \
+  "$OPEN~$ON_THREAD~r~this must not be lost\r~\r~\r~q" \
+  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~Enter again sends it to GitHub~comment is still here~" \
   "$FRAMES")"
 if shown "$FRAMES" "the comment is still here"; then
   ok "the modal says the comment was kept"

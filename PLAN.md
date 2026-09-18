@@ -347,6 +347,10 @@ names the active model.
   `m<N>.sh` scripts remain standalone; the aggregate sets `SMART_REVIEW_SKIP_CARGO=1`
   so they do not repeat the shared gates. Live third-party catalog probing is opt-in
   with `SMART_REVIEW_LIVE_TESTS=1` and is never part of CI.
+- **PTY harness contract (IR-15):** `scripts/validate/test_harness.py` checks fragmented
+  UTF-8/ANSI replay, stale-frame rejection, wait/deadline failure and concurrent driver
+  isolation. `scripts/validate/all.sh --scenarios-only` is the explicit prebuilt mode
+  used by CI; standalone milestone scripts keep their build/test gates.
 
 ---
 

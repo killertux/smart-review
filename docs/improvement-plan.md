@@ -122,8 +122,8 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | In progress (`ir-11-executable-review-order`) |
 | [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | [Merged — PR #25](https://github.com/killertux/smart-review/pull/25) |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | [Open — PR #26](https://github.com/killertux/smart-review/pull/26) |
-| [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | In progress (`ir-14-ui-io-boundary`) |
-| [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Not started |
+| [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | [Merged — PR #27](https://github.com/killertux/smart-review/pull/27) |
+| [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Implemented locally (`ir-15-terminal-harness`) |
 | [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Not started |
 | [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Not started |
 | [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | Not started |
@@ -1364,32 +1364,32 @@ are replaced with observable conditions rather than simply made shorter.
 
 ### Implementation steps
 
-1. [ ] Record current wall time per validator and the number of build/test invocations.
+1. [x] Record current wall time per validator and the number of build/test invocations.
    Keep static wait budgets separate from measured duration. Avoid cold/warm comparison.
-2. [ ] Make unmet readiness/step waits, mismatched key/wait lengths, unexpected child
+2. [x] Make unmet readiness/step waits, mismatched key/wait lengths, unexpected child
    exit and global timeout return nonzero immediately. Save a useful last frame and
    raw capture. Shell callers must propagate failure rather than continue as success.
-3. [ ] Add regression fixtures for the driver itself: one unmet wait must fail even
+3. [x] Add regression fixtures for the driver itself: one unmet wait must fail even
    if a later screen happens to contain a generic success phrase.
-4. [ ] Keep an incremental terminal parser with persistent cursor/buffer/state. Feed
+4. [x] Keep an incremental terminal parser with persistent cursor/buffer/state. Feed
    only new bytes; carry incomplete UTF-8 and escape sequences across read boundaries.
    Avoid repeated suffix copying at every escape sequence.
-5. [ ] Test parser compatibility with the sequences the app emits, resize, Unicode,
+5. [x] Test parser compatibility with the sequences the app emits, resize, Unicode,
    alternate-screen/reset and fragmented reads. Preserve exact frame semantics used
    by existing assertions before changing their expected output.
-6. [ ] Replace empty `--settle 3` waits with local-diff-ready, modal-ready, job-completed,
+6. [x] Replace empty `--settle 3` waits with local-diff-ready, modal-ready, job-completed,
    operation-recorded or fake-provider acceptance conditions. Keep deliberate delays
    only for behaviors specifically testing streaming/cancellation.
-7. [ ] Replace unconditional shutdown settling with waiting for owned-child exit and
+7. [x] Replace unconditional shutdown settling with waiting for owned-child exit and
    final capture drain, under a bounded deadline. Verify terminal restoration after exit.
-8. [ ] Correct the M4 in-flight test: hold the response, send the extra Enter while
+8. [x] Correct the M4 in-flight test: hold the response, send the extra Enter while
    actually in flight, assert call count, then release the response.
-9. [ ] Add explicit prebuilt/scenario-only validator mode; retain standalone mode for
+9. [x] Add explicit prebuilt/scenario-only validator mode; retain standalone mode for
    local use. CI runs fmt, Clippy, full offline Rust tests and build once, then invokes
    scenario-only validators. Consolidate filtered docs/parser checks into the main suite.
-10. [ ] Use unique per-invocation temporary roots and tracked child PIDs. Replace broad
+10. [x] Use unique per-invocation temporary roots and tracked child PIDs. Replace broad
     `pkill -f` cleanup. Only after isolation tests pass consider parallel validators.
-11. [ ] Update CI artifacts/timing summaries. Keep useful failure captures private to
+11. [x] Update CI artifacts/timing summaries. Keep useful failure captures private to
     test fixtures; do not include actual user credentials/content in diagnostics.
 
 ### Required regression cases
@@ -1413,6 +1413,31 @@ an unmet wait, lost ANSI state, cross-process cleanup or weakened assertions.
 **Gates:** shared gates, Python driver/parser tests, all changed validators in standalone
 and/or prebuilt modes as appropriate. Record actual speedup; do not claim the 175.7 s
 static budget is the exact wall-time saving.
+
+**Implementation status (2026-09-18):** implemented and locally verified on
+`ir-15-terminal-harness`.
+The warm pre-change scenario-only baseline, measured sequentially on the same machine,
+was M0 2.028 s, M1 19.870 s, M2a 14.330 s (failed), M2b 16.538 s, M3 36.461 s,
+M4 24.854 s and M5 22.676 s. This is distinct from the historical 175.7 s static wait
+budget. The incremental parser is now shared by live and retrospective replay; driver
+unit tests cover fragmented ANSI/UTF-8, stale waits, timeouts, abnormal exits and
+concurrent isolation. CI uses explicit scenario-only mode, emits per-validator timing,
+and retains synthetic failure captures for seven days. It runs four shared Cargo
+commands (format, Clippy, full tests and build) and zero nested Cargo commands in the
+scenario validators; the partially improved pre-IR-15 CI already had that count, while
+standalone validators retain their own gates. No unconditional fixed settle budget
+remains; short sleeps only poll observable fixture readiness or deliberately pace the
+streaming/cancellation fixture. M4/M5's comparable warm total is
+45.648 s after the change versus 47.530 s before (1.882 s / 4.0% faster); the primary
+gain is trustworthy failure semantics rather than a large runtime claim.
+
+**Local verification (2026-09-18):** formatting, Clippy with all targets/features and
+warnings denied, 1,107 Rust unit tests plus 11 snapshots, 15 Python harness regressions,
+all seven scenario-only validators in parallel, and M4 in standalone mode passed. The
+aggregate also produced the same timing summary/artifact tree configured in CI. A
+second aggregate run with a sentinel `cargo` first on `PATH` passed without invoking
+it, proving scenario-only mode does not start nested Cargo gates. No live network,
+provider, authenticated `gh` or real GitHub mutation was used.
 
 ---
 

@@ -13,6 +13,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/validate/common.sh"
+validation_mode "$@" || exit $?
 
 PASS=0
 FAIL=0
@@ -20,10 +22,16 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m1.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
-cleanup() { rm -rf "$TMP"; }
+cleanup() {
+  if [ "${KEEP:-0}" = "1" ]; then
+    printf '  note: kept %s\n' "$TMP"
+  else
+    rm -rf "$TMP"
+  fi
+}
 trap cleanup EXIT
 
 # Captured before anything runs, so the last step can tell whether the run wrote into
@@ -121,6 +129,7 @@ run_tui() {
   if grep -q 'panicked' "$log" 2>/dev/null; then
     printf '  note: the interface panicked; see %s\n' "$log"
   fi
+  return "$driver_code"
 }
 
 # Matches text on the reconstructed screen, ignoring the padding between columns.
@@ -148,19 +157,19 @@ else
     bad "cargo fmt --check"
   fi
 
-  if cargo clippy --all-targets --all-features -- -D warnings >/tmp/m1-clippy.log 2>&1; then
+  if cargo clippy --all-targets --all-features -- -D warnings >"$TMP/m1-clippy.log" 2>&1; then
     ok "cargo clippy -- -D warnings"
   else
     bad "cargo clippy -- -D warnings"
-    tail -20 /tmp/m1-clippy.log
+    tail -20 "$TMP/m1-clippy.log"
   fi
 
-  if cargo test --all-features >/tmp/m1-test.log 2>&1; then
+  if cargo test --all-features >"$TMP/m1-test.log" 2>&1; then
     ok "cargo test --all-features"
     TESTS_PASSED=1
   else
     bad "cargo test --all-features"
-    grep -E '^test .* FAILED|panicked' /tmp/m1-test.log | head -10
+    grep -E '^test .* FAILED|panicked' "$TMP/m1-test.log" | head -10
   fi
 fi
 
@@ -168,22 +177,22 @@ fi
 step "2/6 the diff parser handles the fixture's awkward cases"
 if [ "$TESTS_PASSED" = "1" ]; then
   ok "the full test gate includes parser cases (renames, binary, mode-only, submodule, CRLF)"
-elif cargo test --all-features --lib domain::diff >/tmp/m1-parser.log 2>&1; then
+elif cargo test --all-features --lib domain::diff >"$TMP/m1-parser.log" 2>&1; then
   ok "the parser's focused tests pass despite another test failure"
 else
   bad "the parser's unit tests fail"
-  grep -E '^test .* FAILED' /tmp/m1-parser.log | head -5
+  grep -E '^test .* FAILED' "$TMP/m1-parser.log" | head -5
 fi
 
 # ---------------------------------------------------------------------------
 step "3/6 build"
 if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
   printf '  SKIP  the parent validator already built the debug binary\n'
-elif cargo build >/tmp/m1-build.log 2>&1; then
+elif cargo build >"$TMP/m1-build.log" 2>&1; then
   ok "cargo build"
 else
   bad "cargo build"
-  tail -20 /tmp/m1-build.log
+  tail -20 "$TMP/m1-build.log"
 fi
 
 # ---------------------------------------------------------------------------
@@ -194,7 +203,7 @@ mkdir -p "$DETECT_HOME" "$TMP/not-a-repo"
 # Outside a clone and without `--repo`, the failure is specific and actionable.
 set +e
 (cd "$TMP/not-a-repo" && SMART_REVIEW_HOME="$DETECT_HOME" "$ROOT/$BIN" --check) \
-  >/tmp/m1-check.log 2>&1
+  >"$TMP/m1-check.log" 2>&1
 CHECK_CODE=$?
 set -e
 
@@ -204,14 +213,14 @@ else
   bad "--check exited 0 outside a repository"
 fi
 
-if grep -q "not a git repository" /tmp/m1-check.log; then
+if grep -q "not a git repository" "$TMP/m1-check.log"; then
   ok "the report says the directory is not a repository"
 else
   bad "the report did not name the first failure"
-  head -20 /tmp/m1-check.log
+  head -20 "$TMP/m1-check.log"
 fi
 
-if grep -q -- "--repo" /tmp/m1-check.log; then
+if grep -q -- "--repo" "$TMP/m1-check.log"; then
   ok "the report offers the next step"
 else
   bad "the report offered no next step"
@@ -224,15 +233,15 @@ cat >"$TMP/nogh/config.toml" <<'TOML'
 gh_path = "/nonexistent/gh-for-m1-validation"
 TOML
 set +e
-SMART_REVIEW_HOME="$TMP/nogh" "$ROOT/$BIN" --check --repo acme/service >/tmp/m1-nogh.log 2>&1
+SMART_REVIEW_HOME="$TMP/nogh" "$ROOT/$BIN" --check --repo acme/service >"$TMP/m1-nogh.log" 2>&1
 NOGH_CODE=$?
 set -e
 
-if grep -q "cli.github.com" /tmp/m1-nogh.log; then
+if grep -q "cli.github.com" "$TMP/m1-nogh.log"; then
   ok "a missing gh is reported with where to install it"
 else
   bad "a missing gh was not reported usefully"
-  head -20 /tmp/m1-nogh.log
+  head -20 "$TMP/m1-nogh.log"
 fi
 
 if [ "$NOGH_CODE" -eq 2 ]; then
@@ -251,7 +260,7 @@ else
   make_fake_gh "$FAKE"
 
   HOME_LIST="$TMP/home-list"
-  SCREEN="$(run_tui "$HOME_LIST" ':q\r' '' "$FAKE" /tmp/m1-list.log)"
+  SCREEN="$(run_tui "$HOME_LIST" ':q\r' '' "$FAKE" "$TMP/m1-list.log")"
 
   # The list is the headline feature: rows, markers and an honest count.
   if printf '%s' "$SCREEN" | grep -q "Add retry to the webhook dispatcher"; then
@@ -282,7 +291,7 @@ else
 
   # `:filter is:all` re-asks GitHub with a different query, and the chips change.
   HOME_FILTER="$TMP/home-filter"
-  SCREEN="$(run_tui "$HOME_FILTER" ':filter is:all\r~:q\r' '\[is:all\]~' "$FAKE" /tmp/m1-filter.log)"
+  SCREEN="$(run_tui "$HOME_FILTER" ':filter is:all\r~:q\r' '\[is:all\]~' "$FAKE" "$TMP/m1-filter.log")"
   if printf '%s' "$SCREEN" | saw "\[is:all\]"; then
     ok "a filter becomes a visible chip"
   else
@@ -292,7 +301,7 @@ else
 
   # `/` filters what has been fetched, without asking GitHub again.
   HOME_SEARCH="$TMP/home-search"
-  SCREEN="$(run_tui "$HOME_SEARCH" '/dependabot\r~:q\r' 'matching 1 of 3 loaded~' "$FAKE" /tmp/m1-search.log)"
+  SCREEN="$(run_tui "$HOME_SEARCH" '/dependabot\r~:q\r' 'matching 1 of 3 loaded~' "$FAKE" "$TMP/m1-search.log")"
   if printf '%s' "$SCREEN" | saw "matching 1 of 3 loaded"; then
     ok "the client-side search narrows the fetched list"
   else
@@ -302,7 +311,7 @@ else
 
   # Enter opens the selected pull request: its diff comes from `gh pr diff`.
   HOME_DIFF="$TMP/home-diff"
-  SCREEN="$(run_tui "$HOME_DIFF" '\r~' 'impl Invoice~' "$FAKE" /tmp/m1-diff.log)"
+  SCREEN="$(run_tui "$HOME_DIFF" '\r~' 'impl Invoice~' "$FAKE" "$TMP/m1-diff.log")"
   if printf '%s' "$SCREEN" | grep -q "impl Invoice"; then
     ok "opening a pull request shows its diff"
   else
@@ -333,7 +342,7 @@ else
   # `}` moves to the next file banner and `j` moves a line, so the status line's
   # file label is what proves the cursor travelled.
   HOME_NAV="$TMP/home-nav"
-  SCREEN="$(run_tui "$HOME_NAV" '\r~}}~:q\r' 'impl Invoice~M scripts/build\.sh~' "$FAKE" /tmp/m1-nav.log)"
+  SCREEN="$(run_tui "$HOME_NAV" '\r~}}~:q\r' 'impl Invoice~M scripts/build\.sh~' "$FAKE" "$TMP/m1-nav.log")"
   if printf '%s' "$SCREEN" | saw "M scripts/build.sh"; then
     ok "file navigation moves the cursor and the status line names the file"
   else
@@ -342,7 +351,10 @@ else
   fi
 
   HOME_HUNK="$TMP/home-hunk"
-  SCREEN="$(run_tui "$HOME_HUNK" '\r~]c~:q\r' 'impl Invoice~impl Billing~' "$FAKE" /tmp/m1-hunk.log)"
+  # Hunk movement is synchronous and changes only cell styling when both hunks already
+  # fit. Settle that key, then assert the final selected hunk instead of accepting the
+  # stale `impl Billing` text that was visible before `]c` (IR-15).
+  SCREEN="$(run_tui "$HOME_HUNK" '\r~]c~:q\r' 'impl Invoice~~' "$FAKE" "$TMP/m1-hunk.log")"
   if printf '%s' "$SCREEN" | saw "impl Billing"; then
     ok "hunk navigation reaches the next hunk"
   else
@@ -354,7 +366,7 @@ else
   # rolling down must move what is displayed: a wheel that only walks a selection down
   # the screen looks broken, and it looked broken here twice.
   HOME_WHEEL="$TMP/home-wheel"
-  SCREEN="$(run_tui "$HOME_WHEEL" ':pr 138\r' 'line 001 of the invoice' "$FAKE" /tmp/m1-wheel-before.log)"
+  SCREEN="$(run_tui "$HOME_WHEEL" ':pr 138\r' 'line 001 of the invoice' "$FAKE" "$TMP/m1-wheel-before.log")"
   if printf '%s' "$SCREEN" | saw "line 001 of the invoice"; then
     ok "a long diff starts at the top"
   else
@@ -363,7 +375,7 @@ else
   fi
 
   HOME_WHEEL2="$TMP/home-wheel2"
-  SCREEN="$(run_tui "$HOME_WHEEL2" ':pr 138\r~\033[<65;60;12M\033[<65;60;12M\033[<65;60;12M' 'line 001 of the invoice~' "$FAKE" /tmp/m1-wheel.log)"
+  SCREEN="$(run_tui "$HOME_WHEEL2" ':pr 138\r~\033[<65;60;12M\033[<65;60;12M\033[<65;60;12M' 'line 001 of the invoice~' "$FAKE" "$TMP/m1-wheel.log")"
   if printf '%s' "$SCREEN" | saw "line 001 of the invoice"; then
     bad "the wheel did not scroll the diff"
     printf '%s\n' "$SCREEN" | tail -8
@@ -373,7 +385,7 @@ else
 
   # And a click lands on the row it was aimed at: the second file in the tree.
   HOME_CLICK="$TMP/home-click"
-  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;5M' 'impl Invoice~A docs/logo\.png' "$FAKE" /tmp/m1-click.log)"
+  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;5M' 'impl Invoice~A docs/logo\.png' "$FAKE" "$TMP/m1-click.log")"
   if printf '%s' "$SCREEN" | saw "A docs/logo.png"; then
     ok "a click on a tree row opens that file"
   else
@@ -384,8 +396,8 @@ else
   # `:copy-path` writes the OSC 52 sequence, which *is* the feature: a path on the
   # clipboard with no clipboard dependency (FR-3.4).
   HOME_COPY="$TMP/home-copy"
-  run_tui "$HOME_COPY" '\r~y~:q\r' 'impl Invoice~copied~' "$FAKE" /tmp/m1-copy.log >/dev/null
-  if grep -q ']52;c;' /tmp/m1-copy.log; then
+  run_tui "$HOME_COPY" '\r~y~:q\r' 'impl Invoice~copied~' "$FAKE" "$TMP/m1-copy.log" >/dev/null
+  if grep -q ']52;c;' "$TMP/m1-copy.log"; then
     ok ":copy-path puts the file path on the terminal clipboard"
   else
     bad ":copy-path wrote no OSC 52 sequence"
@@ -398,7 +410,7 @@ else
   set +e
   PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$HOME_SIGNAL" \
     python3 "$ROOT/scripts/validate/drive.py" \
-      --cols 160 --rows 40 --log /tmp/m1-signal.log \
+      --cols 160 --rows 40 --log "$TMP/m1-signal.log" \
       --ready "Add retry to the webhook dispatcher" -- \
       "$ROOT/$BIN" --repo acme/service >/dev/null
   SIGNAL_CODE=$?
@@ -419,7 +431,7 @@ else
   # then quits. Quitting immediately is a race — the cached page is painted before the
   # fetch is even attempted, so the indicator the check wants appears *after* the first
   # frame, and an app that has already exited never reaches it.
-  SCREEN="$(run_tui "$HOME_LIST" '~:q\r' 'offline~' "$FAKE_FAILING" /tmp/m1-offline.log)"
+  SCREEN="$(run_tui "$HOME_LIST" '~:q\r' 'offline~' "$FAKE_FAILING" "$TMP/m1-offline.log")"
   if printf '%s' "$SCREEN" | grep -q "Add retry to the webhook dispatcher"; then
     ok "a cached list is shown when the network is gone"
   else

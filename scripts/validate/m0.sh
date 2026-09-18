@@ -10,6 +10,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/validate/common.sh"
+validation_mode "$@" || exit $?
 
 PASS=0
 FAIL=0
@@ -17,9 +19,15 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP_HOME="$(mktemp -d)"
+TMP_HOME="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m0.XXXXXX")"
 BIN="target/debug/smart-review"
-cleanup() { rm -rf "$TMP_HOME"; }
+cleanup() {
+  if [ "${KEEP:-0}" = "1" ]; then
+    printf '  note: kept %s\n' "$TMP_HOME"
+  else
+    rm -rf "$TMP_HOME"
+  fi
+}
 trap cleanup EXIT
 
 if [ "${SMART_REVIEW_SKIP_CARGO:-0}" = "1" ]; then
@@ -34,27 +42,27 @@ else
   fi
 
   step "2/7 lints"
-  if cargo clippy --all-targets --all-features -- -D warnings >/tmp/m0-clippy.log 2>&1; then
+  if cargo clippy --all-targets --all-features -- -D warnings >"$TMP_HOME/m0-clippy.log" 2>&1; then
     ok "cargo clippy -- -D warnings"
   else
     bad "cargo clippy -- -D warnings"
-    tail -20 /tmp/m0-clippy.log
+    tail -20 "$TMP_HOME/m0-clippy.log"
   fi
 
   step "3/7 tests"
-  if cargo test --all-features >/tmp/m0-test.log 2>&1; then
-    ok "cargo test --all-features ($(grep -c '^test .* ok$' /tmp/m0-test.log) tests reported)"
+  if cargo test --all-features >"$TMP_HOME/m0-test.log" 2>&1; then
+    ok "cargo test --all-features ($(grep -c '^test .* ok$' "$TMP_HOME/m0-test.log") tests reported)"
   else
     bad "cargo test --all-features"
-    grep -E '^test .* FAILED|panicked' /tmp/m0-test.log | head -10
+    grep -E '^test .* FAILED|panicked' "$TMP_HOME/m0-test.log" | head -10
   fi
 
   step "4/7 build"
-  if cargo build >/tmp/m0-build.log 2>&1; then
+  if cargo build >"$TMP_HOME/m0-build.log" 2>&1; then
     ok "cargo build"
   else
     bad "cargo build"
-    tail -20 /tmp/m0-build.log
+    tail -20 "$TMP_HOME/m0-build.log"
   fi
 fi
 
@@ -80,7 +88,7 @@ fi
 
 step "6/7 first run, configuration robustness and layout"
 set +e
-SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >/tmp/m0-check.log 2>&1
+SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >"$TMP_HOME/m0-check.log" 2>&1
 CHECK_CODE=$?
 set -e
 
@@ -92,18 +100,18 @@ case "$CHECK_CODE" in
   0 | 1 | 2) ok "--check exits with $CHECK_CODE (0 ready / 1 degraded / 2 unusable)" ;;
   *)
     bad "--check exited with $CHECK_CODE; expected 0, 1 or 2"
-    cat /tmp/m0-check.log
+    cat "$TMP_HOME/m0-check.log"
     ;;
 esac
 
-if grep -q 'repository' /tmp/m0-check.log; then
+if grep -q 'repository' "$TMP_HOME/m0-check.log"; then
   ok "the report says which repository was found, or why not"
 else
   bad "the report did not mention the repository"
 fi
 
 for name in config home keybinds llm log terminal theme; do
-  if grep -q "$name" /tmp/m0-check.log; then
+  if grep -q "$name" "$TMP_HOME/m0-check.log"; then
     ok "--check reports the $name check"
   else
     bad "--check does not report the $name check"
@@ -141,39 +149,39 @@ timeoutlen = "soon"
 theme = "light"
 TOML
 set +e
-SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >/tmp/m0-bad-config.log 2>&1
+SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >"$TMP_HOME/m0-bad-config.log" 2>&1
 BAD_CONFIG_CODE=$?
 set -e
 # The point is that the unusable value is *reported* and a report is still produced,
 # not which of the three codes the run lands on: detection may fail for unrelated
 # reasons on the machine running this.
-if [ "$BAD_CONFIG_CODE" -ne 124 ] && grep -q 'timeoutlen' /tmp/m0-bad-config.log; then
+if [ "$BAD_CONFIG_CODE" -ne 124 ] && grep -q 'timeoutlen' "$TMP_HOME/m0-bad-config.log"; then
   ok "an unusable value is reported and the app still starts"
 else
   bad "a bad value did not degrade gracefully (exit $BAD_CONFIG_CODE)"
-  cat /tmp/m0-bad-config.log
+  cat "$TMP_HOME/m0-bad-config.log"
 fi
 
 # The warning itself has to name the file (FR-8.6). The doctor's config line
 # always mentions the path, so match the prefix only a prefixed warning has.
-if grep -q "$TMP_HOME/config.toml: config:" /tmp/m0-bad-config.log; then
+if grep -q "$TMP_HOME/config.toml: config:" "$TMP_HOME/m0-bad-config.log"; then
   ok "the warning names the configuration file"
 else
   bad "the warning does not name the configuration file"
-  cat /tmp/m0-bad-config.log
+  cat "$TMP_HOME/m0-bad-config.log"
 fi
 
 # Broken TOML is unrecoverable and must be a clean, explained failure (exit 2).
 printf '[ui\ntheme =' >"$TMP_HOME/config.toml"
 set +e
-SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >/tmp/m0-broken.log 2>&1
+SMART_REVIEW_HOME="$TMP_HOME" "$BIN" --check >"$TMP_HOME/m0-broken.log" 2>&1
 BROKEN_CODE=$?
 set -e
-if [ "$BROKEN_CODE" -eq 2 ] && grep -q 'not valid TOML' /tmp/m0-broken.log; then
+if [ "$BROKEN_CODE" -eq 2 ] && grep -q 'not valid TOML' "$TMP_HOME/m0-broken.log"; then
   ok "invalid TOML fails cleanly with exit 2"
 else
   bad "invalid TOML gave exit $BROKEN_CODE without an explanation"
-  cat /tmp/m0-broken.log
+  cat "$TMP_HOME/m0-broken.log"
 fi
 
 # Nothing may be written into the user's repository (FR-8.1).
@@ -185,14 +193,14 @@ fi
 
 step "7/7 terminal lifecycle in a real pty"
 if command -v python3 >/dev/null 2>&1; then
-  PTY_HOME="$(mktemp -d)"
+  PTY_HOME="$(mktemp -d "$TMP_HOME/pty.XXXXXX")"
   set +e
   # The driver advances on visible postconditions and an actual quiet PTY rather than
   # paying a fixed sleep after every key.
   SMART_REVIEW_HOME="$PTY_HOME" python3 "$ROOT/scripts/validate/drive.py" \
-    --cols 120 --rows 40 --log /tmp/m0-tui.log --ready 'smart-review' \
+    --cols 120 --rows 40 --log "$TMP_HOME/m0-tui.log" --ready 'smart-review' \
     --keys ' ~\e~:bogus\r~:q\r' --waits 'leader~~not a command~' -- \
-    "$ROOT/$BIN" >/tmp/m0-tui-screen.log
+    "$ROOT/$BIN" >"$TMP_HOME/m0-tui-screen.log"
   TUI_CODE=$?
   set -e
 
@@ -210,46 +218,45 @@ if command -v python3 >/dev/null 2>&1; then
 
   # Prove the screen was painted at all, otherwise the checks below would pass
   # vacuously on an empty render.
-  if grep -q 'smart-review' /tmp/m0-tui-screen.log && grep -q 'NORMAL' /tmp/m0-tui-screen.log; then
+  if grep -q 'smart-review' "$TMP_HOME/m0-tui-screen.log" && grep -q 'NORMAL' "$TMP_HOME/m0-tui-screen.log"; then
     ok "the interface painted the header and the status line"
   else
     bad "the interface rendered nothing"
   fi
 
   if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
-      --path /tmp/m0-tui.log --when leader >/dev/null 2>&1; then
+      --path "$TMP_HOME/m0-tui.log" --when leader >/dev/null 2>&1; then
     ok "the leader menu appears without waiting for the timeout"
   else
     bad "the leader menu did not appear on the key press"
   fi
 
   if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
-      --path /tmp/m0-tui.log --when bogus >/dev/null 2>&1; then
+      --path "$TMP_HOME/m0-tui.log" --when bogus >/dev/null 2>&1; then
     ok "an unknown command is reported on screen"
   else
     bad "an unknown command produced no visible output"
   fi
 
   if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
-      --path /tmp/m0-tui.log --when 'not a command' >/dev/null 2>&1; then
+      --path "$TMP_HOME/m0-tui.log" --when 'not a command' >/dev/null 2>&1; then
     ok "the unknown command error names the problem"
   else
     bad "the unknown command error is missing"
   fi
 
-  if grep -q $'\x1b\[?1049l' /tmp/m0-tui.log; then
+  if grep -q $'\x1b\[?1049l' "$TMP_HOME/m0-tui.log"; then
     ok "the alternate screen was left on exit"
   else
     bad "the alternate screen was not left on exit"
   fi
 
-  if grep -q $'\x1b\[?1006l' /tmp/m0-tui.log; then
+  if grep -q $'\x1b\[?1006l' "$TMP_HOME/m0-tui.log"; then
     ok "mouse capture was released on exit"
   else
     bad "mouse capture was not released on exit"
   fi
 
-  rm -rf "$PTY_HOME"
 else
   printf '  SKIP  python3 is not available, so the pty check was skipped\n'
 fi

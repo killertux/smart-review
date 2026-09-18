@@ -22,12 +22,7 @@ Usage: screen.py [--cols N] [--rows N] [--when PATTERN] < captured.log
 import argparse
 import re
 import sys
-
-# ECMA-48 final bytes span `@` through `~`; most terminal controls use a letter,
-# while keys and a few controls end in `~`. Unrecognised finals are harmlessly ignored
-# by `Screen.csi`, but they still have to be consumed as one sequence.
-CSI = re.compile(r"\x1b\[([0-9;?]*)([@-~])")
-OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+import unicodedata
 
 
 class Screen:
@@ -35,13 +30,34 @@ class Screen:
         self.cols = cols
         self.rows = rows
         self.grid = [[" "] * cols for _ in range(rows)]
+        self.changed = [[0] * cols for _ in range(rows)]
         self.row = 0
         self.col = 0
+        self.saved_row = 0
+        self.saved_col = 0
+        self.revision = 0
 
     def clear(self) -> None:
         self.grid = [[" "] * self.cols for _ in range(self.rows)]
+        self.revision += 1
+        self.changed = [[self.revision] * self.cols for _ in range(self.rows)]
         self.row = 0
         self.col = 0
+
+    def resize(self, cols: int, rows: int) -> None:
+        """Resizes the terminal while preserving the visible intersection."""
+        grid = [[" "] * cols for _ in range(rows)]
+        changed = [[0] * cols for _ in range(rows)]
+        for row in range(min(self.rows, rows)):
+            for col in range(min(self.cols, cols)):
+                grid[row][col] = self.grid[row][col]
+                changed[row][col] = self.changed[row][col]
+        self.cols = cols
+        self.rows = rows
+        self.grid = grid
+        self.changed = changed
+        self.row = min(self.row, rows - 1)
+        self.col = min(self.col, cols - 1)
 
     def put(self, character: str) -> None:
         if character == "\n":
@@ -58,12 +74,24 @@ class Screen:
             return
         if character < " ":
             return
+        if unicodedata.combining(character):
+            if self.col > 0:
+                self.grid[self.row][self.col - 1] += character
+                self.revision += 1
+                self.changed[self.row][self.col - 1] = self.revision
+            return
         if self.col >= self.cols:
             # Autowrap: the next line, as a terminal with DECAWM on would do.
             self.col = 0
             self.row = min(self.row + 1, self.rows - 1)
         self.grid[self.row][self.col] = character
-        self.col += 1
+        self.revision += 1
+        self.changed[self.row][self.col] = self.revision
+        width = 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+        if width == 2 and self.col + 1 < self.cols:
+            self.grid[self.row][self.col + 1] = ""
+            self.changed[self.row][self.col + 1] = self.revision
+        self.col += width
 
     def csi(self, params: str, final: str) -> None:
         numbers = [int(part) for part in params.replace("?", "").split(";") if part.isdigit()]
@@ -85,10 +113,13 @@ class Screen:
             if first == 2 or first == 3:
                 self.clear()
             elif first == 0:
+                self.revision += 1
                 for column in range(self.col, self.cols):
                     self.grid[self.row][column] = " "
+                    self.changed[self.row][column] = self.revision
                 for row in range(self.row + 1, self.rows):
                     self.grid[row] = [" "] * self.cols
+                    self.changed[row] = [self.revision] * self.cols
         elif final == "K":
             if first == 0:
                 for column in range(self.col, self.cols):
@@ -98,63 +129,120 @@ class Screen:
                     self.grid[self.row][column] = " "
             else:
                 self.grid[self.row] = [" "] * self.cols
+            self.revision += 1
+            if first == 0:
+                columns = range(self.col, self.cols)
+            elif first == 1:
+                columns = range(0, self.col + 1)
+            else:
+                columns = range(self.cols)
+            for column in columns:
+                self.changed[self.row][column] = self.revision
+        elif final == "s":
+            self.saved_row = self.row
+            self.saved_col = self.col
+        elif final == "u":
+            self.row = self.saved_row
+            self.col = self.saved_col
 
     def text(self) -> str:
         return "\n".join("".join(row).rstrip() for row in self.grid)
+
+    def pattern_visible_since(self, matcher: re.Pattern[str], revision: int) -> bool:
+        """Whether a visible match contains a cell redrawn after `revision`."""
+        characters: list[str] = []
+        revisions: list[int] = []
+        for row in range(self.rows):
+            end = self.cols
+            while end and self.grid[row][end - 1] == " ":
+                end -= 1
+            for col in range(end):
+                cell = self.grid[row][col]
+                characters.extend(cell)
+                revisions.extend([self.changed[row][col]] * len(cell))
+            if row + 1 < self.rows:
+                characters.append("\n")
+                revisions.append(0)
+        text = "".join(characters)
+        return any(
+            max(revisions[match.start() : match.end()], default=0) > revision
+            for match in matcher.finditer(text)
+        )
 
 
 class Replay:
     """Incrementally applies terminal output to one screen.
 
-    PTY reads may split an escape sequence between two chunks. `pending` keeps that
-    incomplete suffix until the next read, so the live driver does not need to replay
-    its whole capture after every poll.
+    PTY reads may split UTF-8 and escape sequences anywhere. The replay keeps a small
+    parser state rather than copying and reparsing the captured suffix or whole stream.
     """
 
     def __init__(self, cols: int, rows: int) -> None:
         self.screen = Screen(cols, rows)
-        self.pending = ""
+        self.state = "text"
+        self.csi_body = ""
 
     def feed(self, data: str, *, final: bool = False) -> None:
-        data = self.pending + data
-        self.pending = ""
-        index = 0
-        while index < len(data):
-            character = data[index]
-            if character != "\x1b":
-                self.screen.put(character)
-                index += 1
-                continue
-
-            remainder = data[index:]
-            match = CSI.match(remainder)
-            if match:
-                self.screen.csi(match.group(1), match.group(2))
-                index += match.end()
-                continue
-            osc = OSC.match(remainder)
-            if osc:
-                self.pending = ""
-                index += osc.end()
-                continue
-
-            # A CSI or OSC can be split anywhere by a PTY read. Keep it for the next
-            # chunk unless this is the final feed; an unknown complete escape remains
-            # the same harmless two-character sequence the old replay ignored.
-            if not final and (
-                remainder == "\x1b"
-                or remainder.startswith("\x1b[")
-                or remainder.startswith("\x1b]")
-            ):
-                self.pending = remainder
-                return
-            index += min(2, len(remainder))
+        for character in data:
+            if self.state == "text":
+                if character == "\x1b":
+                    self.state = "escape"
+                else:
+                    self.screen.put(character)
+            elif self.state == "escape":
+                if character == "[":
+                    self.state = "csi"
+                    self.csi_body = ""
+                elif character == "]":
+                    self.state = "osc"
+                elif character == "P":
+                    self.state = "dcs"
+                elif character == "7":
+                    self.screen.saved_row = self.screen.row
+                    self.screen.saved_col = self.screen.col
+                    self.state = "text"
+                elif character == "8":
+                    self.screen.row = self.screen.saved_row
+                    self.screen.col = self.screen.saved_col
+                    self.state = "text"
+                elif character == "c":
+                    self.screen.clear()
+                    self.state = "text"
+                elif character in "()":
+                    self.state = "charset"
+                else:
+                    self.state = "text"
+            elif self.state == "csi":
+                if "@" <= character <= "~":
+                    params = self.csi_body.split(" ", maxsplit=1)[0]
+                    self.screen.csi(params, character)
+                    self.csi_body = ""
+                    self.state = "text"
+                else:
+                    self.csi_body += character
+            elif self.state == "osc":
+                if character == "\x07":
+                    self.state = "text"
+                elif character == "\x1b":
+                    self.state = "osc_escape"
+            elif self.state == "osc_escape":
+                self.state = "text" if character == "\\" else "osc"
+            elif self.state == "dcs":
+                if character == "\x1b":
+                    self.state = "dcs_escape"
+            elif self.state == "dcs_escape":
+                self.state = "text" if character == "\\" else "dcs"
+            elif self.state == "charset":
+                self.state = "text"
+        if final:
+            self.state = "text"
+            self.csi_body = ""
 
     def finish(self) -> None:
-        if self.pending:
-            pending = self.pending
-            self.pending = ""
-            self.feed(pending, final=True)
+        self.feed("", final=True)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self.screen.resize(cols, rows)
 
     def text(self) -> str:
         return self.screen.text()
@@ -170,34 +258,18 @@ def replay(data: str, cols: int, rows: int) -> str:
 def replay_until(raw: str, cols: int, rows: int, pattern: str) -> str | None:
     """The screen as it was the first time `pattern` was on it.
 
-    The pattern is checked after every character, because a popup can be drawn and
-    closed inside one keystroke's worth of frames. Only the check is repeated; the
-    screen is rendered when the last character of a possible match has just been
-    written, which keeps this linear in the size of the capture.
+    A popup can be drawn and closed inside one keystroke's worth of frames, so the
+    incremental parser is fed every character. The screen is rendered only when the
+    last character of a possible match has just been written, which keeps replay
+    linear in the size of the capture.
     """
     matcher = re.compile(pattern)
-    screen = Screen(cols, rows)
-    index = 0
+    replayed = Replay(cols, rows)
     tail = pattern[-1]
-    while index < len(raw):
-        character = raw[index]
-        if character == "\x1b":
-            remainder = raw[index:]
-            match = CSI.match(remainder)
-            if match:
-                screen.csi(match.group(1), match.group(2))
-                index += match.end()
-                continue
-            osc = OSC.match(remainder)
-            if osc:
-                index += osc.end()
-                continue
-            index += 2
-            continue
-        screen.put(character)
-        index += 1
+    for character in raw:
+        replayed.feed(character)
         if character == tail:
-            rendered = screen.text()
+            rendered = replayed.text()
             if matcher.search(rendered):
                 return rendered
     return None
