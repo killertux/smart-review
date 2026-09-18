@@ -3175,6 +3175,9 @@ impl App {
     ) {
         if self.detail.as_ref().map(|detail| detail.summary.number) != Some(number)
             || (self.drafts.open && self.drafts.draft.pr == number)
+            // The user may open a composer before the background draft read returns.
+            // Loading disk state must never clear that private text (IR-14).
+            || self.drafts.composer.is_some()
         {
             return;
         }
@@ -3877,6 +3880,11 @@ impl App {
         }
         self.state_revision = self.state_revision.saturating_add(1);
         Some((self.state_revision, self.state.clone()))
+    }
+
+    /// Makes a reducer-requested state save eligible for the ordered persistence queue.
+    pub(crate) fn mark_state_dirty(&mut self) {
+        self.state_dirty = true;
     }
 
     /// Records the job that owns the latest submitted state snapshot.

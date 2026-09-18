@@ -182,6 +182,12 @@ pub fn run(startup: Startup) -> Result<()> {
         terminal.draw(|frame| app.render(frame))?;
     }
 
+    if !runner.flush_persistence(std::time::Duration::from_secs(2)) {
+        logging::log(
+            Level::Warn,
+            "timed out while flushing durable state; keep the application open and retry the last edit",
+        );
+    }
     runner.cancel_all();
     logging::log(Level::Info, "shutting down normally");
     Ok(())
@@ -253,7 +259,7 @@ fn edit_composer(app: &mut App, terminal: &mut terminal::TerminalGuard, body: &s
 pub(crate) fn apply(
     effect: Effect,
     app: &mut App,
-    state_store: &dyn StateStore,
+    _state_store: &dyn StateStore,
     runner: &mut JobRunner,
     terminal: &mut terminal::TerminalGuard,
 ) -> Vec<Effect> {
@@ -263,14 +269,7 @@ pub(crate) fn apply(
     match effect {
         Effect::None | Effect::KeepPending => {}
 
-        Effect::SaveState => {
-            if let Err(error) = state_store.save(&app.state) {
-                app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("could not save state: {error}"),
-                );
-            }
-        }
+        Effect::SaveState => app.mark_state_dirty(),
 
         Effect::DetectEnvironment
         | Effect::LoadPullRequests

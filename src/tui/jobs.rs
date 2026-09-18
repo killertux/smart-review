@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::application::analysis::{
     AnalysisIntent, AnalysisRequest, AnalysisRun, Analyst, Progress as AnalysisProgress,
@@ -1453,6 +1453,35 @@ impl JobRunner {
         self.queue.clear();
     }
 
+    /// Stops ordinary work and gives already-submitted durable snapshots a bounded
+    /// opportunity to finish before process exit (IR-14).
+    ///
+    /// Returns `false` when storage did not acknowledge every queued snapshot before
+    /// the deadline. Callers may then restore the terminal without waiting forever.
+    pub fn flush_persistence(&mut self, timeout: Duration) -> bool {
+        for running in &mut self.running {
+            if !matches!(running.slot, Slot::State | Slot::DraftSave) {
+                running.cancel.cancel();
+            }
+        }
+        self.queue.retain(|(_, _, job)| job.is_ordered_save());
+
+        let deadline = Instant::now() + timeout;
+        while self.has_pending_persistence() && Instant::now() < deadline {
+            let _ = self.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        !self.has_pending_persistence()
+    }
+
+    /// Whether an ordered durable snapshot is queued or still writing.
+    fn has_pending_persistence(&self) -> bool {
+        self.running
+            .iter()
+            .any(|running| matches!(running.slot, Slot::State | Slot::DraftSave))
+            || self.queue.iter().any(|(_, _, job)| job.is_ordered_save())
+    }
+
     /// Whether a slot has a job running or waiting.
     #[must_use]
     pub fn is_busy_in(&self, slot: Slot) -> bool {
@@ -1538,7 +1567,19 @@ impl JobRunner {
     /// Starts as many queued jobs as there is room for.
     fn pump(&mut self) {
         while self.running.len() < MAX_IN_FLIGHT {
-            let Some((id, owner, job)) = self.queue.pop_front() else {
+            // An ordered snapshot must wait for the previous write of *that document
+            // class* to acknowledge. Other jobs may still use a free worker; blocking
+            // the whole queue here would turn a slow disk into a frozen application.
+            let Some(index) = self.queue.iter().position(|(_, _, job)| {
+                !job.is_ordered_save()
+                    || !self
+                        .running
+                        .iter()
+                        .any(|running| running.slot == job.slot())
+            }) else {
+                return;
+            };
+            let Some((id, owner, job)) = self.queue.remove(index) else {
                 return;
             };
             self.start(id, owner, job);
@@ -2157,6 +2198,38 @@ mod tests {
         }
     }
 
+    /// A state store that holds its first write open, making save ordering observable.
+    #[derive(Debug, Default)]
+    struct HoldingStateStore {
+        entered: std::sync::atomic::AtomicBool,
+        release: std::sync::atomic::AtomicBool,
+        values: Mutex<Vec<AppState>>,
+    }
+
+    impl StateStore for HoldingStateStore {
+        fn load(&self) -> crate::Result<AppState> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn save(&self, value: &AppState) -> crate::Result<()> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(value.clone());
+            Ok(())
+        }
+    }
+
     fn runner_with(delay: Duration) -> (JobRunner, Arc<SlowForge>) {
         let mut runner = crate::test_support::test_job_runner(
             Arc::new(fake_workspace()),
@@ -2706,6 +2779,57 @@ mod tests {
                 context: Box::new(context())
             }
             .is_cancellable()
+        );
+    }
+
+    #[test]
+    fn ir_14_an_ordered_state_save_waits_for_the_previous_write() {
+        let (mut runner, _) = runner_with(Duration::ZERO);
+        let store = Arc::new(HoldingStateStore::default());
+        runner.state_store = Arc::clone(&store) as Arc<dyn StateStore>;
+
+        let first = runner.submit(Job::SaveState {
+            revision: 1,
+            state: Box::new(AppState {
+                theme: Some("dark".to_owned()),
+                ..AppState::default()
+            }),
+        });
+        for _ in 0..100 {
+            if store.entered.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(store.entered.load(Ordering::Acquire), "first save started");
+
+        let second = runner.submit(Job::SaveState {
+            revision: 2,
+            state: Box::new(AppState {
+                theme: Some("light".to_owned()),
+                ..AppState::default()
+            }),
+        });
+        assert_eq!(
+            runner
+                .running
+                .iter()
+                .filter(|running| running.slot == Slot::State)
+                .count(),
+            1,
+            "the second snapshot stays queued until the first write acknowledges"
+        );
+
+        store.release.store(true, Ordering::Release);
+        let completions = wait_for_job(&mut runner, second);
+        assert!(
+            completions.iter().any(|completion| completion.job == first),
+            "the first save completed before the second"
+        );
+        assert_eq!(
+            store.load().unwrap().theme.as_deref(),
+            Some("light"),
+            "the newer snapshot wins on disk"
         );
     }
 
