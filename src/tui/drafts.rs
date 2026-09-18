@@ -640,6 +640,10 @@ impl DraftState {
         self.modal = false;
         self.armed = false;
         self.scroll = 0;
+        // A completed dry-run result is meaningful only for the action still in this
+        // modal. Keeping it after Escape would make the next post look complete before
+        // its job has run (FR-6.5).
+        self.status = DraftStatus::Idle;
     }
 
     /// The status the publish in flight should end in (FR-6.3).
@@ -837,6 +841,18 @@ mod tests {
         state.stage(now()).expect("staged");
         assert_eq!(state.open_modal(), Ok(()));
         assert!(state.modal);
+    }
+
+    #[test]
+    fn closing_a_completed_dry_run_does_not_precomplete_the_next_post() {
+        let mut state = fresh();
+        state.status = DraftStatus::DryRun;
+        state.modal = true;
+
+        state.close_modal();
+
+        assert_eq!(state.status, DraftStatus::Idle);
+        assert!(!state.modal);
     }
 
     #[test]
