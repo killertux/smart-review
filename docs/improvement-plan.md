@@ -1218,7 +1218,7 @@ owners and repo names. Remote-only diff semantics are verified against final PR 
    instructions; changing that hard rule requires an owner decision.
 8. [ ] Make cleanup operate only on validated app-owned identities and paths. Honor
    dry-run/confirmation and report a stale/missing workspace recoverably.
-9. [ ] Investigate `gh pr diff --patch` commit-series semantics with a local fixture
+9. [x] Investigate `gh pr diff --patch` commit-series semantics with a local fixture
    representing multiple commits, re-edits and renames. Compare remote-only output
    to the final three-dot PR diff. Fix acquisition/parser composition only if the
    mismatch is reproduced; do not guess from the flag's name.
@@ -1251,14 +1251,16 @@ context/publish contracts. No default unit test requires a real repository or ne
 
 **Implementation status (2026-09-18):** implemented on `ir-13-git-workspace-isolation`.
 Workspaces now use an app-owned bare object store, explicit base/head refs and an
-encoded host/owner/repository identity. The local Git contract covers source-ref and
-`.git/worktrees` isolation, stale-source reuse, collision-free names, metadata recovery,
-missing-checkout recreation, dry-run cleanup and legacy cleanup refusal. Durable
+encoded host/owner/repository identity. A per-repository interprocess lock protects the
+ref and worktree lifecycle. The local Git contract covers source-ref and `.git/worktrees`
+isolation, stale-source reuse, collision-free names, metadata recovery,
+missing-checkout recreation, dry-run cleanup and legacy cleanup refusal with the actual
+owning clone identified from Git metadata. Durable
 repository data keeps its released mixed-case identity; only the app-owned workspace
-key is case-normalised. The remote-only patch fixture covers a multi-commit PR with a
-re-edit, rename, deletion and binary change, and compares `gh pr diff --patch` with the
-final three-dot diff before parser input so intermediate commit anchors cannot be
-mistaken for current PR anchors.
+key is case-normalised. The remote-only diff fixture covers a multi-commit PR with a
+re-edit, rename, deletion and binary change, and pins plain `gh pr diff` as the
+final-state representation; `--patch` is rejected because its intermediate commit
+anchors are not current PR anchors.
 
 ---
 
@@ -1880,7 +1882,7 @@ must add an explicit row/issue rather than leaving a narrative “maybe later”
 | Review/reply bodies in logs | IR-01 | Synthetic bodies absent from ordinary logs, including errors |
 | Reduced diff joins disjoint line ranges | IR-12 | Original line coordinates survive context reduction |
 | Process descendants survive cancel — hypothesis | IR-08 | Local owned process-tree fixture establishes/fixes behavior |
-| Remote --patch is intermediate commit series — hypothesis | IR-13 | Final PR diff comparison proves actual semantics |
+| Remote --patch is intermediate commit series — confirmed | IR-13 | Plain `gh pr diff` is pinned as the final-state representation |
 | UI filesystem/process IO | IR-14 | Slow fake IO does not stop input; dependency inventory is clean |
 | Unbounded progress and discarded deltas | IR-08 | Bounded producer/consumer behavior and exact final content |
 | 250 ms background cadence/redundant draws | IR-17 | Measured event-to-frame and idle render counts |

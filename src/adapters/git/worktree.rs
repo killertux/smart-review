@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::adapters::fs::write_atomic;
+use crate::adapters::fs::{create_private_parents, write_atomic};
 use crate::adapters::git::GitCli;
 use crate::adapters::process::{CommandSpec, Output, ProcessError};
 use crate::domain::repo::RepoId;
@@ -38,6 +38,18 @@ use crate::ports::workspace::{
 /// The timeout for fetch and worktree operations, which touch the network and the
 /// disk and are slower than a `rev-parse` (FR-3.1).
 const SLOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Serialises the ref and worktree lifecycle for one repository across processes.
+pub(crate) struct WorkspaceLock {
+    file: std::fs::File,
+}
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
 
 impl GitCli {
     /// Where managed worktrees live.
@@ -145,6 +157,64 @@ impl GitCli {
         })
     }
 
+    /// Acquires the interprocess lock for one app-owned repository.
+    ///
+    /// Fetching refs, calculating their merge base, and replacing a worktree are one
+    /// operation. Without this lock another process can replace the refs after the
+    /// head check and make the returned revision identity internally inconsistent.
+    pub(crate) fn lock_workspace(
+        &self,
+        key: &str,
+        cancel: &Cancel,
+        wait: bool,
+    ) -> Result<WorkspaceLock, WorkspaceError> {
+        use fs2::FileExt as _;
+
+        let directory = self.worktrees_root()?.join(".locks");
+        create_private_parents(&directory).map_err(|error| {
+            WorkspaceError::Failed(format!(
+                "could not create workspace lock directory {}: {error}; check its permissions and retry",
+                directory.display()
+            ))
+        })?;
+        let path = directory.join(format!("{key}.lock"));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|error| {
+            WorkspaceError::Failed(format!(
+                "could not open workspace lock {}: {error}; check its permissions and retry",
+                path.display()
+            ))
+        })?;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(WorkspaceLock { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && wait => {
+                    if cancel.is_cancelled() {
+                        return Err(WorkspaceError::Cancelled);
+                    }
+                    std::thread::sleep(LOCK_RETRY);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(WorkspaceError::Failed(format!(
+                        "workspace data for {key} is being updated by another smart-review process; retry when that operation finishes"
+                    )));
+                }
+                Err(error) => {
+                    return Err(WorkspaceError::Failed(format!(
+                        "could not lock workspace data at {}: {error}; retry the operation",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+
     /// The ref the pull request's head is fetched into.
     fn head_ref(repo: &RepoId, number: u64) -> String {
         format!("refs/smart-review/{}/pr-{number}/head", repo.storage_key())
@@ -184,6 +254,7 @@ impl GitCli {
         let store = self.store_path(&request.repo).ok_or_else(|| {
             WorkspaceError::Failed("no worktree directory is configured".to_owned())
         })?;
+        let _lock = self.lock_workspace(&request.repo.storage_key(), cancel, true)?;
         self.ensure_store(&store, &request.repo, cancel)?;
 
         // Fetch both immutable request refs before considering reuse. A local branch
@@ -576,6 +647,9 @@ impl GitCli {
         };
         for repo_dir in repos.into_iter().flatten() {
             let key = repo_dir.file_name().to_string_lossy().into_owned();
+            // Listing runs on the UI thread, so it must never wait behind a network
+            // fetch. A busy repository is reported with a retry action instead.
+            let _lock = self.lock_workspace(&key, &Cancel::new(), false)?;
             let store_parent = worktrees_root.join("git").join(&key);
             let store = store_parent.join("repo.git");
             self.validate_bare_store(&store, &Cancel::new())?;
@@ -614,7 +688,10 @@ impl GitCli {
         };
         for directory in legacy_directories.flatten() {
             let name = directory.file_name();
-            if matches!(name.to_str(), Some("git" | "checkouts" | ".ignore-rules")) {
+            if matches!(
+                name.to_str(),
+                Some("git" | "checkouts" | ".ignore-rules" | ".locks")
+            ) {
                 continue;
             }
             let Ok(children) = std::fs::read_dir(directory.path()) else {
@@ -625,19 +702,11 @@ impl GitCli {
                     continue;
                 };
                 let path = child.path();
-                let owner = self.cwd.as_deref().map_or_else(
-                    || "<the original clone>".to_owned(),
-                    |path| path.display().to_string(),
-                );
                 entries.push(WorkspaceEntry {
                     repo: None,
                     number,
                     age_secs: age_secs(&path),
-                    legacy_cleanup: Some(format!(
-                        "legacy workspace at {} is linked to a user repository; remove it manually with `git -C {owner} worktree remove --force {}`",
-                        path.display(),
-                        path.display()
-                    )),
+                    legacy_cleanup: Some(legacy_cleanup_instruction(&path)),
                     path,
                 });
             }
@@ -692,6 +761,57 @@ fn age_secs(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let age = std::time::SystemTime::now().duration_since(modified).ok()?;
     Some(age.as_secs())
+}
+
+/// Reads a linked worktree's own metadata to find the clone that owns it.
+///
+/// Legacy worktrees predate the app-owned object stores. Their `.git` file points at
+/// `<owner>/.git/worktrees/<name>`, whose `commondir` points back to the owning `.git`.
+/// Reading those two files is safe; guessing from the currently open clone is not.
+pub(super) fn legacy_owner_path(path: &Path) -> Option<PathBuf> {
+    let git_file = std::fs::read_to_string(path.join(".git")).ok()?;
+    let git_dir = git_file
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir: "))?;
+    let git_dir = PathBuf::from(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        path.join(git_dir)
+    };
+    let common = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        git_dir.join(common)
+    };
+    let common = std::fs::canonicalize(common).ok()?;
+    if common.file_name().is_some_and(|name| name == ".git") {
+        common.parent().map(Path::to_path_buf)
+    } else {
+        Some(common)
+    }
+}
+
+fn legacy_cleanup_instruction(path: &Path) -> String {
+    legacy_owner_path(path).map_or_else(
+        || {
+            format!(
+                "legacy workspace at {} has unreadable Git ownership metadata; inspect {} and remove it with the repository that owns it",
+                path.display(),
+                path.join(".git").display()
+            )
+        },
+        |owner| {
+            format!(
+                "legacy workspace at {} is linked to a user repository; remove it manually with `git -C {} worktree remove --force {}`",
+                path.display(),
+                owner.display(),
+                path.display()
+            )
+        },
+    )
 }
 
 /// Removes user info from URL-shaped Git diagnostics before they reach a log or UI.
@@ -832,6 +952,46 @@ mod tests {
         assert!(second.reused, "the same head SHA must not be fetched again");
         assert_eq!(second.path, first.path);
         assert_eq!(second.head_sha, head);
+    }
+
+    #[test]
+    fn ir_13_a_second_process_cannot_interleave_a_workspace_lifecycle() {
+        use fs2::FileExt as _;
+
+        let (fixture, _base, head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let git = adapter(&fixture, &root);
+        git.ensure(&request(&fixture, &head), &Cancel::new())
+            .expect("creates the repository lock");
+        let lock_path = root
+            .join(".locks")
+            .join(format!("{}.lock", repo_id().storage_key()));
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("opens the same interprocess lock");
+        lock.lock_exclusive()
+            .expect("holds the lock as another process");
+
+        let cancel = Cancel::new();
+        let signal = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            signal.cancel();
+        });
+        let error = git
+            .ensure(&request(&fixture, &head), &cancel)
+            .expect_err("the competing lifecycle waits rather than changing shared refs");
+        canceller.join().expect("canceller finishes");
+        fs2::FileExt::unlock(&lock).expect("releases the simulated other process");
+
+        assert!(matches!(error, WorkspaceError::Cancelled), "{error:?}");
+        assert!(
+            git.ensure(&request(&fixture, &head), &Cancel::new())
+                .expect("works after the owner releases the lock")
+                .reused
+        );
     }
 
     #[test]
@@ -1262,15 +1422,34 @@ mod tests {
         let (fixture, _base, _head) = fixture();
         let root = fixture.path().join("worktrees");
         let legacy = root.join(repo_id().dir_name()).join("pr-7");
-        std::fs::create_dir_all(&legacy).expect("creates legacy path");
+        let owner = fixture.path().join("legacy-owner");
+        let origin = fixture.origin.to_string_lossy().into_owned();
+        let owner_arg = owner.to_string_lossy().into_owned();
+        let legacy_arg = legacy.to_string_lossy().into_owned();
+        GitFixture::git_in(fixture.path(), &["clone", "--quiet", &origin, &owner_arg]);
+        GitFixture::git_in(
+            &owner,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                &legacy_arg,
+                "HEAD",
+            ],
+        );
         let git = adapter(&fixture, &root);
 
         let error = git
             .remove(&repo_id(), 7, &Cancel::new())
             .expect_err("legacy is refused");
-        assert!(
-            matches!(error, WorkspaceError::LegacyWorkspace { .. }),
-            "{error:?}"
+        let WorkspaceError::LegacyWorkspace { owner_path, .. } = error else {
+            panic!("expected the legacy owner, got {error:?}");
+        };
+        assert_eq!(
+            owner_path,
+            std::fs::canonicalize(&owner).expect("canonical owner"),
+            "the instruction names the owning clone"
         );
         assert!(
             legacy.exists(),
@@ -1337,18 +1516,38 @@ mod tests {
         let (fixture, _base, _head) = fixture();
         let root = fixture.path().join("worktrees");
         let legacy = root.join("ambiguous-name").join("pr-7");
-        std::fs::create_dir_all(&legacy).expect("creates legacy workspace");
+        let owner = fixture.path().join("other-clone");
+        let origin = fixture.origin.to_string_lossy().into_owned();
+        let owner_arg = owner.to_string_lossy().into_owned();
+        let legacy_arg = legacy.to_string_lossy().into_owned();
+        GitFixture::git_in(fixture.path(), &["clone", "--quiet", &origin, &owner_arg]);
+        GitFixture::git_in(
+            &owner,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                &legacy_arg,
+                "HEAD",
+            ],
+        );
         let git = adapter(&fixture, &root);
 
         let entries = git.list().expect("legacy workspace is reported");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].repo, None);
-        assert!(
-            entries[0]
-                .legacy_cleanup
-                .as_deref()
-                .is_some_and(|message| message.contains("git -C"))
-        );
+        let owner = std::fs::canonicalize(owner)
+            .expect("canonical owner")
+            .display()
+            .to_string();
+        let current = std::fs::canonicalize(&fixture.clone)
+            .expect("canonical current clone")
+            .display()
+            .to_string();
+        assert!(entries[0].legacy_cleanup.as_deref().is_some_and(|message| {
+            message.contains("git -C") && message.contains(&owner) && !message.contains(&current)
+        }));
     }
 
     #[test]

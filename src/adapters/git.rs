@@ -465,19 +465,24 @@ impl WorkspacePort for GitCli {
         let store = self.store_path(repo).ok_or_else(|| {
             WorkspaceError::Failed("no worktree directory is configured".to_owned())
         })?;
+        let _lock = self.lock_workspace(&repo.storage_key(), cancel, true)?;
         if !path.exists() {
             let legacy = self
                 .worktrees_root()?
                 .join(repo.dir_name())
                 .join(format!("pr-{number}"));
             if legacy.exists() {
-                return Err(WorkspaceError::LegacyWorkspace {
-                    path: legacy,
-                    owner_path: self
-                        .cwd
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from("the original clone")),
-                });
+                return match worktree::legacy_owner_path(&legacy) {
+                    Some(owner_path) => Err(WorkspaceError::LegacyWorkspace {
+                        path: legacy,
+                        owner_path,
+                    }),
+                    None => Err(WorkspaceError::Failed(format!(
+                        "legacy workspace at {} has unreadable Git ownership metadata; inspect {} and remove it with the repository that owns it",
+                        legacy.display(),
+                        legacy.join(".git").display()
+                    ))),
+                };
             }
             return Ok(());
         }

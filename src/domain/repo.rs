@@ -221,7 +221,7 @@ fn decode_component(component: &str) -> Option<String> {
     }
     let bytes: Option<Vec<u8>> = component
         .as_bytes()
-        .chunks_exact(2)
+        .chunks(2)
         .map(|pair| {
             std::str::from_utf8(pair)
                 .ok()

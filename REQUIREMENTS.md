@@ -159,9 +159,10 @@ Acceptance criteria:
 - [ ] Fork PRs work through the same `refs/pull/<N>/head` path.
 - [ ] Workspaces are listed/removed by `:workspace clean [--all]`; removal runs `git worktree remove` and prunes. On failure the user is told exactly which path to delete manually.
 - [ ] A missing/expired workspace is recreated transparently on demand.
+- [ ] Multiple app instances sharing one home serialize each repository's fetch/ref/worktree lifecycle, so one request cannot mix another request's base or head.
 
 **FR-3.2 Diff acquisition** — MUST — M1 (remote-only) / M2 (local)
-The diff MUST be computed locally in the workspace as `git diff --unified=<ctx> <base>...<head>` (three-dot), with `--find-renames`, `--no-color`, and `--no-ext-diff`. Remote-only mode MAY fall back to `gh pr diff --patch`.
+The diff MUST be computed locally in the workspace as `git diff --unified=<ctx> <base>...<head>` (three-dot), with `--find-renames`, `--no-color`, and `--no-ext-diff`. Remote-only mode MAY fall back to `gh pr diff` without `--patch`; `--patch` returns an mbox-style commit series whose intermediate edits are not valid current PR anchors.
 Acceptance criteria:
 - [ ] Default context = 3 lines, adjustable at runtime (0/3/10) without refetching the whole PR when the workspace exists.
 - [ ] Whitespace-ignoring mode (`-w`) is toggleable and visibly indicated.
@@ -972,7 +973,7 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 | Base SHA / merge base | `git -C <app-store> rev-parse refs/smart-review/<encoded-repository-id>/pr-N/head^{commit}`, `git -C <app-store> merge-base <base-ref> <head-ref>` — **note: `gh pr view --json` has no `baseRefOid` on gh 2.45, so the base SHA must come from git** |
 | Worktree | `git -C <app-store> worktree add --detach <path> <head_sha>`, `git -C <app-store> worktree remove <path>`, `git -C <app-store> worktree prune` |
 | Diff (local) | `git -C <ws> diff --unified=<n> [--ignore-all-space] --find-renames --no-color --no-ext-diff <merge_base> <head_sha>` |
-| Diff (remote fallback) | `gh pr diff N --patch --color never` |
+| Diff (remote fallback) | `gh pr diff N --color never` (never `--patch`, which returns a per-commit series rather than the final PR state) |
 | File list | `git -C <ws> ls-files --cached --others --exclude-standard` |
 | File content | `git -C <ws> show <head_sha>:<path>` (preferred: reads exactly the PR revision, independent of worktree state) |
 | Publish (body/decision) | `gh pr review N --approve|--request-changes|--comment --body-file -` (body via stdin) |
