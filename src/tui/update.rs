@@ -1554,10 +1554,21 @@ fn context_command(app: &mut App, argument: &str) -> Effect {
     match (words.next(), words.next()) {
         (Some("add"), Some(path)) => {
             match app.add_context_file(path) {
-                Ok(message) => {
-                    app.notice(NoticeLevel::Info, message);
-                    return Effect::SaveContextFiles;
+                Ok(Some(Effect::ValidateContextPath(_))) => {
+                    app.notice(NoticeLevel::Info, "checking that path in the workspace…");
+                    return Effect::ValidateContextPath(path.to_owned());
                 }
+                Ok(Some(effect)) => {
+                    app.notice(
+                        NoticeLevel::Info,
+                        format!(
+                            "added {path} to the context of this pull request ({} file(s) in total; every question will include it)",
+                            app.chat.added.len()
+                        ),
+                    );
+                    return effect;
+                }
+                Ok(None) => return Effect::None,
                 Err(message) => app.command_error(message),
             }
             return Effect::None;

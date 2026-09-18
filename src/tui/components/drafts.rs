@@ -339,6 +339,15 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
             },
             theme.style(element::MUTED),
         )));
+    } else if matches!(drafts.status, crate::tui::drafts::DraftStatus::DryRun) {
+        footer.push(Line::from(Span::styled(
+            " dry run: nothing was posted; the comment is still here".to_owned(),
+            theme.style(element::NOTICE_WARN),
+        )));
+        footer.push(Line::from(Span::styled(
+            " Enter records it again in logs/dry-run.log".to_owned(),
+            theme.style(element::MUTED),
+        )));
     } else if app.is_dry_run() {
         footer.push(Line::from(Span::styled(
             " DRY RUN — nothing will be sent".to_owned(),

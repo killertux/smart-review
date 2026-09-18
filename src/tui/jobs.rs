@@ -21,7 +21,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::application::analysis::{
     AnalysisIntent, AnalysisRequest, AnalysisRun, Analyst, Progress as AnalysisProgress,
@@ -35,6 +35,7 @@ use crate::domain::pr::PullRequestDetail;
 use crate::domain::query::PrQuery;
 use crate::domain::repo::RepoId;
 use crate::logging::{self, Level};
+use crate::ports::StateStore;
 use crate::ports::analysis::{AnalysisCachePort, AnalysisKey, StoredAnalysis};
 use crate::ports::cache::CacheStore;
 use crate::ports::catalog::{CatalogLoad, CatalogPolicy, ModelCatalogPort};
@@ -44,6 +45,7 @@ use crate::ports::workspace::{
     DiffOptions, DiffRequest, Workspace, WorkspacePort, WorkspaceRequest,
 };
 use crate::ports::{Cancel, Clock};
+use crate::state::AppState;
 use crate::tui::app::Effect;
 use crate::tui::app::ReviewSession;
 use crate::tui::list_view::PrListState;
@@ -76,6 +78,11 @@ static NEXT_MUTATION_ID: AtomicU64 = AtomicU64::new(1);
 /// Which kind of work a job is, one at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
+    /// Small user preferences written to `state.toml`.
+    ///
+    /// State writes are serialized rather than cancelled: replacing a write that has
+    /// already started would make an older snapshot win after a newer edit (IR-14).
+    State,
     /// Detection, which happens once.
     Environment,
     /// The cached page, painted while the network is asked (FR-2.3).
@@ -119,11 +126,43 @@ pub enum Slot {
     Thread,
     /// Reading the durable mutation journal (IR-07).
     Mutation,
+    /// Checking an optional context path in the immutable workspace (IR-14).
+    ContextPath,
+    /// Reads a local draft for the open pull request.
+    Draft,
+    /// Serial durable draft writes and deletes (IR-14).
+    DraftSave,
 }
 
 /// What a job was asked to do.
 #[derive(Debug, Clone)]
 pub enum Job {
+    /// Persist a snapshot of the small application state (FR-8.5, IR-14).
+    SaveState {
+        /// The reducer revision this snapshot represents.
+        revision: u64,
+        /// The immutable snapshot to write.
+        state: Box<AppState>,
+    },
+    /// Checks whether a user-added context path exists at the opened revision.
+    ValidateContextPath {
+        /// App-owned worktree path.
+        workspace: std::path::PathBuf,
+        /// Immutable revision to inspect.
+        head_sha: String,
+        /// Candidate relative path.
+        path: String,
+    },
+    /// Reads a pull request's local draft.
+    LoadDraft { pr: u64 },
+    /// Writes an immutable draft snapshot.
+    SaveDraft {
+        draft: Box<crate::domain::draft::Draft>,
+        revision: u64,
+        reload_after: bool,
+    },
+    /// Deletes an already-cleared draft.
+    DeleteDraft { pr: u64, revision: u64 },
     /// Work out where we are running (FR-1.1).
     Detect,
     /// Read the cached page, if there is one (FR-2.3).
@@ -289,6 +328,10 @@ impl Job {
     #[must_use]
     pub fn slot(&self) -> Slot {
         match self {
+            Self::SaveState { .. } => Slot::State,
+            Self::ValidateContextPath { .. } => Slot::ContextPath,
+            Self::LoadDraft { .. } => Slot::Draft,
+            Self::SaveDraft { .. } | Self::DeleteDraft { .. } => Slot::DraftSave,
             Self::Detect => Slot::Environment,
             Self::CachedList { .. } => Slot::CachedList,
             Self::List { .. } => Slot::List,
@@ -329,6 +372,14 @@ impl Job {
     pub fn is_cancellable(&self) -> bool {
         !matches!(self, Self::Report { .. })
     }
+
+    /// Whether writes in this slot must complete in submission order.
+    fn is_ordered_save(&self) -> bool {
+        matches!(
+            self,
+            Self::SaveState { .. } | Self::SaveDraft { .. } | Self::DeleteDraft { .. }
+        )
+    }
 }
 
 /// One chat question, with the conversation it belongs to (FR-5.2, FR-5.3).
@@ -356,6 +407,27 @@ pub struct ChatAsk {
 /// as big as the biggest one.
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    /// A `state.toml` snapshot was durably written (IR-14).
+    StateSaved {
+        /// The revision the acknowledged snapshot represents.
+        revision: u64,
+    },
+    /// The immutable workspace did or did not contain a requested context path.
+    ContextPathValidated {
+        /// Candidate path, echoed so a late result cannot add a different file.
+        path: String,
+        /// Whether it existed at the requested revision.
+        exists: bool,
+    },
+    /// A draft read completed.
+    DraftLoaded {
+        pr: u64,
+        draft: Option<Box<crate::domain::draft::Draft>>,
+    },
+    /// A draft snapshot was durably written.
+    DraftSaved { revision: u64, reload_after: bool },
+    /// A cleared draft was removed from durable storage.
+    DraftDeleted { revision: u64 },
     /// Detection succeeded.
     Environment(Box<Environment>),
     /// Detection failed, with the reason to show.
@@ -746,6 +818,11 @@ impl Executor {
             // check do not need a repository resolved through the forge, so
             // `JobRunner` handles them directly.
             Job::Detect
+            | Job::SaveState { .. }
+            | Job::ValidateContextPath { .. }
+            | Job::LoadDraft { .. }
+            | Job::SaveDraft { .. }
+            | Job::DeleteDraft { .. }
             | Job::Report { .. }
             | Job::Catalog { .. }
             | Job::Workspace { .. }
@@ -1239,6 +1316,8 @@ pub struct JobRunner {
     catalog: Arc<dyn ModelCatalogPort>,
     /// The LLM client, for the picker's connection check (FR-4.5).
     llm: Arc<dyn LlmPort>,
+    /// The one small global document whose writes must not run on the UI thread.
+    state_store: Arc<dyn StateStore>,
     /// What the command line asked for.
     request: DetectRequest,
     /// Jobs waiting for a free slot.
@@ -1276,6 +1355,7 @@ impl JobRunner {
         probe: Arc<dyn ForgeProbe>,
         catalog: Arc<dyn ModelCatalogPort>,
         llm: Arc<dyn LlmPort>,
+        state_store: Arc<dyn StateStore>,
         request: DetectRequest,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -1286,6 +1366,7 @@ impl JobRunner {
             probe,
             catalog,
             llm,
+            state_store,
             request,
             queue: VecDeque::new(),
             running: Vec::new(),
@@ -1342,8 +1423,14 @@ impl JobRunner {
         self.next_id += 1;
         let slot = job.slot();
 
-        self.cancel_slot(slot);
-        self.queue.retain(|(_, _, queued)| queued.slot() != slot);
+        if job.is_ordered_save() {
+            // A write that is already running must finish before the latest queued
+            // snapshot starts. Only a not-yet-started snapshot is safely coalesced.
+            self.queue.retain(|(_, _, queued)| queued.slot() != slot);
+        } else {
+            self.cancel_slot(slot);
+            self.queue.retain(|(_, _, queued)| queued.slot() != slot);
+        }
         self.queue.push_back((id, owner, job));
         self.pump();
         id
@@ -1364,6 +1451,39 @@ impl JobRunner {
             running.cancel.cancel();
         }
         self.queue.clear();
+    }
+
+    /// Stops ordinary work and gives durable snapshots and an analysis cache commit a
+    /// bounded opportunity to finish before process exit (IR-14).
+    ///
+    /// Returns `false` when storage did not acknowledge every queued snapshot before
+    /// the deadline. Callers may then restore the terminal without waiting forever.
+    pub fn flush_persistence(&mut self, timeout: Duration) -> bool {
+        for running in &mut self.running {
+            if !matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze) {
+                running.cancel.cancel();
+            }
+        }
+        self.queue
+            .retain(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze));
+
+        let deadline = Instant::now() + timeout;
+        while self.has_pending_persistence() && Instant::now() < deadline {
+            let _ = self.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        !self.has_pending_persistence()
+    }
+
+    /// Whether an ordered durable snapshot or cache-writing analysis is queued or running.
+    fn has_pending_persistence(&self) -> bool {
+        self.running
+            .iter()
+            .any(|running| matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze))
+            || self
+                .queue
+                .iter()
+                .any(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze))
     }
 
     /// Whether a slot has a job running or waiting.
@@ -1451,7 +1571,19 @@ impl JobRunner {
     /// Starts as many queued jobs as there is room for.
     fn pump(&mut self) {
         while self.running.len() < MAX_IN_FLIGHT {
-            let Some((id, owner, job)) = self.queue.pop_front() else {
+            // An ordered snapshot must wait for the previous write of *that document
+            // class* to acknowledge. Other jobs may still use a free worker; blocking
+            // the whole queue here would turn a slow disk into a frozen application.
+            let Some(index) = self.queue.iter().position(|(_, _, job)| {
+                !job.is_ordered_save()
+                    || !self
+                        .running
+                        .iter()
+                        .any(|running| running.slot == job.slot())
+            }) else {
+                return;
+            };
+            let Some((id, owner, job)) = self.queue.remove(index) else {
                 return;
             };
             self.start(id, owner, job);
@@ -1473,6 +1605,7 @@ impl JobRunner {
         let probe = Arc::clone(&self.probe);
         let catalog = Arc::clone(&self.catalog);
         let llm = Arc::clone(&self.llm);
+        let state_store = Arc::clone(&self.state_store);
         let request = self.request.clone();
         let worker_owner = owner.clone();
         let progress_sequence = Arc::new(AtomicU64::new(0));
@@ -1490,6 +1623,7 @@ impl JobRunner {
                     probe: probe.as_ref(),
                     catalog: catalog.as_ref(),
                     llm: llm.as_ref(),
+                    state_store: state_store.as_ref(),
                     executor: executor.as_deref(),
                     request: &request,
                 };
@@ -1606,6 +1740,7 @@ struct JobPorts<'a> {
     probe: &'a dyn ForgeProbe,
     catalog: &'a dyn ModelCatalogPort,
     llm: &'a dyn LlmPort,
+    state_store: &'a dyn StateStore,
     executor: Option<&'a Executor>,
     request: &'a DetectRequest,
 }
@@ -1616,6 +1751,67 @@ struct JobPorts<'a> {
 /// work (`run_job`) can be read and tested apart.
 fn run_job(job: &Job, ports: &JobPorts<'_>, cancel: &Cancel, sink: &ProgressSink<'_>) -> Outcome {
     match job {
+        Job::SaveState { revision, state } => match ports.state_store.save(state) {
+            Ok(()) => Outcome::StateSaved {
+                revision: *revision,
+            },
+            Err(error) => Outcome::Failed(format!("could not save state: {error}")),
+        },
+        Job::ValidateContextPath {
+            workspace,
+            head_sha,
+            path,
+        } => Outcome::ContextPathValidated {
+            path: path.clone(),
+            exists: ports
+                .workspace
+                .read_file(workspace, head_sha, path, cancel)
+                .is_ok(),
+        },
+        Job::LoadDraft { pr } => match ports.executor {
+            Some(executor) => match executor.drafts.load(&executor.repo, *pr) {
+                Ok(draft) => Outcome::DraftLoaded {
+                    pr: *pr,
+                    draft: draft.map(Box::new),
+                },
+                Err(error) => Outcome::Failed(format!("could not load the draft: {error}")),
+            },
+            None => Outcome::Failed(
+                "the repository is not known yet; run :doctor to see why".to_owned(),
+            ),
+        },
+        Job::SaveDraft {
+            draft,
+            revision,
+            reload_after,
+        } => match ports.executor {
+            Some(executor) => match crate::application::drafts::Drafts::new(
+                Arc::clone(&executor.drafts),
+                executor.repo.clone(),
+            )
+            .save(draft)
+            {
+                Ok(()) => Outcome::DraftSaved {
+                    revision: *revision,
+                    reload_after: *reload_after,
+                },
+                Err(error) => Outcome::Failed(format!("the draft could not be saved: {error}")),
+            },
+            None => Outcome::Failed(
+                "the repository is not known yet; run :doctor to see why".to_owned(),
+            ),
+        },
+        Job::DeleteDraft { pr, revision } => match ports.executor {
+            Some(executor) => match executor.drafts.remove(&executor.repo, *pr) {
+                Ok(()) => Outcome::DraftDeleted {
+                    revision: *revision,
+                },
+                Err(error) => Outcome::Failed(format!("the draft could not be removed: {error}")),
+            },
+            None => Outcome::Failed(
+                "the repository is not known yet; run :doctor to see why".to_owned(),
+            ),
+        },
         Job::Detect => match detect(ports.workspace, ports.probe, ports.request, cancel) {
             Ok(environment) => Outcome::Environment(Box::new(environment)),
             Err(error) => Outcome::EnvironmentFailed(Box::new(error)),
@@ -1742,6 +1938,7 @@ pub fn job_for(
         Effect::LoadCatalog(policy) => Some(Job::Catalog { policy: *policy }),
         // A diff reload needs the head SHA, which the caller knows and this does not.
         Effect::ReloadDiff
+        | Effect::ValidateContextPath(_)
         | Effect::LoadMutations
         | Effect::EnsureWorkspace(_)
         | Effect::CheckModel
@@ -1750,6 +1947,7 @@ pub fn job_for(
         | Effect::SaveSelection(_)
         | Effect::CleanWorkspaces(_)
         | Effect::LoadAnalysis
+        | Effect::LoadAnalysisAndDraft
         | Effect::GatherContext(_)
         | Effect::RunAnalysis { .. }
         | Effect::CancelAnalysis
@@ -2002,6 +2200,38 @@ mod tests {
     impl Clock for FakeClock {
         fn now_unix_secs(&self) -> u64 {
             1_000
+        }
+    }
+
+    /// A state store that holds its first write open, making save ordering observable.
+    #[derive(Debug, Default)]
+    struct HoldingStateStore {
+        entered: std::sync::atomic::AtomicBool,
+        release: std::sync::atomic::AtomicBool,
+        values: Mutex<Vec<AppState>>,
+    }
+
+    impl StateStore for HoldingStateStore {
+        fn load(&self) -> crate::Result<AppState> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn save(&self, value: &AppState) -> crate::Result<()> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.values
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(value.clone());
+            Ok(())
         }
     }
 
@@ -2554,6 +2784,57 @@ mod tests {
                 context: Box::new(context())
             }
             .is_cancellable()
+        );
+    }
+
+    #[test]
+    fn ir_14_an_ordered_state_save_waits_for_the_previous_write() {
+        let (mut runner, _) = runner_with(Duration::ZERO);
+        let store = Arc::new(HoldingStateStore::default());
+        runner.state_store = Arc::clone(&store) as Arc<dyn StateStore>;
+
+        let first = runner.submit(Job::SaveState {
+            revision: 1,
+            state: Box::new(AppState {
+                theme: Some("dark".to_owned()),
+                ..AppState::default()
+            }),
+        });
+        for _ in 0..100 {
+            if store.entered.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(store.entered.load(Ordering::Acquire), "first save started");
+
+        let second = runner.submit(Job::SaveState {
+            revision: 2,
+            state: Box::new(AppState {
+                theme: Some("light".to_owned()),
+                ..AppState::default()
+            }),
+        });
+        assert_eq!(
+            runner
+                .running
+                .iter()
+                .filter(|running| running.slot == Slot::State)
+                .count(),
+            1,
+            "the second snapshot stays queued until the first write acknowledges"
+        );
+
+        store.release.store(true, Ordering::Release);
+        let completions = wait_for_job(&mut runner, second);
+        assert!(
+            completions.iter().any(|completion| completion.job == first),
+            "the first save completed before the second"
+        );
+        assert_eq!(
+            store.load().unwrap().theme.as_deref(),
+            Some("light"),
+            "the newer snapshot wins on disk"
         );
     }
 

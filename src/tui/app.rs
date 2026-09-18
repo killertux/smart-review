@@ -126,6 +126,12 @@ pub enum Effect {
     CleanWorkspaces(bool),
     /// Read whatever analysis is stored for the open pull request (FR-4.3).
     LoadAnalysis,
+    /// Load the stored analysis and the review draft after opening a pull request.
+    ///
+    /// Both reads depend on the canonical patch, but neither depends on the other.
+    /// Keeping them in one loop effect prevents one follow-up from silently replacing
+    /// the other (FR-4.3, FR-6.1).
+    LoadAnalysisAndDraft,
     /// Gather the context bundle, which is what an analysis would send (FR-4.6).
     GatherContext(AnalysisIntent),
     /// Ask the provider for an analysis (FR-4.1).
@@ -155,6 +161,8 @@ pub enum Effect {
     PruneChat,
     /// Store the files the user added to the context (FR-5.3).
     SaveContextFiles,
+    /// Check an unchanged path against the workspace without blocking input (IR-14).
+    ValidateContextPath(String),
     /// Read the stored draft for the open pull request (FR-6.1).
     LoadDraft,
     /// Recover unresolved remote mutations without blocking the event loop (IR-07).
@@ -284,6 +292,7 @@ fn effect_name(effect: &Effect) -> String {
         Effect::ClearKey(provider) => format!("clear-key({provider})"),
         Effect::CleanWorkspaces(all) => format!("clean-workspaces({all})"),
         Effect::LoadAnalysis => "load-analysis".to_owned(),
+        Effect::LoadAnalysisAndDraft => "load-analysis-and-draft".to_owned(),
         Effect::GatherContext(intent) => format!("gather-context({intent:?})"),
         Effect::RunAnalysis { force } => format!("run-analysis(force={force})"),
         Effect::CancelAnalysis => "cancel-analysis".to_owned(),
@@ -297,6 +306,7 @@ fn effect_name(effect: &Effect) -> String {
         Effect::ExportChat(format) => format!("export-chat({format})"),
         Effect::PruneChat => "prune-chat".to_owned(),
         Effect::SaveContextFiles => "save-context-files".to_owned(),
+        Effect::ValidateContextPath(_) => "validate-context-path".to_owned(),
         Effect::LoadDraft => "load-draft".to_owned(),
         Effect::LoadMutations => "load-mutations".to_owned(),
         Effect::SaveDraft => "save-draft".to_owned(),
@@ -520,6 +530,11 @@ pub struct PanelState {
     pub context_job: u64,
     /// The job id of the stored-analysis read (FR-4.3).
     pub stored_job: u64,
+    /// An analysis action pressed while the stored-analysis read is still in flight.
+    ///
+    /// The read must settle first: a current cached answer is used without spending a
+    /// second provider request, while a cache miss continues with this intent.
+    pub pending_stored_intent: Option<AnalysisIntent>,
     /// The text that has streamed in (FR-4.4).
     pub stream: StreamBuffer,
     /// The first visible line of the panel, for j/k scrolling (FR-4.4).
@@ -955,6 +970,10 @@ pub struct App {
     chat_bundle: Option<Box<crate::domain::context::Bundle>>,
     /// Which pull request and commit the bundle was gathered for (FR-4.6).
     chat_bundle_for: Option<(u64, crate::application::context::ContextIdentity)>,
+    /// The path currently being checked for `:context add` (IR-14).
+    context_path_check: Option<String>,
+    /// The validation job for [`Self::context_path_check`] (IR-14).
+    context_path_job: u64,
     /// A cancelled chat may still deliver its explicit partial terminal result, but it
     /// must no longer accept progress or an already-queued success (IR-05).
     cancelled_chat_job: u64,
@@ -988,6 +1007,8 @@ pub struct App {
     pub(crate) patch_job: u64,
     /// The job id checking the current pull request's durable mutation journal.
     pub(crate) mutation_job: u64,
+    /// The current asynchronous local-draft load (IR-14).
+    draft_load_job: u64,
     /// The focused pane.
     pub(crate) focus: Pane,
     /// The visible review input target, distinct from its containing pane (IR-09).
@@ -1013,6 +1034,12 @@ pub struct App {
     /// stale and the loop writes it. Without this the one-time opt-in of FR-4.6 lived
     /// only as long as the process, and every restart asked the same question again.
     state_dirty: bool,
+    /// Monotonic revision assigned to state snapshots submitted to the persistence
+    /// queue. An older acknowledgement must never certify a newer edit (IR-14).
+    state_revision: u64,
+    /// The newest state-save job. Kept separately from `state_dirty` because a save may
+    /// be in flight while the user makes another preference change (IR-14).
+    state_save_job: u64,
 }
 
 impl App {
@@ -1110,6 +1137,8 @@ impl App {
             chat: crate::tui::chat::ChatState::default(),
             chat_bundle: None,
             chat_bundle_for: None,
+            context_path_check: None,
+            context_path_job: 0,
             cancelled_chat_job: 0,
             chat_store,
             drafts: crate::tui::drafts::DraftState::default(),
@@ -1126,6 +1155,7 @@ impl App {
             detail_job: 0,
             patch_job: 0,
             mutation_job: 0,
+            draft_load_job: 0,
             state,
             warnings,
             repo,
@@ -1154,6 +1184,8 @@ impl App {
             geometry: Geometry::default(),
             quit: false,
             state_dirty: false,
+            state_revision: 0,
+            state_save_job: 0,
         };
         app.report_startup_warnings();
         Ok(app)
@@ -1695,6 +1727,63 @@ impl App {
         }
 
         match outcome {
+            Outcome::DraftLoaded { pr, draft } if job == self.draft_load_job => {
+                self.draft_load_job = 0;
+                self.apply_loaded_draft(
+                    pr,
+                    draft.map_or_else(
+                        || crate::domain::draft::Draft::new(pr, self.now()),
+                        |draft| *draft,
+                    ),
+                    None,
+                );
+                // The patch completion owns cached-analysis loading. Keeping this
+                // completion for mutation recovery prevents a fast draft read from
+                // suppressing recovery of an earlier remote operation (IR-07).
+                Some(Effect::LoadMutations)
+            }
+            Outcome::DraftSaved {
+                revision,
+                reload_after,
+            } if job == self.drafts.save_job => {
+                if revision == self.drafts.revision {
+                    self.drafts.dirty = false;
+                }
+                self.drafts.save_job = 0;
+                reload_after.then(|| self.reload_after_publish())
+            }
+            Outcome::DraftDeleted { revision } if job == self.drafts.save_job => {
+                if revision == self.drafts.revision {
+                    self.drafts.dirty = false;
+                }
+                self.drafts.save_job = 0;
+                None
+            }
+            Outcome::ContextPathValidated { path, exists } if job == self.context_path_job => {
+                self.context_path_job = 0;
+                self.context_path_check = None;
+                if exists {
+                    self.accept_context_file(&path);
+                    self.notice(
+                        NoticeLevel::Info,
+                        format!(
+                            "added {path} to the context of this pull request ({} file(s) in total; every question will include it)",
+                            self.chat.added.len()
+                        ),
+                    );
+                    Some(Effect::SaveContextFiles)
+                } else {
+                    self.notice(
+                        NoticeLevel::Warn,
+                        format!("{path} is not in this pull request's changed files and not in the checkout at this commit"),
+                    );
+                    None
+                }
+            }
+            Outcome::StateSaved { revision } => {
+                self.state_saved(job, revision);
+                None
+            }
             Outcome::Environment(environment) if job == self.environment_job => {
                 self.set_environment(*environment);
                 self.notice(NoticeLevel::Info, self.environment_summary());
@@ -1734,10 +1823,16 @@ impl App {
                 source,
                 head_sha,
             } if job == self.patch_job => {
-                if job == self.context_patch_job {
+                let load_analysis = job == self.context_patch_job;
+                if load_analysis {
                     self.apply_context_patch(outcome.value().clone());
                 }
-                Some(self.apply_patch(*outcome, source, head_sha))
+                let patch_effect = self.apply_patch(*outcome, source, head_sha);
+                if load_analysis && patch_effect == Effect::LoadDraft {
+                    Some(Effect::LoadAnalysisAndDraft)
+                } else {
+                    Some(patch_effect)
+                }
             }
             Outcome::Patch { outcome, .. } if job == self.context_patch_job => {
                 self.apply_context_patch(outcome.into_value());
@@ -1876,6 +1971,10 @@ impl App {
             | Outcome::ChatAnswered(_)
             | Outcome::ChatGathered { .. }
             | Outcome::MutationFailed { .. }
+            | Outcome::ContextPathValidated { .. }
+            | Outcome::DraftLoaded { .. }
+            | Outcome::DraftSaved { .. }
+            | Outcome::DraftDeleted { .. }
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
@@ -1921,7 +2020,10 @@ impl App {
     }
 
     /// Adds a path to the context, or says why it cannot be (FR-5.3).
-    pub(crate) fn add_context_file(&mut self, path: &str) -> std::result::Result<String, String> {
+    pub(crate) fn add_context_file(
+        &mut self,
+        path: &str,
+    ) -> std::result::Result<Option<Effect>, String> {
         let trimmed = path.trim();
         if trimmed.is_empty() {
             return Err("which file? `:context add src/domain/money.rs`".to_owned());
@@ -1935,21 +2037,26 @@ impl App {
                  never sent"
             ));
         }
-        if !self.path_in_diff(trimmed) && !self.path_exists_at_head(trimmed) {
-            return Err(format!(
-                "{trimmed} is not in this pull request's changed files and not in the \
-                 checkout at this commit"
-            ));
+        if !self.path_in_diff(trimmed) {
+            let Some(workspace) = self.workspace.as_ref().filter(|_| self.workspace_ready()) else {
+                return Err(format!(
+                    "{trimmed} is not in this pull request's changed files and the workspace is not ready; wait for it, then retry `:context add`"
+                ));
+            };
+            let _ = workspace;
+            self.context_path_check = Some(trimmed.to_owned());
+            return Ok(Some(Effect::ValidateContextPath(trimmed.to_owned())));
         }
-        if !self.chat.added.iter().any(|added| added == trimmed) {
-            self.chat.added.push(trimmed.to_owned());
+        self.accept_context_file(trimmed);
+        Ok(Some(Effect::SaveContextFiles))
+    }
+
+    /// Adds a path that was already validated by the diff model or a workspace job.
+    fn accept_context_file(&mut self, path: &str) {
+        if !self.chat.added.iter().any(|added| added == path) {
+            self.chat.added.push(path.to_owned());
         }
         self.invalidate_context_views();
-        Ok(format!(
-            "added {trimmed} to the context of this pull request ({} file(s) in total; \
-             every question will include it)",
-            self.chat.added.len()
-        ))
     }
 
     /// Removes a path from the context (FR-5.3).
@@ -1974,20 +2081,22 @@ impl App {
         self.chat_bundle_for = None;
     }
 
-    /// Whether the checkout at head has a path, which is what `:context add` checks
-    /// against (FR-5.3).
-    fn path_exists_at_head(&self, path: &str) -> bool {
-        let (Some(workspace), true) = (&self.workspace, self.workspace_ready()) else {
-            return false;
-        };
-        self.workspace_port
-            .read_file(
-                &workspace.path,
-                &workspace.head_sha,
-                path,
-                &crate::ports::Cancel::new(),
-            )
-            .is_ok()
+    /// Captures the immutable workspace revision a context-path job may inspect.
+    pub(crate) fn context_path_request(
+        &self,
+        path: &str,
+    ) -> Option<(std::path::PathBuf, String, String)> {
+        let workspace = self.workspace.as_ref().filter(|_| self.workspace_ready())?;
+        Some((
+            workspace.path.clone(),
+            workspace.head_sha.clone(),
+            path.to_owned(),
+        ))
+    }
+
+    /// Records the asynchronous validation for a `:context add` request.
+    pub(crate) fn record_context_path_job(&mut self, job: u64) {
+        self.context_path_job = job;
     }
 
     /// The request a question would send (FR-5.2, FR-5.3).
@@ -2867,7 +2976,7 @@ impl App {
         self.drafts.post_job = 0;
         self.drafts.armed = false;
         if posted.dry_run {
-            self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+            self.drafts.status = crate::tui::drafts::DraftStatus::DryRun;
             self.notice(
                 NoticeLevel::Info,
                 "dry run: nothing was posted; the comment is still here",
@@ -3084,10 +3193,23 @@ impl App {
     ) {
         if self.detail.as_ref().map(|detail| detail.summary.number) != Some(number)
             || (self.drafts.open && self.drafts.draft.pr == number)
+            // The user may open a composer before the background draft read returns.
+            // Loading disk state must never clear that private text (IR-14).
+            || self.drafts.composer.is_some()
         {
             return;
         }
         self.drafts.open(draft, warning);
+    }
+
+    /// Records the draft read currently allowed to populate the review surface.
+    pub(crate) fn record_draft_load_job(&mut self, job: u64) {
+        self.draft_load_job = job;
+    }
+
+    /// Records the newest durable draft snapshot.
+    pub(crate) fn record_draft_save_job(&mut self, job: u64) {
+        self.drafts.save_job = job;
     }
 
     /// Takes the gathered bundle when it is for the commit on screen (FR-4.6).
@@ -3358,12 +3480,17 @@ impl App {
                 plan,
             } if job == self.panel.stored_job => {
                 self.panel.stored_job = 0;
+                let pending_intent = self.panel.pending_stored_intent.take();
+                let has_current = current.is_some();
                 self.apply_stored(
                     current.map(|stored| *stored),
                     stale.map(|stored| *stored),
                     plan.map(|plan| *plan),
                 );
-                None
+                (!has_current)
+                    .then_some(pending_intent)
+                    .flatten()
+                    .map(Effect::GatherContext)
             }
             Outcome::Context {
                 bundle,
@@ -3765,9 +3892,42 @@ impl App {
         self.state_dirty = true;
     }
 
-    /// Whether the state file needs writing, clearing the flag.
-    pub(crate) fn take_state_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.state_dirty)
+    /// Takes the latest state snapshot that needs durable storage.
+    ///
+    /// The snapshot is immutable once it crosses the job boundary. A later edit gets a
+    /// later revision, so an acknowledgement cannot clear a change the worker never
+    /// saw (IR-14).
+    pub(crate) fn take_state_save(&mut self) -> Option<(u64, AppState)> {
+        if !std::mem::take(&mut self.state_dirty) {
+            return None;
+        }
+        self.state_revision = self.state_revision.saturating_add(1);
+        Some((self.state_revision, self.state.clone()))
+    }
+
+    /// Makes a reducer-requested state save eligible for the ordered persistence queue.
+    pub(crate) fn mark_state_dirty(&mut self) {
+        self.state_dirty = true;
+    }
+
+    /// Records the job that owns the latest submitted state snapshot.
+    pub(crate) fn record_state_save(&mut self, job: u64) {
+        self.state_save_job = job;
+    }
+
+    /// Applies an acknowledgement for a state snapshot.
+    pub(crate) fn state_saved(&mut self, job: u64, revision: u64) {
+        if job == self.state_save_job && revision == self.state_revision {
+            self.state_save_job = 0;
+        }
+    }
+
+    /// Makes the latest state snapshot eligible for a retry after its write failed.
+    pub(crate) fn state_save_failed(&mut self, job: u64) {
+        if job == self.state_save_job {
+            self.state_save_job = 0;
+            self.state_dirty = true;
+        }
     }
 
     /// Streams a piece of the answer into the preview (FR-4.4, FR-5.2).
@@ -4019,6 +4179,7 @@ impl App {
     /// Gives up on a run, keeping whatever text arrived (FR-4.4).
     pub(crate) fn cancelled_analysis(&mut self) {
         self.panel.stored_job = 0;
+        self.panel.pending_stored_intent = None;
         if self.panel.state.is_running() {
             self.panel.state = AnalysisState::Cancelling;
         }
@@ -4035,7 +4196,21 @@ impl App {
 
     /// Remembers the job id of a stored-analysis read (FR-4.3).
     pub fn record_stored_job(&mut self, id: u64) {
+        self.panel.pending_stored_intent = None;
         self.panel.stored_job = id;
+    }
+
+    /// Holds an analysis request until the current cache lookup has settled.
+    ///
+    /// A disk cache read and a context gather share a runner slot. Replacing the read
+    /// with the gather would turn a cache hit into a provider request merely because a
+    /// key arrived in the frame immediately after the diff did (FR-4.3).
+    pub(crate) fn defer_until_stored_analysis_loaded(&mut self, intent: AnalysisIntent) -> bool {
+        if self.panel.stored_job == 0 {
+            return false;
+        }
+        self.panel.pending_stored_intent = Some(intent);
+        true
     }
 
     /// Remembers the job id of a context gather (FR-4.6).
@@ -4453,12 +4628,6 @@ impl App {
         self.context_patch_job = 0;
     }
 
-    /// Whether a complete presentation-independent patch is ready for cache lookup.
-    #[must_use]
-    pub(crate) const fn has_context_patch(&self) -> bool {
-        self.context_patch.is_some()
-    }
-
     /// Notes that a pull request is being opened, which the indicator shows.
     pub fn begin_opening(&mut self, number: u64) {
         self.opening = Some(Opening {
@@ -4529,6 +4698,7 @@ impl App {
         // out what happened is the log. That is what a provider which cannot stream
         // looked like before this list was complete.
         job == self.environment_job
+            || job == self.state_save_job
             || job == self.list_job
             || job == self.count_job
             || job == self.detail_job
@@ -4542,10 +4712,13 @@ impl App {
             || job == self.panel.stored_job
             || job == self.chat.job
             || job == self.chat.load_job
+            || job == self.context_path_job
             || job == self.drafts.job
             || job == self.drafts.post_job
             || job == self.discussion.job
             || job == self.mutation_job
+            || job == self.draft_load_job
+            || job == self.drafts.save_job
     }
 
     /// Records a job failure where the user will see it.
@@ -4554,6 +4727,23 @@ impl App {
     /// question that was answered wrongly once, silently, for two of them.
     #[allow(clippy::too_many_lines)]
     fn report_job_failure(&mut self, job: u64, message: &str) {
+        if job == self.drafts.save_job {
+            self.drafts.save_job = 0;
+            self.drafts.warning = Some(message.to_owned());
+            self.notice(
+                NoticeLevel::Warn,
+                format!("{message}; keep editing and retry the draft command"),
+            );
+            return;
+        }
+        if job == self.state_save_job {
+            self.state_save_failed(job);
+            self.notice(
+                NoticeLevel::Warn,
+                format!("could not save state: {message}; keep the app open and it will retry"),
+            );
+            return;
+        }
         if job == self.drafts.job {
             self.drafts.job = 0;
             // The draft is *kept*: this is the moment it matters most (NFR-3.4). The
@@ -4646,6 +4836,7 @@ impl App {
                 self.panel.context_job = 0;
             } else {
                 self.panel.stored_job = 0;
+                self.panel.pending_stored_intent = None;
             }
             // Whatever was waiting on this has nothing coming: leaving the panel saying
             // "gathering the context" is the same stuck pane in a different costume.
@@ -6478,6 +6669,48 @@ mod tests {
     }
 
     #[test]
+    fn fr_4_3_analyze_waits_for_an_in_flight_cache_miss() {
+        let (_dir, mut app) = app();
+        app.record_stored_job(42);
+        assert!(app.defer_until_stored_analysis_loaded(AnalysisIntent::Estimate));
+
+        let effect = app.apply_analysis_outcome(
+            42,
+            jobs::Outcome::Stored {
+                current: None,
+                stale: None,
+                plan: None,
+            },
+        );
+
+        assert_eq!(
+            effect,
+            Some(Effect::GatherContext(AnalysisIntent::Estimate))
+        );
+        assert_eq!(app.panel.stored_job, 0);
+    }
+
+    #[test]
+    fn fr_4_3_cancelling_a_cache_read_discards_its_deferred_analyze() {
+        let (_dir, mut app) = app();
+        app.record_stored_job(42);
+        assert!(app.defer_until_stored_analysis_loaded(AnalysisIntent::Estimate));
+        app.cancelled_analysis();
+        app.record_stored_job(43);
+
+        let effect = app.apply_analysis_outcome(
+            43,
+            jobs::Outcome::Stored {
+                current: None,
+                stale: None,
+                plan: None,
+            },
+        );
+
+        assert_eq!(effect, None);
+    }
+
+    #[test]
     fn ctrl_c_quits() {
         let (_dir, mut app) = app();
         press(&mut app, "<C-c>");
@@ -7518,11 +7751,17 @@ mod tests {
         // FR-4.6's notice is once per repository, which is only true if the record
         // reaches the disk: this flag is what the loop writes it from.
         let (_dir, mut app, _store) = chat_app();
-        assert!(!app.take_state_dirty(), "nothing to write at startup");
+        assert!(
+            app.take_state_save().is_none(),
+            "nothing to write at startup"
+        );
         app.record_analysis_opt_in();
         assert!(app.analysis_opt_in_recorded());
-        assert!(app.take_state_dirty(), "the opt-in is worth writing");
-        assert!(!app.take_state_dirty(), "and only once");
+        assert!(
+            app.take_state_save().is_some(),
+            "the opt-in is worth writing"
+        );
+        assert!(app.take_state_save().is_none(), "and only once");
     }
 
     #[test]
@@ -7656,10 +7895,9 @@ mod tests {
                 head_sha: "head".to_owned(),
             },
         });
-        // The effect that comes back is the draft load, and it must not move the focus
-        // either — a file read is not a reason to take the keyboard off a half-typed
-        // question (FR-6.1).
-        assert_eq!(effect, Some(Effect::LoadDraft));
+        // Both the draft and cached analysis load after the canonical patch is ready;
+        // neither read may take the keyboard off a half-typed question (FR-4.3, FR-6.1).
+        assert_eq!(effect, Some(Effect::LoadAnalysisAndDraft));
         assert_eq!(app.focus(), Pane::Chat, "the compose box kept the keyboard");
         assert_eq!(app.mode(), Mode::Insert);
         press(&mut app, "why?");
@@ -8381,6 +8619,11 @@ mod tests {
             app.drafts().post.is_some(),
             "nothing was posted, so the comment is still here (FR-6.5)"
         );
+        assert_eq!(
+            app.drafts().status,
+            crate::tui::drafts::DraftStatus::DryRun,
+            "the modal keeps the completed dry-run result visible"
+        );
     }
 
     #[test]
@@ -8458,6 +8701,11 @@ mod tests {
         });
 
         assert_eq!(follow_up, Some(Effect::WriteDryRun));
+        assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("nothing changed on GitHub")),
+            "the result remains visible while the ledger is written"
+        );
         assert!(
             app.detail()
                 .expect("detail")

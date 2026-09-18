@@ -62,7 +62,7 @@ pub fn run(startup: Startup) -> Result<()> {
     let clock_source: Arc<dyn Clock> = Arc::new(clock);
     let cache = startup.cache.clone();
     let forge_factory = startup.forge_factory.clone();
-    let state_store: Box<dyn StateStore> = Box::new(startup.state_store.clone());
+    let state_store: Arc<dyn StateStore> = Arc::new(startup.state_store.clone());
 
     let catalog = startup.catalog.clone();
     let llm = startup.llm.clone();
@@ -81,7 +81,7 @@ pub fn run(startup: Startup) -> Result<()> {
     };
     let mut app = App::new(startup)?;
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
-    let mut runner = JobRunner::new(workspace, probe, catalog, llm, request);
+    let mut runner = JobRunner::new(workspace, probe, catalog, llm, state_store.clone(), request);
 
     // Detection is a job, not a startup step: it runs `gh auth status`, which reaches
     // the network, and the first frame must not wait for it (NFR-1.1).
@@ -127,6 +127,17 @@ pub fn run(startup: Startup) -> Result<()> {
             &clock_source,
             &workspace_for_executor,
         );
+        // A completion's follow-up belongs before the next input event. In particular,
+        // the patch completion starts the stored-analysis read; accepting an immediate
+        // Analyze key before scheduling that read lets the key cancel it and misses a
+        // cache entry that is already on disk (FR-4.3).
+        drain_effects(
+            queued,
+            &mut app,
+            state_store.as_ref(),
+            &mut runner,
+            &mut terminal,
+        );
         // A result from a job changes the screen, and the frame above was drawn before
         // it arrived. Without a second draw that change waits for the next event to be
         // seen — which is not a cosmetic delay: pressing a key in between means acting
@@ -151,14 +162,13 @@ pub fn run(startup: Startup) -> Result<()> {
             app.on_timeout()
         };
 
-        let mut queued = queued;
-        queued.extend(apply(
+        let queued = apply(
             effect,
             &mut app,
             state_store.as_ref(),
             &mut runner,
             &mut terminal,
-        ));
+        );
         drain_effects(
             queued,
             &mut app,
@@ -168,14 +178,7 @@ pub fn run(startup: Startup) -> Result<()> {
         );
         // A change that the reducer could not write itself — the one-time opt-in of
         // FR-4.6 is the one that matters — is written here, where the store is.
-        if app.take_state_dirty()
-            && let Err(error) = state_store.save(&app.state)
-        {
-            app.notice(
-                app::NoticeLevel::Warn,
-                format!("could not save state: {error}"),
-            );
-        }
+        schedule_state_save(&mut app, &mut runner);
         // The effects above may have changed the screen too, and they are applied after
         // the event that asked for them. Drawing here rather than at the top of the next
         // iteration means what the key press did is on screen before the loop can block
@@ -183,9 +186,26 @@ pub fn run(startup: Startup) -> Result<()> {
         terminal.draw(|frame| app.render(frame))?;
     }
 
+    if !runner.flush_persistence(std::time::Duration::from_secs(2)) {
+        logging::log(
+            Level::Warn,
+            "timed out while flushing durable state; keep the application open and retry the last edit",
+        );
+    }
     runner.cancel_all();
     logging::log(Level::Info, "shutting down normally");
     Ok(())
+}
+
+/// Submits the latest state snapshot after reducer effects have settled.
+fn schedule_state_save(app: &mut App, runner: &mut JobRunner) {
+    if let Some((revision, state)) = app.take_state_save() {
+        let job = runner.submit(jobs::Job::SaveState {
+            revision,
+            state: Box::new(state),
+        });
+        app.record_state_save(job);
+    }
 }
 
 /// Opens `$EDITOR` with the compose buffer after restoring the user's terminal.
@@ -254,7 +274,7 @@ fn edit_composer(app: &mut App, terminal: &mut terminal::TerminalGuard, body: &s
 pub(crate) fn apply(
     effect: Effect,
     app: &mut App,
-    state_store: &dyn StateStore,
+    _state_store: &dyn StateStore,
     runner: &mut JobRunner,
     terminal: &mut terminal::TerminalGuard,
 ) -> Vec<Effect> {
@@ -264,14 +284,7 @@ pub(crate) fn apply(
     match effect {
         Effect::None | Effect::KeepPending => {}
 
-        Effect::SaveState => {
-            if let Err(error) = state_store.save(&app.state) {
-                app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("could not save state: {error}"),
-                );
-            }
-        }
+        Effect::SaveState => app.mark_state_dirty(),
 
         Effect::DetectEnvironment
         | Effect::LoadPullRequests
@@ -334,6 +347,20 @@ pub(crate) fn apply(
 
         Effect::ReloadDiff => reload_diff(app, runner, &mut pending_effects),
 
+        Effect::ValidateContextPath(path) => {
+            if let Some((workspace, head_sha, path)) = app.context_path_request(&path) {
+                let id = runner.submit_owned(
+                    review_job_owner(app),
+                    jobs::Job::ValidateContextPath {
+                        workspace,
+                        head_sha,
+                        path,
+                    },
+                );
+                app.record_context_path_job(id);
+            }
+        }
+
         Effect::CopyPath(path) => {
             // OSC 52 asks the terminal to set the clipboard. A terminal that does not
             // implement it simply ignores the sequence, so the notice says what was
@@ -377,6 +404,14 @@ pub(crate) fn apply(
         | Effect::CancelAnalysis
         | Effect::SavePlan(_) => {
             let _ = apply_analysis_effect(&effect, app, runner, &mut pending_effects);
+        }
+
+        Effect::LoadAnalysisAndDraft => {
+            // The draft load establishes the editable document. Start it before the
+            // independent cache read so an eager comment cannot race a delayed empty
+            // draft response and be overwritten (FR-4.3, FR-6.1).
+            let _ = apply_draft_effect(&Effect::LoadDraft, app, runner);
+            let _ = apply_analysis_effect(&Effect::LoadAnalysis, app, runner, &mut pending_effects);
         }
 
         // The review effects are their own group: they are the only ones that write
@@ -532,6 +567,9 @@ fn apply_analysis_effect(
         }
 
         Effect::GatherContext(intent) => {
+            if app.defer_until_stored_analysis_loaded(*intent) {
+                return true;
+            }
             let Some(request) = app.analysis_request() else {
                 app.notice(
                     app::NoticeLevel::Warn,
@@ -1020,48 +1058,33 @@ fn drain_effects(
 fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> Option<Effect> {
     match effect {
         Effect::LoadDraft => {
-            let service = app.draft_service.as_ref()?;
             let number = app.detail.as_ref().map(|detail| detail.summary.number)?;
-            let (draft, warning) = service.load(number, app.now());
-            app.apply_loaded_draft(number, draft, warning);
-            if app.has_context_patch()
-                && let Some(key) = app.analysis_key()
-            {
-                let id = runner.submit_owned(
-                    review_job_owner(app),
-                    jobs::Job::LoadAnalysis { key: Box::new(key) },
-                );
-                app.record_stored_job(id);
-            }
-            return Some(Effect::LoadMutations);
+            let id =
+                runner.submit_owned(review_job_owner(app), jobs::Job::LoadDraft { pr: number });
+            app.record_draft_load_job(id);
         }
         Effect::SaveDraft | Effect::SaveDraftAndReload => {
-            let service = app.draft_service.as_ref()?;
-            if let Err(error) = service.save(&app.drafts.draft) {
-                // The text is still in memory and the user can carry on, but a draft
-                // that is not on disk must never look like one that is (NFR-3.4).
-                let message = format!("the draft could not be saved: {error}");
-                app.drafts.warning = Some(message.clone());
-                app.notice(app::NoticeLevel::Warn, message);
-            } else {
-                app.drafts.dirty = false;
-            }
-            if matches!(effect, Effect::SaveDraftAndReload) {
-                return Some(app.reload_after_publish());
-            }
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::SaveDraft {
+                    draft: Box::new(app.drafts.draft.clone()),
+                    revision: app.drafts.revision,
+                    reload_after: matches!(effect, Effect::SaveDraftAndReload),
+                },
+            );
+            app.record_draft_save_job(id);
         }
         Effect::ClearDraft => {
             app.drafts.clear(app.now());
-            if let Some(service) = app.draft_service.as_ref()
-                && let Err(error) = service.remove(app.drafts.draft.pr)
-            {
-                app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("the draft could not be removed: {error}"),
-                );
-            }
-            app.drafts.dirty = false;
-            app.notice(app::NoticeLevel::Info, "the draft is empty");
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::DeleteDraft {
+                    pr: app.drafts.draft.pr,
+                    revision: app.drafts.revision,
+                },
+            );
+            app.record_draft_save_job(id);
+            app.notice(app::NoticeLevel::Info, "the draft is empty; saving…");
         }
         Effect::CancelPublish => {
             if app.drafts.post_job != 0 {
@@ -1165,6 +1188,9 @@ fn list_worktrees(app: &mut App) {
 }
 
 /// Writes the calls a dry run recorded to `logs/dry-run.log` (FR-6.5).
+///
+/// The initiating action already reports what it did (or did not do). Do not replace
+/// that confirmation with a bookkeeping notice before the terminal has rendered it.
 fn write_dry_run(app: &mut App) {
     let Some(ledger) = app.dry_run_ledger.clone() else {
         return;
@@ -1174,13 +1200,7 @@ fn write_dry_run(app: &mut App) {
     }
     let path = app.home.logs().join("dry-run.log");
     match ledger.write_to(&path) {
-        Ok(count) => app.notice(
-            app::NoticeLevel::Info,
-            format!(
-                "dry run: nothing was sent; {count} command(s) in {}",
-                crate::paths::shorten_for_display(&path, 40)
-            ),
-        ),
+        Ok(_) => {}
         Err(error) => app.notice(
             app::NoticeLevel::Warn,
             format!("dry run: could not write {}: {error}", path.display()),

@@ -75,7 +75,7 @@ pub trait ConfigStore: std::fmt::Debug {
 }
 
 /// Reads and writes small persisted state (FR-8.5).
-pub trait StateStore: std::fmt::Debug {
+pub trait StateStore: std::fmt::Debug + Send + Sync {
     /// Reads the state, returning defaults when the file does not exist.
     ///
     /// # Errors

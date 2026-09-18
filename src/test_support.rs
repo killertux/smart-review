@@ -1264,6 +1264,7 @@ pub(crate) fn test_job_runner(
         probe,
         std::sync::Arc::new(NoCatalog),
         std::sync::Arc::new(NoLlm),
+        std::sync::Arc::new(InMemoryStateStore::default()),
         request,
     )
 }
