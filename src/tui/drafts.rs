@@ -322,6 +322,10 @@ pub struct DraftState {
     /// file system work out of the reducer without hiding it in a background thread
     /// that the user cannot see.
     pub dirty: bool,
+    /// Monotonic revision of the in-memory draft (IR-14).
+    pub revision: u64,
+    /// The latest queued or running save/delete job (IR-14).
+    pub save_job: u64,
     /// A draft that could not be read, or a save that failed (FR-9.1).
     pub warning: Option<String>,
     /// How far the modal is scrolled.
@@ -349,6 +353,8 @@ impl Default for DraftState {
             unresolved_mutation: false,
             cursor: 1,
             dirty: false,
+            revision: 0,
+            save_job: 0,
             warning: None,
             scroll: 0,
         }
@@ -356,6 +362,12 @@ impl Default for DraftState {
 }
 
 impl DraftState {
+    /// Marks the document changed, assigning the revision a persistence acknowledgement
+    /// must match before it may say the draft is safe (IR-14).
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.revision = self.revision.saturating_add(1);
+    }
     /// Adopts a draft for the open pull request (FR-6.1).
     pub fn open(&mut self, draft: Draft, warning: Option<String>) {
         self.draft = draft;
@@ -508,7 +520,7 @@ impl DraftState {
                 self.composer = None;
                 self.selection = None;
                 self.cursor = 1;
-                self.dirty = true;
+                self.mark_dirty();
                 Ok(())
             }
             Err(error) => {
@@ -524,7 +536,7 @@ impl DraftState {
     pub fn remove(&mut self, number: usize, now: Timestamp) -> Option<DraftComment> {
         let removed = self.draft.remove(number, now);
         if removed.is_some() {
-            self.dirty = true;
+            self.mark_dirty();
             self.clamp_cursor();
         }
         removed
@@ -533,7 +545,7 @@ impl DraftState {
     /// Clears every staged comment, the decision and the body (FR-6.1).
     pub fn clear(&mut self, now: Timestamp) {
         self.draft.clear(now);
-        self.dirty = true;
+        self.mark_dirty();
         self.cursor = 1;
         self.armed = false;
     }
@@ -541,13 +553,13 @@ impl DraftState {
     /// Records the decision (FR-6.1).
     pub fn set_decision(&mut self, decision: Option<Decision>, now: Timestamp) {
         self.draft.set_decision(decision, now);
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     /// Records the review body (FR-6.1).
     pub fn set_body(&mut self, body: impl Into<String>, now: Timestamp) {
         self.draft.set_body(body, now);
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     /// Remembers the commit the first comment is written against (FR-6.3).
@@ -560,7 +572,7 @@ impl DraftState {
             return;
         }
         self.draft.head_sha = Some(head_sha.to_owned());
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     /// Whether the draft has drifted from the commit on screen (FR-6.3).
@@ -632,7 +644,7 @@ impl DraftState {
         let submitted = self.publishing_draft.take();
         if submitted.as_ref() == Some(&self.draft) {
             self.draft.clear(now);
-            self.dirty = true;
+            self.mark_dirty();
         }
         self.job = 0;
         self.status = DraftStatus::Idle;

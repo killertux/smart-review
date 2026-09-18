@@ -62,7 +62,7 @@ pub fn run(startup: Startup) -> Result<()> {
     let clock_source: Arc<dyn Clock> = Arc::new(clock);
     let cache = startup.cache.clone();
     let forge_factory = startup.forge_factory.clone();
-    let state_store: Box<dyn StateStore> = Box::new(startup.state_store.clone());
+    let state_store: Arc<dyn StateStore> = Arc::new(startup.state_store.clone());
 
     let catalog = startup.catalog.clone();
     let llm = startup.llm.clone();
@@ -81,7 +81,7 @@ pub fn run(startup: Startup) -> Result<()> {
     };
     let mut app = App::new(startup)?;
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
-    let mut runner = JobRunner::new(workspace, probe, catalog, llm, request);
+    let mut runner = JobRunner::new(workspace, probe, catalog, llm, state_store.clone(), request);
 
     // Detection is a job, not a startup step: it runs `gh auth status`, which reaches
     // the network, and the first frame must not wait for it (NFR-1.1).
@@ -168,13 +168,12 @@ pub fn run(startup: Startup) -> Result<()> {
         );
         // A change that the reducer could not write itself — the one-time opt-in of
         // FR-4.6 is the one that matters — is written here, where the store is.
-        if app.take_state_dirty()
-            && let Err(error) = state_store.save(&app.state)
-        {
-            app.notice(
-                app::NoticeLevel::Warn,
-                format!("could not save state: {error}"),
-            );
+        if let Some((revision, state)) = app.take_state_save() {
+            let job = runner.submit(jobs::Job::SaveState {
+                revision,
+                state: Box::new(state),
+            });
+            app.record_state_save(job);
         }
         // The effects above may have changed the screen too, and they are applied after
         // the event that asked for them. Drawing here rather than at the top of the next
@@ -333,6 +332,20 @@ pub(crate) fn apply(
         }
 
         Effect::ReloadDiff => reload_diff(app, runner, &mut pending_effects),
+
+        Effect::ValidateContextPath(path) => {
+            if let Some((workspace, head_sha, path)) = app.context_path_request(&path) {
+                let id = runner.submit_owned(
+                    review_job_owner(app),
+                    jobs::Job::ValidateContextPath {
+                        workspace,
+                        head_sha,
+                        path,
+                    },
+                );
+                app.record_context_path_job(id);
+            }
+        }
 
         Effect::CopyPath(path) => {
             // OSC 52 asks the terminal to set the clipboard. A terminal that does not
@@ -1020,48 +1033,33 @@ fn drain_effects(
 fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) -> Option<Effect> {
     match effect {
         Effect::LoadDraft => {
-            let service = app.draft_service.as_ref()?;
             let number = app.detail.as_ref().map(|detail| detail.summary.number)?;
-            let (draft, warning) = service.load(number, app.now());
-            app.apply_loaded_draft(number, draft, warning);
-            if app.has_context_patch()
-                && let Some(key) = app.analysis_key()
-            {
-                let id = runner.submit_owned(
-                    review_job_owner(app),
-                    jobs::Job::LoadAnalysis { key: Box::new(key) },
-                );
-                app.record_stored_job(id);
-            }
-            return Some(Effect::LoadMutations);
+            let id =
+                runner.submit_owned(review_job_owner(app), jobs::Job::LoadDraft { pr: number });
+            app.record_draft_load_job(id);
         }
         Effect::SaveDraft | Effect::SaveDraftAndReload => {
-            let service = app.draft_service.as_ref()?;
-            if let Err(error) = service.save(&app.drafts.draft) {
-                // The text is still in memory and the user can carry on, but a draft
-                // that is not on disk must never look like one that is (NFR-3.4).
-                let message = format!("the draft could not be saved: {error}");
-                app.drafts.warning = Some(message.clone());
-                app.notice(app::NoticeLevel::Warn, message);
-            } else {
-                app.drafts.dirty = false;
-            }
-            if matches!(effect, Effect::SaveDraftAndReload) {
-                return Some(app.reload_after_publish());
-            }
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::SaveDraft {
+                    draft: Box::new(app.drafts.draft.clone()),
+                    revision: app.drafts.revision,
+                    reload_after: matches!(effect, Effect::SaveDraftAndReload),
+                },
+            );
+            app.record_draft_save_job(id);
         }
         Effect::ClearDraft => {
             app.drafts.clear(app.now());
-            if let Some(service) = app.draft_service.as_ref()
-                && let Err(error) = service.remove(app.drafts.draft.pr)
-            {
-                app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("the draft could not be removed: {error}"),
-                );
-            }
-            app.drafts.dirty = false;
-            app.notice(app::NoticeLevel::Info, "the draft is empty");
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::DeleteDraft {
+                    pr: app.drafts.draft.pr,
+                    revision: app.drafts.revision,
+                },
+            );
+            app.record_draft_save_job(id);
+            app.notice(app::NoticeLevel::Info, "the draft is empty; saving…");
         }
         Effect::CancelPublish => {
             if app.drafts.post_job != 0 {

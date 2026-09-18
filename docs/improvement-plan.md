@@ -122,7 +122,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | In progress (`ir-11-executable-review-order`) |
 | [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | [Merged — PR #25](https://github.com/killertux/smart-review/pull/25) |
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | [Open — PR #26](https://github.com/killertux/smart-review/pull/26) |
-| [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | Not started |
+| [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | In progress (`ir-14-ui-io-boundary`) |
 | [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Not started |
 | [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Not started |
 | [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Not started |
@@ -1334,6 +1334,12 @@ recovered text belongs to the right PR. Failure includes a frozen UI, older save
 overwriting newer text, false “saved,” or a terminal left in raw mode.
 
 **Gates:** shared gates, controlled save-order scenarios, terminal and publishing contracts.
+
+**Implementation status (2026-09-18):** in progress. State and draft persistence now
+run through ordered background jobs with revision-aware acknowledgements, and
+unchanged `:context add` paths are checked in a workspace job rather than by the
+reducer. Chat persistence, exports, model/key/config writes and explicit reloads remain
+to be moved through the same boundary.
 
 ---
 
