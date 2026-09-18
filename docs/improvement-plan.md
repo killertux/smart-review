@@ -68,7 +68,7 @@ without minutes of unconditional waiting.
 | `cargo fmt --all` | Passed, 0.563 s |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Passed, 8.232 s |
 | `cargo test --all-features` | 987 unit + 11 snapshot tests passed, 2.697 s |
-| `scripts/validate/m5.sh` | 32 checks passed, 131.310 s |
+| `scripts/validate/review-collaboration.sh` | 32 checks passed, 131.310 s |
 | M5 programmed settling waits | 114.9 s, statically counted |
 | M4 + M5 programmed settling waits | 175.7 s, statically counted |
 
@@ -314,7 +314,8 @@ full review/reply/LLM request bodies.
 - `src/tui/app.rs`: analysis/chat request construction.
 - `src/adapters/gh/review.rs`, `gh/comments.rs`, `gh/mod.rs`.
 - `src/adapters/process.rs`: command rendering and dry-run logging.
-- Existing context tests and `scripts/validate/m2b.sh`, `m3.sh`, `m4.sh`, `m5.sh`.
+- Existing context tests and the `analysis.sh`, `chat.sh`, `review-publishing.sh`, and
+  `review-collaboration.sh` feature validators under `scripts/validate/`.
 
 ### Implementation steps
 
@@ -1193,7 +1194,7 @@ owners and repo names. Remote-only diff semantics are verified against final PR 
 - `src/adapters/git/worktree.rs`, `src/adapters/git.rs`.
 - `src/domain/repo.rs`, workspace/revision ports, paths and cleanup UI.
 - Forge diff command construction and parser fixtures.
-- Existing local Git contract fixtures in milestone validators.
+- Existing local Git contract fixtures in feature validators.
 
 ### Implementation steps
 
@@ -1359,7 +1360,7 @@ are replaced with observable conditions rather than simply made shorter.
 ### Start in these areas
 
 - `scripts/validate/drive.py`, `screen.py`.
-- `scripts/validate/m0.sh` through `m5.sh`, fake provider scripts.
+- Feature validators under `scripts/validate/`, plus fake provider scripts.
 - `.github/workflows/ci.yml` and testing instructions.
 
 ### Implementation steps
@@ -1432,8 +1433,9 @@ streaming/cancellation fixture. M4/M5's comparable warm total is
 gain is trustworthy failure semantics rather than a large runtime claim.
 
 **Local verification (2026-09-18):** formatting, Clippy with all targets/features and
-warnings denied, 1,107 Rust unit tests plus 11 snapshots, 15 Python harness regressions,
-all seven scenario-only validators in parallel, and M4 in standalone mode passed. The
+warnings denied, 1,107 Rust unit tests plus 11 snapshots, 16 Python harness regressions,
+all seven feature validators in scenario-only mode, and review publishing in standalone
+mode passed. The
 aggregate also produced the same timing summary/artifact tree configured in CI. A
 second aggregate run with a sentinel `cargo` first on `PATH` passed without invoking
 it, proving scenario-only mode does not start nested Cargo gates. No live network,
@@ -1797,17 +1799,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Run the relevant existing milestone validator(s) listed in the PR, using their
+Run the relevant existing feature validator(s) listed in the PR, using their
 scenario-only/prebuilt form once IR-15 introduces it. Current commands are:
 
 ```sh
-scripts/validate/m0.sh
-scripts/validate/m1.sh
-scripts/validate/m2a.sh
-scripts/validate/m2b.sh
-scripts/validate/m3.sh
-scripts/validate/m4.sh
-scripts/validate/m5.sh
+scripts/validate/shell.sh
+scripts/validate/pull-requests.sh
+scripts/validate/workspace-models.sh
+scripts/validate/analysis.sh
+scripts/validate/chat.sh
+scripts/validate/review-publishing.sh
+scripts/validate/review-collaboration.sh
 ```
 
 Choose by affected behavior; a shared lifecycle/runtime change needs the affected

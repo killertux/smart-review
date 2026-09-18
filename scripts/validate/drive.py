@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drive `smart-review` in a pty until expected text appears, then print the screen.
 
-The milestone validators used to send key groups separated by fixed sleeps: enough
+The feature validators used to send key groups separated by fixed sleeps: enough
 pause that a background job (opening a pull request, fetching the catalog, streaming
 an analysis) had surely finished. That is slow — every step costs its sleep even when
 the interface answered in a few hundred milliseconds — and it made the non-quitting
@@ -43,7 +43,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Importing `screen` must not write a `__pycache__` into the checkout: m1.sh asserts
+# Importing `screen` must not write a `__pycache__` into the checkout: pull-requests.sh asserts
 # that the validation run leaves the repository untouched.
 sys.dont_write_bytecode = True
 

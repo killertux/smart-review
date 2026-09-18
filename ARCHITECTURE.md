@@ -183,7 +183,7 @@ terminal takeover are fatal.
   without writing to disk.
 - Rendering is a pure function of state, so `TestBackend` snapshots cover the
   screens (`tests/shell_snapshots.rs`).
-- Black-box milestone scenarios use one incremental terminal state machine for live
+- Black-box feature scenarios use one incremental terminal state machine for live
   waits and capture replay. A step can match only cells redrawn after its keys were
   sent, preventing an earlier frame from satisfying a later assertion (IR-15).
 - Adapters will get fakes in `application` tests; the real `gh`/LLM paths stay

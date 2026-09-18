@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the shared Rust gates once, then run the independent milestone scenarios in
+# Run the shared Rust gates once, then run the independent feature scenarios in
 # parallel. Set SMART_REVIEW_VALIDATE_PARALLEL=0 for ordered output while debugging.
 
 set -uo pipefail
@@ -22,12 +22,20 @@ if [ "${SMART_REVIEW_SKIP_CARGO:-0}" != "1" ]; then
 fi
 
 export SMART_REVIEW_SKIP_CARGO=1
-VALIDATORS=(m0 m1 m2a m2b m3 m4 m5)
+VALIDATORS=(
+  shell
+  pull-requests
+  workspace-models
+  analysis
+  chat
+  review-publishing
+  review-collaboration
+)
 
 if [ "${SMART_REVIEW_VALIDATE_PARALLEL:-1}" = "0" ]; then
-  for milestone in "${VALIDATORS[@]}"; do
-    printf '\n######## %s ########\n' "$milestone"
-    bash "$ROOT/scripts/validate/$milestone.sh" --scenarios-only || exit 1
+  for feature in "${VALIDATORS[@]}"; do
+    printf '\n######## %s ########\n' "$feature"
+    bash "$ROOT/scripts/validate/$feature.sh" --scenarios-only || exit 1
   done
   exit 0
 fi
@@ -48,17 +56,17 @@ cleanup() {
 trap cleanup EXIT
 
 pids=()
-for milestone in "${VALIDATORS[@]}"; do
+for feature in "${VALIDATORS[@]}"; do
   (
-    mkdir -p "$OUTPUT/tmp/$milestone"
+    mkdir -p "$OUTPUT/tmp/$feature"
     started="$(python3 -c 'import time; print(time.monotonic_ns())')"
-    SMART_REVIEW_VALIDATION_TMP="$OUTPUT/tmp/$milestone" KEEP="$((1 - OWN_OUTPUT))" \
-      bash "$ROOT/scripts/validate/$milestone.sh" --scenarios-only \
-      >"$OUTPUT/$milestone.log" 2>&1
+    SMART_REVIEW_VALIDATION_TMP="$OUTPUT/tmp/$feature" KEEP="$((1 - OWN_OUTPUT))" \
+      bash "$ROOT/scripts/validate/$feature.sh" --scenarios-only \
+      >"$OUTPUT/$feature.log" 2>&1
     code=$?
     finished="$(python3 -c 'import time; print(time.monotonic_ns())')"
     printf '%s %s\n' "$code" "$(( (finished - started) / 1000000 ))" \
-      >"$OUTPUT/$milestone.result"
+      >"$OUTPUT/$feature.result"
     exit "$code"
   ) &
   pids+=("$!")
@@ -66,10 +74,10 @@ done
 
 failed=0
 for index in "${!VALIDATORS[@]}"; do
-  milestone="${VALIDATORS[$index]}"
+  feature="${VALIDATORS[$index]}"
   wait "${pids[$index]}" || true
-  if [ -f "$OUTPUT/$milestone.result" ]; then
-    read -r code duration_ms <"$OUTPUT/$milestone.result"
+  if [ -f "$OUTPUT/$feature.result" ]; then
+    read -r code duration_ms <"$OUTPUT/$feature.result"
   else
     code=1
     duration_ms=0
@@ -78,24 +86,24 @@ for index in "${!VALIDATORS[@]}"; do
     failed=1
   fi
   printf '\n######## %s (exit %d, %d.%03ds) ########\n' \
-    "$milestone" "$code" "$(( duration_ms / 1000 ))" "$(( duration_ms % 1000 ))"
-  cat "$OUTPUT/$milestone.log"
+    "$feature" "$code" "$(( duration_ms / 1000 ))" "$(( duration_ms % 1000 ))"
+  cat "$OUTPUT/$feature.log"
 done
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
-    printf '### Milestone scenario timing\n\n'
+    printf '### Feature scenario timing\n\n'
     printf '| Validator | Result | Seconds |\n|---|---:|---:|\n'
     for index in "${!VALIDATORS[@]}"; do
-      milestone="${VALIDATORS[$index]}"
-      if [ -f "$OUTPUT/$milestone.result" ]; then
-        read -r code duration_ms <"$OUTPUT/$milestone.result"
+      feature="${VALIDATORS[$index]}"
+      if [ -f "$OUTPUT/$feature.result" ]; then
+        read -r code duration_ms <"$OUTPUT/$feature.result"
       else
         code=1
         duration_ms=0
       fi
       printf '| %s | %d | %d.%03d |\n' \
-        "$milestone" "$code" "$(( duration_ms / 1000 ))" "$(( duration_ms % 1000 ))"
+        "$feature" "$code" "$(( duration_ms / 1000 ))" "$(( duration_ms % 1000 ))"
     done
   } >>"$GITHUB_STEP_SUMMARY"
 fi

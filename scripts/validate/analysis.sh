@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# M2b validation: the analysis path, from a diff to an ordered review (FR-3.5,
+# Analysis validation: the path from a diff to an ordered review (FR-3.5,
 # FR-4.1-4.4, FR-4.6).
 #
 # Everything is local: a fake catalog server (so the app routes through the
@@ -10,7 +10,7 @@
 # privacy rules of FR-4.6 are checked on the wire rather than on trust: the diff and
 # the changed files must be there, and the repository's `.env` must not be.
 #
-# Usage: scripts/validate/m2b.sh        (KEEP=1 keeps the temporary directory)
+# Usage: scripts/validate/analysis.sh   (KEEP=1 keeps the temporary directory)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,7 +24,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m2b.XXXXXX")"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/analysis.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 
@@ -198,7 +198,7 @@ git -C "$REPO/clone" checkout --quiet main
 git -C "$REPO/clone" branch --quiet -D work
 
 # ---------------------------------------------------------------------------
-# The fake `gh`, as in m1.sh: a quoted heredoc, data read from its own directory.
+# The fake `gh`, as in pull-requests.sh: a quoted heredoc, data read from its own directory.
 # ---------------------------------------------------------------------------
 FAKE="$TMP/fake"
 mkdir -p "$FAKE"

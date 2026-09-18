@@ -217,8 +217,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 python3 scripts/validate/test_harness.py
 scripts/validate/all.sh                 # shared gates once, then all scenarios
-scripts/validate/m4.sh                  # one standalone validator, including build
-scripts/validate/m4.sh --scenarios-only # use an already-built debug binary
+scripts/validate/review-publishing.sh                  # standalone, including build
+scripts/validate/review-publishing.sh --scenarios-only # use an already-built binary
 ```
 
 Snapshot tests cover the rendered screens; regenerate them after an intentional

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# M5 validation: replies, resolution, the pull request conversation, external editing,
-# and the release/docs promises (FR-6.2, FR-6.4, DEC-16).
+# Review collaboration validation: replies, resolution, the pull request conversation,
+# external editing, and the release/docs promises (FR-6.2, FR-6.4, DEC-16).
 #
 # Everything is local, and the forge is a fake `gh` that records its argv. That matters
-# more here than anywhere else in this project: three of the four things this milestone
+# more here than anywhere else in this project: three of the four things this feature
 # adds are *mutations*, and the only evidence that a reply answered the right comment or
 # that a resolve named the right thread is what was written on the wire.
 #
@@ -18,7 +18,7 @@
 #   5. a failure that loses the words, which is the moment they matter most;
 #   6. an editor integration that leaves raw mode but fails to put its words back.
 #
-# Usage: scripts/validate/m5.sh         (KEEP=1 keeps the temporary directory)
+# Usage: scripts/validate/review-collaboration.sh (KEEP=1 keeps temporary files)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -32,7 +32,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m5.XXXXXX")"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/review-collaboration.XXXXXX")"
 BIN="target/debug/smart-review"
 
 cleanup() {
@@ -45,7 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
-# A repository with one pull request, the same shape m4.sh builds: a real clone and a
+# A repository with one pull request, the same shape review-publishing.sh builds: a real clone and a
 # real ref, so the review screen is the one a user would see.
 # ---------------------------------------------------------------------------
 REPO="$TMP/repo"
@@ -294,7 +294,7 @@ run_tui() {
   shift 4
   # The keystrokes and the waits are index-paired, so two lists of different lengths
   # shift every pattern one group and the step silently checks the wrong moment. That
-  # happened twice in M3 and once when this file was first written, so it is counted
+  # happened twice in chat validation and once when this file was first written, so it is counted
   # rather than trusted: a mispaired step is a bug in the validator, not in the app.
   local key_groups="${keys//[!~]/}" wait_groups="${waits//[!~]/}"
   if [ "${#key_groups}" != "${#wait_groups}" ]; then
@@ -603,7 +603,7 @@ if [ -s docs/themes.md ] && [ -s docs/configuration.md ] \
   && grep -q 'strip = true' Cargo.toml; then
   ok "the docs, release profile and three native release targets are present"
 else
-  bad "the M5 docs or release configuration is incomplete"
+  bad "the release docs or release configuration is incomplete"
 fi
 
 if [ -f "$TMP/driver.failed" ]; then

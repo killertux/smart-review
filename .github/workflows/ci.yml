@@ -87,7 +87,7 @@ jobs:
           fi
 
       # Cargo's gates already passed above. The aggregate runner therefore executes
-      # only the independent black-box milestone scenarios, in parallel, with local
+      # only the independent black-box feature scenarios, in parallel, with local
       # fake forge/catalog/model services and reconstructed PTY screens.
       - name: Milestone validation
         env:
@@ -98,7 +98,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: milestone-validation-captures
+          name: feature-validation-captures
           path: ${{ runner.temp }}/smart-review-validation
           if-no-files-found: ignore
           retention-days: 7

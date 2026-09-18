@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# M4 validation: staging a review, and the one call that posts it (FR-6.1-6.5).
+# Review publishing validation: staging a review and the one call that posts it.
 #
 # Everything is local. The forge is a fake `gh` that records its argv and keeps a copy
 # of anything passed with `--input`, so what is checked is what reached the wire rather
 # than what the code that built it believed: one `POST .../reviews` call carrying the
 # decision, the body and every comment, and no per-comment calls at all.
 #
-# The four things this milestone can get wrong, and which each get a step here:
+# The four things this feature can get wrong, and which each get a step here:
 #
 #   1. a comment that is never staged, or staged twice, or staged without text;
 #   2. a review posted as N comments instead of one review (the whole reason the
@@ -15,7 +15,7 @@
 #   3. a failure that loses the draft, which is the moment it matters most;
 #   4. a dry run that sends something anyway (FR-6.5).
 #
-# Usage: scripts/validate/m4.sh         (KEEP=1 keeps the temporary directory)
+# Usage: scripts/validate/review-publishing.sh (KEEP=1 keeps temporary files)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -29,7 +29,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m4.XXXXXX")"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/review-publishing.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 
@@ -44,7 +44,7 @@ trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # The repository the app reads: a real clone with a real pull request ref, the same
-# shape m3.sh sets up, so the review screen is the one a user would see.
+# shape chat.sh sets up, so the review screen is the one a user would see.
 # ---------------------------------------------------------------------------
 REPO="$TMP/repo"
 mkdir -p "$REPO/origin.git"

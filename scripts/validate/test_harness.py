@@ -285,6 +285,22 @@ time.sleep(0.05)
 
 
 class ValidatorModeTests(unittest.TestCase):
+    def test_ir_15_validators_are_named_for_features_not_milestones(self) -> None:
+        expected = {
+            "shell.sh",
+            "pull-requests.sh",
+            "workspace-models.sh",
+            "analysis.sh",
+            "chat.sh",
+            "review-publishing.sh",
+            "review-collaboration.sh",
+        }
+        self.assertTrue(expected.issubset({path.name for path in HERE.glob("*.sh")}))
+        self.assertEqual(list(HERE.glob("m[0-9]*.sh")), [])
+        aggregate = (HERE / "all.sh").read_text(encoding="utf-8")
+        for filename in expected:
+            self.assertIn(filename.removesuffix(".sh"), aggregate)
+
     def test_ir_15_scenarios_only_mode_marks_cargo_gates_prebuilt(self) -> None:
         result = subprocess.run(
             [

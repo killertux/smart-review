@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared command-line contract for milestone validators (IR-15).
+# Shared command-line contract for feature validators (IR-15).
 
 validation_mode() {
   case "$#:${1:-}" in

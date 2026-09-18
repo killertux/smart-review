@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# M3 validation: the conversation, over the same bundle an analysis sends (FR-5.1-5.4).
+# Chat validation over the same context bundle an analysis sends (FR-5.1-5.4).
 #
-# Everything is local, and the same harness as M2b: a fake catalog (so the app routes
+# Everything is local, and the same harness as analysis validation: a fake catalog (so the app routes
 # through the OpenAI-compatible passthrough) and a scripted provider that answers chat
 # with prose, a path reference and a `[general]` sentence, or dribbles an answer out
-# slowly so it can be stopped halfway. Which is the point: this milestone is about a
+# slowly so it can be stopped halfway. Which is the point: this feature is about a
 # *conversation*, so what is checked is what reaches the provider and what comes back
 # into the pane — the correction, the partial answer, the multi-turn history, and the
 # fact that a committed `.env` still never leaves.
 #
-# Usage: scripts/validate/m3.sh         (KEEP=1 keeps the temporary directory)
+# Usage: scripts/validate/chat.sh       (KEEP=1 keeps the temporary directory)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,7 +24,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m3.XXXXXX")"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/chat.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 
@@ -241,7 +241,7 @@ git -C "$REPO/clone" checkout --quiet main
 git -C "$REPO/clone" branch --quiet -D work
 
 # ---------------------------------------------------------------------------
-# The fake `gh`, as in m1.sh: a quoted heredoc, data read from its own directory.
+# The fake `gh`, as in pull-requests.sh: a quoted heredoc, data read from its own directory.
 # ---------------------------------------------------------------------------
 FAKE="$TMP/fake"
 mkdir -p "$FAKE"

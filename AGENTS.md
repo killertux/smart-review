@@ -80,7 +80,7 @@ claiming any work is done, run:
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-scripts/validate/m<N>.sh
+scripts/validate/all.sh
 ```
 
 Rules of engagement with the lints:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""A scripted, OpenAI-compatible provider, for validating M2b and M3 end to end.
+"""A scripted OpenAI-compatible provider for analysis and chat validation.
 
-The point of the analysis milestone is the path from a diff to an ordered review, and
+The point of analysis validation is the path from a diff to an ordered review, and
 the only way to validate that path without paying a provider is to be the provider. This
 serves just enough of `/chat/completions` — streaming and not — for the `llm` crate's
 OpenAI backend to talk to it, and answers from a script:
@@ -18,9 +18,9 @@ says between one run and the next. Modes:
                      state to know which attempt it is
     empty            a JSON object that says nothing
     chat             a chat answer: prose, one path reference, one general-knowledge
-                     line (M3)
+                     line (chat)
     chat-slow        the same, dribbled out over a second, so the checker can stop it
-                     halfway (M3)
+                     halfway (chat)
 
 Every request body is appended to the log file, one JSON object per line, which is how
 the checker asserts what was actually sent: the diff, the file contents, the repository
@@ -78,7 +78,7 @@ GOOD = {
     "suggested_questions": ["Is the rounding rule documented for finance?"],
 }
 
-# A chat answer, with the two things the M3 checker looks for: a reference to a file
+# A chat answer, with the two things the chat checker looks for: a reference to a file
 # that is in the diff (so the pane can say it is jumpable) and a sentence the model
 # marked as general knowledge rather than as coming from the context (FR-5.3).
 CHAT = "\n\n".join(
@@ -219,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         """Server-sent events, in several chunks, as a real provider does.
 
         `slow` dribbles the answer out over about a second, which is what gives the
-        M3 checker a window in which to press `Esc`: a stream that finishes in one
+        chat checker a window in which to press `Esc`: a stream that finishes in one
         millisecond cannot be cancelled, and a cancellation nobody can test is a
         cancellation nobody knows works.
         """

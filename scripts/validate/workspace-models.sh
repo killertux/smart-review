@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# M2a validation: the workspace, the model catalog, the credentials file and the
+# Workspace, model catalog, credentials, and model picker validation.
 # picker (FR-3.1, FR-3.2, FR-4.5, FR-4.7, FR-4.8).
 #
 # The catalog is served by a local HTTP server rather than models.dev, so the checks
@@ -9,7 +9,7 @@
 # because that is what actually broke the picker once: a single provider publishing
 # `"min": -1` made the whole document unreadable. The normal suite remains offline.
 #
-# Usage: scripts/validate/m2a.sh
+# Usage: scripts/validate/workspace-models.sh
 #        KEEP=1 keeps temporary files; SMART_REVIEW_LIVE_TESTS=1 also probes models.dev.
 set -uo pipefail
 
@@ -24,7 +24,7 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/m2a.XXXXXX")"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/workspace-models.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 MODELS="$ROOT/tests/fixtures/models/providers.json"
@@ -75,7 +75,7 @@ fi
 CATALOG_URL="http://127.0.0.1:$PORT/api.json"
 
 # ---------------------------------------------------------------------------
-# A fake `gh`, as in m1.sh: a quoted heredoc, and data files read from its own
+# A fake `gh`, as in pull-requests.sh: a quoted heredoc, and data files read from its own
 # directory so no check ever rewrites a committed fixture.
 # ---------------------------------------------------------------------------
 make_fake_gh() {
@@ -126,7 +126,7 @@ EOF
 }
 
 # Keys are sent in groups separated by `~`, each followed by a wait for the group's
-# effect to appear on screen. The drive is the same as m1.sh's: see the comment there.
+# effect to appear on screen. The drive is the same as pull-requests.sh's; see its comment.
 run_tui() {
   local home="$1" keys="$2" waits="$3" fake="$4" log="$5" step_timeout="${6:-15}"
   local driver_code=0
