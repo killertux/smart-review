@@ -1943,6 +1943,7 @@ pub fn job_for(
         | Effect::SaveSelection(_)
         | Effect::CleanWorkspaces(_)
         | Effect::LoadAnalysis
+        | Effect::LoadAnalysisAndDraft
         | Effect::GatherContext(_)
         | Effect::RunAnalysis { .. }
         | Effect::CancelAnalysis

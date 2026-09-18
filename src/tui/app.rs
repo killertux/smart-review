@@ -126,6 +126,12 @@ pub enum Effect {
     CleanWorkspaces(bool),
     /// Read whatever analysis is stored for the open pull request (FR-4.3).
     LoadAnalysis,
+    /// Load the stored analysis and the review draft after opening a pull request.
+    ///
+    /// Both reads depend on the canonical patch, but neither depends on the other.
+    /// Keeping them in one loop effect prevents one follow-up from silently replacing
+    /// the other (FR-4.3, FR-6.1).
+    LoadAnalysisAndDraft,
     /// Gather the context bundle, which is what an analysis would send (FR-4.6).
     GatherContext(AnalysisIntent),
     /// Ask the provider for an analysis (FR-4.1).
@@ -286,6 +292,7 @@ fn effect_name(effect: &Effect) -> String {
         Effect::ClearKey(provider) => format!("clear-key({provider})"),
         Effect::CleanWorkspaces(all) => format!("clean-workspaces({all})"),
         Effect::LoadAnalysis => "load-analysis".to_owned(),
+        Effect::LoadAnalysisAndDraft => "load-analysis-and-draft".to_owned(),
         Effect::GatherContext(intent) => format!("gather-context({intent:?})"),
         Effect::RunAnalysis { force } => format!("run-analysis(force={force})"),
         Effect::CancelAnalysis => "cancel-analysis".to_owned(),
@@ -1816,10 +1823,16 @@ impl App {
                 source,
                 head_sha,
             } if job == self.patch_job => {
-                if job == self.context_patch_job {
+                let load_analysis = job == self.context_patch_job;
+                if load_analysis {
                     self.apply_context_patch(outcome.value().clone());
                 }
-                Some(self.apply_patch(*outcome, source, head_sha))
+                let patch_effect = self.apply_patch(*outcome, source, head_sha);
+                if load_analysis && patch_effect == Effect::LoadDraft {
+                    Some(Effect::LoadAnalysisAndDraft)
+                } else {
+                    Some(patch_effect)
+                }
             }
             Outcome::Patch { outcome, .. } if job == self.context_patch_job => {
                 self.apply_context_patch(outcome.into_value());
@@ -7882,10 +7895,9 @@ mod tests {
                 head_sha: "head".to_owned(),
             },
         });
-        // The effect that comes back is the draft load, and it must not move the focus
-        // either — a file read is not a reason to take the keyboard off a half-typed
-        // question (FR-6.1).
-        assert_eq!(effect, Some(Effect::LoadDraft));
+        // Both the draft and cached analysis load after the canonical patch is ready;
+        // neither read may take the keyboard off a half-typed question (FR-4.3, FR-6.1).
+        assert_eq!(effect, Some(Effect::LoadAnalysisAndDraft));
         assert_eq!(app.focus(), Pane::Chat, "the compose box kept the keyboard");
         assert_eq!(app.mode(), Mode::Insert);
         press(&mut app, "why?");

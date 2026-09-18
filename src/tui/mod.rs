@@ -399,6 +399,7 @@ pub(crate) fn apply(
         // ones are: they share state, and they queue each other (a gather is followed
         // by the request it was gathered for).
         Effect::LoadAnalysis
+        | Effect::LoadAnalysisAndDraft
         | Effect::GatherContext(_)
         | Effect::RunAnalysis { .. }
         | Effect::CancelAnalysis
@@ -545,7 +546,7 @@ fn apply_analysis_effect(
     pending_effects: &mut Vec<Effect>,
 ) -> bool {
     match effect {
-        Effect::LoadAnalysis => {
+        Effect::LoadAnalysis | Effect::LoadAnalysisAndDraft => {
             let Some(key) = app.analysis_key() else {
                 // Nothing is open, or no model is chosen: there is no question to ask
                 // the cache, and asking it with half a key would be a bug.
@@ -556,6 +557,9 @@ fn apply_analysis_effect(
                 jobs::Job::LoadAnalysis { key: Box::new(key) },
             );
             app.record_stored_job(id);
+            if matches!(effect, Effect::LoadAnalysisAndDraft) {
+                pending_effects.push(Effect::LoadDraft);
+            }
         }
 
         Effect::GatherContext(intent) => {
