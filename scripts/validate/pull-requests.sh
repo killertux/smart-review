@@ -116,11 +116,12 @@ GH
 # popups that `:q` closes can be replayed from it (see `shown` in analysis.sh).
 run_tui() {
   local home="$1" keys="$2" waits="$3" fake="$4" log="$5"
+  local ready="${DRIVE_READY:-Add retry to the webhook dispatcher}"
   local driver_code=0
   PATH="$fake:$PATH" SMART_REVIEW_HOME="$home" \
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$log" \
-      --ready "Add retry to the webhook dispatcher" \
+      --ready "$ready" \
       --keys "$keys" --waits "$waits" -- \
       "$ROOT/$BIN" --repo acme/service || driver_code=$?
   if [ "$driver_code" -ne 0 ]; then
@@ -427,11 +428,11 @@ else
   # shown must come from the cache with an honest offline marker (FR-2.3, DEC-14).
   FAKE_FAILING="$TMP/fake-gh-offline"
   make_fake_gh "$FAKE_FAILING" 1
-  # The first key group is empty: it waits for the offline state to be reached, and only
-  # then quits. Quitting immediately is a race — the cached page is painted before the
-  # fetch is even attempted, so the indicator the check wants appears *after* the first
-  # frame, and an app that has already exited never reaches it.
-  SCREEN="$(run_tui "$HOME_LIST" '~:q\r' 'offline~' "$FAKE_FAILING" "$TMP/pull-requests-offline.log")"
+  # Treat offline as readiness, not as the effect of an empty keypress. On a fast
+  # machine the failed refresh and cached list can land in the initial frame; on a
+  # slower one they arrive later. Both are valid, and only then should the driver quit.
+  SCREEN="$(DRIVE_READY='offline' run_tui "$HOME_LIST" ':q\r' '' \
+    "$FAKE_FAILING" "$TMP/pull-requests-offline.log")"
   if printf '%s' "$SCREEN" | grep -q "Add retry to the webhook dispatcher"; then
     ok "a cached list is shown when the network is gone"
   else
