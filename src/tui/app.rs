@@ -2976,7 +2976,7 @@ impl App {
         self.drafts.post_job = 0;
         self.drafts.armed = false;
         if posted.dry_run {
-            self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
+            self.drafts.status = crate::tui::drafts::DraftStatus::DryRun;
             self.notice(
                 NoticeLevel::Info,
                 "dry run: nothing was posted; the comment is still here",
@@ -8618,6 +8618,11 @@ mod tests {
         assert!(
             app.drafts().post.is_some(),
             "nothing was posted, so the comment is still here (FR-6.5)"
+        );
+        assert_eq!(
+            app.drafts().status,
+            crate::tui::drafts::DraftStatus::DryRun,
+            "the modal keeps the completed dry-run result visible"
         );
     }
 

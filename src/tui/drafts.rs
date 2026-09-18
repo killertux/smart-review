@@ -246,6 +246,8 @@ pub enum DraftStatus {
     Idle,
     /// A publish is in flight; the modal says so and the key does nothing.
     Publishing,
+    /// A dry run recorded the requested mutation without sending it (FR-6.5).
+    DryRun,
     /// The last publish failed, with the reason (FR-6.3).
     Failed {
         /// What GitHub or the network said.
@@ -266,6 +268,7 @@ impl DraftStatus {
         match self {
             Self::Idle => "idle".to_owned(),
             Self::Publishing => "publishing…".to_owned(),
+            Self::DryRun => "dry run recorded".to_owned(),
             Self::Failed { reason } => format!("failed: {reason}"),
         }
     }
