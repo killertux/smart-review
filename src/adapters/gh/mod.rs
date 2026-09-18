@@ -484,7 +484,10 @@ impl ForgePort for GhCliForge {
 
     fn pull_request_diff(&self, number: u64, cancel: &Cancel) -> Result<String> {
         let number = number.to_string();
-        let spec = self.spec(&["pr", "diff", &number, "--patch"]);
+        // `--patch` asks GitHub for an mbox-style patch per commit. Parsing that as
+        // one PR diff repeats intermediate edits and produces obsolete line anchors.
+        // The default representation is the final three-dot PR diff (IR-13).
+        let spec = self.spec(&["pr", "diff", &number, "--color", "never"]);
         self.text(&spec, cancel)
     }
 
@@ -1265,7 +1268,81 @@ mod tests {
         let call = fake.last_call();
         assert_eq!(
             call,
-            vec!["pr", "diff", "141", "--patch", "--repo", "acme/service"]
+            vec![
+                "pr",
+                "diff",
+                "141",
+                "--color",
+                "never",
+                "--repo",
+                "acme/service",
+            ]
+        );
+    }
+
+    #[test]
+    fn ir_13_remote_diff_requests_final_state_not_a_commit_series() {
+        let fixture = crate::test_support::GitFixture::new();
+        fixture.commit("old-name.txt", "rename me\n", "add renamed file");
+        fixture.commit("edited.txt", "before\n", "add edited file");
+        fixture.commit("deleted.txt", "remove me\n", "add deleted file");
+        let base = fixture.head_sha();
+        fixture.push_main();
+        fixture.publish_pull_request(77, |fixture| {
+            fixture.commit("edited.txt", "first edit\n", "first edit");
+            fixture.commit("edited.txt", "final edit\n", "re-edit the same file");
+            fixture.git(&["mv", "old-name.txt", "new-name.txt"]);
+            fixture.git(&["rm", "--quiet", "deleted.txt"]);
+            std::fs::write(fixture.clone.join("image.bin"), [0_u8, 1, 2, 255])
+                .expect("writes binary file");
+            fixture.git(&["add", "--", "image.bin"]);
+            fixture.git(&["commit", "--quiet", "-m", "rename, delete and add binary"]);
+            fixture.git(&["rev-parse", "HEAD"]).trim().to_owned()
+        });
+        fixture.git(&[
+            "fetch",
+            "--quiet",
+            "origin",
+            "refs/pull/77/head:refs/smart-review-test/ir-13-head",
+        ]);
+        let revision = format!("{base}...refs/smart-review-test/ir-13-head");
+        let expected = fixture.git(&["diff", "--binary", "--find-renames", &revision]);
+        // The fake returns the final diff for this multi-commit PR. The argv below
+        // is the regression boundary: adding `--patch` would make real gh return a
+        // commit series instead of this final state.
+        let fake = FakeGh::scripted(&[("pr:diff", &expected)]);
+        let forge = fake.forge("acme/service");
+        let remote = forge
+            .pull_request_diff(77, &Cancel::new())
+            .expect("reads patch");
+        assert_eq!(remote, expected);
+        assert_eq!(
+            fake.last_call(),
+            vec![
+                "pr",
+                "diff",
+                "77",
+                "--color",
+                "never",
+                "--repo",
+                "acme/service",
+            ]
+        );
+        let parsed = crate::domain::diff::parse_patch(&remote);
+        assert!(
+            parsed
+                .find(&crate::domain::diff::RelPath::parse("new-name.txt").expect("valid path"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .find(&crate::domain::diff::RelPath::parse("deleted.txt").expect("valid path"))
+                .is_some()
+        );
+        assert!(
+            parsed
+                .find(&crate::domain::diff::RelPath::parse("image.bin").expect("valid path"))
+                .is_some()
         );
     }
 
@@ -1295,7 +1372,8 @@ mod tests {
         // FR-9.1 wants a copyable command alongside the message, which is why the
         // error keeps the two apart.
         let command = error.command().unwrap();
-        assert!(command.contains("gh pr diff 141 --patch"), "{command}");
+        assert!(command.contains("gh pr diff 141"), "{command}");
+        assert!(!command.contains("--patch"), "{command}");
     }
 
     #[test]

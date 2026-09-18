@@ -861,6 +861,27 @@ mod tests {
     }
 
     #[test]
+    fn ir_13_a_mixed_case_manual_review_plan_remains_readable() {
+        let (cache, root) = cache();
+        let repo = RepoId::new("github.com", "Acme", "Service");
+        let plan = Plan::heuristic("abc123", &["src/a.rs".to_owned()]);
+        cache.put_plan(&repo, 141, &plan).expect("writes");
+
+        assert!(
+            root.join("github.com/Acme/Service/pr-141/plan.json")
+                .exists()
+        );
+        assert_eq!(
+            cache
+                .plan(&repo, 141)
+                .expect("reads")
+                .map(|stored| stored.head_sha),
+            Some(plan.head_sha)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_plan_that_cannot_be_read_is_a_miss_not_an_error() {
         let (cache, root) = cache();
         let path = cache.pr_dir(&repo(), 141).join(PLAN_FILE);

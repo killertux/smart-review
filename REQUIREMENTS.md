@@ -153,15 +153,16 @@ Acceptance criteria:
 **FR-3.1 PR workspace** — MUST — M2 — *DEC-1 `[DECIDED]`: managed git worktree*
 The app MUST materialize the PR head on disk in an app-owned git worktree so the LLM and the user can read whole files, without ever modifying the user's working tree.
 Acceptance criteria:
-- [ ] Workspace path is `<SMART_REVIEW_HOME>/worktrees/<owner>-<repo>/pr-<N>`.
-- [ ] Creation uses, in order: reuse existing valid workspace for the same head SHA → `git fetch origin <baseRefName> refs/pull/<N>/head` → `git worktree add --detach <path> <fetched-head-sha>`.
-- [ ] The user's working tree, index, HEAD and branches are never modified; a dirty working tree is never a precondition for using the app.
+- [ ] Workspace path is `<SMART_REVIEW_HOME>/worktrees/checkouts/<encoded-repository-id>/pr-<N>`, with the matching bare object store under `worktrees/git/<encoded-repository-id>/repo.git`. The encoded identity includes host, owner and repository unambiguously.
+- [ ] Creation uses, in order: reuse an existing valid checkout only after resolving the current base/head refs in the app-owned object store → fetch the base and `refs/pull/<N>/head` into explicit app-owned refs → calculate the merge base there → `git worktree add --detach <path> <fetched-head-sha>` from that store.
+- [ ] The user's working tree, index, HEAD, branches, refs and `.git` bookkeeping are never modified; a dirty working tree is never a precondition for using the app.
 - [ ] Fork PRs work through the same `refs/pull/<N>/head` path.
 - [ ] Workspaces are listed/removed by `:workspace clean [--all]`; removal runs `git worktree remove` and prunes. On failure the user is told exactly which path to delete manually.
 - [ ] A missing/expired workspace is recreated transparently on demand.
+- [ ] Multiple app instances sharing one home serialize each repository's fetch/ref/worktree lifecycle, so one request cannot mix another request's base or head.
 
 **FR-3.2 Diff acquisition** — MUST — M1 (remote-only) / M2 (local)
-The diff MUST be computed locally in the workspace as `git diff --unified=<ctx> <base>...<head>` (three-dot), with `--find-renames`, `--no-color`, and `--no-ext-diff`. Remote-only mode MAY fall back to `gh pr diff --patch`.
+The diff MUST be computed locally in the workspace as `git diff --unified=<ctx> <base>...<head>` (three-dot), with `--find-renames`, `--no-color`, and `--no-ext-diff`. Remote-only mode MAY fall back to `gh pr diff` without `--patch`; `--patch` returns an mbox-style commit series whose intermediate edits are not valid current PR anchors.
 Acceptance criteria:
 - [ ] Default context = 3 lines, adjustable at runtime (0/3/10) without refetching the whole PR when the workspace exists.
 - [ ] Whitespace-ignoring mode (`-w`) is toggleable and visibly indicated.
@@ -396,7 +397,8 @@ Root: `$SMART_REVIEW_HOME` if set, else `~/.smart-review`.
   reviews/
     <host>/<owner>/<name>/pr-<N>/plan.json
 drafts/<host>/<owner>/<name>/pr-<N>.json
-  worktrees/<owner>-<repo>/pr-<N>/
+  worktrees/git/<encoded-repository-id>/repo.git
+  worktrees/checkouts/<encoded-repository-id>/pr-<N>/
   logs/smart-review.log       # rotated, max 5 files × 2 MiB
   README.md                   # generated on first run: where things live
 ```
@@ -915,7 +917,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 
 | ID | Question | Proposed default | Impact if changed |
 |---|---|---|---|
-| **DEC-1** | How is the PR head materialized on disk? | `[DECIDED]` **Managed git worktree** at `~/.smart-review/worktrees/<owner>-<repo>/pr-<N>`, detached at the head SHA; the user's working tree, index, HEAD and branches are never modified. | Touches FR-3.1, FR-3.2, FR-4.6, persistence layout, safety story. |
+| **DEC-1** | How is the PR head materialized on disk? | `[DECIDED]` **Managed git worktree** backed by an app-owned bare object store at `~/.smart-review/worktrees/git/<encoded-repository-id>/repo.git`, with detached checkouts at `worktrees/checkouts/<encoded-repository-id>/pr-<N>`. Fetches, refs and worktree bookkeeping never touch the user's clone. | Touches FR-3.1, FR-3.2, FR-4.6, persistence layout, safety story. |
 | **DEC-2** | Which LLM capabilities are in v1: analysis only, analysis + chat, or analysis + chat + agentic file reading (tool loop over the repo)? | `[DECIDED]` **Analysis + chat** over a deterministic context bundle. Agentic file reading is deferred to M5+ (cost, latency, privacy predictability); its guardrails are pre-specified in FR-5.3. | FR-5.3, ARCH-2 `LlmPort` (no tool surface in v1), prompt design, M2/M3 scope. |
 | **DEC-3** | Review publishing scope in v1: (a) local drafts only, (b) publish with `gh pr review` (no inline comments), (c) publish decision + body + batched inline comments. | `[DECIDED]` **(c)** — one batched review containing decision, body and inline comments; `gh pr review` only as the no-inline-comment shortcut. **The route was corrected at M4:** the batch is a single `POST …/pulls/{N}/reviews` with a JSON body (`gh api --input`), not the GraphQL pair this row originally recorded. One request cannot half-happen, and a list of GraphQL input objects cannot be passed as a variable over argv. See FR-6.3's implementation note and Appendix A. | FR-6.1–6.3, Appendix A, and the amount of GitHub API surface to absorb. |
 | **DEC-4** | Diff presentation: unified only, unified + side-by-side toggle, and is syntax highlighting required? | `[DECIDED]` **Unified default + side-by-side toggle at width ≥ 140**, delivered in M1. **Syntax highlighting deferred** (large dependency + per-language risk); no highlighting crate in v1. | FR-3.3, ARCH-8 dependency list, M1 scope. |
@@ -941,7 +943,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 ### 11.1 Decision log
 | Date | ID | Decision | By |
 |---|---|---|---|
-| — | DEC-1 | PR head is materialized in an app-owned `git worktree`, detached at the head SHA; the user's clone is never modified. | owner |
+| 2026-09-17 | DEC-1 | PR heads use app-owned bare object stores and detached worktrees; fetches, refs and worktree bookkeeping never modify the user's clone. | owner |
 | — | DEC-2 | v1 ships analysis + chat over a deterministic context bundle; agentic file reading remains deferred after M5. | owner |
 | M4 | DEC-3 | v1 publishes one batched review (decision + body + inline comments) — route corrected to one REST request (`gh api -X POST …/reviews --input`), which the owner chose over the GraphQL pair DEC-3 had recorded. | owner |
 | — | DEC-4 | Unified diff by default, side-by-side toggle at ≥140 cols, no syntax highlighting in v1. | owner |
@@ -967,11 +969,11 @@ Verified against `gh` 2.45 / `git` 2.43 on the development machine. `gh` always 
 | Checks | `gh pr view N --json statusCheckRollup` |
 | Reviews | `gh pr view N --json reviews,latestReviews` |
 | Inline comments | `gh api --paginate repos/{owner}/{repo}/pulls/N/comments` |
-| Fetch head | `git fetch origin <baseRefName> refs/pull/N/head --no-tags` |
-| Base SHA / merge base | `git rev-parse refs/remotes/origin/<baseRefName>`, `git merge-base <base> <head>` — **note: `gh pr view --json` has no `baseRefOid` on gh 2.45, so the base SHA must come from git** |
-| Worktree | `git worktree add --detach <path> <head_sha>`, `git worktree remove <path>`, `git worktree prune` |
+| Fetch base and head | `git -C <app-store> fetch --no-tags <selected-remote-url> +refs/heads/<baseRefName>:refs/smart-review/<encoded-repository-id>/pr-N/base +refs/pull/N/head:refs/smart-review/<encoded-repository-id>/pr-N/head` |
+| Base SHA / merge base | `git -C <app-store> rev-parse refs/smart-review/<encoded-repository-id>/pr-N/head^{commit}`, `git -C <app-store> merge-base <base-ref> <head-ref>` — **note: `gh pr view --json` has no `baseRefOid` on gh 2.45, so the base SHA must come from git** |
+| Worktree | `git -C <app-store> worktree add --detach <path> <head_sha>`, `git -C <app-store> worktree remove <path>`, `git -C <app-store> worktree prune` |
 | Diff (local) | `git -C <ws> diff --unified=<n> [--ignore-all-space] --find-renames --no-color --no-ext-diff <merge_base> <head_sha>` |
-| Diff (remote fallback) | `gh pr diff N --patch --color never` |
+| Diff (remote fallback) | `gh pr diff N --color never` (never `--patch`, which returns a per-commit series rather than the final PR state) |
 | File list | `git -C <ws> ls-files --cached --others --exclude-standard` |
 | File content | `git -C <ws> show <head_sha>:<path>` (preferred: reads exactly the PR revision, independent of worktree state) |
 | Publish (body/decision) | `gh pr review N --approve|--request-changes|--comment --body-file -` (body via stdin) |

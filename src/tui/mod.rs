@@ -814,23 +814,24 @@ fn apply_model_effect(
         Effect::EnsureWorkspace(number) => {
             // Without a resolved repository and an open detail there is nothing to
             // fetch, and saying nothing is right: the request came from the loop.
-            let (Some(detail), Some(repo)) = (
-                app.detail.as_ref(),
-                app.environment
-                    .as_ref()
-                    .map(|environment| environment.repo.clone()),
-            ) else {
+            let (Some(detail), Some(environment)) = (app.detail.as_ref(), app.environment.as_ref())
+            else {
                 return true;
             };
             // The remote the repository was identified from is the one to fetch: a
             // fork's pull request lives on the base repository's `refs/pull/N/head`,
             // which is exactly where this looks (FR-3.1).
-            let remote = app
-                .environment
-                .as_ref()
-                .and_then(|environment| environment.remote.clone())
+            let remote = environment
+                .remote
+                .clone()
                 .unwrap_or_else(|| "origin".to_owned());
-            let request = workspace_request(&repo, &remote, detail, *number);
+            let request = workspace_request(
+                &environment.repo,
+                &remote,
+                environment.remote_url.clone(),
+                detail,
+                *number,
+            );
             let id = runner.submit_owned(
                 review_job_owner(app),
                 jobs::Job::Workspace {
@@ -920,12 +921,14 @@ fn apply_model_effect(
 fn workspace_request(
     repo: &RepoId,
     remote: &str,
+    remote_url: Option<String>,
     detail: &crate::domain::pr::PullRequestDetail,
     number: u64,
 ) -> crate::ports::workspace::WorkspaceRequest {
     crate::ports::workspace::WorkspaceRequest {
         repo: repo.clone(),
         remote: remote.to_owned(),
+        remote_url,
         number,
         base: detail.summary.base_ref.clone(),
         head_sha: detail.summary.head_sha.clone(),

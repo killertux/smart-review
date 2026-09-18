@@ -1780,7 +1780,7 @@ impl App {
             } if job == self.workspace_job => {
                 self.workspace_job = 0;
                 self.report_worktrees_cleaned(removed, kept, &failed);
-                None
+                self.dry_run.then_some(Effect::WriteDryRun)
             }
             Outcome::ReviewPosted(posted) if job == self.drafts.job => {
                 Some(self.apply_review_posted(&posted))
@@ -4352,7 +4352,12 @@ impl App {
 
     /// Says what `:workspace clean` did (FR-3.1).
     fn report_worktrees_cleaned(&mut self, removed: usize, kept: usize, failed: &[String]) {
-        let mut message = format!("removed {removed} worktree(s), kept {kept}");
+        let verb = if self.dry_run {
+            "would remove"
+        } else {
+            "removed"
+        };
+        let mut message = format!("{verb} {removed} worktree(s), kept {kept}");
         if !failed.is_empty() {
             let _ = std::fmt::Write::write_fmt(
                 &mut message,

@@ -353,7 +353,7 @@ impl WorkspacePort for GitCli {
 
     fn read_file(
         &self,
-        _repo: &Path,
+        repo: &Path,
         rev: &str,
         path: &str,
         cancel: &Cancel,
@@ -363,8 +363,9 @@ impl WorkspacePort for GitCli {
         // (FR-4.6). A path that is not in the revision is a named error rather than
         // an empty file, so callers can skip it deliberately.
         let spec = format!("{rev}:{path}");
-        let command = self
-            .spec(&["show", &spec])
+        let command = CommandSpec::new(&self.program)
+            .args(["show", &spec])
+            .current_dir(repo)
             .timeout(std::time::Duration::from_secs(60));
         let output = self
             .runner
@@ -461,11 +462,32 @@ impl WorkspacePort for GitCli {
         let path = self.worktree_path(repo, number).ok_or_else(|| {
             WorkspaceError::Failed("no worktree directory is configured".to_owned())
         })?;
-        // The ref is deleted first, while the worktree still resolves to the
-        // repository that owns both: afterwards there is nothing left to run git in
-        // when the app was started from a different checkout.
-        self.delete_head_ref(repo, number, cancel);
-        self.drop_worktree(&path, cancel)?;
+        let store = self.store_path(repo).ok_or_else(|| {
+            WorkspaceError::Failed("no worktree directory is configured".to_owned())
+        })?;
+        let _lock = self.lock_workspace(&repo.storage_key(), cancel, true)?;
+        if !path.exists() {
+            let legacy = self
+                .worktrees_root()?
+                .join(repo.dir_name())
+                .join(format!("pr-{number}"));
+            if legacy.exists() {
+                return match worktree::legacy_owner_path(&legacy) {
+                    Some(owner_path) => Err(WorkspaceError::LegacyWorkspace {
+                        path: legacy,
+                        owner_path,
+                    }),
+                    None => Err(WorkspaceError::Failed(format!(
+                        "legacy workspace at {} has unreadable Git ownership metadata; inspect {} and remove it with the repository that owns it",
+                        legacy.display(),
+                        legacy.join(".git").display()
+                    ))),
+                };
+            }
+            return Ok(());
+        }
+        self.drop_worktree(&store, &path, cancel)?;
+        self.delete_head_ref(&store, repo, number, cancel);
         Ok(())
     }
 }

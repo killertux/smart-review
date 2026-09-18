@@ -723,6 +723,7 @@ pub(crate) fn environment() -> crate::domain::environment::Environment {
         repo: crate::domain::repo::RepoId::new("github.com", "acme", "service"),
         mode: crate::domain::environment::RunMode::InRepo,
         remote: Some("origin".to_owned()),
+        remote_url: Some("https://github.com/acme/service.git".to_owned()),
         root: Some(std::path::PathBuf::from("/src/service")),
         default_branch: Some("main".to_owned()),
         git_version: "2.43.0".to_owned(),

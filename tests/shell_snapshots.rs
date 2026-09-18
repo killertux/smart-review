@@ -246,6 +246,7 @@ fn environment() -> smart_review::domain::environment::Environment {
         repo: smart_review::domain::RepoId::parse("acme/service").expect("repository"),
         mode: smart_review::domain::environment::RunMode::InRepo,
         remote: Some("origin".to_owned()),
+        remote_url: Some("https://github.com/acme/service.git".to_owned()),
         root: Some(PathBuf::from("/src/service")),
         default_branch: Some("main".to_owned()),
         git_version: "2.43.0".to_owned(),

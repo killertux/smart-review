@@ -1664,9 +1664,17 @@ fn clean_workspaces(
         if !all && !old_enough {
             continue;
         }
-        match workspace.remove(&entry.repo, entry.number, cancel) {
-            Ok(()) => removed += 1,
-            Err(error) => failed.push(format!("pr-{}: {error}", entry.number)),
+        match (&entry.repo, &entry.legacy_cleanup) {
+            (Some(repo), _) => match workspace.remove(repo, entry.number, cancel) {
+                Ok(()) => removed += 1,
+                Err(error) => failed.push(format!("pr-{}: {error}", entry.number)),
+            },
+            (None, Some(instruction)) => failed.push(instruction.clone()),
+            (None, None) => failed.push(format!(
+                "pr-{}: legacy workspace at {} cannot be removed automatically",
+                entry.number,
+                entry.path.display()
+            )),
         }
     }
     Outcome::WorkspacesCleaned {

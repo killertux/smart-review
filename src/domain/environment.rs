@@ -111,6 +111,9 @@ pub struct Environment {
     pub mode: RunMode,
     /// The git remote the repository was identified from, if any.
     pub remote: Option<String>,
+    /// The selected remote's URL, captured during detection so workspace jobs do not
+    /// reread mutable source-clone configuration (IR-13).
+    pub remote_url: Option<String>,
     /// The root of the working tree, when there is one.
     pub root: Option<PathBuf>,
     /// The repository's default branch, when it could be determined.
@@ -341,6 +344,7 @@ mod tests {
             repo: RepoId::parse("acme/service").unwrap(),
             mode: RunMode::RemoteOnly,
             remote: None,
+            remote_url: None,
             root: None,
             default_branch: None,
             git_version: "2.43.0".to_owned(),

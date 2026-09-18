@@ -143,7 +143,7 @@ List open PRs (newest first, paginated), type `/` to filter, press `Enter` to op
 - [x] PR list UI: rows, draft marker, author, relative time, ±stats, check summary, review decision; explicit pagination with `:load-more` and an honest "showing 50 of ≥137" (FR-2.1).
 - [x] Filter chips → `gh --search` query builder + local fuzzy incremental search (FR-2.2).
 - [x] Disk cache with TTLs, cache-first first paint, revalidate-in-place preserving cursor/scroll, offline indicator (FR-2.3, DEC-14 default).
-- [x] Diff acquisition: remote mode via `gh pr diff --patch` (local mode arrives in M2a) (FR-3.2).
+- [x] Diff acquisition: remote mode via final-state `gh pr diff` output (never the per-commit `--patch` representation); local mode arrives in M2a (FR-3.2).
 - [x] **Unified diff parser** as a pure, exhaustively unit-tested function: renames, binary, mode-only, submodule, CRLF, `\ No newline at end of file`, missing trailing newline, malformed input (FR-3.2).
 - [x] Diff rendering: file tree with per-file stats and folder grouping, hunk headers, dual line numbers, add/del/context styles, cursor line, **virtualized** (only visible lines laid out) (FR-3.3).
 - [x] Side-by-side toggle at width ≥ 140, unavailable below with an explanation (DEC-4, FR-3.3).

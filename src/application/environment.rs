@@ -117,10 +117,15 @@ pub fn detect(
         });
     }
 
+    let remote_url = remote
+        .as_deref()
+        .and_then(|name| info.remote(name))
+        .map(|remote| remote.url.clone());
     Ok(Environment {
         repo,
         mode,
         remote,
+        remote_url,
         root: info.root.clone(),
         default_branch: info.default_branch.clone(),
         git_version: info.git_version.clone(),
@@ -318,6 +323,10 @@ mod tests {
             detect_with(&workspace, &ready("2.45.0"), &DetectRequest::default()).unwrap();
         assert_eq!(environment.repo.slug(), "acme/service");
         assert_eq!(environment.remote.as_deref(), Some("origin"));
+        assert_eq!(
+            environment.remote_url.as_deref(),
+            Some("git@github.com:acme/service.git")
+        );
         assert_eq!(environment.mode, RunMode::InRepo);
         assert_eq!(environment.default_branch.as_deref(), Some("main"));
         assert_eq!(environment.gh.account.as_deref(), Some("bruno"));
