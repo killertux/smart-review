@@ -152,14 +152,18 @@ pub struct DiffRequest {
 /// A managed worktree as the app sees it, for `:workspace` and `:doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEntry {
-    /// The repository the worktree belongs to.
-    pub repo: RepoId,
+    /// The repository the app-owned worktree belongs to. Legacy worktrees omit this
+    /// because their old directory name is not a safe repository identity.
+    pub repo: Option<RepoId>,
     /// The pull request number.
     pub number: u64,
     /// The directory.
     pub path: PathBuf,
     /// How many seconds since it was last used, when known.
     pub age_secs: Option<u64>,
+    /// An actionable instruction for a legacy worktree that must not be removed
+    /// through this app because its Git bookkeeping belongs to a user clone.
+    pub legacy_cleanup: Option<String>,
 }
 
 /// Anything that can describe and materialise the checkout the app reviews.

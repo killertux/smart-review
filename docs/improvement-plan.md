@@ -1249,14 +1249,16 @@ on reuse, collided workspace, or intermediate diff anchors.
 **Gates:** shared gates, explicit local Git/forge contracts, `m1` and `m2a` plus affected
 context/publish contracts. No default unit test requires a real repository or network.
 
-**Implementation status (2026-09-17):** implemented on `ir-13-git-workspace-isolation`.
+**Implementation status (2026-09-18):** implemented on `ir-13-git-workspace-isolation`.
 Workspaces now use an app-owned bare object store, explicit base/head refs and an
 encoded host/owner/repository identity. The local Git contract covers source-ref and
-`.git/worktrees` isolation, stale-source reuse, collision-free names and legacy cleanup
-refusal. The remote-only path remains `gh pr diff <number> --patch`, which the CLI
-documents as the selected pull request's changes; it is parsed directly as one final
-patch (including rename, binary and mode-only entries), with no intermediate commit
-anchors composed by the application.
+`.git/worktrees` isolation, stale-source reuse, collision-free names, metadata recovery,
+missing-checkout recreation, dry-run cleanup and legacy cleanup refusal. Durable
+repository data keeps its released mixed-case identity; only the app-owned workspace
+key is case-normalised. The remote-only patch fixture covers a multi-commit PR with a
+re-edit, rename, deletion and binary change, and compares `gh pr diff --patch` with the
+final three-dot diff before parser input so intermediate commit anchors cannot be
+mistaken for current PR anchors.
 
 ---
 

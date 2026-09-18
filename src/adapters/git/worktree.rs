@@ -25,6 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::adapters::fs::write_atomic;
 use crate::adapters::git::GitCli;
 use crate::adapters::process::{CommandSpec, Output, ProcessError};
 use crate::domain::repo::RepoId;
@@ -101,7 +102,7 @@ impl GitCli {
     }
 
     fn failure(args: &[&str], stderr: &str) -> WorkspaceError {
-        let detail = stderr.trim();
+        let detail = redact_credential_urls(stderr.trim());
         logging::log(
             Level::Debug,
             format!("git {} failed: {detail}", args.join(" ")),
@@ -109,7 +110,20 @@ impl GitCli {
         if detail.is_empty() {
             WorkspaceError::Failed(format!("git {} failed with no output", args.join(" ")))
         } else {
-            WorkspaceError::Failed(detail.to_owned())
+            WorkspaceError::Failed(detail.clone())
+        }
+    }
+
+    fn failure_spec(spec: &CommandSpec, stderr: &str) -> WorkspaceError {
+        let detail = redact_credential_urls(stderr.trim());
+        logging::log(
+            Level::Debug,
+            format!("{} failed: {detail}", spec.diagnostic()),
+        );
+        if detail.is_empty() {
+            WorkspaceError::Failed(format!("{} failed with no output", spec.diagnostic()))
+        } else {
+            WorkspaceError::Failed(detail)
         }
     }
 
@@ -190,21 +204,19 @@ impl GitCli {
             fallback_remote_url = self.remote_url(&request.remote, cancel)?;
             &fallback_remote_url
         };
-        self.run_checked_in(
-            &store,
-            &[
-                "fetch",
-                "--no-tags",
-                remote_url,
-                &base_refspec,
-                &head_refspec,
-            ],
-            cancel,
-        )
-        .map_err(|error| match error {
-            WorkspaceError::Failed(detail) => WorkspaceError::Fetch(detail),
-            other => other,
-        })?;
+        // A remote may embed HTTP credentials. It must reach git verbatim but never
+        // diagnostics, including timeout errors produced by the process runner.
+        let fetch = CommandSpec::new(&self.program)
+            .args(["fetch", "--no-tags"])
+            .sensitive_arg(remote_url)
+            .args([base_refspec.as_str(), head_refspec.as_str()])
+            .current_dir(&store)
+            .timeout(SLOW_TIMEOUT);
+        self.run_checked_in_spec(&fetch, cancel)
+            .map_err(|error| match error {
+                WorkspaceError::Failed(detail) => WorkspaceError::Fetch(detail),
+                other => other,
+            })?;
         let head_sha = self.rev_parse_in(&store, &format!("{head_ref}^{{commit}}"), cancel)?;
         if head_sha != request.head_sha {
             return Err(WorkspaceError::Fetch(format!(
@@ -237,6 +249,12 @@ impl GitCli {
                 head_sha: head,
                 reused: true,
             });
+        }
+
+        // An interrupted removal can leave Git's registration behind after its path
+        // vanished. Prune before add in both that case and a fresh checkout.
+        if !path.exists() {
+            self.prune_worktrees(&store, cancel)?;
         }
 
         // 2. A worktree that exists but holds something else is removed first:
@@ -287,9 +305,6 @@ impl GitCli {
         repo: &RepoId,
         cancel: &Cancel,
     ) -> Result<(), WorkspaceError> {
-        if store.is_dir() {
-            return Ok(());
-        }
         let parent = store.parent().ok_or_else(|| {
             WorkspaceError::Failed(format!(
                 "could not determine parent for {}",
@@ -299,13 +314,78 @@ impl GitCli {
         std::fs::create_dir_all(parent).map_err(|error| {
             WorkspaceError::Failed(format!("could not create {}: {error}", parent.display()))
         })?;
-        let store_arg = store.to_string_lossy().into_owned();
-        self.run_checked(&["init", "--bare", &store_arg], cancel)?;
+        if !store.exists() {
+            let store_arg = store.to_string_lossy().into_owned();
+            self.run_checked(&["init", "--bare", &store_arg], cancel)?;
+        }
+        self.validate_bare_store(store, cancel)?;
+        let stored = Self::store_identity(parent, &repo.storage_key())?;
+        if stored.storage_key() != repo.storage_key() {
+            return Err(WorkspaceError::Failed(format!(
+                "workspace identity metadata at {} does not match its storage directory",
+                parent.join("identity.json").display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_bare_store(&self, store: &Path, cancel: &Cancel) -> Result<(), WorkspaceError> {
+        if !store.is_dir() {
+            return Err(WorkspaceError::Failed(format!(
+                "workspace object store {} is missing; remove its parent and reopen the pull request",
+                store.display()
+            )));
+        }
+        let git_dir = format!("--git-dir={}", store.to_string_lossy());
+        let is_bare = self.run_checked(&[&git_dir, "rev-parse", "--is-bare-repository"], cancel)?;
+        if is_bare.trim() != "true" {
+            return Err(WorkspaceError::Failed(format!(
+                "workspace object store {} is not a bare Git repository; remove it and reopen the pull request",
+                store.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn store_identity(parent: &Path, key: &str) -> Result<RepoId, WorkspaceError> {
         let metadata = parent.join("identity.json");
-        let bytes = serde_json::to_vec(repo).map_err(|error| {
+        let repo = match std::fs::read_to_string(&metadata) {
+            Ok(body) => serde_json::from_str::<RepoId>(&body).map_err(|error| {
+                WorkspaceError::Failed(format!(
+                    "workspace identity metadata at {} is invalid: {error}",
+                    metadata.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let repo = RepoId::from_storage_key(key).ok_or_else(|| {
+                    WorkspaceError::Failed(format!(
+                        "workspace storage directory {key} has no recoverable repository identity"
+                    ))
+                })?;
+                Self::write_store_identity(&metadata, &repo)?;
+                repo
+            }
+            Err(error) => {
+                return Err(WorkspaceError::Failed(format!(
+                    "could not read workspace identity metadata at {}: {error}",
+                    metadata.display()
+                )));
+            }
+        };
+        if repo.storage_key() != key {
+            return Err(WorkspaceError::Failed(format!(
+                "workspace identity metadata at {} does not match its storage directory",
+                metadata.display()
+            )));
+        }
+        Ok(repo)
+    }
+
+    fn write_store_identity(metadata: &Path, repo: &RepoId) -> Result<(), WorkspaceError> {
+        let body = serde_json::to_string(repo).map_err(|error| {
             WorkspaceError::Failed(format!("could not encode repository identity: {error}"))
         })?;
-        std::fs::write(&metadata, bytes).map_err(|error| {
+        write_atomic(metadata, &body).map_err(|error| {
             WorkspaceError::Failed(format!("could not write {}: {error}", metadata.display()))
         })
     }
@@ -351,6 +431,19 @@ impl GitCli {
             Ok(stdout)
         } else {
             Err(Self::failure(args, &stderr))
+        }
+    }
+
+    fn run_checked_in_spec(
+        &self,
+        spec: &CommandSpec,
+        cancel: &Cancel,
+    ) -> Result<String, WorkspaceError> {
+        let (ok, stdout, stderr) = self.run_in_spec(spec, cancel)?;
+        if ok {
+            Ok(stdout)
+        } else {
+            Err(Self::failure_spec(spec, &stderr))
         }
     }
 
@@ -404,7 +497,17 @@ impl GitCli {
                 .args(["worktree", "remove", "--force", &path_arg])
                 .current_dir(store)
                 .mutating();
-            let (_, _, stderr) = self.run_in_spec(&spec, cancel)?;
+            let output = self
+                .runner
+                .run(&spec, cancel)
+                .map_err(ProcessError::into_workspace)?;
+            if output.dry_run {
+                return Ok(());
+            }
+            if !output.success() {
+                return Err(Self::failure_spec(&spec, &output.stderr));
+            }
+            let stderr = output.stderr;
             if path.exists() {
                 // `worktree remove` refuses a directory with local modifications or
                 // an untracked file it would lose; the message says what to delete,
@@ -421,12 +524,13 @@ impl GitCli {
                 )));
             }
         }
-        let spec = CommandSpec::new(&self.program)
-            .args(["worktree", "prune"])
-            .current_dir(store)
-            .mutating();
-        let _ = self.run_in_spec(&spec, cancel);
+        let _ = self.prune_worktrees(store, cancel);
         Ok(())
+    }
+
+    fn prune_worktrees(&self, store: &Path, cancel: &Cancel) -> Result<(), WorkspaceError> {
+        self.run_checked_in(store, &["worktree", "prune"], cancel)
+            .map(|_| ())
     }
 
     /// Deletes the fetched refs for a pull request, if they exist.
@@ -455,13 +559,14 @@ impl GitCli {
 
     /// Every managed worktree, newest names last (FR-3.1).
     pub(crate) fn list_workspaces(&self) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
-        let root = self.worktrees_root()?.join("checkouts");
+        let worktrees_root = self.worktrees_root()?;
+        let root = worktrees_root.join("checkouts");
         let mut entries = Vec::new();
-        let repos = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
+        let repos: Vec<_> = match std::fs::read_dir(&root) {
+            Ok(entries) => entries.collect(),
             // A root that does not exist yet means nothing has been materialised,
-            // which is an empty answer rather than an error.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+            // but legacy entries may still need to be reported.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 return Err(WorkspaceError::Failed(format!(
                     "could not read {}: {error}",
@@ -469,21 +574,18 @@ impl GitCli {
                 )));
             }
         };
-        for repo_dir in repos.flatten() {
-            let metadata = self
-                .worktrees_root()?
-                .join("git")
-                .join(repo_dir.file_name())
-                .join("identity.json");
-            let Ok(bytes) = std::fs::read(&metadata) else {
-                continue;
-            };
-            let Ok(repo) = serde_json::from_slice::<RepoId>(&bytes) else {
-                continue;
-            };
-            let Ok(inner) = std::fs::read_dir(repo_dir.path()) else {
-                continue;
-            };
+        for repo_dir in repos.into_iter().flatten() {
+            let key = repo_dir.file_name().to_string_lossy().into_owned();
+            let store_parent = worktrees_root.join("git").join(&key);
+            let store = store_parent.join("repo.git");
+            self.validate_bare_store(&store, &Cancel::new())?;
+            let repo = Self::store_identity(&store_parent, &key)?;
+            let inner = std::fs::read_dir(repo_dir.path()).map_err(|error| {
+                WorkspaceError::Failed(format!(
+                    "could not read {}: {error}",
+                    repo_dir.path().display()
+                ))
+            })?;
             for entry in inner.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let Some(number) = parse_pr_dir(&name) else {
@@ -491,17 +593,64 @@ impl GitCli {
                 };
                 let path = entry.path();
                 entries.push(WorkspaceEntry {
-                    repo: repo.clone(),
+                    repo: Some(repo.clone()),
                     number,
                     age_secs: age_secs(&path),
+                    path,
+                    legacy_cleanup: None,
+                });
+            }
+        }
+        let legacy_root = self.worktrees_root()?;
+        let legacy_directories = match std::fs::read_dir(legacy_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+            Err(error) => {
+                return Err(WorkspaceError::Failed(format!(
+                    "could not read {}: {error}",
+                    legacy_root.display()
+                )));
+            }
+        };
+        for directory in legacy_directories.flatten() {
+            let name = directory.file_name();
+            if matches!(name.to_str(), Some("git" | "checkouts" | ".ignore-rules")) {
+                continue;
+            }
+            let Ok(children) = std::fs::read_dir(directory.path()) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let Some(number) = parse_pr_dir(&child.file_name().to_string_lossy()) else {
+                    continue;
+                };
+                let path = child.path();
+                let owner = self.cwd.as_deref().map_or_else(
+                    || "<the original clone>".to_owned(),
+                    |path| path.display().to_string(),
+                );
+                entries.push(WorkspaceEntry {
+                    repo: None,
+                    number,
+                    age_secs: age_secs(&path),
+                    legacy_cleanup: Some(format!(
+                        "legacy workspace at {} is linked to a user repository; remove it manually with `git -C {owner} worktree remove --force {}`",
+                        path.display(),
+                        path.display()
+                    )),
                     path,
                 });
             }
         }
         entries.sort_by(|a, b| {
             a.repo
-                .key()
-                .cmp(&b.repo.key())
+                .as_ref()
+                .map_or_else(|| a.path.display().to_string(), RepoId::key)
+                .cmp(
+                    &b.repo
+                        .as_ref()
+                        .map_or_else(|| b.path.display().to_string(), RepoId::key),
+                )
                 .then(a.number.cmp(&b.number))
         });
         Ok(entries)
@@ -543,6 +692,30 @@ fn age_secs(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let age = std::time::SystemTime::now().duration_since(modified).ok()?;
     Some(age.as_secs())
+}
+
+/// Removes user info from URL-shaped Git diagnostics before they reach a log or UI.
+fn redact_credential_urls(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(scheme) = remaining.find("://") {
+        let authority_start = scheme + 3;
+        let authority_end = remaining[authority_start..]
+            .find(|character: char| character == '/' || character.is_whitespace())
+            .map_or(remaining.len(), |offset| authority_start + offset);
+        let authority = &remaining[authority_start..authority_end];
+        let Some(at) = authority.rfind('@') else {
+            redacted.push_str(&remaining[..authority_end]);
+            remaining = &remaining[authority_end..];
+            continue;
+        };
+        redacted.push_str(&remaining[..authority_start]);
+        redacted.push_str("<redacted>@");
+        redacted.push_str(&authority[at + 1..]);
+        remaining = &remaining[authority_end..];
+    }
+    redacted.push_str(remaining);
+    redacted
 }
 
 #[cfg(test)]
@@ -995,7 +1168,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, workspace.path);
         assert_eq!(entries[0].number, 7);
-        assert_eq!(entries[0].repo.dir_name(), "acme-service");
+        assert_eq!(
+            entries[0].repo.as_ref().map(RepoId::dir_name).as_deref(),
+            Some("acme-service")
+        );
         assert!(entries[0].age_secs.is_some());
 
         git.remove(&repo_id(), 7, &cancel).expect("removed");
@@ -1009,6 +1185,37 @@ mod tests {
         assert!(
             !fixture.clone.join(".git/worktrees").exists(),
             "the source clone has no app worktree bookkeeping"
+        );
+    }
+
+    #[test]
+    fn ir_13_dry_run_cleanup_reports_a_simulated_removal() {
+        let (fixture, _base, head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let workspace = adapter(&fixture, &root)
+            .ensure(&request(&fixture, &head), &Cancel::new())
+            .expect("created");
+        let ledger = crate::adapters::process::DryRunLedger::new();
+        let dry_run = GitCli::new()
+            .with_program("git")
+            .in_dir(&fixture.clone)
+            .with_worktrees(&root)
+            .with_runner(
+                crate::adapters::process::ProcessRunner::new().with_dry_run(ledger.clone()),
+            );
+
+        dry_run
+            .remove(&repo_id(), 7, &Cancel::new())
+            .expect("a dry run is a successful simulation");
+        assert!(
+            workspace.path.exists(),
+            "dry run leaves the checkout intact"
+        );
+        assert!(
+            ledger
+                .commands()
+                .iter()
+                .any(|command| command.contains("worktree remove --force"))
         );
     }
 
@@ -1068,6 +1275,92 @@ mod tests {
         assert!(
             legacy.exists(),
             "legacy data is left for explicit owner cleanup"
+        );
+    }
+
+    #[test]
+    fn ir_13_recreates_a_deleted_checkout_registered_by_the_bare_store() {
+        let (fixture, _base, head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let git = adapter(&fixture, &root);
+        let workspace = git
+            .ensure(&request(&fixture, &head), &Cancel::new())
+            .expect("created");
+        std::fs::remove_dir_all(&workspace.path).expect("simulates an interrupted removal");
+        assert!(
+            git.store_path(&repo_id())
+                .expect("store path")
+                .join("worktrees")
+                .exists()
+        );
+
+        let recreated = git
+            .ensure(&request(&fixture, &head), &Cancel::new())
+            .expect("missing checkout is pruned and recreated");
+        assert!(!recreated.reused);
+        assert_eq!(recreated.head_sha, head);
+        assert!(recreated.path.is_dir());
+    }
+
+    #[test]
+    fn ir_13_recovers_missing_metadata_and_refuses_mismatched_metadata() {
+        let (fixture, _base, head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let git = adapter(&fixture, &root);
+        git.ensure(&request(&fixture, &head), &Cancel::new())
+            .expect("created");
+        let identity = root
+            .join("git")
+            .join(repo_id().storage_key())
+            .join("identity.json");
+        std::fs::remove_file(&identity).expect("simulates a crash before metadata write");
+
+        let entries = git.list().expect("the deterministic identity is recovered");
+        assert_eq!(entries[0].repo, Some(repo_id()));
+        assert!(
+            identity.exists(),
+            "recovery writes identity metadata atomically"
+        );
+
+        let other = RepoId::new("github.com", "other", "repository");
+        std::fs::write(
+            &identity,
+            serde_json::to_string(&other).expect("serialises"),
+        )
+        .expect("corrupts metadata");
+        let error = git.list().expect_err("mismatched metadata is unsafe");
+        assert!(error.to_string().contains("does not match"), "{error}");
+    }
+
+    #[test]
+    fn ir_13_lists_legacy_worktrees_without_guessing_their_repository() {
+        let (fixture, _base, _head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let legacy = root.join("ambiguous-name").join("pr-7");
+        std::fs::create_dir_all(&legacy).expect("creates legacy workspace");
+        let git = adapter(&fixture, &root);
+
+        let entries = git.list().expect("legacy workspace is reported");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].repo, None);
+        assert!(
+            entries[0]
+                .legacy_cleanup
+                .as_deref()
+                .is_some_and(|message| message.contains("git -C"))
+        );
+    }
+
+    #[test]
+    fn ir_13_redacts_credentials_from_git_diagnostics() {
+        let sentinel = "IR13_SECRET_TOKEN";
+        let detail = redact_credential_urls(&format!(
+            "fatal: could not read https://user:{sentinel}@github.example/acme/service"
+        ));
+        assert!(!detail.contains(sentinel), "{detail}");
+        assert!(
+            detail.contains("https://<redacted>@github.example"),
+            "{detail}"
         );
     }
 

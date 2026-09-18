@@ -247,6 +247,26 @@ mod tests {
     }
 
     #[test]
+    fn ir_13_a_mixed_case_released_partition_remains_readable() {
+        let home = temp_home();
+        let store = FileDraftStore::new(home.path());
+        let repo = RepoId::new("github.com", "Acme", "Service");
+        let draft = staged(141);
+        home.write(
+            "drafts/github.com/Acme/Service/pr-141.json",
+            &draft.to_json().expect("serialises"),
+        );
+
+        assert_eq!(repo.key(), "github.com/Acme/Service");
+        assert_eq!(
+            store
+                .load(&repo, 141)
+                .expect("released draft remains visible"),
+            Some(draft)
+        );
+    }
+
+    #[test]
     fn drafts_are_per_pull_request_and_per_repository() {
         let home = temp_home();
         let store = FileDraftStore::new(home.path());

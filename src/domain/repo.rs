@@ -35,11 +35,10 @@ impl RepoId {
         let name = name.strip_suffix(".git").unwrap_or(name);
         Self {
             host: host.trim().to_ascii_lowercase(),
-            // GitHub repository paths are case-insensitive. Normalising every
-            // component gives cache and app-owned Git storage one identity for a
-            // remote regardless of how a local clone happened to capitalise it.
-            owner: owner.trim().to_ascii_lowercase(),
-            name: name.trim().to_ascii_lowercase(),
+            // Keep the durable cache identity stable. Released versions retained
+            // owner/name casing, so normalisation belongs only to workspace storage.
+            owner: owner.trim().to_owned(),
+            name: name.trim().to_owned(),
         }
     }
 
@@ -165,9 +164,26 @@ impl RepoId {
         format!(
             "h-{}--o-{}--r-{}",
             hex_component(&self.host),
-            hex_component(&self.owner),
-            hex_component(&self.name)
+            hex_component(&self.owner.to_ascii_lowercase()),
+            hex_component(&self.name.to_ascii_lowercase())
         )
+    }
+
+    /// Recovers the normalised identity encoded in an app-owned workspace key.
+    ///
+    /// This key contains no user-controlled separators, so recovery never needs to
+    /// infer a repository from a human-friendly directory name.
+    #[must_use]
+    pub fn from_storage_key(key: &str) -> Option<Self> {
+        let parts: Vec<&str> = key.split("--").collect();
+        let [host, owner, name] = parts.as_slice() else {
+            return None;
+        };
+        Some(Self::new(
+            decode_component(host.strip_prefix("h-")?)?.as_str(),
+            decode_component(owner.strip_prefix("o-")?)?.as_str(),
+            decode_component(name.strip_prefix("r-")?)?.as_str(),
+        ))
     }
 
     /// `host/owner/name`, the cache partitioning key (FR-1.3).
@@ -197,6 +213,22 @@ fn hex_component(component: &str) -> String {
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
+}
+
+fn decode_component(component: &str) -> Option<String> {
+    if !component.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = component
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        })
+        .collect();
+    String::from_utf8(bytes?).ok()
 }
 
 impl fmt::Display for RepoId {
@@ -230,10 +262,18 @@ mod tests {
     #[test]
     fn ir_13_storage_identity_is_case_normalized_and_collision_free() {
         let mixed = RepoId::new("GitHub.COM", "Acme", "Service");
-        assert_eq!(mixed, RepoId::new("github.com", "acme", "service"));
+        assert_ne!(mixed, RepoId::new("github.com", "acme", "service"));
+        assert_eq!(
+            mixed.storage_key(),
+            RepoId::new("github.com", "acme", "service").storage_key()
+        );
         assert_ne!(
             RepoId::new("github.com", "a-b", "c").storage_key(),
             RepoId::new("github.com", "a", "b-c").storage_key()
+        );
+        assert_eq!(
+            RepoId::from_storage_key(&mixed.storage_key()),
+            Some(RepoId::new("github.com", "acme", "service"))
         );
     }
 

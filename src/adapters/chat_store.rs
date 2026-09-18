@@ -617,6 +617,25 @@ mod tests {
     }
 
     #[test]
+    fn ir_13_a_mixed_case_released_partition_remains_readable() {
+        let (store, home) = store();
+        let repo = RepoId::new("github.com", "Acme", "Service");
+        let mut session = session("100-0", 100);
+        session.repo = repo.key();
+        store.put(&session).expect("writes the released partition");
+
+        assert!(
+            home.path()
+                .join("chats/github.com/Acme/Service/pr-141/100-0.json")
+                .exists()
+        );
+        assert_eq!(
+            store.load(&repo, 141, "100-0").expect("reads"),
+            Some(session)
+        );
+    }
+
+    #[test]
     fn sessions_are_scoped_to_their_pull_request_and_repository() {
         let (store, _home) = store();
         store.put(&session("100-0", 100)).expect("writes");
