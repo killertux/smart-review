@@ -1725,9 +1725,9 @@ impl App {
                     ),
                     None,
                 );
-                if self.has_context_patch() && self.analysis_key().is_some() {
-                    return Some(Effect::LoadAnalysis);
-                }
+                // The patch completion owns cached-analysis loading. Keeping this
+                // completion for mutation recovery prevents a fast draft read from
+                // suppressing recovery of an earlier remote operation (IR-07).
                 Some(Effect::LoadMutations)
             }
             Outcome::DraftSaved {
@@ -4580,12 +4580,6 @@ impl App {
     pub(crate) fn apply_context_patch(&mut self, patch: crate::domain::diff::Patch) {
         self.context_patch = Some(Box::new(patch));
         self.context_patch_job = 0;
-    }
-
-    /// Whether a complete presentation-independent patch is ready for cache lookup.
-    #[must_use]
-    pub(crate) const fn has_context_patch(&self) -> bool {
-        self.context_patch.is_some()
     }
 
     /// Notes that a pull request is being opened, which the indicator shows.
