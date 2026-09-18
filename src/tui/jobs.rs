@@ -1453,18 +1453,19 @@ impl JobRunner {
         self.queue.clear();
     }
 
-    /// Stops ordinary work and gives already-submitted durable snapshots a bounded
-    /// opportunity to finish before process exit (IR-14).
+    /// Stops ordinary work and gives durable snapshots and an analysis cache commit a
+    /// bounded opportunity to finish before process exit (IR-14).
     ///
     /// Returns `false` when storage did not acknowledge every queued snapshot before
     /// the deadline. Callers may then restore the terminal without waiting forever.
     pub fn flush_persistence(&mut self, timeout: Duration) -> bool {
         for running in &mut self.running {
-            if !matches!(running.slot, Slot::State | Slot::DraftSave) {
+            if !matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze) {
                 running.cancel.cancel();
             }
         }
-        self.queue.retain(|(_, _, job)| job.is_ordered_save());
+        self.queue
+            .retain(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze));
 
         let deadline = Instant::now() + timeout;
         while self.has_pending_persistence() && Instant::now() < deadline {
@@ -1474,12 +1475,15 @@ impl JobRunner {
         !self.has_pending_persistence()
     }
 
-    /// Whether an ordered durable snapshot is queued or still writing.
+    /// Whether an ordered durable snapshot or cache-writing analysis is queued or running.
     fn has_pending_persistence(&self) -> bool {
         self.running
             .iter()
-            .any(|running| matches!(running.slot, Slot::State | Slot::DraftSave))
-            || self.queue.iter().any(|(_, _, job)| job.is_ordered_save())
+            .any(|running| matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze))
+            || self
+                .queue
+                .iter()
+                .any(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze))
     }
 
     /// Whether a slot has a job running or waiting.

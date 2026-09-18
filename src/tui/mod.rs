@@ -1188,6 +1188,9 @@ fn list_worktrees(app: &mut App) {
 }
 
 /// Writes the calls a dry run recorded to `logs/dry-run.log` (FR-6.5).
+///
+/// The initiating action already reports what it did (or did not do). Do not replace
+/// that confirmation with a bookkeeping notice before the terminal has rendered it.
 fn write_dry_run(app: &mut App) {
     let Some(ledger) = app.dry_run_ledger.clone() else {
         return;
@@ -1197,13 +1200,7 @@ fn write_dry_run(app: &mut App) {
     }
     let path = app.home.logs().join("dry-run.log");
     match ledger.write_to(&path) {
-        Ok(count) => app.notice(
-            app::NoticeLevel::Info,
-            format!(
-                "dry run: nothing was sent; {count} command(s) in {}",
-                crate::paths::shorten_for_display(&path, 40)
-            ),
-        ),
+        Ok(_) => {}
         Err(error) => app.notice(
             app::NoticeLevel::Warn,
             format!("dry run: could not write {}: {error}", path.display()),

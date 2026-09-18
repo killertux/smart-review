@@ -8702,6 +8702,11 @@ mod tests {
 
         assert_eq!(follow_up, Some(Effect::WriteDryRun));
         assert!(
+            app.latest_notice()
+                .is_some_and(|notice| notice.text.contains("nothing changed on GitHub")),
+            "the result remains visible while the ledger is written"
+        );
+        assert!(
             app.detail()
                 .expect("detail")
                 .comments
