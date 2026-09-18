@@ -273,7 +273,10 @@ def main() -> int:
             except ProcessLookupError:
                 pass  # it exited between the poll and the signal
             try:
-                process.wait(timeout=0.5)
+                # IR-14 gives durable state and draft writes up to two seconds to
+                # finish during orderly shutdown. Allow that contract to complete
+                # before treating the application as stuck and force-killing it.
+                process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)

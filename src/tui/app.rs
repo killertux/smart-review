@@ -523,6 +523,11 @@ pub struct PanelState {
     pub context_job: u64,
     /// The job id of the stored-analysis read (FR-4.3).
     pub stored_job: u64,
+    /// An analysis action pressed while the stored-analysis read is still in flight.
+    ///
+    /// The read must settle first: a current cached answer is used without spending a
+    /// second provider request, while a cache miss continues with this intent.
+    pub pending_stored_intent: Option<AnalysisIntent>,
     /// The text that has streamed in (FR-4.4).
     pub stream: StreamBuffer,
     /// The first visible line of the panel, for j/k scrolling (FR-4.4).
@@ -3462,12 +3467,17 @@ impl App {
                 plan,
             } if job == self.panel.stored_job => {
                 self.panel.stored_job = 0;
+                let pending_intent = self.panel.pending_stored_intent.take();
+                let has_current = current.is_some();
                 self.apply_stored(
                     current.map(|stored| *stored),
                     stale.map(|stored| *stored),
                     plan.map(|plan| *plan),
                 );
-                None
+                (!has_current)
+                    .then_some(pending_intent)
+                    .flatten()
+                    .map(Effect::GatherContext)
             }
             Outcome::Context {
                 bundle,
@@ -4156,6 +4166,7 @@ impl App {
     /// Gives up on a run, keeping whatever text arrived (FR-4.4).
     pub(crate) fn cancelled_analysis(&mut self) {
         self.panel.stored_job = 0;
+        self.panel.pending_stored_intent = None;
         if self.panel.state.is_running() {
             self.panel.state = AnalysisState::Cancelling;
         }
@@ -4172,7 +4183,21 @@ impl App {
 
     /// Remembers the job id of a stored-analysis read (FR-4.3).
     pub fn record_stored_job(&mut self, id: u64) {
+        self.panel.pending_stored_intent = None;
         self.panel.stored_job = id;
+    }
+
+    /// Holds an analysis request until the current cache lookup has settled.
+    ///
+    /// A disk cache read and a context gather share a runner slot. Replacing the read
+    /// with the gather would turn a cache hit into a provider request merely because a
+    /// key arrived in the frame immediately after the diff did (FR-4.3).
+    pub(crate) fn defer_until_stored_analysis_loaded(&mut self, intent: AnalysisIntent) -> bool {
+        if self.panel.stored_job == 0 {
+            return false;
+        }
+        self.panel.pending_stored_intent = Some(intent);
+        true
     }
 
     /// Remembers the job id of a context gather (FR-4.6).
@@ -4798,6 +4823,7 @@ impl App {
                 self.panel.context_job = 0;
             } else {
                 self.panel.stored_job = 0;
+                self.panel.pending_stored_intent = None;
             }
             // Whatever was waiting on this has nothing coming: leaving the panel saying
             // "gathering the context" is the same stuck pane in a different costume.
@@ -6627,6 +6653,48 @@ mod tests {
         assert_eq!(app.mode(), Mode::Normal);
         assert_eq!(app.overlay(), Overlay::None);
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn fr_4_3_analyze_waits_for_an_in_flight_cache_miss() {
+        let (_dir, mut app) = app();
+        app.record_stored_job(42);
+        assert!(app.defer_until_stored_analysis_loaded(AnalysisIntent::Estimate));
+
+        let effect = app.apply_analysis_outcome(
+            42,
+            jobs::Outcome::Stored {
+                current: None,
+                stale: None,
+                plan: None,
+            },
+        );
+
+        assert_eq!(
+            effect,
+            Some(Effect::GatherContext(AnalysisIntent::Estimate))
+        );
+        assert_eq!(app.panel.stored_job, 0);
+    }
+
+    #[test]
+    fn fr_4_3_cancelling_a_cache_read_discards_its_deferred_analyze() {
+        let (_dir, mut app) = app();
+        app.record_stored_job(42);
+        assert!(app.defer_until_stored_analysis_loaded(AnalysisIntent::Estimate));
+        app.cancelled_analysis();
+        app.record_stored_job(43);
+
+        let effect = app.apply_analysis_outcome(
+            43,
+            jobs::Outcome::Stored {
+                current: None,
+                stale: None,
+                plan: None,
+            },
+        );
+
+        assert_eq!(effect, None);
     }
 
     #[test]

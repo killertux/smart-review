@@ -127,6 +127,17 @@ pub fn run(startup: Startup) -> Result<()> {
             &clock_source,
             &workspace_for_executor,
         );
+        // A completion's follow-up belongs before the next input event. In particular,
+        // the patch completion starts the stored-analysis read; accepting an immediate
+        // Analyze key before scheduling that read lets the key cancel it and misses a
+        // cache entry that is already on disk (FR-4.3).
+        drain_effects(
+            queued,
+            &mut app,
+            state_store.as_ref(),
+            &mut runner,
+            &mut terminal,
+        );
         // A result from a job changes the screen, and the frame above was drawn before
         // it arrived. Without a second draw that change waits for the next event to be
         // seen — which is not a cosmetic delay: pressing a key in between means acting
@@ -151,14 +162,13 @@ pub fn run(startup: Startup) -> Result<()> {
             app.on_timeout()
         };
 
-        let mut queued = queued;
-        queued.extend(apply(
+        let queued = apply(
             effect,
             &mut app,
             state_store.as_ref(),
             &mut runner,
             &mut terminal,
-        ));
+        );
         drain_effects(
             queued,
             &mut app,
@@ -168,13 +178,7 @@ pub fn run(startup: Startup) -> Result<()> {
         );
         // A change that the reducer could not write itself — the one-time opt-in of
         // FR-4.6 is the one that matters — is written here, where the store is.
-        if let Some((revision, state)) = app.take_state_save() {
-            let job = runner.submit(jobs::Job::SaveState {
-                revision,
-                state: Box::new(state),
-            });
-            app.record_state_save(job);
-        }
+        schedule_state_save(&mut app, &mut runner);
         // The effects above may have changed the screen too, and they are applied after
         // the event that asked for them. Drawing here rather than at the top of the next
         // iteration means what the key press did is on screen before the loop can block
@@ -191,6 +195,17 @@ pub fn run(startup: Startup) -> Result<()> {
     runner.cancel_all();
     logging::log(Level::Info, "shutting down normally");
     Ok(())
+}
+
+/// Submits the latest state snapshot after reducer effects have settled.
+fn schedule_state_save(app: &mut App, runner: &mut JobRunner) {
+    if let Some((revision, state)) = app.take_state_save() {
+        let job = runner.submit(jobs::Job::SaveState {
+            revision,
+            state: Box::new(state),
+        });
+        app.record_state_save(job);
+    }
 }
 
 /// Opens `$EDITOR` with the compose buffer after restoring the user's terminal.
@@ -544,6 +559,9 @@ fn apply_analysis_effect(
         }
 
         Effect::GatherContext(intent) => {
+            if app.defer_until_stored_analysis_loaded(*intent) {
+                return true;
+            }
             let Some(request) = app.analysis_request() else {
                 app.notice(
                     app::NoticeLevel::Warn,
