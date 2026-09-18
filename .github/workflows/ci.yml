@@ -87,9 +87,18 @@ jobs:
           fi
 
       # Cargo's gates already passed above. The aggregate runner therefore executes
-      # only the independent black-box milestone scenarios, in parallel, with local
+      # only the independent black-box feature scenarios, in parallel, with local
       # fake forge/catalog/model services and reconstructed PTY screens.
       - name: Milestone validation
         env:
-          SMART_REVIEW_SKIP_CARGO: "1"
-        run: bash scripts/validate/all.sh
+          SMART_REVIEW_VALIDATION_OUTPUT: ${{ runner.temp }}/smart-review-validation
+        run: bash scripts/validate/all.sh --scenarios-only
+
+      - name: Upload validator failure captures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-validation-captures
+          path: ${{ runner.temp }}/smart-review-validation
+          if-no-files-found: ignore
+          retention-days: 7

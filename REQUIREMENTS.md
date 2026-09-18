@@ -775,7 +775,7 @@ Default bindings (all remappable; the generated [`docs/keymaps.md`](docs/keymaps
 **NFR-4.1 Resilience** — network failures, `gh` rate limits, malformed JSON, expired tokens and missing workspaces produce retry-able, explained states. Drafts and chat history are never lost to a crash (atomic writes).
 **NFR-4.2 Terminal integrity** — the terminal is restored on normal exit, error exit, panic and SIGINT/SIGTERM.
 **NFR-5.1 Maintainability** — `cargo fmt` clean; `cargo clippy -- -D warnings` clean; no file over ~800 lines without justification; domain/application unit-test coverage of branches that encode requirements.
-**NFR-5.2 Testability** — ports have fakes; time and randomness injected; no test performs network IO or requires `gh` (adapter contract tests are opt-in behind a feature/env var).
+**NFR-5.2 Testability** — ports have fakes; time and randomness injected; no test performs network IO or requires `gh` (adapter contract tests are opt-in behind a feature/env var). The PTY scenario driver MUST fail on an unmet ready/step wait, an unexpected child exit, mismatched steps or its global deadline; each step's wait observes cells redrawn after that step rather than stale text from an earlier frame. CI runs the shared Rust gates and build once, then runs feature validators in explicit `--scenarios-only` mode against that binary.
 **NFR-5.3 Observability** — tracing spans per job (`job id`, kind, duration, result); log level from config.
 
 ---
@@ -938,7 +938,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | **DEC-19** | *(decided)* How does the model picker write `[llm.active]` back without destroying the user's file? | **Add `toml_edit` in M2** and edit the document in place, so comments and formatting survive. Alternative: keep never writing configuration and require the user to edit it by hand. `toml` 1.x has no comment-preserving API (verified at M0). | FR-4.5, FR-8.2, FR-8.6, the M2 dependency ledger in PLAN.md §5. |
 | **DEC-20** | `?` was listed both as help and as backward search. Which wins? | **Help.** `?` is the TUI convention for the keybinding popup and the app already shows `? help` in its status line. Backward search entry is dropped; `N` repeats a search backwards, and `/` re-opens the prompt. Recorded because the same key cannot mean two things and silently picking one later would change a habit. | FR-7.3, FR-7.4, the §5.4 keymap. |
 | **DEC-21** | Are the diff options a submenu popup or leader continuations? | **Continuations**: `<leader>d s`, `<leader>d c`, `<leader>d w`. The keymap engine already resolves multi-key sequences and the leader menu lists them, so a popup would add a mode for no gain. The cost is that `<leader>d` alone does nothing (like vim's `g`), which the leader menu makes discoverable. | FR-3.2, FR-3.3, FR-7.2, the §5.4 keymap. |
-| **DEC-22** | *(decided)* Is macOS kept in CI alongside Ubuntu? | **Not for now.** The milestone validators (m0–m2b) only run on Ubuntu because they need GNU `script`, so the macOS job ran only fmt/clippy/test/build and added wall-clock without covering the milestone gates. CI is a single Ubuntu `tests` job until the pty steps are portable. | NFR-2.1, the CI workflow. |
+| **DEC-22** | *(decided)* Is macOS kept in CI alongside Ubuntu? | **Not for now.** The feature validators only run on Ubuntu because they need GNU `script`, so the macOS job ran only fmt/clippy/test/build and added wall-clock without covering the scenario gates. CI is a single Ubuntu `tests` job until the pty steps are portable. | NFR-2.1, the CI workflow. |
 
 ### 11.1 Decision log
 | Date | ID | Decision | By |
@@ -951,7 +951,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | — | DEC-6 | No default provider or model. The user must configure one; the model list comes from `https://models.dev/api.json`, which also drives thinking options, limits and cost. | owner |
 | — | DEC-19 (decided) | Config write-back in M2a needs `toml_edit` to preserve comments; recorded here so the dependency is approved with the M2 batch rather than discovered mid-implementation. | — |
 | M5 | DEC-16 | PR conversation comments, existing-thread replies, and resolve/reopen ship; the owner selected the REST/GraphQL split that matches GitHub's API surfaces. | owner |
-| 2026-09-12 | DEC-22 (decided) | macOS CI removed for now: the milestone validators need GNU `script` and only ran on Ubuntu, so the macOS job added time without covering the milestone gates. CI is a single Ubuntu `tests` job. | owner |
+| 2026-09-12 | DEC-22 (decided) | macOS CI removed for now: the feature validators need GNU `script` and only ran on Ubuntu, so the macOS job added time without covering the scenario gates. CI is a single Ubuntu `tests` job. | owner |
 
 ---
 

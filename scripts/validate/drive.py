@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drive `smart-review` in a pty until expected text appears, then print the screen.
 
-The milestone validators used to send key groups separated by fixed sleeps: enough
+The feature validators used to send key groups separated by fixed sleeps: enough
 pause that a background job (opening a pull request, fetching the catalog, streaming
 an analysis) had surely finished. That is slow — every step costs its sleep even when
 the interface answered in a few hundred milliseconds — and it made the non-quitting
@@ -43,7 +43,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Importing `screen` must not write a `__pycache__` into the checkout: m1.sh asserts
+# Importing `screen` must not write a `__pycache__` into the checkout: pull-requests.sh asserts
 # that the validation run leaves the repository untouched.
 sys.dont_write_bytecode = True
 
@@ -109,11 +109,22 @@ class Capture:
     def text(self) -> str:
         return self.replay.text()
 
+    @property
+    def revision(self) -> int:
+        return self.replay.screen.revision
+
+    def matches_since(self, matcher: re.Pattern[str], revision: int | None) -> bool:
+        if revision is None:
+            return matcher.search(self.text()) is not None
+        return self.replay.screen.pattern_visible_since(matcher, revision)
+
 
 def drain(master: int, capture: Capture) -> tuple[bool, bool]:
     """Reads available PTY output. Returns `(read_data, reached_eof)`."""
     read_data = False
-    while True:
+    # A noisy child must not keep this helper inside one unbounded drain while the
+    # global/step deadline and keyboard dispatch wait outside it.
+    for _ in range(64):
         ready, _, _ = select.select([master], [], [], 0)
         if not ready:
             break
@@ -133,40 +144,93 @@ def wait_for(
     capture: Capture,
     pattern: str,
     deadline: float,
-) -> bool:
+    *,
+    since_revision: int | None = None,
+) -> tuple[bool, bool]:
     """Waits until `pattern` matches the live screen, or the deadline."""
     matcher = re.compile(pattern)
-    if matcher.search(capture.text()):
-        return True
+    if capture.matches_since(matcher, since_revision):
+        return True, False
     while time.monotonic() < deadline:
         remaining = max(0.0, deadline - time.monotonic())
         ready, _, _ = select.select([master], [], [], min(0.1, remaining))
         if not ready:
             continue
         read_data, reached_eof = drain(master, capture)
-        if read_data and matcher.search(capture.text()):
-            return True
+        if read_data and capture.matches_since(matcher, since_revision):
+            return True, reached_eof
         if reached_eof:
-            return False
+            return False, True
     drain(master, capture)
-    return False
+    return capture.matches_since(matcher, since_revision), False
 
 
-def settle(master: int, capture: Capture, quiet_seconds: float, deadline: float) -> None:
-    """Returns after the PTY has stayed quiet, bounded by `deadline`."""
+def settle(master: int, capture: Capture, quiet_seconds: float, deadline: float) -> tuple[bool, bool]:
+    """Returns `(became_quiet, reached_eof)` under `deadline`."""
     quiet_deadline = min(deadline, time.monotonic() + quiet_seconds)
     while time.monotonic() < deadline:
         remaining = max(0.0, quiet_deadline - time.monotonic())
         if remaining == 0:
-            return
+            return quiet_deadline < deadline, False
         ready, _, _ = select.select([master], [], [], remaining)
         if not ready:
-            return
+            return quiet_deadline < deadline, False
         read_data, reached_eof = drain(master, capture)
         if reached_eof:
-            return
+            return True, True
         if read_data:
             quiet_deadline = min(deadline, time.monotonic() + quiet_seconds)
+    return False, False
+
+
+def wait_for_exit(
+    master: int,
+    capture: Capture,
+    process: subprocess.Popen[bytes],
+    deadline: float,
+) -> bool:
+    """Waits for the owned child while draining its final terminal output."""
+    reached_eof = False
+    while time.monotonic() < deadline:
+        if process.poll() is not None and reached_eof:
+            return True
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([master], [], [], min(0.05, remaining))
+        if ready:
+            _, reached_eof = drain(master, capture)
+        elif process.poll() is not None:
+            # Some PTYs report EOF only after one final non-blocking read.
+            _, reached_eof = drain(master, capture)
+            if reached_eof:
+                return True
+    drain(master, capture)
+    return process.poll() is not None
+
+
+def wait_for_exit_or_quiet(
+    master: int,
+    capture: Capture,
+    process: subprocess.Popen[bytes],
+    quiet_seconds: float,
+    deadline: float,
+) -> tuple[bool, bool]:
+    """Returns `(exited, became_quiet)` while continuously draining output."""
+    quiet_deadline = min(deadline, time.monotonic() + quiet_seconds)
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return wait_for_exit(master, capture, process, deadline), False
+        remaining = max(0.0, min(quiet_deadline, deadline) - time.monotonic())
+        if remaining == 0:
+            return False, quiet_deadline < deadline
+        ready, _, _ = select.select([master], [], [], remaining)
+        if not ready:
+            return False, quiet_deadline < deadline
+        read_data, reached_eof = drain(master, capture)
+        if reached_eof and process.poll() is not None:
+            return True, False
+        if read_data:
+            quiet_deadline = min(deadline, time.monotonic() + quiet_seconds)
+    return process.poll() is not None, False
 
 
 def main() -> int:
@@ -185,6 +249,10 @@ def main() -> int:
     )
     parser.add_argument("--keys", default="", help="`~`-separated key groups")
     parser.add_argument("--waits", default="", help="`~`-separated regexes, one per key group")
+    parser.add_argument(
+        "--step-notify",
+        help="write step-N.sent files here after each key group (fixture coordination)",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
 
@@ -206,7 +274,15 @@ def main() -> int:
             f"({len(key_groups)} keys, {len(wait_groups)} waits)",
             file=sys.stderr,
         )
+        try:
+            with open(arguments.log, "wb"):
+                pass
+        except OSError:
+            pass
         return 2
+
+    if arguments.step_notify:
+        os.makedirs(arguments.step_notify, exist_ok=True)
 
     master, slave = os.openpty()
     fcntl.ioctl(
@@ -235,36 +311,68 @@ def main() -> int:
     failure = ""
     try:
         if arguments.ready:
-            if not wait_for(
+            matched, _ = wait_for(
                 master,
                 capture,
                 arguments.ready,
                 step_deadline(),
-            ):
+            )
+            if not matched:
                 failure = f"the ready state {arguments.ready!r} never appeared"
 
         for index, (keys, pattern) in enumerate(zip(key_groups, wait_groups), start=1):
             if failure:
                 break
+            before_revision = capture.revision
             try:
                 os.write(master, interpret_keys(keys))
             except OSError as error:
                 failure = f"step {index} could not send its keys: {error}"
                 break
+            if arguments.step_notify:
+                marker = os.path.join(arguments.step_notify, f"step-{index}.sent")
+                with open(marker, "w", encoding="utf-8") as handle:
+                    handle.write(f"{time.monotonic()}\n")
             if pattern:
-                if not wait_for(
+                matched, reached_eof = wait_for(
                     master,
                     capture,
                     pattern,
                     step_deadline(),
-                ):
+                    since_revision=before_revision,
+                )
+                if not matched:
                     failure = f"step {index} pattern {pattern!r} never appeared"
             else:
-                settle(master, capture, arguments.settle, step_deadline())
+                quiet, reached_eof = settle(
+                    master, capture, arguments.settle, step_deadline()
+                )
+                if not quiet and time.monotonic() >= overall_deadline:
+                    failure = "the global timeout expired while waiting for terminal output to settle"
 
-        # Capture the last frame and the terminal restore, then stop the app if it is
-        # still running (a run whose keys do not quit).
-        settle(master, capture, arguments.settle, step_deadline())
+            code = process.poll()
+            if reached_eof and index < len(key_groups) and not failure:
+                failure = f"the child exited with status {code} before step {index + 1}"
+            elif code not in (None, 0) and not failure:
+                failure = f"the child exited with status {code}"
+            if time.monotonic() >= overall_deadline and not failure:
+                failure = "the global timeout expired"
+
+        # Give a quitting child a bounded opportunity to restore the terminal and
+        # drain its final frame. Runs intentionally ending on an open modal are then
+        # stopped through their owned process group rather than a broad process match.
+        exited, quiet = wait_for_exit_or_quiet(
+            master,
+            capture,
+            process,
+            arguments.settle,
+            step_deadline(),
+        )
+        if not exited and not quiet and time.monotonic() >= overall_deadline and not failure:
+            failure = "the global timeout expired while collecting the final frame"
+        code = process.poll()
+        if code not in (None, 0) and not failure:
+            failure = f"the child exited with status {code}"
         if process.poll() is None:
             try:
                 # The child owns a fresh session. Signal that process group so a
@@ -283,7 +391,7 @@ def main() -> int:
                 except ProcessLookupError:
                     pass
                 process.wait()
-        settle(master, capture, 0.05, time.monotonic() + 0.25)
+        wait_for_exit(master, capture, process, time.monotonic() + 0.25)
     finally:
         if process.poll() is None:
             try:

@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 #
-# M3 validation: the conversation, over the same bundle an analysis sends (FR-5.1-5.4).
+# Chat validation over the same context bundle an analysis sends (FR-5.1-5.4).
 #
-# Everything is local, and the same harness as M2b: a fake catalog (so the app routes
+# Everything is local, and the same harness as analysis validation: a fake catalog (so the app routes
 # through the OpenAI-compatible passthrough) and a scripted provider that answers chat
 # with prose, a path reference and a `[general]` sentence, or dribbles an answer out
-# slowly so it can be stopped halfway. Which is the point: this milestone is about a
+# slowly so it can be stopped halfway. Which is the point: this feature is about a
 # *conversation*, so what is checked is what reaches the provider and what comes back
 # into the pane — the correction, the partial answer, the multi-turn history, and the
 # fact that a committed `.env` still never leaves.
 #
-# Usage: scripts/validate/m3.sh         (KEEP=1 keeps the temporary directory)
+# Usage: scripts/validate/chat.sh       (KEEP=1 keeps the temporary directory)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/validate/common.sh"
+validation_mode "$@" || exit $?
 
 PASS=0
 FAIL=0
@@ -22,15 +24,15 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/chat.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 
 CATALOG_PID=""
 LLM_PID=""
 cleanup() {
-  [ -n "$CATALOG_PID" ] && kill "$CATALOG_PID" 2>/dev/null
-  [ -n "$LLM_PID" ] && kill "$LLM_PID" 2>/dev/null
+  stop_child "$CATALOG_PID"
+  stop_child "$LLM_PID"
   if [ "${KEEP:-0}" = "1" ]; then
     printf '  note: kept %s\n' "$TMP"
   else
@@ -145,6 +147,7 @@ python3 "$ROOT/scripts/validate/fake_llm.py" "$LLM_PORT" "$TMP/mode" "$TMP/reque
   >"$TMP/llm-server.log" 2>&1 &
 LLM_PID=$!
 
+SERVERS_READY=0
 for _ in $(seq 1 40); do
   if python3 - "$CATALOG_PORT" "$LLM_PORT" <<'PY' 2>/dev/null
 import socket, sys, urllib.request
@@ -152,9 +155,13 @@ urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/api.json", timeout=1).re
 with socket.create_connection(("127.0.0.1", int(sys.argv[2])), timeout=1):
     pass
 PY
-  then break; fi
+  then SERVERS_READY=1; break; fi
   sleep 0.25
 done
+if [ "$SERVERS_READY" -ne 1 ]; then
+  printf 'catalog/provider fixtures did not become ready; see %s\n' "$TMP" >&2
+  exit 1
+fi
 
 CATALOG_URL="http://127.0.0.1:$CATALOG_PORT/api.json"
 
@@ -234,7 +241,7 @@ git -C "$REPO/clone" checkout --quiet main
 git -C "$REPO/clone" branch --quiet -D work
 
 # ---------------------------------------------------------------------------
-# The fake `gh`, as in m1.sh: a quoted heredoc, data read from its own directory.
+# The fake `gh`, as in pull-requests.sh: a quoted heredoc, data read from its own directory.
 # ---------------------------------------------------------------------------
 FAKE="$TMP/fake"
 mkdir -p "$FAKE"
@@ -354,6 +361,7 @@ run_tui() {
   if [ "$driver_code" -ne 0 ]; then
     touch "$TMP/driver.failed"
   fi
+  return "$driver_code"
 }
 
 # ---------------------------------------------------------------------------

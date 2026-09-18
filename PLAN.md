@@ -8,7 +8,7 @@
 ## 0. How to use this plan
 
 - **A milestone is a shippable increment, not a phase.** Every milestone ends with a binary the owner can run and judge. If a milestone cannot be demonstrated in the terminal in under five minutes, it is scoped wrong.
-- **Exit criteria are objective.** A milestone is done when: (a) its FR acceptance criteria in `REQUIREMENTS.md` all pass, (b) `scripts/validate/m<N>.sh` passes, (c) CI is green on `fmt` + `clippy -D warnings` + `test`, and (d) the manual demo in §2 is rehearsed.
+- **Exit criteria are objective.** A milestone is done when: (a) its FR acceptance criteria in `REQUIREMENTS.md` all pass, (b) its feature validator under `scripts/validate/` passes, (c) CI is green on `fmt` + `clippy -D warnings` + `test`, and (d) the manual demo in §2 is rehearsed.
 - **Order is a hard dependency chain** (DEV-3). Do not start `M(n+1)` while `M(n)` is open. Within a milestone, work items can be parallelised.
 - **Every work item names the FRs it satisfies**, so coverage gaps are visible by grepping for an FR id across the plan.
 - **Crates are gated.** No dependency is added without explicit owner approval (DEP-1). The ledger in §5 lists everything each milestone would need, with justification, so approvals can be granted in one batch per milestone.
@@ -31,13 +31,13 @@
 
 | ID | Theme | Runnable artifact (what you can *do*) | Validation | Primary FRs | New crates (approval needed) |
 |---|---|---|---|---|---|
-| **M0** | Skeleton, rules, CI | `smart-review` opens a themed TUI shell: status line, placeholder panes, modes, `?` help, `<leader>` menu, `:theme`, `:q`. `--version`, `--check`. | `scripts/validate/m0.sh` + manual demo | FR-7.1–7.4, 7.6–7.8, 8.1–8.3, 9.1, 9.2 | ratatui, crossterm, clap, serde, toml, thiserror, anyhow |
-| **M1** | PR browsing & diff reading | Inside a clone: list PRs, filter/search, open one, read metadata + full diff with vim navigation, mouse support, cached. | `scripts/validate/m1.sh` + manual demo | FR-1.1–1.3, 2.1–2.4, 3.2–3.4, 7.5, 7.7, 9.3 | serde_json, `time` (or chrono), unicode-width |
-| **M2a** | Workspace + model configuration | Read a PR from a managed worktree (local diff, context and whitespace toggles), and pick provider/model/thinking + paste a key **in the TUI**, with the choice verified against the provider. | `scripts/validate/m2a.sh` + manual demo | FR-3.1, 3.2 (local), 4.5, 4.7, 4.8 | llm, tokio, reqwest, toml_edit |
-| **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/m2b.sh` (35 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
-| **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/m3.sh` + manual demo | FR-5.1–5.4 | none new |
-| **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` writes the commands it would run to `logs/dry-run.log`. | `scripts/validate/m4.sh` (23 checks) + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
-| **M5** | Polish & release | Visual ranges, replies/resolution, PR conversation comments, `$EDITOR`, checked docs and tagged Linux/macOS releases. | `scripts/validate/m5.sh` + manual demo | backlog + NFR polish | no new crates |
+| **M0** | Skeleton, rules, CI | `smart-review` opens a themed TUI shell: status line, placeholder panes, modes, `?` help, `<leader>` menu, `:theme`, `:q`. `--version`, `--check`. | `scripts/validate/shell.sh` + manual demo | FR-7.1–7.4, 7.6–7.8, 8.1–8.3, 9.1, 9.2 | ratatui, crossterm, clap, serde, toml, thiserror, anyhow |
+| **M1** | PR browsing & diff reading | Inside a clone: list PRs, filter/search, open one, read metadata + full diff with vim navigation, mouse support, cached. | `scripts/validate/pull-requests.sh` + manual demo | FR-1.1–1.3, 2.1–2.4, 3.2–3.4, 7.5, 7.7, 9.3 | serde_json, `time` (or chrono), unicode-width |
+| **M2a** | Workspace + model configuration | Read a PR from a managed worktree (local diff, context and whitespace toggles), and pick provider/model/thinking + paste a key **in the TUI**, with the choice verified against the provider. | `scripts/validate/workspace-models.sh` + manual demo | FR-3.1, 3.2 (local), 4.5, 4.7, 4.8 | llm, tokio, reqwest, toml_edit |
+| **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/analysis.sh` (35 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
+| **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/chat.sh` + manual demo | FR-5.1–5.4 | none new |
+| **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` writes the commands it would run to `logs/dry-run.log`. | `scripts/validate/review-publishing.sh` + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
+| **M5** | Polish & release | Visual ranges, replies/resolution, PR conversation comments, `$EDITOR`, checked docs and tagged Linux/macOS releases. | `scripts/validate/review-collaboration.sh` + manual demo | backlog + NFR polish | no new crates |
 
 Each milestone is a strictly larger subset of the same binary — never a rewrite. M0's TUI shell, action registry, job framework and config loader are load-bearing for M1–M5, which is why they get disproportionate care up front.
 
@@ -63,7 +63,7 @@ Inside the TUI: switch modes (`:` command line), open `?` help, press `<leader>`
 *Repo & tooling*
 - [ ] `Cargo.toml`: `edition = "2024"`, `rust-version = "1.88"` (ratatui 0.30.2 is the binding constraint — DEV-1), description/repository, and the lint policy in `[workspace.lints]` with `[lints] workspace = true`: `clippy::pedantic`, `missing_errors_doc`, `missing_panics_doc`, `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `unreachable`, `dbg_macro`, `unsafe_code = "forbid"` (DEV-8).
 - [ ] `rustfmt.toml` (stable-only options), `.gitignore` reviewed (`/target`, `*.log`, `.env*`).
-- [ ] `scripts/validate/m0.sh` — formatting, lints, tests, release build, CLI surface, first-run layout and permissions, graceful degradation on an unusable config value, clean failure on unparseable TOML, and proof that nothing is written inside the repository.
+- [ ] `scripts/validate/shell.sh` — formatting, lints, tests, release build, CLI surface, first-run layout and permissions, graceful degradation on an unusable config value, clean failure on unparseable TOML, and proof that nothing is written inside the repository.
 - [ ] `README.md`: what it is, prerequisites (`git` ≥ 2.30, `gh` ≥ 2.40), quick start, where state lives.
 - [ ] `AGENTS.md` — see the required content below. This is the first file an agent reads; write it before writing code.
 - [ ] `.github/workflows/ci.yml` — a single `tests` job on `ubuntu-latest`, triggered on pushes to `main` and on all PRs, with `concurrency` cancellation and a Rust build cache. `clippy` runs `-D warnings`; `test` runs `--all-features`.
@@ -117,7 +117,7 @@ Inside the TUI: switch modes (`:` command line), open `?` help, press `<leader>`
 - [ ] A test asserting the terminal guard restores on a simulated panic.
 
 *Validation*
-- [ ] `scripts/validate/m0.sh`: `fmt --check`, `clippy -D warnings`, `test`, `build --release`, `--version`, `--help`, `--check` exit code, and a `SMART_REVIEW_HOME=$(mktemp -d)` run asserting the directory layout and permissions.
+- [ ] `scripts/validate/shell.sh`: `fmt --check`, `clippy -D warnings`, `test`, `build --release`, `--version`, `--help`, `--check` exit code, and a `SMART_REVIEW_HOME=$(mktemp -d)` run asserting the directory layout and permissions.
 
 **FR coverage:** FR-1.2 (CLI surface), FR-7.1–7.4, 7.6–7.8, FR-8.1–8.6 (config/keybinds/themes/state), FR-9.1, FR-9.2.
 **Crates to approve:** `ratatui`, `crossterm`, `clap`, `serde`, `toml`, `thiserror`, `anyhow` (see §5).
@@ -159,7 +159,7 @@ user's choice, and its `DateTime<Utc>` is the type the fixtures and the cache us
 **Risks:** diff virtualization and the parser's edge cases are where time disappears;
 the fake-`gh` harness must land early so no test needs the network (NFR-5.2).
 
-**Delivered.** `scripts/validate/m1.sh` drives the whole chain through a fake `gh`
+**Delivered.** `scripts/validate/pull-requests.sh` drives the whole chain through a fake `gh`
 and asserts what the *screen* shows, with a small terminal emulator
 (`scripts/validate/screen.py`) reconstructing the final frame from the pty capture,
 because the raw stream contains only the cells that changed.
@@ -200,7 +200,7 @@ names the active model.
 - [x] Thinking controls constrained by `reasoning_options` (`toggle` / `effort` / `budget_tokens`), explicit refusal for unmappable options, reasoning token usage displayed, **no trace promised** (FR-4.8, DEC-18).
 - [x] `[llm.active]` written back with `toml_edit`, preserving the user's comments and formatting (FR-8.6, DEC-19).
 - [x] `LlmPort` + `llm`-crate adapter: chat with streaming and usage, bounded concurrency, cancellation by job id, superseded results dropped (FR-4.4, ARCH-5), plus the connection check the picker runs.
-- [x] Tests: worktree lifecycle against a real fixture repo, diff flags, catalog parsing from a committed fixture, credential file mode and env precedence, picker state machine, thinking-option mapping. `scripts/validate/m2a.sh` covers the same ground end to end, with a local catalog server and a real git repository.
+- [x] Tests: worktree lifecycle against a real fixture repo, diff flags, catalog parsing from a committed fixture, credential file mode and env precedence, picker state machine, thinking-option mapping. `scripts/validate/workspace-models.sh` covers the same ground end to end, with a local catalog server and a real git repository.
 
 **FR coverage:** FR-3.1, 3.2 (local), 4.5, 4.7, 4.8.
 **Outstanding from this milestone:** the optional `[llm.presets]` convenience (`:model save` / `:model use`) and the manual-entry fallback for a catalog that cannot be fetched at all (FR-4.7's MAY). Both are recorded in §6.
@@ -221,7 +221,7 @@ names the active model.
 - [x] Context bundle builder: metadata + commits + diff + changed files at head + `AGENTS.md`/`CLAUDE.md`/`README.md`, redaction of `.env*`/ignored/oversize/binary, truncation order, token estimate, `:context` inspector + opt-in notice (FR-4.6).
 - [x] Review plan UI: groups with rationale, recommended vs path order toggle, manual overrides persisted per PR (FR-3.5, FR-4.2, DEC-10 default).
 - [x] Tests: analysis normalization/repair, cache key sensitivity to thinking, context truncation/redaction, cancellation and superseded-job discard.
-- [x] `scripts/validate/m2b.sh`: 35 checks, driven end to end against a scripted OpenAI-compatible provider (`scripts/validate/fake_llm.py`), including what the app actually sent.
+- [x] `scripts/validate/analysis.sh`: 35 checks, driven end to end against a scripted OpenAI-compatible provider (`scripts/validate/fake_llm.py`), including what the app actually sent.
 
 **Notes on what M2b decided, where it is not obvious from the requirements**
 - **`.gitignore` is enforced by construction.** Only paths that exist in the head revision are considered for the bundle (`git ls-tree`), so an ignored file is not a candidate in the first place; a `.env` that somebody committed by accident is caught by the secret denylist on top of that. The validator asserts on the wire that such a file never reaches the provider.
@@ -250,7 +250,7 @@ names the active model.
 - [x] Token/cost accounting per session, optional per-message cost estimate from catalog `cost` (FR-5.4).
 - [x] Retention cap per DEC-9 (default: 50 sessions × 2 MB per PR) with announced pruning (FR-8.5).
 - [x] Tests: history persistence round-trip, trimming, cancellation, prompt assembly snapshots with a fake `LlmPort`.
-- [x] `scripts/validate/m3.sh`: 59 checks, driving the chat against a scripted provider and reading the wire, including a provider the pinned crate cannot stream for and one that never answers.
+- [x] `scripts/validate/chat.sh`: 59 checks, driving the chat against a scripted provider and reading the wire, including a provider the pinned crate cannot stream for and one that never answers.
 
 **Notes on what M3 decided, where it is not obvious from the requirements**
 - **The context goes in the system prompt, not in a message.** That is what makes FR-4.6's third truncation step safe: the oldest turns can be dropped without ever being able to drop the subject of the conversation, and no message has to be flagged as the important one. The cost is that the bundle is re-sent with every turn, which is what "the model sees exactly what `:context` reports" costs.
@@ -260,7 +260,7 @@ names the active model.
 - **`:context add <path>` refuses** a path the pull request does not have, and refuses anything that looks like a secret outright: a bundle that silently leaves out what the user asked for by name is the one thing FR-4.6 exists to prevent. The added files live in `state.toml` per pull request — a preference about the pull request, not about one conversation.
 - **Transcripts are written to `exports/`**, not to `cache/`: a transcript the user asked for is not disposable (FR-8.5).
 - **A provider the crate cannot stream for still answers.** DeepSeek implements neither stream method, while Groq, Mistral and OpenRouter are OpenAI-compatible structured-stream providers. The adapter selects the locally known capability before dispatch, then uses the passthrough or one un-streamed request for DeepSeek. It stops after any dispatched failure, because that request may already have been paid for. Appendix B has the measurements.
-- **A failed job is never invisible.** Every job slot a pane can hold belongs in `is_current_job`; leaving one out does not make its failure harmless, it makes it look like a pane that is still thinking. `scripts/validate/m3.sh` now checks the failure *on screen*, for the chat and for the analysis, because that is the shape the bug took: a real provider, a real error, and a pane that said "asking" forever.
+- **A failed job is never invisible.** Every job slot a pane can hold belongs in `is_current_job`; leaving one out does not make its failure harmless, it makes it look like a pane that is still thinking. `scripts/validate/chat.sh` now checks the failure *on screen*, for the chat and for the analysis, because that is the shape the bug took: a real provider, a real error, and a pane that said "asking" forever.
 - **The crate does not ask for streaming usage on the passthrough route** (FR-5.4's tokens and per-session cost would be permanently empty): only its native `OpenAI` backend sets `stream_options.include_usage`. The passthrough provider's config now sets `SUPPORT_STREAM_OPTIONS`, and the validator asserts the field is on the wire.
 
 **FR coverage:** FR-5.1–5.4.
@@ -284,7 +284,7 @@ names the active model.
 - [x] Existing reviews/comments/threads displayed read-only, under the affected diff line (FR-6.4).
 - [x] `--dry-run` honoured by every mutating adapter: the gate is a property of the process runner, so `:workspace clean` is covered by the same promise (FR-6.5).
 - [x] Tests: comment validation, payload construction, failure-preserves-draft, double-submit prevention, fake-`gh` argv and payload assertions.
-- [x] `scripts/validate/m4.sh`: 23 checks over the whole flow, including that the batched request is the *only* mutating call, that a dry run reaches nothing, and that an existing thread is drawn.
+- [x] `scripts/validate/review-publishing.sh`: checks the whole flow, including that the batched request is the *only* mutating call, that a dry run reaches nothing, and that an existing thread is drawn.
 
 **Notes on what M4 decided, where it is not obvious from the requirements**
 - **One REST call, not two GraphQL ones.** DEC-3 chose a batched review and recorded `gh api graphql` as the route; the route changed at the owner's suggestion once the shape was clear. `POST /repos/{owner}/{repo}/pulls/{N}/reviews` takes the decision, the body and every comment in **one** request, so "one review" cannot half-happen — and the payload is built by `serde_json` and passed as a file, so nothing ever escapes user prose by hand. A list of GraphQL input objects cannot be passed as a variable over argv, which is what the two-call route would have required. DEC-3's *decision* (one batched review, inline comments in v1) is unchanged; only its recorded route is, and REQUIREMENTS says so.
@@ -343,10 +343,14 @@ names the active model.
 - **Snapshot tests** (`TestBackend`) are the primary UI regression net; snapshots are reviewed like code.
 - **Clock is injected** so TTL/cache/staleness tests are deterministic.
 - **Fast aggregate gate:** `scripts/validate/all.sh` runs fmt, Clippy, tests and the
-  debug build once, then runs the hermetic milestone scenarios in parallel. Individual
-  `m<N>.sh` scripts remain standalone; the aggregate sets `SMART_REVIEW_SKIP_CARGO=1`
-  so they do not repeat the shared gates. Live third-party catalog probing is opt-in
-  with `SMART_REVIEW_LIVE_TESTS=1` and is never part of CI.
+  debug build once, then runs the hermetic feature scenarios in parallel. Individual
+  feature scripts remain standalone; the aggregate uses their explicit
+  `--scenarios-only` mode so they do not repeat the shared gates. Live third-party
+  catalog probing is opt-in with `SMART_REVIEW_LIVE_TESTS=1` and is never part of CI.
+- **PTY harness contract (IR-15):** `scripts/validate/test_harness.py` checks fragmented
+  UTF-8/ANSI replay, stale-frame rejection, wait/deadline failure and concurrent driver
+  isolation. `scripts/validate/all.sh --scenarios-only` is the explicit prebuilt mode
+  used by CI; standalone feature scripts keep their build/test gates.
 
 ---
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# M2a validation: the workspace, the model catalog, the credentials file and the
+# Workspace, model catalog, credentials, and model picker validation.
 # picker (FR-3.1, FR-3.2, FR-4.5, FR-4.7, FR-4.8).
 #
 # The catalog is served by a local HTTP server rather than models.dev, so the checks
@@ -9,12 +9,14 @@
 # because that is what actually broke the picker once: a single provider publishing
 # `"min": -1` made the whole document unreadable. The normal suite remains offline.
 #
-# Usage: scripts/validate/m2a.sh
+# Usage: scripts/validate/workspace-models.sh
 #        KEEP=1 keeps temporary files; SMART_REVIEW_LIVE_TESTS=1 also probes models.dev.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/validate/common.sh"
+validation_mode "$@" || exit $?
 
 PASS=0
 FAIL=0
@@ -22,14 +24,14 @@ ok() { printf '  PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/workspace-models.XXXXXX")"
 BIN="target/debug/smart-review"
 FIXTURES="$ROOT/tests/fixtures/gh"
 MODELS="$ROOT/tests/fixtures/models/providers.json"
 
 SERVER_PID=""
 cleanup() {
-  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  stop_child "$SERVER_PID"
   # `KEEP=1` leaves the temporary directory behind, for when a check fails and the
   # reason is in the app's log rather than on the screen.
   if [ "${KEEP:-0}" = "1" ]; then
@@ -56,19 +58,24 @@ cp "$MODELS" "$TMP/srv/api.json"
 ( cd "$TMP/srv" && exec python3 -m http.server "$PORT" --bind 127.0.0.1 ) >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
 
+SERVER_READY=0
 for _ in $(seq 1 40); do
   if python3 - "$PORT" <<'PY' 2>/dev/null
 import sys, urllib.request
 urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/api.json", timeout=1).read(16)
 PY
-  then break; fi
+  then SERVER_READY=1; break; fi
   sleep 0.25
 done
+if [ "$SERVER_READY" -ne 1 ]; then
+  printf 'catalog fixture did not become ready; see %s\n' "$TMP/server.log" >&2
+  exit 1
+fi
 
 CATALOG_URL="http://127.0.0.1:$PORT/api.json"
 
 # ---------------------------------------------------------------------------
-# A fake `gh`, as in m1.sh: a quoted heredoc, and data files read from its own
+# A fake `gh`, as in pull-requests.sh: a quoted heredoc, and data files read from its own
 # directory so no check ever rewrites a committed fixture.
 # ---------------------------------------------------------------------------
 make_fake_gh() {
@@ -119,7 +126,7 @@ EOF
 }
 
 # Keys are sent in groups separated by `~`, each followed by a wait for the group's
-# effect to appear on screen. The drive is the same as m1.sh's: see the comment there.
+# effect to appear on screen. The drive is the same as pull-requests.sh's; see its comment.
 run_tui() {
   local home="$1" keys="$2" waits="$3" fake="$4" log="$5" step_timeout="${6:-15}"
   local driver_code=0
@@ -136,6 +143,7 @@ run_tui() {
   if [ -f "$home/logs/smart-review.log" ] && grep -q 'panicked' "$home/logs/smart-review.log"; then
     printf '  note: the interface panicked; see %s\n' "$home/logs/smart-review.log"
   fi
+  return "$driver_code"
 }
 
 saw() { grep -q "$1"; }
@@ -423,8 +431,7 @@ fi
 step "6/7 offline behaviour"
 # Stopping the server proves the cache is what answered, and it happens after every
 # check that needs the network rather than in the middle of them.
-kill "$SERVER_PID" 2>/dev/null
-wait "$SERVER_PID" 2>/dev/null
+stop_child "$SERVER_PID"
 SERVER_PID=""
 SCREEN="$(run_tui "$HOME_CATALOG" ' m~' 'providers,~' "$FAKE" "$TMP/catalog-offline.log")"
 if printf '%s' "$SCREEN" | saw "cached"; then

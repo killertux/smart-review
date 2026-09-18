@@ -215,7 +215,10 @@ how the tests isolate themselves.
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-scripts/validate/m0.sh
+python3 scripts/validate/test_harness.py
+scripts/validate/all.sh                 # shared gates once, then all scenarios
+scripts/validate/review-publishing.sh                  # standalone, including build
+scripts/validate/review-publishing.sh --scenarios-only # use an already-built binary
 ```
 
 Snapshot tests cover the rendered screens; regenerate them after an intentional
