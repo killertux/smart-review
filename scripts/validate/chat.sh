@@ -403,6 +403,45 @@ fi
 HOME_MAIN="$TMP/home"
 make_home "$HOME_MAIN"
 
+if validation_smoke_only; then
+  step "smoke: provider stream and cancellation"
+  echo chat-slow >"$TMP/mode"
+  : >"$TMP/requests.jsonl"
+  FRAMES="$TMP/stream-cancel.log"
+  run_tui "$HOME_MAIN" "$OPEN~explain the rounding\r~\e" \
+    "$OPEN_WAIT~You asked: \"explain the rounding~model \\(stopped\\)" "$FRAMES" >/dev/null
+  if shown "$FRAMES" "model \\(stopped\\)" \
+      && shown "$FRAMES" "explain the rounding"; then
+    ok "a streamed answer can be cancelled without losing its question or partial state"
+  else
+    bad "the provider stream/cancel contract was not visible"
+  fi
+  if python3 - "$TMP/requests.jsonl" <<'PY'
+import json, sys
+bodies = [json.loads(line).get("body", {}) for line in open(sys.argv[1]) if line.strip()]
+assert len(bodies) == 1, f"expected one provider request, got {len(bodies)}"
+assert bodies[0].get("stream") is True, bodies[0]
+assert (bodies[0].get("stream_options") or {}).get("include_usage") is True, bodies[0]
+PY
+  then
+    ok "the smoke made one streaming provider request with usage enabled"
+  else
+    bad "the smoke did not make the intended streaming provider request"
+  fi
+  CHAT_DIR="$HOME_MAIN/chats/github.com/acme/service/pr-141"
+  if grep -q '"partial": *true' "$CHAT_DIR"/*.json 2>/dev/null; then
+    ok "the cancelled partial answer was durably recorded"
+  else
+    bad "the cancelled answer was not stored as partial"
+  fi
+  if [ -f "$TMP/driver.failed" ]; then
+    bad "the provider PTY smoke did not reach its expected screen state"
+  fi
+  printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" = "0" ]
+  exit $?
+fi
+
 step "2/8 the pane, and typing in it"
 # Letters are letters, including the ones bound in normal mode: a question with a `?`
 # in it must not open the help popup.

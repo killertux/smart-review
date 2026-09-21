@@ -223,10 +223,15 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 python3 scripts/validate/test_harness.py
-scripts/validate/all.sh                 # shared gates once, then all scenarios
+scripts/validate/all.sh                 # shared gates, then the named smoke suite
+scripts/validate/all.sh --smoke-only    # smoke only, using the built debug binary
+SMART_REVIEW_FULL_VALIDATION=1 scripts/validate/all.sh # historical broad validators
 scripts/validate/review-publishing.sh                  # standalone, including build
 scripts/validate/review-publishing.sh --scenarios-only # use an already-built binary
 ```
+
+The IR-18 coverage map and smoke contracts are recorded in
+[`docs/testing/ir-18.md`](docs/testing/ir-18.md).
 
 Snapshot tests cover the rendered screens; regenerate them after an intentional
 UI change and review the diff:

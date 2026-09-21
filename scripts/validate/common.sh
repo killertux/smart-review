@@ -7,12 +7,21 @@ validation_mode() {
       ;;
     1:--scenarios-only)
       export SMART_REVIEW_SKIP_CARGO=1
+      unset SMART_REVIEW_SMOKE_ONLY
+      ;;
+    1:--smoke-only)
+      export SMART_REVIEW_SKIP_CARGO=1
+      export SMART_REVIEW_SMOKE_ONLY=1
       ;;
     *)
-      printf 'usage: %s [--scenarios-only]\n' "$0" >&2
+      printf 'usage: %s [--scenarios-only|--smoke-only]\n' "$0" >&2
       return 2
       ;;
   esac
+}
+
+validation_smoke_only() {
+  [ "${SMART_REVIEW_SMOKE_ONLY:-0}" = "1" ]
 }
 
 stop_child() {

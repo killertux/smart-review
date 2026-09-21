@@ -57,7 +57,7 @@ src/
     layout.rs        rectangles and the minimum terminal size
     terminal.rs      the RAII terminal guard and the panic hook
     components/      one renderer per screen element
-    test_support.rs  (test-only) buffer-to-text helper for snapshots
+    test_support.rs  (test-only) deterministic reducer/completion/render scenarios
 ```
 
 ## 3. Ports
@@ -190,10 +190,14 @@ terminal takeover are fatal.
 - The configuration is parsed into a preserved document before being read into
   typed structs, so round-tripping and unknown-key preservation are testable
   without writing to disk.
-- Rendering is a pure function of state, so `TestBackend` snapshots cover the
-  screens (`tests/shell_snapshots.rs`).
-- Black-box feature scenarios use one incremental terminal state machine for live
-  waits and capture replay. A step can match only cells redrawn after its keys were
-  sent, preventing an earlier frame from satisfying a later assertion (IR-15).
-- Adapters will get fakes in `application` tests; the real `gh`/LLM paths stay
-  opt-in and never run in CI.
+- Rendering is a pure function of state, so stable representative screens use
+  `TestBackend` snapshots (`tests/shell_snapshots.rs`). Cross-feature regressions use
+  `tui::test_support::Scenario` to compose decoded actions, emitted effects, held fake
+  completions and deterministic frames in any completion order (IR-18).
+- The small black-box smoke suite uses one incremental terminal state machine for live
+  waits and capture replay. A step can match only cells redrawn after its keys or resize
+  were sent, preventing an earlier frame from satisfying a later assertion (IR-15,
+  IR-18).
+- Application tests use fake ports. Routine tests and smoke use no external network,
+  account, credential or user repository; live provider/forge contracts remain
+  separately opt-in.

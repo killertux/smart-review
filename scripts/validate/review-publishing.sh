@@ -245,7 +245,7 @@ run_tui() {
     PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
       python3 "$ROOT/scripts/validate/drive.py" \
         --cols 160 --rows 40 --log "$log" \
-        --timeout 90 --step-timeout 12 --settle 0.1 \
+        --timeout 90 --step-timeout 12 --settle "${DRIVE_SETTLE:-0.1}" \
         --step-notify "$DRIVE_STEP_NOTIFY" \
         --ready "Add retry to the webhook dispatcher" \
         --keys "$keys" --waits "$waits" -- \
@@ -254,7 +254,7 @@ run_tui() {
     PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
       python3 "$ROOT/scripts/validate/drive.py" \
         --cols 160 --rows 40 --log "$log" \
-        --timeout 90 --step-timeout 12 --settle 0.1 \
+        --timeout 90 --step-timeout 12 --settle "${DRIVE_SETTLE:-0.1}" \
         --ready "Add retry to the webhook dispatcher" \
         --keys "$keys" --waits "$waits" -- \
         "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
@@ -272,6 +272,15 @@ shown() {
 
 draft_file() {
   printf '%s/drafts/github.com/acme/service/pr-141.json' "$1"
+}
+
+wait_until_absent() {
+  local path="$1"
+  for _ in $(seq 1 240); do
+    [ ! -f "$path" ] && return 0
+    sleep 0.05
+  done
+  [ ! -f "$path" ]
 }
 
 # The keystrokes, as groups: `~` separates one group per wait.
@@ -299,6 +308,75 @@ elif cargo build --quiet 2>"$TMP/build.log"; then
 else
   bad "the debug binary does not build"
   cat "$TMP/build.log" | tail -20
+fi
+
+if validation_smoke_only; then
+  step "smoke: confirmed publish payload"
+  HOME_SMOKE="$TMP/home-smoke"
+  home_for "$HOME_SMOKE"
+  : >"$FAKE/argv.txt"
+  PUBLISHED_DRAFT="$(draft_file "$HOME_SMOKE")"
+  STAGE_FRAMES="$TMP/publish-smoke-stage.log"
+  run_tui "$HOME_SMOKE" \
+    "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~:q\r" \
+    "from the worktree~M src/domain/money~comment on~1 comment staged~" \
+    "$STAGE_FRAMES" >/dev/null
+  if [ -f "$PUBLISHED_DRAFT" ] && check_json "$PUBLISHED_DRAFT" <<'PY'
+import json, sys
+draft = json.load(open(sys.argv[1]))
+assert len(draft.get("comments", [])) == 1, draft
+assert draft["comments"][0]["body"] == "the rounding is hidden behind a magic ten", draft
+PY
+  then
+    ok "the staged comment is durable before publishing"
+  else
+    bad "the staged comment was not persisted before publishing"
+    cat "$TMP/check.log" 2>/dev/null
+  fi
+
+  FRAMES="$TMP/publish-smoke.log"
+  run_tui "$HOME_SMOKE" \
+    "$OPEN~ rr~a~\r~\e~:q\r" \
+    "1 draft~publish review~approve —~review posted~~" \
+    "$FRAMES" >/dev/null
+  if shown "$FRAMES" \
+      "approve — this unblocks the pull request[\\s\\S]*the rounding is hidden behind a magic ten|the rounding is hidden behind a magic ten[\\s\\S]*approve — this unblocks the pull request"; then
+    ok "the immutable preview showed the verdict and comment before publishing"
+  else
+    bad "the publish preview did not show the confirmed payload"
+  fi
+  if [ "$(count_calls 'pulls/141/reviews')" = "1" ] \
+      && [ "$(count_calls 'POST')" = "1" ]; then
+    ok "the confirmed review used exactly one mutating call"
+  else
+    bad "the confirmed review was not one mutation"
+  fi
+  if check_json "$FAKE/review.json" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["event"] == "APPROVE", body
+assert len(body["comments"]) == 1, body
+assert body["comments"][0]["path"] == "src/domain/money.rs", body
+assert body["comments"][0]["body"] == "the rounding is hidden behind a magic ten", body
+assert body.get("commit_id"), body
+PY
+  then
+    ok "the adapter received the exact confirmed review payload"
+  else
+    bad "the adapter payload differed from the preview"
+    cat "$TMP/check.log"
+  fi
+  if wait_until_absent "$PUBLISHED_DRAFT"; then
+    ok "the published draft is durably cleared"
+  else
+    bad "the published draft is still on disk, so it could be sent twice"
+  fi
+  if [ -f "$TMP/driver.failed" ]; then
+    bad "the publish PTY smoke did not reach its expected screen state"
+  fi
+  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
 fi
 
 step "2/8 a comment is staged on a line of the diff"
@@ -377,8 +455,8 @@ home_for "$HOME_TWO"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/publish.log"
 SCREEN="$(run_tui "$HOME_TWO" \
-  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~review posted" \
+  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r~\e~:q\r" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~review posted~~" \
   "$FRAMES")"
 if shown "$FRAMES" "approve — this unblocks the pull request"; then
   ok "the modal names the verdict it is about to give"
@@ -422,14 +500,10 @@ fi
 PUBLISHED_DRAFT="$(draft_file "$HOME_TWO")"
 # The success notice is reduced before the ordered background delete reaches disk.
 # Wait for that durable postcondition rather than racing it on fast machines.
-for _ in $(seq 1 40); do
-  [ ! -f "$PUBLISHED_DRAFT" ] && break
-  sleep 0.05
-done
-if [ -f "$PUBLISHED_DRAFT" ]; then
-  bad "the published draft is still on disk, so it would be sent twice"
-else
+if wait_until_absent "$PUBLISHED_DRAFT"; then
   ok "the draft is cleared once the review is posted"
+else
+  bad "the published draft is still on disk, so it would be sent twice"
 fi
 
 step "5/8 a refusal keeps the draft and explains itself"

@@ -194,12 +194,21 @@ fi
 step "7/7 terminal lifecycle in a real pty"
 if command -v python3 >/dev/null 2>&1; then
   PTY_HOME="$(mktemp -d "$TMP_HOME/pty.XXXXXX")"
+  RESIZE_STEPS=""
+  TUI_KEYS=' ~\e~:bogus\r~:q\r'
+  TUI_WAITS='leader~~not a command~'
+  if validation_smoke_only; then
+    RESIZE_STEPS='79x23=terminal too small~120x40=smart-review'
+    TUI_KEYS=':theme light\r~ ~\e~:bogus\r~:q\r'
+    TUI_WAITS='theme: light~leader~~not a command~'
+  fi
   set +e
   # The driver advances on visible postconditions and an actual quiet PTY rather than
   # paying a fixed sleep after every key.
   SMART_REVIEW_HOME="$PTY_HOME" python3 "$ROOT/scripts/validate/drive.py" \
     --cols 120 --rows 40 --log "$TMP_HOME/shell-tui.log" --ready 'smart-review' \
-    --keys ' ~\e~:bogus\r~:q\r' --waits 'leader~~not a command~' -- \
+    --resize-steps "$RESIZE_STEPS" \
+    --keys "$TUI_KEYS" --waits "$TUI_WAITS" -- \
     "$ROOT/$BIN" >"$TMP_HOME/shell-tui-screen.log"
   TUI_CODE=$?
   set -e
@@ -257,6 +266,28 @@ if command -v python3 >/dev/null 2>&1; then
     ok "mouse capture was released on exit"
   else
     bad "mouse capture was not released on exit"
+  fi
+
+  if validation_smoke_only && [ "$TUI_CODE" -eq 0 ]; then
+    ok "SIGWINCH reflows to the minimum-size warning and back"
+  elif validation_smoke_only; then
+    bad "the resize smoke did not render the minimum-size warning"
+  fi
+
+  if validation_smoke_only; then
+    set +e
+    SMART_REVIEW_HOME="$PTY_HOME" python3 "$ROOT/scripts/validate/drive.py" \
+      --cols 120 --rows 40 --log "$TMP_HOME/shell-restore.log" --ready 'smart-review' \
+      --keys ':theme\r~\e~:q\r' --waits '\* light~~' -- \
+      "$ROOT/$BIN" >"$TMP_HOME/shell-restore-screen.log"
+    RESTORE_CODE=$?
+    set -e
+    if [ "$RESTORE_CODE" -eq 0 ] \
+        && grep -q 'theme = "light"' "$PTY_HOME/state.toml" 2>/dev/null; then
+      ok "startup restores the state saved by the previous terminal session"
+    else
+      bad "the second terminal session did not restore the saved theme"
+    fi
   fi
 
 else

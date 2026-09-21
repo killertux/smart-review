@@ -20,6 +20,7 @@ that `:q` closes are unchanged.
 Usage:
   drive.py --cols 160 --rows 40 --log capture.log \
            [--ready REGEX] [--timeout SECS] [--settle SECS] \
+           [--resize-steps '80x24=REGEX~160x40=REGEX'] \
            --keys 'g1~g2~g3' --waits 'p1~p2~p3' \
            -- cmd args...
 
@@ -233,6 +234,22 @@ def wait_for_exit_or_quiet(
     return process.poll() is not None, False
 
 
+def resize_steps(text: str) -> list[tuple[int, int, str]]:
+    """Parses `COLSxROWS=REGEX` groups used to exercise SIGWINCH wiring."""
+    if not text:
+        return []
+    steps = []
+    for group in text.split("~"):
+        size, separator, pattern = group.partition("=")
+        match = re.fullmatch(r"([1-9][0-9]*)x([1-9][0-9]*)", size)
+        if not separator or match is None:
+            raise ValueError(
+                "--resize-steps entries must be COLSxROWS=REGEX, separated by `~`"
+            )
+        steps.append((int(match.group(1)), int(match.group(2)), pattern))
+    return steps
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cols", type=int, default=160)
@@ -249,6 +266,11 @@ def main() -> int:
     )
     parser.add_argument("--keys", default="", help="`~`-separated key groups")
     parser.add_argument("--waits", default="", help="`~`-separated regexes, one per key group")
+    parser.add_argument(
+        "--resize-steps",
+        default="",
+        help="`~`-separated COLSxROWS=REGEX resizes performed after readiness",
+    )
     parser.add_argument(
         "--step-notify",
         help="write step-N.sent files here after each key group (fixture coordination)",
@@ -274,6 +296,16 @@ def main() -> int:
             f"({len(key_groups)} keys, {len(wait_groups)} waits)",
             file=sys.stderr,
         )
+        try:
+            with open(arguments.log, "wb"):
+                pass
+        except OSError:
+            pass
+        return 2
+    try:
+        resizes = resize_steps(arguments.resize_steps)
+    except ValueError as error:
+        print(f"drive.py: {error}", file=sys.stderr)
         try:
             with open(arguments.log, "wb"):
                 pass
@@ -319,6 +351,52 @@ def main() -> int:
             )
             if not matched:
                 failure = f"the ready state {arguments.ready!r} never appeared"
+
+        for index, (cols, rows, pattern) in enumerate(resizes, start=1):
+            if failure:
+                break
+            before_revision = capture.revision
+            fcntl.ioctl(
+                master,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", rows, cols, 0, 0),
+            )
+            try:
+                # A headless PTY has no foreground process group for the kernel to
+                # notify portably. Emulate a real terminal resize for the session
+                # owned by this driver instead of relying on platform behaviour.
+                os.killpg(process.pid, signal.SIGWINCH)
+            except ProcessLookupError:
+                failure = f"the child exited before resize step {index}"
+                break
+            capture.replay.resize(cols, rows)
+            matched, reached_eof = wait_for(
+                master,
+                capture,
+                pattern,
+                step_deadline(),
+                since_revision=before_revision,
+            )
+            if not matched:
+                failure = (
+                    f"resize step {index} ({cols}x{rows}) pattern {pattern!r} never appeared"
+                )
+            if reached_eof and not failure:
+                failure = f"the child exited during resize step {index}"
+            if not failure:
+                # A visible frame proves the resize was handled, but its final writes
+                # may still be queued. Serialise acknowledgements so a following
+                # TIOCSWINSZ cannot be coalesced with work from this one.
+                quiet, reached_eof = settle(
+                    master, capture, arguments.settle, step_deadline()
+                )
+                if reached_eof:
+                    failure = f"the child exited after resize step {index}"
+                elif not quiet:
+                    failure = (
+                        f"resize step {index} ({cols}x{rows}) did not become quiet "
+                        "before its deadline"
+                    )
 
         for index, (keys, pattern) in enumerate(zip(key_groups, wait_groups), start=1):
             if failure:

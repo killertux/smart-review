@@ -171,6 +171,7 @@ fi
 FAKE="$TMP/fake"
 make_fake_gh "$FAKE"
 
+if ! validation_smoke_only; then
 step "2/7 the catalog adapter"
 HOME_CATALOG="$TMP/home-catalog"
 make_home "$HOME_CATALOG"
@@ -309,6 +310,7 @@ if [ -f "$HOME_KEEP/config.toml.bak" ]; then
 else
   bad "no backup was written before changing config.toml"
 fi
+fi
 
 step "5/7 the worktree"
 # A worktree needs a real repository, a real remote and a real pull request ref, so
@@ -395,6 +397,15 @@ if printf '%s' "$(cat "$TMP/ws.screen")" | saw "src.rs"; then
   ok "the review screen shows the worktree's file"
 else
   bad "the review screen never showed the worktree's diff"
+fi
+
+if validation_smoke_only; then
+  if [ -f "$TMP/driver.failed" ]; then
+    bad "the remote-to-local PTY smoke did not reach its expected screen state"
+  fi
+  printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
 fi
 
 # Cleaning from a different directory still works because the app-owned object store
