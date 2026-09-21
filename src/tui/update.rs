@@ -328,7 +328,7 @@ fn cycle_review_progress(app: &mut App) -> Effect {
     let Some(path) = app
         .review
         .as_ref()
-        .and_then(crate::tui::diff_view::DiffView::current_path)
+        .and_then(crate::tui::diff_view::DiffView::focused_path)
         .map(ToString::to_string)
     else {
         app.notice(NoticeLevel::Warn, "put the cursor in a changed file first");
@@ -1375,20 +1375,33 @@ fn plan_command(app: &mut App, argument: &str) -> Effect {
 
 /// `:plan reset`: back to the order the analysis asked for (FR-4.2).
 fn reset_plan(app: &mut App) -> Effect {
-    let Some(stored) = app.panel.analysis.as_deref() else {
+    let Some(analysis) = app
+        .panel
+        .analysis
+        .as_deref()
+        .map(|stored| stored.analysis.clone())
+    else {
         app.notice(
             NoticeLevel::Warn,
             "there is no analysed plan to reset to".to_owned(),
         );
         return Effect::None;
     };
-    let plan = crate::domain::plan::Plan::from_analysis(&stored.analysis);
-    app.set_plan(plan.clone());
+    let Some(plan) = app.plan_mut() else {
+        app.notice(
+            NoticeLevel::Warn,
+            "the review plan is not ready yet; reopen the pull request and try again",
+        );
+        return Effect::None;
+    };
+    plan.reset_order_from_analysis(&analysis);
+    let updated = plan.clone();
+    app.after_plan_change();
     app.notice(
         NoticeLevel::Info,
         "the review order is the analysis's again".to_owned(),
     );
-    Effect::SavePlan(Box::new(plan))
+    Effect::SavePlan(Box::new(updated))
 }
 
 /// `:model`, `:model show`, `:model pick` (FR-4.5).
@@ -2425,6 +2438,44 @@ mod tests {
     }
 
     #[test]
+    fn ir_16_marking_uses_the_tree_selected_file_when_tree_and_diff_differ() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        {
+            let view = app.review.as_mut().expect("open review");
+            assert_eq!(
+                view.current_path().map(ToString::to_string).as_deref(),
+                Some("src/domain/money.rs")
+            );
+            let tests_row = view
+                .tree
+                .iter()
+                .position(|row| {
+                    let crate::tui::diff_view::TreeKind::File { index } = &row.kind else {
+                        return false;
+                    };
+                    view.patch.files[*index]
+                        .path()
+                        .is_some_and(|path| path.as_str() == "tests/money.rs")
+                })
+                .expect("tests file row");
+            view.tree_focused = true;
+            view.tree_cursor = tests_row;
+        }
+
+        let Effect::SavePlan(plan) = dispatch(&mut app, "review.cycle_progress") else {
+            panic!("the tree-selected marker must be persisted")
+        };
+        assert_eq!(
+            plan.review_status("tests/money.rs"),
+            crate::domain::plan::ReviewStatus::Reviewed
+        );
+        assert_eq!(
+            plan.review_status("src/domain/money.rs"),
+            crate::domain::plan::ReviewStatus::NotReviewed
+        );
+    }
+
+    #[test]
     fn an_unusable_answer_keeps_its_text_and_says_why() {
         let (_dir, mut app) = app_ready_to_analyse();
         app.record_analysis_job(3);
@@ -2528,19 +2579,30 @@ mod tests {
         // Reset needs the analysis to reset *to*, which is what a user has when they
         // are looking at a plan derived from one (FR-4.2).
         app.panel.analysis = Some(Box::new(crate::test_support::stored_analysis("abc123")));
-        app.set_plan(crate::domain::plan::Plan::from_analysis(
-            &app.panel.analysis.as_ref().expect("set").analysis,
-        ));
+        {
+            let plan = app.plan_mut().expect("heuristic plan");
+            plan.document_revision = 9;
+            assert!(plan.set_review_status(
+                "src/domain/money.rs",
+                crate::domain::plan::ReviewStatus::Reviewed
+            ));
+        }
         let effect = command(&mut app, "plan move tests/money.rs domain");
         let Effect::SavePlan(plan) = effect else {
             panic!("expected a save, got {effect:?}");
         };
         assert_eq!(plan.group_of("tests/money.rs"), Some("domain"));
-        assert!(matches!(
-            command(&mut app, "plan reset"),
-            Effect::SavePlan(_)
-        ));
-        assert!(!app.plan().expect("a plan").overridden, "reset clears it");
+        let Effect::SavePlan(reset) = command(&mut app, "plan reset") else {
+            panic!("reset must persist the restored ordering")
+        };
+        assert!(!reset.overridden, "reset clears only the manual ordering");
+        assert_eq!(reset.document_revision, 9, "the durable revision survives");
+        assert_eq!(
+            reset.review_status("src/domain/money.rs"),
+            crate::domain::plan::ReviewStatus::Reviewed,
+            "human progress survives an ordering reset"
+        );
+        assert_eq!(reset.group_of("tests/money.rs"), Some("tests"));
         // `:plan` with no argument explains the current order.
         assert!(matches!(command(&mut app, "plan"), Effect::None));
         let notice = app.latest_notice().expect("a notice").text.clone();

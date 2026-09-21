@@ -781,6 +781,22 @@ impl DiffView {
         self.patch.files.get(self.current_file()?)?.path()
     }
 
+    /// The file selected by the pane that currently owns file-workflow navigation.
+    ///
+    /// Tree and diff cursors are intentionally independent. An action invoked while
+    /// the tree is focused must therefore use its selected file rather than the file
+    /// still displayed under the diff cursor.
+    #[must_use]
+    pub fn focused_path(&self) -> Option<&RelPath> {
+        if !self.tree_focused {
+            return self.current_path();
+        }
+        let TreeKind::File { index } = &self.current_tree_row()?.kind else {
+            return None;
+        };
+        self.patch.files.get(*index)?.path()
+    }
+
     /// Scrolls the diff view by `delta` rows, dragging the cursor if it would be left
     /// outside the window.
     pub fn scroll_by(&mut self, delta: i32) {

@@ -107,6 +107,8 @@ pub enum Slot {
     Analysis,
     /// The analysis request itself (FR-4.1).
     Analyze,
+    /// Serial durable review-plan writes (FR-4.2, IR-14).
+    PlanSave,
     /// Reading the chat sessions for a pull request (FR-5.1).
     Chat,
     /// One chat answer (FR-5.2).
@@ -247,6 +249,13 @@ pub enum Job {
         /// agreed to send is what is sent.
         bundle: Box<crate::domain::context::Bundle>,
     },
+    /// Writes one immutable review-plan snapshot off the event-loop thread.
+    SavePlan {
+        /// Pull request whose durable review state is being written.
+        pr: u64,
+        /// Immutable state captured by the reducer.
+        plan: Box<crate::domain::plan::Plan>,
+    },
     /// Read a pull request's chat sessions (FR-5.1).
     LoadChat {
         /// Which pull request.
@@ -349,6 +358,7 @@ impl Job {
             // analysis", and a second request should replace the first.
             Self::LoadAnalysis { .. } | Self::GatherContext { .. } => Slot::Analysis,
             Self::RunAnalysis { .. } => Slot::Analyze,
+            Self::SavePlan { .. } => Slot::PlanSave,
             // Reading and writing are one slot: the list and the conversation are the
             // same resource, and a second request should replace the first.
             // Reading, gathering and asking are three slots: the first is about the
@@ -377,7 +387,10 @@ impl Job {
     fn is_ordered_save(&self) -> bool {
         matches!(
             self,
-            Self::SaveState { .. } | Self::SaveDraft { .. } | Self::DeleteDraft { .. }
+            Self::SaveState { .. }
+                | Self::SaveDraft { .. }
+                | Self::DeleteDraft { .. }
+                | Self::SavePlan { .. }
         )
     }
 }
@@ -481,6 +494,11 @@ pub enum Outcome {
         run: Box<AnalysisRun>,
         /// Immutable cache identity captured before the job started (IR-12).
         key: Box<crate::ports::AnalysisKey>,
+    },
+    /// A review-plan snapshot was durably written.
+    PlanSaved {
+        /// Store revision assigned to the acknowledged snapshot.
+        document_revision: u64,
     },
     /// A pull request's sessions, and the one the caller asked to open (FR-5.1).
     ChatLoaded {
@@ -786,18 +804,9 @@ impl Executor {
                 }
             }
             Job::RunAnalysis { request, bundle } => {
-                let analyst = self.analyst();
-                let mut report = |update: AnalysisProgress| {
-                    sink.send(ProgressUpdate::Analysis(update));
-                };
-                match analyst.run(request, bundle, cancel, &mut report) {
-                    Ok(run) => Outcome::Analyzed {
-                        run: Box::new(run),
-                        key: Box::new(request.key.clone()),
-                    },
-                    Err(error) => Outcome::Failed(error.to_string()),
-                }
+                self.run_analysis(request, bundle, cancel, sink)
             }
+            Job::SavePlan { pr, plan } => self.save_plan(*pr, plan),
             Job::LoadChat { .. } | Job::GatherChat { .. } | Job::AskChat { .. } => {
                 self.chat_job(job, cancel, sink)
             }
@@ -1277,6 +1286,37 @@ impl Executor {
             &self.repo,
         )
     }
+
+    /// Runs and reports one analysis request.
+    fn run_analysis(
+        &self,
+        request: &AnalysisRequest,
+        bundle: &crate::domain::context::Bundle,
+        cancel: &Cancel,
+        sink: &ProgressSink<'_>,
+    ) -> Outcome {
+        let analyst = self.analyst();
+        let mut report = |update: AnalysisProgress| {
+            sink.send(ProgressUpdate::Analysis(update));
+        };
+        match analyst.run(request, bundle, cancel, &mut report) {
+            Ok(run) => Outcome::Analyzed {
+                run: Box::new(run),
+                key: Box::new(request.key.clone()),
+            },
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+
+    /// Persists one ordered plan snapshot away from the event loop.
+    fn save_plan(&self, pr: u64, plan: &crate::domain::plan::Plan) -> Outcome {
+        match self.analysis.put_plan(&self.repo, pr, plan) {
+            Ok(saved) => Outcome::PlanSaved {
+                document_revision: saved.document_revision,
+            },
+            Err(error) => Outcome::Failed(format!("could not save review progress: {error}")),
+        }
+    }
 }
 
 fn is_definite_forge_refusal(error: &crate::Error) -> bool {
@@ -1460,7 +1500,10 @@ impl JobRunner {
     /// the deadline. Callers may then restore the terminal without waiting forever.
     pub fn flush_persistence(&mut self, timeout: Duration) -> bool {
         for running in &mut self.running {
-            if !matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze) {
+            if !matches!(
+                running.slot,
+                Slot::State | Slot::DraftSave | Slot::PlanSave | Slot::Analyze
+            ) {
                 running.cancel.cancel();
             }
         }
@@ -1477,13 +1520,15 @@ impl JobRunner {
 
     /// Whether an ordered durable snapshot or cache-writing analysis is queued or running.
     fn has_pending_persistence(&self) -> bool {
-        self.running
+        self.running.iter().any(|running| {
+            matches!(
+                running.slot,
+                Slot::State | Slot::DraftSave | Slot::PlanSave | Slot::Analyze
+            )
+        }) || self
+            .queue
             .iter()
-            .any(|running| matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze))
-            || self
-                .queue
-                .iter()
-                .any(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze))
+            .any(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze))
     }
 
     /// Whether a slot has a job running or waiting.
@@ -2785,6 +2830,15 @@ mod tests {
             }
             .is_cancellable()
         );
+        let plan_save = Job::SavePlan {
+            pr: 141,
+            plan: Box::new(crate::domain::plan::Plan::heuristic(
+                "head",
+                &["src/a.rs".to_owned()],
+            )),
+        };
+        assert_eq!(plan_save.slot(), Slot::PlanSave);
+        assert!(plan_save.is_ordered_save());
     }
 
     #[test]

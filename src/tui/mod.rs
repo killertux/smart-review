@@ -626,25 +626,20 @@ fn apply_analysis_effect(
         }
 
         Effect::SavePlan(plan) => {
-            // A small, local write next to the analysis it belongs to: the same
-            // exception the config write-back gets, and it happens here because this
-            // is where the cache lives.
-            let Some(repo) = app
-                .environment()
-                .map(|environment| environment.repo.clone())
-            else {
+            let Some(plan) = app.take_plan_save(plan) else {
                 return true;
             };
             let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
                 return true;
             };
-            match app.analysis_cache.put_plan(&repo, pr, plan) {
-                Ok(saved) => app.set_plan(saved),
-                Err(error) => app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("could not save the review order: {error}"),
-                ),
-            }
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::SavePlan {
+                    pr,
+                    plan: Box::new(plan),
+                },
+            );
+            app.record_plan_save_job(id);
         }
 
         _ => return false,

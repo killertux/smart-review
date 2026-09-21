@@ -546,7 +546,12 @@ impl Plan {
             .collect();
     }
 
-    /// Carries human state to a new head only where the file change is provably equal.
+    /// Reconciles durable human state with a freshly derived plan.
+    ///
+    /// On the same head, review markers and manual ordering are copied directly: no
+    /// file has changed, including binary files whose patch cannot provide a useful
+    /// fingerprint. Across heads, state is carried only where fingerprints prove the
+    /// file change is identical (DEC-23).
     #[must_use]
     pub fn carry_forward(
         previous: &Self,
@@ -554,6 +559,16 @@ impl Plan {
         patch: &crate::domain::diff::Patch,
     ) -> Self {
         current.document_revision = previous.document_revision;
+        if previous.head_sha == current.head_sha {
+            current.file_reviews.clone_from(&previous.file_reviews);
+            if previous.overridden {
+                current.groups.clone_from(&previous.groups);
+                current.overridden = true;
+            }
+            current.override_invalidated = previous.override_invalidated;
+            return current;
+        }
+
         current.sync_file_reviews(patch);
         let old: BTreeMap<&str, &FileReview> = previous
             .file_reviews
@@ -587,6 +602,15 @@ impl Plan {
             }
         }
         current
+    }
+
+    /// Restores only the analysis-proposed ordering, preserving durable review state.
+    pub fn reset_order_from_analysis(&mut self, analysis: &Analysis) {
+        self.head_sha.clone_from(&analysis.head_sha);
+        self.source = PlanSource::Analysis;
+        self.groups.clone_from(&analysis.review_plan);
+        self.overridden = false;
+        self.override_invalidated = false;
     }
 
     /// The explicit status for a path.
@@ -676,8 +700,8 @@ pub fn file_fingerprints(parsed_patch: &crate::domain::diff::Patch) -> Vec<(Stri
                     canonical,
                     "{:?}:{}:{}:{}:{}\u{1}",
                     line.kind,
-                    line.old_line.map_or(0, |line| line),
-                    line.new_line.map_or(0, |line| line),
+                    line.old_line.unwrap_or(0),
+                    line.new_line.unwrap_or(0),
                     line.content,
                     line.no_newline
                 );
@@ -1180,8 +1204,7 @@ mod tests {
         previous.sync_file_reviews(&patch);
         assert!(previous.set_review_status("logo.png", ReviewStatus::Reviewed));
 
-        let mut same_head = previous.clone();
-        same_head.sync_file_reviews(&patch);
+        let same_head = Plan::carry_forward(&previous, Plan::heuristic("head1", &paths), &patch);
         assert_eq!(same_head.review_status("logo.png"), ReviewStatus::Reviewed);
 
         let current = Plan::heuristic("head2", &paths);
@@ -1190,6 +1213,26 @@ mod tests {
             carried.review_status("logo.png"),
             ReviewStatus::NeedsRevisit
         );
+    }
+
+    #[test]
+    fn ir_16_same_head_reanalysis_keeps_manual_order_and_progress() {
+        let patch = review_patch("new test");
+        let paths = patch_paths(&patch);
+        let mut previous = Plan::heuristic("head1", &paths);
+        previous.sync_file_reviews(&patch);
+        previous.document_revision = 7;
+        assert!(previous.set_review_status("src/a.rs", ReviewStatus::Reviewed));
+        let first_group = previous.groups[0].group.clone();
+        assert!(previous.move_group(&first_group, 1));
+        let expected_groups = previous.groups.clone();
+
+        let carried = Plan::carry_forward(&previous, Plan::heuristic("head1", &paths), &patch);
+
+        assert_eq!(carried.document_revision, 7);
+        assert_eq!(carried.review_status("src/a.rs"), ReviewStatus::Reviewed);
+        assert!(carried.overridden);
+        assert_eq!(carried.groups, expected_groups);
     }
 
     #[test]
