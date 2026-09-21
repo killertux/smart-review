@@ -20,7 +20,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP_HOME="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/shell.XXXXXX")"
-BIN="target/debug/smart-review"
+BIN="${SMART_REVIEW_BIN:-$ROOT/target/debug/smart-review}"
 cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then
     printf '  note: kept %s\n' "$TMP_HOME"
@@ -209,7 +209,7 @@ if command -v python3 >/dev/null 2>&1; then
     --cols 120 --rows 40 --log "$TMP_HOME/shell-tui.log" --ready 'smart-review' \
     --resize-steps "$RESIZE_STEPS" \
     --keys "$TUI_KEYS" --waits "$TUI_WAITS" -- \
-    "$ROOT/$BIN" >"$TMP_HOME/shell-tui-screen.log"
+    "$BIN" >"$TMP_HOME/shell-tui-screen.log"
   TUI_CODE=$?
   set -e
 
@@ -279,7 +279,7 @@ if command -v python3 >/dev/null 2>&1; then
     SMART_REVIEW_HOME="$PTY_HOME" python3 "$ROOT/scripts/validate/drive.py" \
       --cols 120 --rows 40 --log "$TMP_HOME/shell-restore.log" --ready 'smart-review' \
       --keys ':theme\r~\e~:q\r' --waits '\* light~~' -- \
-      "$ROOT/$BIN" >"$TMP_HOME/shell-restore-screen.log"
+      "$BIN" >"$TMP_HOME/shell-restore-screen.log"
     RESTORE_CODE=$?
     set -e
     if [ "$RESTORE_CODE" -eq 0 ] \

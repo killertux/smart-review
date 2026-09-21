@@ -33,7 +33,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/review-collaboration.XXXXXX")"
-BIN="target/debug/smart-review"
+BIN="${SMART_REVIEW_BIN:-$ROOT/target/debug/smart-review}"
 
 cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then
@@ -307,7 +307,7 @@ run_tui() {
       --timeout 90 --step-timeout 12 --settle 0.1 \
       --ready "Add retry to the webhook dispatcher" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+      "$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
   if [ "$driver_code" -ne 0 ]; then
     touch "$TMP/driver.failed"
   fi

@@ -10,6 +10,14 @@ cd "$ROOT"
 source "$ROOT/scripts/validate/common.sh"
 validation_mode "$@" || exit $?
 
+if [ -z "${SMART_REVIEW_BIN:-}" ]; then
+  TARGET_DIR="$(cargo metadata --no-deps --format-version 1 \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')" \
+    || exit 1
+  SMART_REVIEW_BIN="$TARGET_DIR/debug/smart-review"
+fi
+export SMART_REVIEW_BIN
+
 HARNESS_STARTED="$(python3 -c 'import time; print(time.monotonic_ns())')"
 printf '\n== terminal harness tests ==\n'
 python3 "$ROOT/scripts/validate/test_harness.py" || exit 1
@@ -19,6 +27,9 @@ RUST_TEST_MS="${SMART_REVIEW_RUST_TEST_MS:-}"
 
 printf '\n== documentation ==\n'
 python3 "$ROOT/scripts/validate/docs.py" || exit 1
+
+printf '\n== release installer ==\n'
+bash "$ROOT/scripts/validate/installer.sh" || exit 1
 
 if [ "${SMART_REVIEW_SKIP_CARGO:-0}" != "1" ]; then
   printf '\n== shared Cargo gates ==\n'

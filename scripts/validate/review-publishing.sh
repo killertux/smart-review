@@ -30,7 +30,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/review-publishing.XXXXXX")"
-BIN="target/debug/smart-review"
+BIN="${SMART_REVIEW_BIN:-$ROOT/target/debug/smart-review}"
 FIXTURES="$ROOT/tests/fixtures/gh"
 
 cleanup() {
@@ -249,7 +249,7 @@ run_tui() {
         --step-notify "$DRIVE_STEP_NOTIFY" \
         --ready "Add retry to the webhook dispatcher" \
         --keys "$keys" --waits "$waits" -- \
-        "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+        "$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
   else
     PATH="$FAKE:$PATH" SMART_REVIEW_HOME="$home" \
       python3 "$ROOT/scripts/validate/drive.py" \
@@ -257,7 +257,7 @@ run_tui() {
         --timeout 90 --step-timeout 12 --settle "${DRIVE_SETTLE:-0.1}" \
         --ready "Add retry to the webhook dispatcher" \
         --keys "$keys" --waits "$waits" -- \
-        "$ROOT/$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
+        "$BIN" --repo acme/service --path "$REPO/clone" "$@" || driver_code=$?
   fi
   if [ "$driver_code" -ne 0 ]; then
     touch "$TMP/driver.failed"
