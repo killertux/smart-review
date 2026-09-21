@@ -23,7 +23,7 @@ bad() { printf '  FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 step() { printf '\n== %s ==\n' "$1"; }
 
 TMP="$(mktemp -d "${SMART_REVIEW_VALIDATION_TMP:-${TMPDIR:-/tmp}}/pull-requests.XXXXXX")"
-BIN="target/debug/smart-review"
+BIN="${SMART_REVIEW_BIN:-$ROOT/target/debug/smart-review}"
 FIXTURES="$ROOT/tests/fixtures/gh"
 cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then
@@ -123,7 +123,7 @@ run_tui() {
       --cols 160 --rows 40 --log "$log" \
       --ready "$ready" \
       --keys "$keys" --waits "$waits" -- \
-      "$ROOT/$BIN" --repo acme/service || driver_code=$?
+      "$BIN" --repo acme/service || driver_code=$?
   if [ "$driver_code" -ne 0 ]; then
     touch "$TMP/driver.failed"
   fi
@@ -230,7 +230,7 @@ mkdir -p "$DETECT_HOME" "$TMP/not-a-repo"
 
 # Outside a clone and without `--repo`, the failure is specific and actionable.
 set +e
-(cd "$TMP/not-a-repo" && SMART_REVIEW_HOME="$DETECT_HOME" "$ROOT/$BIN" --check) \
+(cd "$TMP/not-a-repo" && SMART_REVIEW_HOME="$DETECT_HOME" "$BIN" --check) \
   >"$TMP/pull-requests-check.log" 2>&1
 CHECK_CODE=$?
 set -e
@@ -261,7 +261,7 @@ cat >"$TMP/nogh/config.toml" <<'TOML'
 gh_path = "/nonexistent/gh-for-pull-requests-validation"
 TOML
 set +e
-SMART_REVIEW_HOME="$TMP/nogh" "$ROOT/$BIN" --check --repo acme/service >"$TMP/pull-requests-nogh.log" 2>&1
+SMART_REVIEW_HOME="$TMP/nogh" "$BIN" --check --repo acme/service >"$TMP/pull-requests-nogh.log" 2>&1
 NOGH_CODE=$?
 set -e
 
@@ -440,7 +440,7 @@ else
     python3 "$ROOT/scripts/validate/drive.py" \
       --cols 160 --rows 40 --log "$TMP/pull-requests-signal.log" \
       --ready "Add retry to the webhook dispatcher" -- \
-      "$ROOT/$BIN" --repo acme/service >/dev/null
+      "$BIN" --repo acme/service >/dev/null
   SIGNAL_CODE=$?
   set -e
 

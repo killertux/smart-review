@@ -12,9 +12,10 @@ Run the same complete gate used for review:
 scripts/validate/all.sh
 ```
 
-It runs terminal-driver unit tests, local Markdown-link validation, format, Clippy with
-warnings denied, all Rust tests/features, one debug build, then six named smoke validators
-against that binary. CI performs the same stages once and records Rust/smoke timings.
+It runs terminal-driver unit tests, local Markdown-link and release-installer validation,
+format, Clippy with warnings denied, all Rust tests/features, one debug build, then six
+named smoke validators against that binary. CI performs the same stages once and records
+Rust/smoke timings.
 
 During iteration, run the smallest relevant Rust filter or validator, then run the
 complete gate before declaring the change done:

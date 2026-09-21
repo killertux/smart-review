@@ -13,6 +13,25 @@ and an explicit preview before anything is posted to GitHub.
 
 ## Install and run
 
+Install the latest native release to `~/.local/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/killertux/smart-review/main/install.sh | sh
+```
+
+The installer selects Linux x86_64, macOS Intel, or macOS Apple Silicon, verifies the
+release checksum, and prints a PATH reminder when needed. To choose another writable
+destination without `sudo`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/killertux/smart-review/main/install.sh \
+  | SMART_REVIEW_INSTALL_DIR="$HOME/bin" sh
+```
+
+To build from source instead:
+
 ```sh
 git clone https://github.com/killertux/smart-review.git
 cd smart-review

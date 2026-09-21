@@ -91,9 +91,9 @@ jobs:
           fi
 
       # Cargo's deterministic gates already passed above. The aggregate runner checks
-      # local documentation links, then executes only the named wiring smoke contracts
-      # against temporary repositories, fake services and reconstructed PTY screens.
-      - name: Documentation and named wiring smoke
+      # documentation links and the release installer, then executes the named wiring
+      # smoke against temporary repositories, fake services and reconstructed screens.
+      - name: Documentation, installer and named wiring smoke
         env:
           SMART_REVIEW_VALIDATION_OUTPUT: ${{ runner.temp }}/smart-review-validation
         run: bash scripts/validate/all.sh --smoke-only

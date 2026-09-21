@@ -3,7 +3,7 @@ resolver = "3"
 
 [package]
 name = "smart-review"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Ratatui 0.30.2 declares rust-version 1.88.0, and it is the highest in the tree,
 # so the real MSRV is 1.88 rather than the edition-2024 minimum of 1.85.
