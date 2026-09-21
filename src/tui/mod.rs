@@ -626,9 +626,6 @@ fn apply_analysis_effect(
         }
 
         Effect::SavePlan(plan) => {
-            let Some(plan) = app.take_plan_save(plan) else {
-                return true;
-            };
             let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
                 return true;
             };
@@ -636,7 +633,7 @@ fn apply_analysis_effect(
                 review_job_owner(app),
                 jobs::Job::SavePlan {
                     pr,
-                    plan: Box::new(plan),
+                    plan: plan.clone(),
                 },
             );
             app.record_plan_save_job(id);

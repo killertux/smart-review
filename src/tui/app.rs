@@ -526,8 +526,6 @@ pub struct PanelState {
     pub plan: Option<crate::domain::plan::Plan>,
     /// The durable plan write currently allowed to acknowledge this review session.
     pub plan_save_job: u64,
-    /// Whether a newer in-memory plan must be saved after the current write finishes.
-    pub plan_save_pending: bool,
     /// The job id of the run (FR-4.4).
     pub job: u64,
     /// The job id of the context gather (FR-4.6).
@@ -1813,19 +1811,14 @@ impl App {
                 self.state_saved(job, revision);
                 None
             }
-            Outcome::PlanSaved { document_revision } if job == self.panel.plan_save_job => {
+            Outcome::PlanSaved {
+                document_revision, ..
+            } if job == self.panel.plan_save_job => {
                 self.panel.plan_save_job = 0;
                 if let Some(plan) = self.panel.plan.as_mut() {
-                    plan.document_revision = document_revision;
+                    plan.document_revision = plan.document_revision.max(document_revision);
                 }
-                if std::mem::take(&mut self.panel.plan_save_pending) {
-                    self.panel
-                        .plan
-                        .clone()
-                        .map(|plan| Effect::SavePlan(Box::new(plan)))
-                } else {
-                    None
-                }
+                None
             }
             Outcome::Environment(environment) if job == self.environment_job => {
                 self.set_environment(*environment);
@@ -4435,20 +4428,6 @@ impl App {
         self.apply_plan_to_review();
     }
 
-    /// Captures the latest plan snapshot, coalescing edits behind an active write.
-    pub(crate) fn take_plan_save(
-        &mut self,
-        plan: &crate::domain::plan::Plan,
-    ) -> Option<crate::domain::plan::Plan> {
-        if self.panel.plan_save_job != 0 {
-            self.panel.plan_save_pending = true;
-            None
-        } else {
-            self.panel.plan_save_pending = false;
-            Some(plan.clone())
-        }
-    }
-
     /// Records the ordered background write for the current plan snapshot.
     pub(crate) fn record_plan_save_job(&mut self, job: u64) {
         self.panel.plan_save_job = job;
@@ -4880,7 +4859,6 @@ impl App {
     fn report_job_failure(&mut self, job: u64, message: &str) {
         if job == self.panel.plan_save_job {
             self.panel.plan_save_job = 0;
-            self.panel.plan_save_pending = true;
             self.notice(
                 NoticeLevel::Warn,
                 format!(
@@ -8268,41 +8246,6 @@ mod tests {
         });
         assert_eq!(app.panel.state, AnalysisState::Cancelled);
         assert!(app.panel.analysis.is_none(), "late success is discarded");
-    }
-
-    #[test]
-    fn ir_16_plan_saves_coalesce_and_continue_from_the_acknowledged_revision() {
-        let (_dir, mut app) = draft_app();
-        let first = crate::domain::plan::Plan::heuristic("abc123", &["src/a.rs".to_owned()]);
-        app.set_plan(first.clone());
-        assert_eq!(app.take_plan_save(&first), Some(first));
-        app.record_plan_save_job(7);
-
-        let mut latest = app.plan().expect("active plan").clone();
-        latest.overridden = true;
-        app.set_plan(latest.clone());
-        assert_eq!(
-            app.take_plan_save(&latest),
-            None,
-            "the newer edit coalesces"
-        );
-        assert!(app.panel.plan_save_pending);
-
-        let follow_up = app.apply_completion(crate::tui::jobs::Completion {
-            progress_through: 0,
-            job: 7,
-            owner: crate::tui::jobs::JobOwner::Global,
-            outcome: crate::tui::jobs::Outcome::PlanSaved {
-                document_revision: 4,
-            },
-        });
-        let Some(Effect::SavePlan(pending)) = follow_up else {
-            panic!("the latest coalesced plan must be saved next")
-        };
-        assert!(pending.overridden, "the latest edit, not the old snapshot");
-        assert_eq!(pending.document_revision, 4);
-        assert_eq!(app.panel.plan_save_job, 0);
-        assert!(!app.panel.plan_save_pending);
     }
 
     #[test]
