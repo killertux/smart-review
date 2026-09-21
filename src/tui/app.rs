@@ -1871,8 +1871,15 @@ impl App {
                     self.apply_context_patch(outcome.value().patch.clone());
                 }
                 let patch_effect = self.apply_patch(*outcome, source, head_sha);
-                if load_analysis && patch_effect == Effect::LoadDraft {
-                    Some(Effect::LoadAnalysisAndDraft)
+                if load_analysis {
+                    Some(if patch_effect == Effect::LoadDraft {
+                        Effect::LoadAnalysisAndDraft
+                    } else {
+                        // Workspace arrival changes the context identity from remote-only
+                        // to local. Re-read that identity's cache after the canonical local
+                        // patch lands rather than leaving the earlier remote miss in force.
+                        Effect::LoadAnalysis
+                    })
                 } else {
                     Some(patch_effect)
                 }
@@ -8400,6 +8407,32 @@ mod tests {
         assert_eq!(app.chat.input.text(), "why?");
     }
 
+    #[test]
+    fn fr_4_3_local_patch_refresh_reloads_the_workspace_keyed_analysis() {
+        let (_dir, mut app) = draft_app();
+        app.drafts.open = true;
+        app.drafts.draft.pr = 141;
+        app.patch_job = 41;
+        app.context_patch_job = 41;
+        app.diff_loading = true;
+        let patch = app.review.as_ref().expect("review").patch.clone();
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            progress_through: 0,
+            owner: crate::tui::jobs::JobOwner::Global,
+            job: 41,
+            outcome: crate::tui::jobs::Outcome::Patch {
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(DiffView::new(
+                    patch,
+                ))),
+                source: crate::domain::diff::DiffSource::Worktree,
+                head_sha: "abc123".to_owned(),
+            },
+        });
+
+        assert_eq!(effect, Some(Effect::LoadAnalysis));
+    }
+
     /// An app with a two-file patch open, whose second file is the one to comment on.
     fn draft_app() -> (TempHome, App) {
         let (dir, mut app) = list_app();
@@ -8774,8 +8807,8 @@ mod tests {
 
         assert_eq!(
             effect,
-            Some(Effect::None),
-            "a same-review refresh does not reload disk state"
+            Some(Effect::LoadAnalysis),
+            "a same-review refresh reloads analysis state but not the draft"
         );
         let composer = app.drafts.composer.as_ref().expect("writing survives");
         assert_eq!(composer.input.text(), "keep this exact sentence");

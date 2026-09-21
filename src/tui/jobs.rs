@@ -70,10 +70,16 @@ const PROGRESS_BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
 /// what ARCH-5 allows.
 pub const MAX_IN_FLIGHT: usize = 4;
 
-/// Disambiguates operation records created in one process. The durable store still
-/// rejects a collision after restart rather than assuming this local counter is an API
-/// idempotency key (IR-07).
+/// Disambiguates operation records created in one process. The process id added by
+/// [`mutation_operation_id`] extends that distinction across rapid restarts (IR-07).
 static NEXT_MUTATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn mutation_operation_id(seconds: u64, process_id: u32, serial: u64) -> String {
+    // The serial is process-local. Including the PID prevents two short-lived app
+    // processes started in the same second from producing the same durable operation
+    // id and incorrectly blocking the second confirmed mutation (IR-07).
+    format!("{seconds}-{process_id}-{serial}")
+}
 
 /// Which kind of work a job is, one at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1182,7 +1188,7 @@ impl Executor {
         let now = crate::domain::time::from_unix_secs(i64::try_from(seconds).unwrap_or(i64::MAX));
         let serial = NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed);
         let mut operation = crate::domain::mutation::MutationOperation::queued(
-            format!("{seconds}-{serial}"),
+            mutation_operation_id(seconds, std::process::id(), serial),
             self.repo.clone(),
             pr,
             head_sha,
@@ -2214,6 +2220,14 @@ pub fn job_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ir_07_mutation_ids_differ_across_processes_started_in_the_same_second() {
+        assert_ne!(
+            mutation_operation_id(100, 41, 1),
+            mutation_operation_id(100, 42, 1)
+        );
+    }
     use crate::domain::pr::{CheckRun, CheckSummary, PrState, PullRequestSummary};
     use crate::ports::forge::ForgeCapabilities;
     use crate::ports::workspace::RepoInfo;
