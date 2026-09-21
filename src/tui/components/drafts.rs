@@ -283,7 +283,7 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
 
     let decision = drafts.draft.effective_decision();
     // One modal, two subjects (FR-6.3, FR-6.4): a review and a reply are both words
-    // about to go to GitHub, and both get the same two Enters. The title is what differs,
+    // about to go to GitHub, and both get one explicit action after preview. The title differs,
     // because what differs is the only thing that must not be got wrong.
     let mut title = match drafts.post.as_ref() {
         Some(post) => format!(
@@ -357,19 +357,14 @@ pub fn render_modal(frame: &mut Frame<'_>, area: Rect, app: &App, drafts: &Draft
             " Enter records the commands in logs/dry-run.log".to_owned(),
             theme.style(element::MUTED),
         )));
-    } else if drafts.armed {
-        footer.push(Line::from(Span::styled(
-            " Enter again sends it to GitHub".to_owned(),
-            theme.style(element::NOTICE_WARN),
-        )));
-        footer.push(Line::from(Span::styled(
-            decision_keys(drafts),
-            theme.style(element::MUTED),
-        )));
     } else {
         footer.push(Line::from(Span::styled(
-            " Enter to review it once more, then Enter again to send".to_owned(),
-            theme.style(element::FG),
+            if drafts.post.is_some() {
+                " Enter posts this exact comment to GitHub".to_owned()
+            } else {
+                " Enter publishes this exact review to GitHub".to_owned()
+            },
+            theme.style(element::NOTICE_WARN),
         )));
         footer.push(Line::from(Span::styled(
             decision_keys(drafts),

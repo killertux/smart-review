@@ -582,6 +582,7 @@ fn apply_analysis_effect(
                 return true;
             };
             app.panel.state = app::AnalysisState::Gathering;
+            app.panel.started_at = app.now_unix_secs();
             let id = runner.submit_owned(
                 review_job_owner(app),
                 jobs::Job::GatherContext {
@@ -625,25 +626,17 @@ fn apply_analysis_effect(
         }
 
         Effect::SavePlan(plan) => {
-            // A small, local write next to the analysis it belongs to: the same
-            // exception the config write-back gets, and it happens here because this
-            // is where the cache lives.
-            let Some(repo) = app
-                .environment()
-                .map(|environment| environment.repo.clone())
-            else {
-                return true;
-            };
             let Some(pr) = app.detail.as_ref().map(|detail| detail.summary.number) else {
                 return true;
             };
-            match app.analysis_cache.put_plan(&repo, pr, plan) {
-                Ok(saved) => app.set_plan(saved),
-                Err(error) => app.notice(
-                    app::NoticeLevel::Warn,
-                    format!("could not save the review order: {error}"),
-                ),
-            }
+            let id = runner.submit_owned(
+                review_job_owner(app),
+                jobs::Job::SavePlan {
+                    pr,
+                    plan: plan.clone(),
+                },
+            );
+            app.record_plan_save_job(id);
         }
 
         _ => return false,
@@ -1092,7 +1085,6 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             } else if app.drafts.job != 0 {
                 runner.cancel(jobs::Slot::Review);
             }
-            app.drafts.armed = false;
             app.notice(
                 app::NoticeLevel::Warn,
                 "cancelling the request; its result will determine whether it can be retried",

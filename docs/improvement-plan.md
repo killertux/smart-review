@@ -124,7 +124,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | [Open — PR #26](https://github.com/killertux/smart-review/pull/26) |
 | [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | [Merged — PR #27](https://github.com/killertux/smart-review/pull/27) |
 | [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Implemented locally (`ir-15-terminal-harness`) |
-| [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Not started |
+| [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Implemented locally; owner walkthrough pending |
 | [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Not started |
 | [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | Not started |
 | [IR-19](#ir-19-replace-milestone-docs-with-a-small-living-product-contract) | P3 | Accurate product, architecture and testing documentation | IR-01 through IR-18 | M | Not started |
@@ -1464,39 +1464,39 @@ accessible. Human progress is explicit and never inferred from AI completion.
 
 ### Implementation steps
 
-1. [ ] Use the HTML mockup and §3.5 as the product baseline, with actual terminal widths.
+1. [x] Use the HTML mockup and §3.5 as the product baseline, with actual terminal widths.
    Confirm material behavior changes with the owner, including grouping semantics,
    reviewed markers and any confirmation simplification. Record approved decisions.
-2. [ ] Evolve the structured output contract with a prompt/schema version bump:
+2. [x] Evolve the structured output contract with a prompt/schema version bump:
    - PR brief: approximately two concise sentences.
    - Inferred purpose, clearly separate from the author's description.
    - Review steps with human names, ordered files and a one-sentence rationale.
    - Per-file `what`, inferred `why`, up to two concrete checks and evidence references.
    - Explicit coverage/limitations and suggested follow-up questions.
-3. [ ] Guide the model toward short fields, but keep full useful text in an expandable
+3. [x] Guide the model toward short fields, but keep full useful text in an expandable
    detail view instead of silently discarding an overlong response. Bound parsing/
    rendering and retain the existing one-repair/diagnostic behavior.
-4. [ ] Remove the blanket prompt rule “tests and docs last.” Ask for a dependency/
+4. [x] Remove the blanket prompt rule “tests and docs last.” Ask for a dependency/
    understanding sequence that fits this PR: contract/examples may lead, tests may
    accompany behavior, generated/mechanical changes may follow but stay included.
-5. [ ] Keep ordering advisory. Show AI/heuristic/user provenance, an immediately visible
+5. [x] Keep ordering advisory. Show AI/heuristic/user provenance, an immediately visible
    path-order toggle, and exact changed-file coverage. Preserve current selection when
    partial/final analysis arrives; do not jump the reviewer away automatically.
-6. [ ] Overview shows the brief and full plan. Files shows a compact current-file
+6. [x] Overview shows the brief and full plan. Files shows a compact current-file
    explanation near the diff: What / Why (inferred) / Verify. At 80×24 collapse to
    a few lines with an explicit expand action; the code remains the main surface.
-7. [ ] Evidence links jump to validated files/coordinates. Missing evidence or truncated
+7. [x] Evidence links jump to validated files/coordinates. Missing evidence or truncated
    source is visible. Suggested questions enter the compose box for user review;
    they do not auto-send paid requests.
-8. [ ] Add explicit human review markers: not reviewed, reviewed, needs revisit.
+8. [x] Add explicit human review markers: not reviewed, reviewed, needs revisit.
    Bind them to a stable file-change fingerprint. On a new head, carry over only
    provably unchanged changes; changed/ambiguous files need revisit. Never mark a file
    reviewed merely because the LLM analyzed it or the cursor passed through it.
-9. [ ] Preserve manual plan overrides and markers durably. Explain invalidated overrides
+9. [x] Preserve manual plan overrides and markers durably. Explain invalidated overrides
    after revision changes and offer reset without silently replacing user choices.
-10. [ ] Show analysis phase, elapsed time, model/settings, cache age, current/stale status
+10. [x] Show analysis phase, elapsed time, model/settings, cache age, current/stale status
     and partial coverage without overwhelming the normal reading view.
-11. [ ] Add offline/no-model/failed-model journeys: browsing, checks, discussion and local
+11. [x] Add offline/no-model/failed-model journeys: browsing, checks, discussion and local
     drafting remain useful; AI setup and retry have clear next actions.
 
 ### Required regression cases
@@ -1523,6 +1523,17 @@ order, ungrounded links, auto-spend or falsely preserved human review progress.
 
 **Gates:** shared gates, normalization/prompt contract tests, reviewed UI snapshots and
 guided-review smoke. Owner review of actual 80×24 and wide-terminal output is required.
+
+**Owner decisions (2026-09-18, recorded as DEC-23):** use contextual semantic
+multi-file steps; carry human markers across a new head only when the file-change
+fingerprint is identical, otherwise mark prior human work `needs revisit`; replace the
+old arming Enter with one clearly labelled Publish/Post action after immutable preview.
+
+**Implementation status (2026-09-18):** implemented on `ir-16-guided-review`. The
+required formatting, Clippy, full test and aggregate validator gates pass, including the
+40-check guided-analysis scenario and one-action publish/reply/conversation scenarios.
+The owner walkthrough across the three PR archetypes remains manual acceptance, not an
+automated claim.
 
 ---
 
@@ -1945,7 +1956,7 @@ of hard guarantees still require explicit approval.
 |---|---|---|
 | Source repository isolation | App-owned object store; honor the existing no-.git-write rule | IR-13; ask only if proposing to relax that rule |
 | Legacy user-linked worktree cleanup | Read/identify; provide manual owner cleanup instead of automatically mutating source .git | IR-13 |
-| Single publish confirmation vs two Enters | Keep current confirmation until owner approves one clear explicit Publish action | IR-07 / IR-16 |
+| Single publish confirmation vs two Enters | One clearly labelled Publish/Post action after immutable preview (DEC-23) | IR-07 / IR-16 |
 | Request budget semantics | Explicit user ceilings plus catalog capacity, with full framing/output accounting | IR-03; document and resolve affected DEC/FR contradictions |
 | Context and display toggles | Canonical review context independent of visual whitespace hiding; explicit context controls affect manifest | IR-12 |
 | Concurrent app instances | Preserve data with conflict detection/serialization; no silent overwrite | IR-06; dependency approval if needed |

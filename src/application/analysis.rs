@@ -633,6 +633,14 @@ pub struct PanelModel {
     pub risks: Vec<PanelRisk>,
     /// The questions worth asking the author.
     pub questions: Vec<String>,
+    /// Human-named reading steps in model order.
+    pub steps: Vec<PanelStep>,
+    /// Canonical files the model says it analyzed.
+    pub analyzed_files: Vec<String>,
+    /// Files whose source was incomplete.
+    pub truncated_files: Vec<String>,
+    /// Explicit limits on the answer.
+    pub limitations: Vec<String>,
 }
 
 impl PanelModel {
@@ -640,10 +648,14 @@ impl PanelModel {
     #[must_use]
     pub fn of(analysis: &Analysis) -> Self {
         Self {
-            summary: analysis.summary.clone(),
-            intent: analysis.intent.clone(),
+            summary: analysis.brief.clone(),
+            intent: analysis.inferred_purpose.clone(),
             risks: analysis.risk_areas.iter().map(PanelRisk::of).collect(),
             questions: analysis.suggested_questions.clone(),
+            steps: analysis.review_plan.iter().map(PanelStep::of).collect(),
+            analyzed_files: analysis.coverage.analyzed_files.clone(),
+            truncated_files: analysis.coverage.truncated_files.clone(),
+            limitations: analysis.coverage.limitations.clone(),
         }
     }
 
@@ -654,6 +666,71 @@ impl PanelModel {
             && self.intent.is_empty()
             && self.risks.is_empty()
             && self.questions.is_empty()
+            && self.steps.is_empty()
+    }
+}
+
+/// One reviewer-facing reading step (IR-16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelStep {
+    /// One-based position.
+    pub order: u32,
+    /// Human action-oriented name.
+    pub name: String,
+    /// Why it comes at this point.
+    pub rationale: String,
+    /// Exact changed files covered by the step.
+    pub files: Vec<String>,
+}
+
+impl PanelStep {
+    fn of(group: &crate::domain::analysis::PlanGroup) -> Self {
+        Self {
+            order: group.order,
+            name: group.group.clone(),
+            rationale: group.rationale.clone(),
+            files: group.files.clone(),
+        }
+    }
+}
+
+/// Compact guidance shown beside the current file (IR-16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileGuidance {
+    /// Canonical current path.
+    pub path: String,
+    /// Concise description of the change.
+    pub what_changed: String,
+    /// Model inference, always labeled as such in the UI.
+    pub inferred_why: String,
+    /// Concrete checks; excess useful model output remains available when expanded.
+    pub verify: Vec<String>,
+    /// Validated changed-file evidence.
+    pub evidence: Vec<crate::domain::analysis::Evidence>,
+    /// Whether the model supplied no note for this changed file.
+    pub missing: bool,
+    /// Whether source for this file was reported truncated.
+    pub truncated: bool,
+}
+
+impl FileGuidance {
+    /// Builds honest guidance even when the model omitted the current file.
+    #[must_use]
+    pub fn of(analysis: &Analysis, path: &str) -> Self {
+        let note = analysis.note(path);
+        Self {
+            path: path.to_owned(),
+            what_changed: note.map_or_else(String::new, |note| note.what_changed.clone()),
+            inferred_why: note.map_or_else(String::new, |note| note.why.clone()),
+            verify: note.map_or_else(Vec::new, |note| note.verify.clone()),
+            evidence: note.map_or_else(Vec::new, |note| note.evidence.clone()),
+            missing: note.is_none(),
+            truncated: analysis
+                .coverage
+                .truncated_files
+                .iter()
+                .any(|candidate| candidate == path),
+        }
     }
 }
 
@@ -864,7 +941,7 @@ mod tests {
         let AnalysisRun::Ready(ready) = outcome else {
             panic!("expected a ready analysis, got {outcome:?}");
         };
-        assert_eq!(ready.analysis.summary, "Billing rounds half up now.");
+        assert_eq!(ready.analysis.brief, "Billing rounds half up now.");
         // FR-4.3: the document records the model, the commit and what it cost.
         assert_eq!(ready.analysis.head_sha, "abc123");
         assert_eq!(ready.analysis.model, "deepseek/deepseek-v4-pro");
@@ -907,7 +984,7 @@ mod tests {
             panic!("expected a repaired analysis, got {outcome:?}");
         };
         assert!(ready.repaired, "the panel says a retry happened");
-        assert_eq!(ready.analysis.summary, "Billing rounds half up now.");
+        assert_eq!(ready.analysis.brief, "Billing rounds half up now.");
         // The second attempt's usage is added, not lost.
         assert_eq!(ready.analysis.token_usage.prompt, 20);
         let progress = progress.into_inner().expect("lock");
@@ -1465,7 +1542,7 @@ mod tests {
             .expect("reads")
             .expect("the older analysis is found");
         assert_eq!(stale.key.head_sha, "abc123");
-        assert_eq!(stale.analysis.summary, "Billing rounds half up now.");
+        assert_eq!(stale.analysis.brief, "Billing rounds half up now.");
 
         // A different model is not a stale version of this one: it is another question.
         let other = AnalysisKey {

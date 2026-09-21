@@ -13,11 +13,15 @@
 //! - **the user wins.** A group moved by hand stays moved: the override is kept with
 //!   the analysis, `overridden` records that it happened, and re-deriving the plan from
 //!   the same analysis never silently discards it (FR-4.2).
-//! - **an override is bound to the head it was made against.** New commits mean a new
-//!   set of files, so a stale override is dropped rather than applied to a plan whose
-//!   files it no longer describes.
+//! - **an override is bound to exact file changes.** A new head keeps it only when all
+//!   file-change fingerprints still match; otherwise the derived plan wins and the UI
+//!   explains the reset.
 //!
-//! Pure: no IO, no terminal, no diff model (NFR-5.2).
+//! Pure: no IO or terminal knowledge; the domain diff is its only change input
+//! (NFR-5.2).
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +67,63 @@ pub enum PlanSource {
     Analysis,
     /// Path rules, because there is no analysis (FR-3.5's fallback).
     Heuristic,
+}
+
+/// Human review progress for one changed file (IR-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    /// The reviewer has not explicitly completed this file.
+    #[default]
+    NotReviewed,
+    /// The reviewer explicitly completed this exact file change.
+    Reviewed,
+    /// The reviewer wants to return, or the previously reviewed change moved.
+    NeedsRevisit,
+}
+
+impl ReviewStatus {
+    /// Compact marker shown beside a file.
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::NotReviewed => "□",
+            Self::Reviewed => "✓",
+            Self::NeedsRevisit => "!",
+        }
+    }
+
+    /// Human-readable status.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotReviewed => "not reviewed",
+            Self::Reviewed => "reviewed",
+            Self::NeedsRevisit => "needs revisit",
+        }
+    }
+
+    /// The next explicit state for the default `m` action.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::NotReviewed => Self::Reviewed,
+            Self::Reviewed => Self::NeedsRevisit,
+            Self::NeedsRevisit => Self::NotReviewed,
+        }
+    }
+}
+
+/// Durable human state bound to an exact file change (IR-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileReview {
+    /// Canonical changed-file path.
+    pub path: String,
+    /// Stable digest of the file's changed content and coordinates.
+    pub fingerprint: String,
+    /// Explicit human progress; never inferred from AI or cursor movement.
+    #[serde(default)]
+    pub status: ReviewStatus,
 }
 
 impl PlanSource {
@@ -217,6 +278,12 @@ pub struct Plan {
     /// Whether the user has moved anything by hand.
     #[serde(default)]
     pub overridden: bool,
+    /// Human review markers, including the fingerprint that makes carryover safe.
+    #[serde(default)]
+    pub file_reviews: Vec<FileReview>,
+    /// Whether a manual order could not safely be carried to this revision.
+    #[serde(default)]
+    pub override_invalidated: bool,
 }
 
 impl Plan {
@@ -229,6 +296,8 @@ impl Plan {
             source: PlanSource::Analysis,
             groups: analysis.review_plan.clone(),
             overridden: false,
+            file_reviews: Vec::new(),
+            override_invalidated: false,
         }
     }
 
@@ -284,6 +353,8 @@ impl Plan {
             source: PlanSource::Heuristic,
             groups,
             overridden: false,
+            file_reviews: Vec::new(),
+            override_invalidated: false,
         }
     }
 
@@ -402,26 +473,43 @@ impl Plan {
     /// asked for a heading, and inventing one is friendlier than an error message
     /// listing the ones that do exist.
     pub fn pin_file(&mut self, path: &str, group: &str) -> bool {
-        let name = group.trim().to_lowercase().replace(' ', "-");
+        let name = group.trim();
         if name.is_empty() || path.trim().is_empty() {
             return false;
         }
-        if self.group_of(path) == Some(name.as_str()) {
+        if self
+            .group_of(path)
+            .is_some_and(|current| current.eq_ignore_ascii_case(name))
+        {
             return false;
         }
+        let existing_name = self
+            .groups
+            .iter()
+            .find(|existing| existing.group.eq_ignore_ascii_case(name))
+            .map(|existing| existing.group.clone());
+        let target_name = existing_name.unwrap_or_else(|| name.to_owned());
         for existing in &mut self.groups {
             existing.files.retain(|file| file != path);
         }
-        if !self.groups.iter().any(|existing| existing.group == name) {
+        if !self
+            .groups
+            .iter()
+            .any(|existing| existing.group == target_name)
+        {
             let order = u32::try_from(self.groups.len() + 1).unwrap_or(u32::MAX);
             self.groups.push(PlanGroup {
                 order,
-                group: name.clone(),
+                group: target_name.clone(),
                 rationale: "added by hand".to_owned(),
                 files: Vec::new(),
             });
         }
-        if let Some(target) = self.groups.iter_mut().find(|g| g.group == name) {
+        if let Some(target) = self
+            .groups
+            .iter_mut()
+            .find(|group| group.group == target_name)
+        {
             target.files.push(path.to_owned());
             target.files.sort();
             target.files.dedup();
@@ -438,12 +526,213 @@ impl Plan {
         !self.head_sha.is_empty() && self.head_sha == head_sha
     }
 
+    /// Ensures every current file has a marker bound to its exact change.
+    pub fn sync_file_reviews(&mut self, patch: &crate::domain::diff::Patch) {
+        let previous: BTreeMap<&str, &FileReview> = self
+            .file_reviews
+            .iter()
+            .map(|review| (review.path.as_str(), review))
+            .collect();
+        self.file_reviews = file_fingerprints(patch)
+            .into_iter()
+            .map(|(path, fingerprint)| FileReview {
+                status: previous
+                    .get(path.as_str())
+                    .filter(|review| review.fingerprint == fingerprint)
+                    .map_or(ReviewStatus::NotReviewed, |review| review.status),
+                path,
+                fingerprint,
+            })
+            .collect();
+    }
+
+    /// Reconciles durable human state with a freshly derived plan.
+    ///
+    /// On the same head, review markers and manual ordering are copied directly: no
+    /// file has changed, including binary files whose patch cannot provide a useful
+    /// fingerprint. Across heads, state is carried only where fingerprints prove the
+    /// file change is identical (DEC-23).
+    #[must_use]
+    pub fn carry_forward(
+        previous: &Self,
+        mut current: Self,
+        patch: &crate::domain::diff::Patch,
+    ) -> Self {
+        current.document_revision = previous.document_revision;
+        if previous.head_sha == current.head_sha {
+            current.file_reviews.clone_from(&previous.file_reviews);
+            if previous.overridden {
+                current.groups.clone_from(&previous.groups);
+                current.overridden = true;
+            }
+            current.override_invalidated = previous.override_invalidated;
+            return current;
+        }
+
+        current.sync_file_reviews(patch);
+        let old: BTreeMap<&str, &FileReview> = previous
+            .file_reviews
+            .iter()
+            .map(|review| (review.path.as_str(), review))
+            .collect();
+        for review in &mut current.file_reviews {
+            let Some(previous) = old.get(review.path.as_str()) else {
+                continue;
+            };
+            review.status = if carryable_match(&previous.fingerprint, &review.fingerprint) {
+                previous.status
+            } else if previous.status == ReviewStatus::NotReviewed {
+                ReviewStatus::NotReviewed
+            } else {
+                ReviewStatus::NeedsRevisit
+            };
+        }
+
+        if previous.overridden {
+            let unchanged = current.file_reviews.len() == previous.file_reviews.len()
+                && current.file_reviews.iter().all(|review| {
+                    old.get(review.path.as_str())
+                        .is_some_and(|old| carryable_match(&old.fingerprint, &review.fingerprint))
+                });
+            if unchanged {
+                current.groups.clone_from(&previous.groups);
+                current.overridden = true;
+            } else {
+                current.override_invalidated = true;
+            }
+        }
+        current
+    }
+
+    /// Restores only the analysis-proposed ordering, preserving durable review state.
+    pub fn reset_order_from_analysis(&mut self, analysis: &Analysis) {
+        self.head_sha.clone_from(&analysis.head_sha);
+        self.source = PlanSource::Analysis;
+        self.groups.clone_from(&analysis.review_plan);
+        self.overridden = false;
+        self.override_invalidated = false;
+    }
+
+    /// The explicit status for a path.
+    #[must_use]
+    pub fn review_status(&self, path: &str) -> ReviewStatus {
+        self.file_reviews
+            .iter()
+            .find(|review| review.path == path)
+            .map_or(ReviewStatus::NotReviewed, |review| review.status)
+    }
+
+    /// Sets a human marker, returning whether it changed.
+    pub fn set_review_status(&mut self, path: &str, status: ReviewStatus) -> bool {
+        let Some(review) = self
+            .file_reviews
+            .iter_mut()
+            .find(|review| review.path == path)
+        else {
+            return false;
+        };
+        if review.status == status {
+            return false;
+        }
+        review.status = status;
+        true
+    }
+
+    /// Reviewed files and total files.
+    #[must_use]
+    pub fn review_progress(&self) -> (usize, usize, usize) {
+        let reviewed = self
+            .file_reviews
+            .iter()
+            .filter(|review| review.status == ReviewStatus::Reviewed)
+            .count();
+        let revisit = self
+            .file_reviews
+            .iter()
+            .filter(|review| review.status == ReviewStatus::NeedsRevisit)
+            .count();
+        (reviewed, revisit, self.file_reviews.len())
+    }
+
     /// Renumbers the groups from one, so the panel never shows "2, 1".
     fn renumber(&mut self) {
         for (position, group) in self.groups.iter_mut().enumerate() {
             group.order = u32::try_from(position + 1).unwrap_or(u32::MAX);
         }
     }
+}
+
+/// Stable, non-secret fingerprints for every file change in patch order.
+#[must_use]
+pub fn file_fingerprints(parsed_patch: &crate::domain::diff::Patch) -> Vec<(String, String)> {
+    parsed_patch
+        .files
+        .iter()
+        .filter_map(|file| {
+            let file_path = file.path()?.to_string();
+            let mut canonical = String::new();
+            let _ = write!(
+                canonical,
+                "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
+                file.old_path
+                    .as_ref()
+                    .map_or("", crate::domain::diff::RelPath::as_str),
+                file.new_path
+                    .as_ref()
+                    .map_or("", crate::domain::diff::RelPath::as_str),
+                file.status.label(),
+                file.binary,
+                file.mode_change
+                    .as_ref()
+                    .map_or_else(String::new, |mode| format!(
+                        "{}>{}",
+                        mode.old.as_deref().unwrap_or(""),
+                        mode.new.as_deref().unwrap_or("")
+                    ))
+            );
+            for line in file
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .filter(|line| line.kind != crate::domain::diff::LineKind::Context)
+            {
+                let _ = write!(
+                    canonical,
+                    "{:?}:{}:{}:{}:{}\u{1}",
+                    line.kind,
+                    line.old_line.unwrap_or(0),
+                    line.new_line.unwrap_or(0),
+                    line.content,
+                    line.no_newline
+                );
+            }
+            let fingerprint =
+                if file.binary || (file.hunks.is_empty() && file.mode_change.is_none()) {
+                    // A binary/metadata-only patch does not carry enough content to prove
+                    // equality across heads. It may still be marked on this head, but an
+                    // empty fingerprint deliberately never carries forward (DEC-23).
+                    String::new()
+                } else {
+                    fnv(&canonical)
+                };
+            Some((file_path, fingerprint))
+        })
+        .collect()
+}
+
+fn carryable_match(previous: &str, current: &str) -> bool {
+    !current.is_empty() && previous == current
+}
+
+fn fnv(text: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 /// Which heuristic layer a path belongs to, if any.
@@ -565,6 +854,22 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec()
+    }
+
+    fn review_patch(second_line: &str) -> crate::domain::diff::Patch {
+        crate::domain::diff::parse_patch(&format!(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n\
+             diff --git a/tests/a.rs b/tests/a.rs\n--- a/tests/a.rs\n+++ b/tests/a.rs\n@@ -1 +1 @@\n-old test\n+{second_line}\n"
+        ))
+    }
+
+    fn patch_paths(patch: &crate::domain::diff::Patch) -> Vec<String> {
+        patch
+            .files
+            .iter()
+            .filter_map(crate::domain::diff::FileDiff::path)
+            .map(ToString::to_string)
+            .collect()
     }
 
     #[test]
@@ -793,7 +1098,7 @@ mod tests {
     fn pinning_to_a_new_group_creates_it() {
         let mut plan = plan();
         assert!(plan.pin_file("tests/billing.rs", "my own group"));
-        assert_eq!(plan.group_of("tests/billing.rs"), Some("my-own-group"));
+        assert_eq!(plan.group_of("tests/billing.rs"), Some("my own group"));
         // And an empty group left behind by the move is dropped.
         assert!(plan.groups.iter().all(|group| !group.files.is_empty()));
     }
@@ -854,5 +1159,114 @@ mod tests {
         assert_eq!(PlanSource::Analysis.label(), "from the analysis");
         assert!(PlanSource::Heuristic.label().contains("path rules"));
         assert_eq!(plan().source, PlanSource::Analysis);
+    }
+
+    #[test]
+    fn ir_16_human_progress_is_explicit_and_bound_to_the_file_change() {
+        let patch = review_patch("new test");
+        let paths = patch_paths(&patch);
+        let mut plan = Plan::heuristic("head1", &paths);
+        plan.sync_file_reviews(&patch);
+        assert_eq!(plan.review_progress(), (0, 0, 2));
+        assert!(plan.set_review_status("src/a.rs", ReviewStatus::Reviewed));
+        assert_eq!(plan.review_status("src/a.rs"), ReviewStatus::Reviewed);
+        assert_eq!(plan.review_progress(), (1, 0, 2));
+    }
+
+    #[test]
+    fn ir_16_a_new_head_keeps_only_provably_unchanged_review_progress() {
+        let old_patch = review_patch("new test");
+        let old_paths = patch_paths(&old_patch);
+        let mut previous = Plan::heuristic("head1", &old_paths);
+        previous.sync_file_reviews(&old_patch);
+        assert!(previous.set_review_status("src/a.rs", ReviewStatus::Reviewed));
+        assert!(previous.set_review_status("tests/a.rs", ReviewStatus::Reviewed));
+
+        let new_patch = review_patch("different test");
+        let new_paths = patch_paths(&new_patch);
+        let current = Plan::heuristic("head2", &new_paths);
+        let carried = Plan::carry_forward(&previous, current, &new_patch);
+
+        assert_eq!(carried.review_status("src/a.rs"), ReviewStatus::Reviewed);
+        assert_eq!(
+            carried.review_status("tests/a.rs"),
+            ReviewStatus::NeedsRevisit
+        );
+    }
+
+    #[test]
+    fn ir_16_ambiguous_binary_changes_need_revisit_on_a_new_head() {
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/logo.png b/logo.png\n--- a/logo.png\n+++ b/logo.png\nBinary files a/logo.png and b/logo.png differ\n",
+        );
+        let paths = patch_paths(&patch);
+        let mut previous = Plan::heuristic("head1", &paths);
+        previous.sync_file_reviews(&patch);
+        assert!(previous.set_review_status("logo.png", ReviewStatus::Reviewed));
+
+        let same_head = Plan::carry_forward(&previous, Plan::heuristic("head1", &paths), &patch);
+        assert_eq!(same_head.review_status("logo.png"), ReviewStatus::Reviewed);
+
+        let current = Plan::heuristic("head2", &paths);
+        let carried = Plan::carry_forward(&previous, current, &patch);
+        assert_eq!(
+            carried.review_status("logo.png"),
+            ReviewStatus::NeedsRevisit
+        );
+    }
+
+    #[test]
+    fn ir_16_same_head_reanalysis_keeps_manual_order_and_progress() {
+        let patch = review_patch("new test");
+        let paths = patch_paths(&patch);
+        let mut previous = Plan::heuristic("head1", &paths);
+        previous.sync_file_reviews(&patch);
+        previous.document_revision = 7;
+        assert!(previous.set_review_status("src/a.rs", ReviewStatus::Reviewed));
+        let first_group = previous.groups[0].group.clone();
+        assert!(previous.move_group(&first_group, 1));
+        let expected_groups = previous.groups.clone();
+
+        let carried = Plan::carry_forward(&previous, Plan::heuristic("head1", &paths), &patch);
+
+        assert_eq!(carried.document_revision, 7);
+        assert_eq!(carried.review_status("src/a.rs"), ReviewStatus::Reviewed);
+        assert!(carried.overridden);
+        assert_eq!(carried.groups, expected_groups);
+    }
+
+    #[test]
+    fn ir_16_revision_changes_explain_and_reset_only_incompatible_manual_order() {
+        let old_patch = review_patch("new test");
+        let old_paths = patch_paths(&old_patch);
+        let mut previous = Plan::heuristic("head1", &old_paths);
+        previous.sync_file_reviews(&old_patch);
+        let first_group = previous.groups[0].group.clone();
+        assert!(previous.move_group(&first_group, 1));
+        let overridden_groups = previous.groups.clone();
+
+        let unchanged =
+            Plan::carry_forward(&previous, Plan::heuristic("head2", &old_paths), &old_patch);
+        assert!(unchanged.overridden);
+        assert!(!unchanged.override_invalidated);
+        assert_eq!(unchanged.groups, overridden_groups);
+
+        let changed_patch = review_patch("different test");
+        let changed_paths = patch_paths(&changed_patch);
+        let changed = Plan::carry_forward(
+            &previous,
+            Plan::heuristic("head3", &changed_paths),
+            &changed_patch,
+        );
+        assert!(!changed.overridden);
+        assert!(changed.override_invalidated);
+    }
+
+    #[test]
+    fn ir_16_human_step_names_are_not_forced_into_machine_slugs() {
+        let mut plan = plan();
+        assert!(plan.pin_file("tests/billing.rs", "Verify behavior"));
+        assert_eq!(plan.group_of("tests/billing.rs"), Some("Verify behavior"));
+        assert!(!plan.pin_file("tests/billing.rs", "verify BEHAVIOR"));
     }
 }

@@ -389,6 +389,10 @@ checks = [
     ("the analysis asked for streaming", any(r["body"].get("stream") for r in requests)),
     ("the system prompt asks for one JSON object", "one JSON object" in blob),
     ("the prompt asks for a review plan", "review_plan" in blob),
+    ("the prompt asks for concise guided-review fields", all(field in blob for field in (
+        "inferred_purpose", "what_changed", "evidence", "coverage"))),
+    ("tests may accompany the behavior they verify", "tests may accompany" in blob),
+    ("the old tests-and-docs-last rule is gone", "tests and documentation come last" not in blob),
 ]
 failed = 0
 for name, passed in checks:
@@ -418,8 +422,8 @@ else
   bad "the tree never entered the recommended order"
   printf '%s\n' "$SCREEN" | tail -12
 fi
-if printf '%s' "$SCREEN" | grep -q "1\. domain"; then
-  ok "the plan groups are shown with their position"
+if printf '%s' "$SCREEN" | grep -q "1\. Understand rounding"; then
+  ok "the semantic review steps are shown with their position"
 else
   bad "the plan groups are missing"
 fi
@@ -432,6 +436,39 @@ if printf '%s' "$SCREEN" | grep -q "plan ·\|/2 plan"; then
   ok "both orders' positions are shown"
 else
   bad "the positions in both orders are missing"
+fi
+
+# The guidance stays in the file workflow, expands without another provider call, and
+# exposes only validated evidence. Marking progress writes the durable plan document.
+GUIDED_LOG="$TMP/guided.log"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~gg~e~m~:q\r' \
+  'money\.rs~Money now rounds half up~~M src/domain/money\.rs~Evidence 1~✓M money\.rs~' \
+  "$GUIDED_LOG")"
+if shown "$GUIDED_LOG" "What.*rounds half up" \
+  && shown "$GUIDED_LOG" "Why · inferred" \
+  && shown "$GUIDED_LOG" "Verify 1.*negative amounts"; then
+  ok "Files keeps concise what, inferred why and concrete verification beside the code"
+else
+  bad "the current-file guided review was not readable"
+  printf '%s\n' "$SCREEN" | tail -16
+fi
+if shown "$GUIDED_LOG" "Evidence 1" && shown "$GUIDED_LOG" "new rounding expression"; then
+  ok "expanded guidance shows the validated evidence"
+else
+  bad "the expanded guidance did not show its evidence"
+fi
+PLAN_FILE="$HOME_MAIN/reviews/github.com/acme/service/pr-141/plan.json"
+if python3 - "$PLAN_FILE" <<'PY' 2>/dev/null
+import json, sys
+plan = json.load(open(sys.argv[1]))
+review = next(item for item in plan["file_reviews"] if item["path"] == "src/domain/money.rs")
+assert review["status"] == "reviewed", review
+assert review["fingerprint"], review
+PY
+then
+  ok "the explicit reviewed marker is durable and bound to a file fingerprint"
+else
+  bad "the reviewed marker was not stored in the durable plan"
 fi
 # `o` switches to the path order and says so.
 SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~o~:q\r' 'money\.rs~Money now rounds half up~~path order~' "$TMP/order-toggle.log")"

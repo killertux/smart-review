@@ -107,6 +107,8 @@ pub enum Slot {
     Analysis,
     /// The analysis request itself (FR-4.1).
     Analyze,
+    /// Serial durable review-plan writes (FR-4.2, IR-14).
+    PlanSave,
     /// Reading the chat sessions for a pull request (FR-5.1).
     Chat,
     /// One chat answer (FR-5.2).
@@ -247,6 +249,13 @@ pub enum Job {
         /// agreed to send is what is sent.
         bundle: Box<crate::domain::context::Bundle>,
     },
+    /// Writes one immutable review-plan snapshot off the event-loop thread.
+    SavePlan {
+        /// Pull request whose durable review state is being written.
+        pr: u64,
+        /// Immutable state captured by the reducer.
+        plan: Box<crate::domain::plan::Plan>,
+    },
     /// Read a pull request's chat sessions (FR-5.1).
     LoadChat {
         /// Which pull request.
@@ -349,6 +358,7 @@ impl Job {
             // analysis", and a second request should replace the first.
             Self::LoadAnalysis { .. } | Self::GatherContext { .. } => Slot::Analysis,
             Self::RunAnalysis { .. } => Slot::Analyze,
+            Self::SavePlan { .. } => Slot::PlanSave,
             // Reading and writing are one slot: the list and the conversation are the
             // same resource, and a second request should replace the first.
             // Reading, gathering and asking are three slots: the first is about the
@@ -377,7 +387,10 @@ impl Job {
     fn is_ordered_save(&self) -> bool {
         matches!(
             self,
-            Self::SaveState { .. } | Self::SaveDraft { .. } | Self::DeleteDraft { .. }
+            Self::SaveState { .. }
+                | Self::SaveDraft { .. }
+                | Self::DeleteDraft { .. }
+                | Self::SavePlan { .. }
         )
     }
 }
@@ -481,6 +494,13 @@ pub enum Outcome {
         run: Box<AnalysisRun>,
         /// Immutable cache identity captured before the job started (IR-12).
         key: Box<crate::ports::AnalysisKey>,
+    },
+    /// A review-plan snapshot was durably written.
+    PlanSaved {
+        /// Pull request whose document was acknowledged.
+        pr: u64,
+        /// Store revision assigned to the acknowledged snapshot.
+        document_revision: u64,
     },
     /// A pull request's sessions, and the one the caller asked to open (FR-5.1).
     ChatLoaded {
@@ -786,18 +806,9 @@ impl Executor {
                 }
             }
             Job::RunAnalysis { request, bundle } => {
-                let analyst = self.analyst();
-                let mut report = |update: AnalysisProgress| {
-                    sink.send(ProgressUpdate::Analysis(update));
-                };
-                match analyst.run(request, bundle, cancel, &mut report) {
-                    Ok(run) => Outcome::Analyzed {
-                        run: Box::new(run),
-                        key: Box::new(request.key.clone()),
-                    },
-                    Err(error) => Outcome::Failed(error.to_string()),
-                }
+                self.run_analysis(request, bundle, cancel, sink)
             }
+            Job::SavePlan { pr, plan } => self.save_plan(*pr, plan),
             Job::LoadChat { .. } | Job::GatherChat { .. } | Job::AskChat { .. } => {
                 self.chat_job(job, cancel, sink)
             }
@@ -1277,6 +1288,38 @@ impl Executor {
             &self.repo,
         )
     }
+
+    /// Runs and reports one analysis request.
+    fn run_analysis(
+        &self,
+        request: &AnalysisRequest,
+        bundle: &crate::domain::context::Bundle,
+        cancel: &Cancel,
+        sink: &ProgressSink<'_>,
+    ) -> Outcome {
+        let analyst = self.analyst();
+        let mut report = |update: AnalysisProgress| {
+            sink.send(ProgressUpdate::Analysis(update));
+        };
+        match analyst.run(request, bundle, cancel, &mut report) {
+            Ok(run) => Outcome::Analyzed {
+                run: Box::new(run),
+                key: Box::new(request.key.clone()),
+            },
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+
+    /// Persists one ordered plan snapshot away from the event loop.
+    fn save_plan(&self, pr: u64, plan: &crate::domain::plan::Plan) -> Outcome {
+        match self.analysis.put_plan(&self.repo, pr, plan) {
+            Ok(saved) => Outcome::PlanSaved {
+                pr,
+                document_revision: saved.document_revision,
+            },
+            Err(error) => Outcome::Failed(format!("could not save review progress: {error}")),
+        }
+    }
 }
 
 fn is_definite_forge_refusal(error: &crate::Error) -> bool {
@@ -1460,7 +1503,10 @@ impl JobRunner {
     /// the deadline. Callers may then restore the terminal without waiting forever.
     pub fn flush_persistence(&mut self, timeout: Duration) -> bool {
         for running in &mut self.running {
-            if !matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze) {
+            if !matches!(
+                running.slot,
+                Slot::State | Slot::DraftSave | Slot::PlanSave | Slot::Analyze
+            ) {
                 running.cancel.cancel();
             }
         }
@@ -1477,13 +1523,15 @@ impl JobRunner {
 
     /// Whether an ordered durable snapshot or cache-writing analysis is queued or running.
     fn has_pending_persistence(&self) -> bool {
-        self.running
+        self.running.iter().any(|running| {
+            matches!(
+                running.slot,
+                Slot::State | Slot::DraftSave | Slot::PlanSave | Slot::Analyze
+            )
+        }) || self
+            .queue
             .iter()
-            .any(|running| matches!(running.slot, Slot::State | Slot::DraftSave | Slot::Analyze))
-            || self
-                .queue
-                .iter()
-                .any(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze))
+            .any(|(_, _, job)| job.is_ordered_save() || matches!(job.slot(), Slot::Analyze))
     }
 
     /// Whether a slot has a job running or waiting.
@@ -1526,6 +1574,7 @@ impl JobRunner {
     pub fn poll(&mut self) -> Vec<Completion> {
         while let Ok(completion) = self.receiver.try_recv() {
             self.running.retain(|running| running.id != completion.job);
+            self.advance_queued_plan_save(&completion);
             self.pending_completions.push_back(completion);
         }
 
@@ -1549,6 +1598,33 @@ impl JobRunner {
         // the running list is exactly "jobs that have not answered yet".
         self.pump();
         completions
+    }
+
+    /// Chains a queued snapshot to the revision assigned to the write before it.
+    ///
+    /// Plan saves are coalesced while one write is running, but the queued immutable
+    /// snapshot was captured before that write received its durable revision. Updating
+    /// it here keeps optimistic concurrency intact without returning filesystem work to
+    /// the event loop. The pull-request key prevents one document's revision from being
+    /// applied to another queued save.
+    fn advance_queued_plan_save(&mut self, completion: &Completion) {
+        let Outcome::PlanSaved {
+            pr,
+            document_revision,
+        } = &completion.outcome
+        else {
+            return;
+        };
+        for (_, _, job) in &mut self.queue {
+            if let Job::SavePlan {
+                pr: queued_pr,
+                plan,
+            } = job
+                && queued_pr == pr
+            {
+                plan.document_revision = plan.document_revision.max(*document_revision);
+            }
+        }
     }
 
     /// Everything the running jobs have said since the last call.
@@ -2235,7 +2311,80 @@ mod tests {
         }
     }
 
+    /// An analysis store that holds its first plan write so shutdown ordering is visible.
+    #[derive(Debug, Default)]
+    struct HoldingAnalysisStore {
+        inner: crate::test_support::InMemoryAnalysis,
+        entered: std::sync::atomic::AtomicBool,
+        release: std::sync::atomic::AtomicBool,
+        writes: AtomicU64,
+    }
+
+    impl AnalysisCachePort for HoldingAnalysisStore {
+        fn get(
+            &self,
+            key: &AnalysisKey,
+        ) -> Result<Option<StoredAnalysis>, crate::ports::AnalysisCacheError> {
+            self.inner.get(key)
+        }
+
+        fn list(
+            &self,
+            repo: &RepoId,
+            pr: u64,
+        ) -> Result<Vec<StoredAnalysis>, crate::ports::AnalysisCacheError> {
+            self.inner.list(repo, pr)
+        }
+
+        fn put(&self, stored: &StoredAnalysis) -> Result<(), crate::ports::AnalysisCacheError> {
+            self.inner.put(stored)
+        }
+
+        fn plan(
+            &self,
+            repo: &RepoId,
+            pr: u64,
+        ) -> Result<Option<crate::domain::plan::Plan>, crate::ports::AnalysisCacheError> {
+            self.inner.plan(repo, pr)
+        }
+
+        fn put_plan(
+            &self,
+            repo: &RepoId,
+            pr: u64,
+            plan: &crate::domain::plan::Plan,
+        ) -> Result<crate::domain::plan::Plan, crate::ports::AnalysisCacheError> {
+            if self.writes.fetch_add(1, Ordering::AcqRel) == 0 {
+                self.entered.store(true, Ordering::Release);
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let current_revision = self
+                .inner
+                .plan(repo, pr)?
+                .map_or(0, |stored| stored.document_revision);
+            if current_revision != plan.document_revision {
+                return Err(crate::ports::AnalysisCacheError::Conflict);
+            }
+            let mut saved = plan.clone();
+            saved.document_revision = current_revision.saturating_add(1);
+            self.inner.put_plan(repo, pr, &saved)?;
+            Ok(saved)
+        }
+    }
+
     fn runner_with(delay: Duration) -> (JobRunner, Arc<SlowForge>) {
+        runner_with_analysis(
+            delay,
+            Arc::new(crate::test_support::InMemoryAnalysis::default()),
+        )
+    }
+
+    fn runner_with_analysis(
+        delay: Duration,
+        analysis: Arc<dyn AnalysisCachePort>,
+    ) -> (JobRunner, Arc<SlowForge>) {
         let mut runner = crate::test_support::test_job_runner(
             Arc::new(fake_workspace()),
             Arc::new(FakeProbe {
@@ -2252,7 +2401,7 @@ mod tests {
             cache: Arc::new(InMemoryCache::default()),
             clock: Arc::new(FakeClock),
             workspace: Arc::new(fake_workspace()),
-            analysis: Arc::new(crate::test_support::InMemoryAnalysis::default()),
+            analysis,
             llm: Arc::new(crate::test_support::NoLlm),
             repo: RepoId::parse("acme/service").unwrap(),
             policy: crate::application::prs::CachePolicy::default(),
@@ -2785,6 +2934,15 @@ mod tests {
             }
             .is_cancellable()
         );
+        let plan_save = Job::SavePlan {
+            pr: 141,
+            plan: Box::new(crate::domain::plan::Plan::heuristic(
+                "head",
+                &["src/a.rs".to_owned()],
+            )),
+        };
+        assert_eq!(plan_save.slot(), Slot::PlanSave);
+        assert!(plan_save.is_ordered_save());
     }
 
     #[test]
@@ -2836,6 +2994,61 @@ mod tests {
             Some("light"),
             "the newer snapshot wins on disk"
         );
+    }
+
+    #[test]
+    fn ir_16_shutdown_flushes_the_latest_plan_edit_queued_behind_a_held_write() {
+        let store = Arc::new(HoldingAnalysisStore::default());
+        let (mut runner, _) = runner_with_analysis(
+            Duration::ZERO,
+            Arc::clone(&store) as Arc<dyn AnalysisCachePort>,
+        );
+        let repo = RepoId::parse("acme/service").expect("valid repository");
+        let first_plan = crate::domain::plan::Plan::heuristic("head", &["src/a.rs".to_owned()]);
+        runner.submit(Job::SavePlan {
+            pr: 141,
+            plan: Box::new(first_plan.clone()),
+        });
+        for _ in 0..100 {
+            if store.entered.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(store.entered.load(Ordering::Acquire), "first save started");
+
+        let mut latest_plan = first_plan;
+        latest_plan.overridden = true;
+        runner.submit(Job::SavePlan {
+            pr: 141,
+            plan: Box::new(latest_plan),
+        });
+        assert!(
+            runner
+                .queue
+                .iter()
+                .any(|(_, _, job)| matches!(job, Job::SavePlan { pr: 141, .. })),
+            "the latest snapshot is visible to the persistence queue before exit"
+        );
+
+        let release_store = Arc::clone(&store);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            release_store.release.store(true, Ordering::Release);
+        });
+        assert!(
+            runner.flush_persistence(Duration::from_secs(1)),
+            "shutdown waits for both plan snapshots"
+        );
+        release.join().expect("release thread finished");
+
+        let saved = store
+            .plan(&repo, 141)
+            .expect("plan store is readable")
+            .expect("latest plan was stored");
+        assert!(saved.overridden, "the second edit, not the first, wins");
+        assert_eq!(saved.document_revision, 2);
+        assert_eq!(store.writes.load(Ordering::Acquire), 2);
     }
 
     #[test]

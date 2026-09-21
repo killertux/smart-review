@@ -24,8 +24,8 @@ pub mod repo;
 pub mod time;
 
 pub use analysis::{
-    ANALYSIS_VERSION, Analysis, AnalysisUsage, FileNote, PROMPT_VERSION, ParseFailure, PathIndex,
-    PlanGroup, RiskArea, Severity, UNCLASSIFIED,
+    ANALYSIS_VERSION, Analysis, AnalysisUsage, Coverage, Evidence, FileNote, PROMPT_VERSION,
+    ParseFailure, PathIndex, PlanGroup, RiskArea, Severity, UNCLASSIFIED,
 };
 pub use chat::{
     CHAT_PROMPT_VERSION, Message, Pruned, Reference, Role, Session, SessionMeta, Totals,
@@ -43,7 +43,7 @@ pub use model::{
     ReasoningOption, Route, Thinking, ThinkingChoice, ThinkingError, ThinkingRequest,
 };
 pub use mutation::{MUTATION_VERSION, MutationKind, MutationOperation, MutationState};
-pub use plan::{OrderMode, Plan, PlanSource};
+pub use plan::{FileReview, OrderMode, Plan, PlanSource, ReviewStatus};
 pub use pr::{
     CheckRun, CheckState, CheckSummary, Commit, PrState, PullRequestDetail, PullRequestRef,
     PullRequestSummary, Review, ReviewComment, ReviewDecision, ReviewState,

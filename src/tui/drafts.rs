@@ -226,10 +226,7 @@ impl Composer {
     }
 }
 
-/// A message waiting for its second Enter (FR-6.4, FR-6.5).
-///
-/// The same two-step the review gets: the modal is the last place a mistake can be
-/// seen, and this is the other surface that can put words on the internet.
+/// A message captured for immutable preview before an explicit post (FR-6.4, FR-6.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPost {
     /// What is being answered, or that it is the conversation.
@@ -276,9 +273,9 @@ impl DraftStatus {
 
 /// Everything the review actions own (FR-6.1–FR-6.3).
 ///
-/// Five independent yes/no questions live here — is a pull request open, is the panel
-/// shown, is the modal shown, has the confirm been given twice, is there something to
-/// write — and they are read one at a time by different code. Folding them into a
+/// Four independent yes/no questions live here — is a pull request open, is the panel
+/// shown, is the modal shown, is there something to write — and they are read one at a
+/// time by different code. Folding them into a
 /// state machine would be a bigger change than the problem, so the lint is answered
 /// rather than obeyed.
 #[allow(clippy::struct_excessive_bools)]
@@ -290,7 +287,7 @@ pub struct DraftState {
     pub open: bool,
     /// The comment being written, when the composer is open (FR-6.2).
     pub composer: Option<Composer>,
-    /// The reply or conversation comment waiting for its second Enter (FR-6.4).
+    /// The reply or conversation comment frozen for preview (FR-6.4).
     ///
     /// Separate from the composer because it is what will be *sent*: the composer is
     /// what the user is typing, and this is the frozen copy they confirmed.
@@ -301,8 +298,6 @@ pub struct DraftState {
     pub panel: bool,
     /// Whether the publish modal is open (FR-6.3).
     pub modal: bool,
-    /// Whether the modal's second confirm has been given (FR-6.3).
-    pub armed: bool,
     /// What the last action is doing.
     pub status: DraftStatus,
     /// The job id of the publish in flight (FR-6.3).
@@ -348,7 +343,6 @@ impl Default for DraftState {
             selection: None,
             panel: false,
             modal: false,
-            armed: false,
             status: DraftStatus::Idle,
             job: 0,
             post_job: 0,
@@ -377,7 +371,6 @@ impl DraftState {
         self.open = true;
         self.panel = false;
         self.modal = false;
-        self.armed = false;
         self.composer = None;
         self.post = None;
         self.selection = None;
@@ -398,7 +391,6 @@ impl DraftState {
         self.open = false;
         self.panel = false;
         self.modal = false;
-        self.armed = false;
         self.composer = None;
         self.post = None;
         self.selection = None;
@@ -550,7 +542,6 @@ impl DraftState {
         self.draft.clear(now);
         self.mark_dirty();
         self.cursor = 1;
-        self.armed = false;
     }
 
     /// Records the decision (FR-6.1).
@@ -629,7 +620,6 @@ impl DraftState {
     pub fn open_modal(&mut self) -> Result<(), DraftError> {
         self.draft.publishable()?;
         self.modal = true;
-        self.armed = false;
         self.scroll = 0;
         self.status = DraftStatus::Idle;
         Ok(())
@@ -638,7 +628,6 @@ impl DraftState {
     /// Closes the modal (FR-6.3).
     pub fn close_modal(&mut self) {
         self.modal = false;
-        self.armed = false;
         self.scroll = 0;
         // A completed dry-run result is meaningful only for the action still in this
         // modal. Keeping it after Escape would make the next post look complete before
@@ -656,7 +645,6 @@ impl DraftState {
         self.job = 0;
         self.status = DraftStatus::Idle;
         self.modal = false;
-        self.armed = false;
         self.cursor = 1;
         self.warning = url.map(|url| format!("review posted: {url}"));
     }
@@ -665,7 +653,6 @@ impl DraftState {
     pub fn publish_failed(&mut self, reason: impl Into<String>) {
         self.job = 0;
         self.publishing_draft = None;
-        self.armed = false;
         self.status = DraftStatus::Failed {
             reason: reason.into(),
         };
@@ -873,7 +860,7 @@ mod tests {
         state.publishing_draft = Some(state.draft.clone());
         assert!(
             state.status.is_publishing(),
-            "the second Enter does nothing"
+            "another Enter does nothing while the explicit publish is in flight"
         );
 
         state.published(Some("https://example.test/review/7"), now());
@@ -919,7 +906,6 @@ mod tests {
         state.publish_failed("the token is not allowed");
         assert_eq!(state.draft.comments.len(), 1);
         assert!(state.modal, "the modal stays open: the draft is still here");
-        assert!(!state.armed, "and the confirmation is forgotten");
         assert_eq!(
             state.status.label(),
             "failed: the token is not allowed",

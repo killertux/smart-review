@@ -81,7 +81,10 @@ fn panel_title(app: &App) -> String {
             Some(provenance) => format!(" analysis · {provenance} "),
             None => " analysis ".to_owned(),
         },
-        state => format!(" analysis · {} ", state.label()),
+        state => app.analysis_elapsed().map_or_else(
+            || format!(" analysis · {} ", state.label()),
+            |elapsed| format!(" analysis · {} · {elapsed}s ", state.label()),
+        ),
     }
 }
 
@@ -112,6 +115,11 @@ fn running_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled(" ", theme.style(element::FG)),
             Span::styled(app.analysis_state().label(), theme.style(element::ACCENT)),
+            Span::styled(
+                app.analysis_elapsed()
+                    .map_or_else(String::new, |elapsed| format!(" · {elapsed}s")),
+                theme.style(element::MUTED),
+            ),
             Span::styled(
                 if app.analysis_state().is_running() {
                     "  (Esc cancels)"
@@ -323,7 +331,7 @@ fn cancelled_lines(theme: &Theme) -> Vec<Line<'static>> {
     ]
 }
 
-/// The parsed answer: summary, intent, risks, questions and the plan (FR-4.1).
+/// The parsed answer: brief, inferred purpose, risks, questions and the plan (FR-4.1).
 ///
 /// One function per section, because a section is what a reviewer reads and what a
 /// future milestone will want to reorder or fold.

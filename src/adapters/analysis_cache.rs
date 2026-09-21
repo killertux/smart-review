@@ -608,7 +608,7 @@ mod tests {
     use super::*;
     use crate::domain::analysis::{Analysis, AnalysisUsage};
     use crate::domain::model::Thinking;
-    use crate::domain::plan::{OrderMode, Plan, PlanSource};
+    use crate::domain::plan::{OrderMode, Plan, PlanSource, ReviewStatus};
     use crate::ports::analysis::AnalysisCachePort;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -660,12 +660,13 @@ mod tests {
                 completion: 200,
                 reasoning: Some(50),
             },
-            summary: "what changed".to_owned(),
-            intent: "why".to_owned(),
+            brief: "what changed".to_owned(),
+            inferred_purpose: "why".to_owned(),
             risk_areas: Vec::new(),
             review_plan: Vec::new(),
             per_file_notes: Vec::new(),
             suggested_questions: Vec::new(),
+            coverage: crate::domain::analysis::Coverage::default(),
         }
     }
 
@@ -686,7 +687,7 @@ mod tests {
         let key = key();
         cache.put(&stored(&key, 100)).expect("stores");
         let found = cache.get(&key).expect("reads").expect("is there");
-        assert_eq!(found.analysis.summary, "what changed");
+        assert_eq!(found.analysis.brief, "what changed");
         assert_eq!(found.analysis.token_usage.reasoning, Some(50));
         assert_eq!(found.raw, "{\"summary\": \"what changed\"}");
         assert_eq!(found.stored_at, 100);
@@ -830,10 +831,10 @@ mod tests {
         let key = key();
         cache.put(&stored(&key, 100)).expect("stores");
         let mut replacement = stored(&key, 300);
-        replacement.analysis.summary = "a newer answer".to_owned();
+        replacement.analysis.brief = "a newer answer".to_owned();
         cache.put(&replacement).expect("stores");
         let found = cache.get(&key).expect("reads").expect("is there");
-        assert_eq!(found.analysis.summary, "a newer answer");
+        assert_eq!(found.analysis.brief, "a newer answer");
         assert_eq!(cache.list(&repo(), 141).expect("lists").len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -848,6 +849,8 @@ mod tests {
             source: PlanSource::Analysis,
             groups: Vec::new(),
             overridden: true,
+            file_reviews: Vec::new(),
+            override_invalidated: false,
         };
         cache.put_plan(&repo(), 141, &plan).expect("stores");
         let found = cache.plan(&repo(), 141).expect("reads").expect("is there");
@@ -957,6 +960,33 @@ mod tests {
             durable.plan(&repo(), 141).expect("reads durable plan"),
             Some(saved_legacy)
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ir_16_human_review_progress_survives_restart_and_analysis_cache_eviction() {
+        let (_cache, root) = cache();
+        let durable =
+            DiskAnalysisCache::with_review_root(root.join("cache/analysis"), root.join("reviews"));
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let mut plan = Plan::heuristic("abc123", &["src/a.rs".to_owned()]);
+        plan.sync_file_reviews(&patch);
+        assert!(plan.set_review_status("src/a.rs", ReviewStatus::Reviewed));
+        durable
+            .put_plan(&repo(), 141, &plan)
+            .expect("stores progress");
+
+        std::fs::create_dir_all(root.join("cache")).expect("creates disposable cache");
+        std::fs::remove_dir_all(root.join("cache")).expect("evicts disposable cache");
+        let reopened =
+            DiskAnalysisCache::with_review_root(root.join("cache/analysis"), root.join("reviews"));
+        let saved = reopened
+            .plan(&repo(), 141)
+            .expect("reads durable progress")
+            .expect("plan exists");
+        assert_eq!(saved.review_status("src/a.rs"), ReviewStatus::Reviewed);
         let _ = std::fs::remove_dir_all(root);
     }
 

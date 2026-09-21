@@ -476,7 +476,7 @@ pub enum Overlay {
     Doctor,
     /// Theme selection (FR-7.7).
     ThemePicker,
-    /// The analysis panel: the summary, the intent, the risks and the plan (FR-4.1).
+    /// The analysis panel: brief, inferred purpose, risks, plan and coverage (FR-4.1).
     Analysis,
     /// The context inspector: what would be sent and what was left out (FR-4.6).
     Context,
@@ -524,6 +524,8 @@ pub struct PanelState {
     pub bundle_for: Option<(u64, crate::application::context::ContextIdentity)>,
     /// The review plan in force (FR-4.2).
     pub plan: Option<crate::domain::plan::Plan>,
+    /// The durable plan write currently allowed to acknowledge this review session.
+    pub plan_save_job: u64,
     /// The job id of the run (FR-4.4).
     pub job: u64,
     /// The job id of the context gather (FR-4.6).
@@ -545,6 +547,12 @@ pub struct PanelState {
     pub raw: Option<(String, String)>,
     /// Whether the user has confirmed the first send for this repository (FR-4.6).
     pub confirmed: bool,
+    /// Whether the current-file guidance is expanded above the diff (IR-16).
+    pub guidance_expanded: bool,
+    /// First visible line of expanded current-file guidance.
+    pub guidance_scroll: usize,
+    /// When the current analysis journey started, for visible elapsed time (IR-16).
+    pub started_at: u64,
 }
 
 /// Everything the analysis panel owns (FR-4.1, FR-4.3, FR-4.4, FR-4.6).
@@ -1297,6 +1305,25 @@ impl App {
         // and the diff are both in hand.
         view.set_comments(&detail.comments);
         self.detail = Some(detail);
+        let head_sha = self
+            .detail
+            .as_ref()
+            .map(|detail| detail.summary.head_sha.as_str())
+            .unwrap_or_default();
+        let mut plan = self
+            .panel
+            .plan
+            .take()
+            .unwrap_or_else(|| crate::domain::plan::Plan::heuristic(head_sha, &view.paths()));
+        if plan.matches_head(head_sha) {
+            plan.sync_file_reviews(&view.patch);
+        } else {
+            let mut current = crate::domain::plan::Plan::heuristic(head_sha, &view.paths());
+            current.sync_file_reviews(&view.patch);
+            plan = crate::domain::plan::Plan::carry_forward(&plan, current, &view.patch);
+        }
+        self.panel.plan = Some(plan.clone());
+        view.set_plan(Some(plan));
         if opening {
             self.load_context_files();
         }
@@ -1784,6 +1811,15 @@ impl App {
                 self.state_saved(job, revision);
                 None
             }
+            Outcome::PlanSaved {
+                document_revision, ..
+            } if job == self.panel.plan_save_job => {
+                self.panel.plan_save_job = 0;
+                if let Some(plan) = self.panel.plan.as_mut() {
+                    plan.document_revision = plan.document_revision.max(document_revision);
+                }
+                None
+            }
             Outcome::Environment(environment) if job == self.environment_job => {
                 self.set_environment(*environment);
                 self.notice(NoticeLevel::Info, self.environment_summary());
@@ -1975,6 +2011,7 @@ impl App {
             | Outcome::DraftLoaded { .. }
             | Outcome::DraftSaved { .. }
             | Outcome::DraftDeleted { .. }
+            | Outcome::PlanSaved { .. }
             | Outcome::Failed(_)
             | Outcome::Abandoned => None,
         }
@@ -2846,9 +2883,9 @@ impl App {
 
     /// Shows what is about to be posted, or stages a comment (FR-6.2, FR-6.4, FR-6.5).
     ///
-    /// The two Enters of FR-6.3 apply to a reply as well, and for the same reason: the
-    /// modal is the last place a mistake can be seen, and a reply is also something
-    /// other people will read. A line comment is the different case — it is staged
+    /// The modal is the last place a mistake can be seen before the explicit Post
+    /// action, because a reply is something other people will read. A line comment is
+    /// the different case — it is staged
     /// locally, reversible, and not sent until the whole review is.
     pub(crate) fn confirm_composer(&mut self) -> Effect {
         let Some(composer) = self.drafts.composer.as_ref() else {
@@ -2867,7 +2904,6 @@ impl App {
         }
         self.drafts.post = Some(crate::tui::drafts::PendingPost { target, body });
         self.drafts.composer = None;
-        self.drafts.armed = false;
         self.drafts.scroll = 0;
         self.drafts.modal = true;
         self.mode = Mode::Normal;
@@ -2896,7 +2932,6 @@ impl App {
         let Some(post) = self.drafts.post.as_ref() else {
             return Effect::None;
         };
-        self.drafts.armed = false;
         self.drafts.status = crate::tui::drafts::DraftStatus::Publishing;
         match &post.target {
             crate::tui::drafts::Target::Thread { root, .. } => Effect::PostReply {
@@ -2974,7 +3009,6 @@ impl App {
     /// Says what a posted comment did, and refreshes what it changed (FR-6.4).
     fn apply_comment_posted(&mut self, posted: &crate::ports::CommentPosted) -> Effect {
         self.drafts.post_job = 0;
-        self.drafts.armed = false;
         if posted.dry_run {
             self.drafts.status = crate::tui::drafts::DraftStatus::DryRun;
             self.notice(
@@ -3080,11 +3114,10 @@ impl App {
         }
     }
 
-    /// Arms the publish, or sends it when it is already armed (FR-6.3).
+    /// Sends the immutable review or post shown in the already-open preview (FR-6.3).
     ///
-    /// Two Enters, and the second one is the one that posts: the modal is the last
-    /// place a mistake can be seen, and a single key that both shows and sends would
-    /// make reading it and committing to it the same act.
+    /// Opening the modal and publishing are separate actions: `<leader>rr` opens the
+    /// verbatim preview, then one explicit Enter publishes what is shown (IR-16).
     pub(crate) fn confirm_publish(&mut self) -> Effect {
         if self.drafts.status.is_publishing() {
             // In flight: the key does nothing at all. This is the double-submit guard,
@@ -3092,12 +3125,8 @@ impl App {
             // answer arrives, never before.
             return Effect::None;
         }
-        if !self.drafts.armed {
-            self.drafts.armed = true;
-            return Effect::None;
-        }
-        // One modal, two subjects: a review and a reply are both "words about to go to
-        // GitHub", and the second Enter is what sends whichever is in the modal.
+        // One modal, two subjects: a review and a reply are both words about to go to
+        // GitHub, and Enter is the explicit Publish/Post action after preview.
         if self.drafts.post.is_some() {
             return self.send_post();
         }
@@ -3123,7 +3152,6 @@ impl App {
             );
             return Effect::None;
         }
-        self.drafts.armed = false;
         self.drafts.publishing_draft = Some(self.drafts.draft.clone());
         self.drafts.status = crate::tui::drafts::DraftStatus::Publishing;
         Effect::PublishDraft
@@ -3138,7 +3166,6 @@ impl App {
         self.drafts.job = 0;
         if posted.dry_run {
             self.drafts.status = crate::tui::drafts::DraftStatus::Idle;
-            self.drafts.armed = false;
             self.notice(
                 NoticeLevel::Info,
                 "dry run: nothing was sent; the draft is still here",
@@ -3614,18 +3641,25 @@ impl App {
                 ),
             );
         }
-        // The stored overrides win only when they describe the same commit the
-        // analysis does; otherwise the analysis's own order is used (FR-4.2).
-        if let Some(plan) = plan {
-            let head = self.analysis_head();
-            let usable = head.as_deref().is_some_and(|head| plan.matches_head(head));
-            if usable {
-                self.panel.plan = Some(plan);
-                self.apply_plan_to_review();
-            } else if plan.overridden {
+        if let Some(mut saved) = plan {
+            let current = self.panel.plan.take();
+            if let Some(view) = self.review.as_ref() {
+                saved = if saved.matches_head(view.head_sha.as_deref().unwrap_or_default()) {
+                    saved.sync_file_reviews(&view.patch);
+                    saved
+                } else if let Some(current) = current {
+                    crate::domain::plan::Plan::carry_forward(&saved, current, &view.patch)
+                } else {
+                    saved
+                };
+            }
+            let invalidated = saved.override_invalidated;
+            self.panel.plan = Some(saved);
+            self.apply_plan_to_review();
+            if invalidated {
                 self.notice(
                     NoticeLevel::Info,
-                    "the saved review order was made against an older commit and was not used"
+                    "the pull request changed, so incompatible manual ordering was reset; unchanged review markers were kept and changed files need revisit"
                         .to_owned(),
                 );
             }
@@ -3772,13 +3806,14 @@ impl App {
     fn adopt_analysis(&mut self, stored: crate::ports::StoredAnalysis) {
         // The plan is derived here rather than in the view, so the panel and the tree
         // can never disagree about what the analysis said (FR-4.2).
-        let derived = crate::domain::plan::Plan::from_analysis(&stored.analysis);
+        let mut derived = crate::domain::plan::Plan::from_analysis(&stored.analysis);
+        if let Some(view) = self.review.as_ref() {
+            derived.sync_file_reviews(&view.patch);
+        }
         // A user who ordered the files by hand keeps that order when the same analysis
         // is read again; a plan for a different commit is replaced rather than applied
         // to files it no longer describes (FR-4.2).
-        let keep = self.panel.plan.as_ref().is_some_and(|existing| {
-            existing.overridden && existing.matches_head(&stored.analysis.head_sha)
-        });
+        let existing = self.panel.plan.take();
         let repaired = stored.repaired;
         self.panel.warnings.clone_from(&stored.warnings);
         self.panel.stale = None;
@@ -3787,9 +3822,11 @@ impl App {
         self.panel.scroll = 0;
         self.panel.state = AnalysisState::Ready;
         self.panel.analysis = Some(Box::new(stored));
-        if !keep {
-            self.panel.plan = Some(derived);
-        }
+        self.panel.plan = Some(existing.map_or(derived.clone(), |previous| {
+            self.review.as_ref().map_or(derived.clone(), |view| {
+                crate::domain::plan::Plan::carry_forward(&previous, derived, &view.patch)
+            })
+        }));
         self.apply_plan_to_review();
         if repaired {
             self.notice(
@@ -4164,6 +4201,9 @@ impl App {
     /// The panel opens with it, because a stream nobody is looking at is a spinner
     /// with extra steps.
     pub(crate) fn begin_analysis(&mut self, queued: bool) {
+        if self.panel.started_at == 0 {
+            self.panel.started_at = self.now_unix_secs;
+        }
         self.panel.stream.clear();
         self.panel.raw = None;
         self.panel.state = if queued {
@@ -4235,6 +4275,13 @@ impl App {
         &self.panel.state
     }
 
+    /// Elapsed time for the current analysis phase, while work remains in flight.
+    #[must_use]
+    pub fn analysis_elapsed(&self) -> Option<u64> {
+        (self.panel.state.is_running() && self.panel.started_at > 0)
+            .then(|| self.now_unix_secs.saturating_sub(self.panel.started_at))
+    }
+
     /// The text that has streamed in so far (FR-4.4).
     #[must_use]
     pub fn analysis_stream(&self) -> &str {
@@ -4283,17 +4330,91 @@ impl App {
         let stored = self.panel.analysis.as_ref()?;
         let path = self.review.as_ref()?.current_path()?.to_string();
         let note = stored.analysis.note(&path)?;
-        let text = if note.notes.trim().is_empty() {
-            note.change.trim()
+        let text = if note.why.trim().is_empty() {
+            note.what_changed.trim()
         } else {
-            note.notes.trim()
+            note.why.trim()
         };
         if text.is_empty() {
             // A note with a review_focus list and nothing else still says something.
-            let focus = note.review_focus.join("; ");
+            let focus = note.verify.join("; ");
             return (!focus.is_empty()).then(|| format!("check: {focus}"));
         }
         Some(text.to_owned())
+    }
+
+    /// Structured current-file guidance, including honest missing/truncated states.
+    #[must_use]
+    pub fn current_file_guidance(&self) -> Option<crate::application::analysis::FileGuidance> {
+        let stored = self.panel.analysis.as_ref()?;
+        let path = self.review.as_ref()?.current_path()?.as_str();
+        Some(crate::application::analysis::FileGuidance::of(
+            &stored.analysis,
+            path,
+        ))
+    }
+
+    /// Expands or collapses guidance without changing the selected code.
+    pub(crate) fn toggle_file_guidance(&mut self) {
+        if self.current_file_guidance().is_none() {
+            self.notice(
+                NoticeLevel::Info,
+                "no current analysis guidance; <leader>a generates it",
+            );
+            return;
+        }
+        self.panel.guidance_expanded = !self.panel.guidance_expanded;
+        self.panel.guidance_scroll = 0;
+    }
+
+    /// Scrolls expanded guidance without moving the selected code.
+    pub(crate) fn scroll_file_guidance(&mut self, delta: isize) {
+        self.panel.guidance_scroll = self.panel.guidance_scroll.saturating_add_signed(delta);
+    }
+
+    /// Jumps to one validated evidence reference for the current file (IR-16).
+    pub(crate) fn jump_to_current_evidence(&mut self, number: usize) {
+        let Some(evidence) = self
+            .current_file_guidance()
+            .and_then(|guidance| guidance.evidence.get(number.saturating_sub(1)).cloned())
+        else {
+            self.notice(
+                NoticeLevel::Warn,
+                format!("there is no evidence reference {number} for this file"),
+            );
+            return;
+        };
+        let jumped = self
+            .review
+            .as_mut()
+            .is_some_and(|view| view.goto_evidence(&evidence.path, evidence.side, evidence.line));
+        if jumped {
+            self.select_review_tab(ReviewTab::Files);
+            self.notice(
+                NoticeLevel::Info,
+                format!("evidence {number}: {}", evidence.path),
+            );
+        } else {
+            self.notice(
+                NoticeLevel::Warn,
+                "that evidence no longer exists in the displayed diff; refresh and re-analyze",
+            );
+        }
+    }
+
+    /// Rows reserved for guidance in the current Files layout.
+    #[must_use]
+    fn guidance_height(&self, area: ratatui::layout::Rect) -> u16 {
+        if self.review_tab != ReviewTab::Files || self.current_file_guidance().is_none() {
+            return 0;
+        }
+        if self.panel.guidance_expanded {
+            area.height.saturating_sub(8).clamp(6, 14)
+        } else if area.width <= 100 || area.height <= 24 {
+            6
+        } else {
+            7
+        }
     }
 
     /// The review plan, for editing (FR-4.2).
@@ -4305,6 +4426,11 @@ impl App {
     pub fn set_plan(&mut self, plan: crate::domain::plan::Plan) {
         self.panel.plan = Some(plan);
         self.apply_plan_to_review();
+    }
+
+    /// Records the ordered background write for the current plan snapshot.
+    pub(crate) fn record_plan_save_job(&mut self, job: u64) {
+        self.panel.plan_save_job = job;
     }
 
     /// Rebuilds the view after an override, keeping the file the cursor is in.
@@ -4395,6 +4521,9 @@ impl App {
             .provenance(crate::domain::time::from_unix_secs(
                 i64::try_from(self.now_unix_secs).unwrap_or(i64::MAX),
             ));
+        if let Some(thinking) = crate::domain::model::Thinking::label(&stored.key.thinking) {
+            let _ = std::fmt::Write::write_fmt(&mut label, format_args!(" · {thinking}"));
+        }
         if !stored.analysis.matches_prompt() {
             let _ = std::fmt::Write::write_fmt(
                 &mut label,
@@ -4710,6 +4839,7 @@ impl App {
             || job == self.panel.job
             || job == self.panel.context_job
             || job == self.panel.stored_job
+            || job == self.panel.plan_save_job
             || job == self.chat.job
             || job == self.chat.load_job
             || job == self.context_path_job
@@ -4727,6 +4857,16 @@ impl App {
     /// question that was answered wrongly once, silently, for two of them.
     #[allow(clippy::too_many_lines)]
     fn report_job_failure(&mut self, job: u64, message: &str) {
+        if job == self.panel.plan_save_job {
+            self.panel.plan_save_job = 0;
+            self.notice(
+                NoticeLevel::Warn,
+                format!(
+                    "{message}; reopen the pull request before changing the marker or order again"
+                ),
+            );
+            return;
+        }
         if job == self.drafts.save_job {
             self.drafts.save_job = 0;
             self.drafts.warning = Some(message.to_owned());
@@ -5072,6 +5212,9 @@ impl App {
                 return Some(Pane::Chat);
             }
             return (layout.tree.contains((column, row).into())
+                || layout
+                    .guidance
+                    .is_some_and(|guidance| guidance.contains((column, row).into()))
                 || layout.diff.contains((column, row).into())
                 || layout
                     .composer
@@ -5091,7 +5234,12 @@ impl App {
     fn record_geometry(&mut self, body: ratatui::layout::Rect) {
         self.geometry.width = body.width;
         self.geometry.review = self.review.is_some().then(|| {
-            crate::tui::components::review::layout(body, false, self.drafts.is_composing())
+            crate::tui::components::review::layout(
+                body,
+                false,
+                self.drafts.is_composing(),
+                self.guidance_height(body),
+            )
         });
         if self.overlay != Overlay::Conversation
             && self.focus_target == FocusTarget::CommentComposer
@@ -5118,14 +5266,14 @@ impl App {
     /// The renderer and the mouse both read the result, so the row a click maps to is
     /// the row that was drawn there.
     fn sync_scroll(&mut self) {
+        let fallback_layout = crate::tui::components::review::layout(
+            self.geometry.list,
+            false,
+            self.drafts.is_composing(),
+            self.guidance_height(self.geometry.list),
+        );
         if let Some(view) = self.review.as_mut() {
-            let layout = self.geometry.review.unwrap_or_else(|| {
-                crate::tui::components::review::layout(
-                    self.geometry.list,
-                    false,
-                    self.drafts.is_composing(),
-                )
-            });
+            let layout = self.geometry.review.unwrap_or(fallback_layout);
             view.prepare(
                 layout.diff.height.saturating_sub(2),
                 layout.tree.height.saturating_sub(2),
@@ -6384,18 +6532,15 @@ impl App {
                 self.drafts.scroll = self.drafts.scroll.saturating_sub(10);
                 Effect::None
             }
-            // The publish modal: the decision keys, then Enter to arm and Enter to send
+            // The publish modal: decision keys and one explicit Enter after preview
             // (FR-6.3). `j`/`k` scroll it, because a review body can be long.
             KeyCode::Char('a') if self.overlay == Overlay::Publish => {
-                self.drafts.armed = false;
                 self.set_draft_decision("approve")
             }
             KeyCode::Char('r') if self.overlay == Overlay::Publish => {
-                self.drafts.armed = false;
                 self.set_draft_decision("request-changes")
             }
             KeyCode::Char('c') if self.overlay == Overlay::Publish => {
-                self.drafts.armed = false;
                 self.set_draft_decision("comment")
             }
             KeyCode::Char('j') | KeyCode::Down if self.overlay == Overlay::Publish => {
@@ -8429,9 +8574,7 @@ mod tests {
         assert_eq!(post.body, "agreed, fixed in 9f2c1ab");
         assert!(app.drafts().draft.is_empty(), "and nothing was staged");
 
-        // The second arms, the third sends — and it names the comment it answers.
-        assert_eq!(press(&mut app, "<Enter>"), Effect::None);
-        assert!(app.drafts().armed);
+        // One explicit Post action after preview sends and names the comment it answers.
         let effect = press(&mut app, "<Enter>");
         assert_eq!(
             effect,
@@ -8523,7 +8666,6 @@ mod tests {
             Some("half a thought"),
             "and the words are still here"
         );
-        assert!(!app.drafts().armed, "the confirmation is forgotten");
         assert!(
             app.drafts().status.label().contains("token"),
             "the reason is in the modal: {}",
@@ -8795,7 +8937,6 @@ mod tests {
 
         press(&mut app, "<Enter>");
         assert!(app.drafts().modal);
-        press(&mut app, "<Enter>");
         let effect = press(&mut app, "<Enter>");
         assert_eq!(
             effect,

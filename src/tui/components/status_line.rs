@@ -36,7 +36,37 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         _ => theme.style(element::STATUS_NORMAL),
     };
 
-    let left = vec![
+    let left = if failed {
+        // An error is the next action, not decoration. Keep the mode and focus for
+        // orientation, but give the provider/forge reason the row it needs instead of
+        // truncating it behind file and plan-position metadata (FR-9.1).
+        vec![
+            Span::styled(format!(" {} ", app.mode().label()), background),
+            Span::styled(format!("{} ", app.focus().label()), background),
+        ]
+    } else {
+        persistent_spans(app, theme, background)
+    };
+
+    let right = match app.latest_notice() {
+        Some(notice) => vec![Span::styled(
+            format!("{} ", notice.text),
+            notice_style(theme, notice.level),
+        )],
+        None => vec![Span::styled(
+            "? help · <leader> actions · : commands ".to_owned(),
+            theme.style(element::MUTED),
+        )],
+    };
+
+    frame.render_widget(
+        Paragraph::new(padded_line(left, right, area.width)).style(background),
+        area,
+    );
+}
+
+fn persistent_spans(app: &App, theme: &Theme, background: Style) -> Vec<Span<'static>> {
+    vec![
         Span::styled(format!(" {} ", app.mode().label()), background),
         Span::styled(format!("{} ", app.focus().label()), background),
         Span::styled(format!("· {} ", repository_label(app)), background),
@@ -76,23 +106,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 background
             },
         ),
-    ];
-
-    let right = match app.latest_notice() {
-        Some(notice) => vec![Span::styled(
-            format!("{} ", notice.text),
-            notice_style(theme, notice.level),
-        )],
-        None => vec![Span::styled(
-            "? help · <leader> actions · : commands ".to_owned(),
-            theme.style(element::MUTED),
-        )],
-    };
-
-    frame.render_widget(
-        Paragraph::new(padded_line(left, right, area.width)).style(background),
-        area,
-    );
+    ]
 }
 
 /// The staged review: how many comments are waiting, and whether any are (FR-6.1).
