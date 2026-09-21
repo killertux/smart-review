@@ -1,10 +1,11 @@
 # Smart Review — Reliability and Product Improvement Plan
 
-**Status:** proposed implementation backlog; no implementation PR is complete.\
+**Status:** historical implementation record. IR-01 through IR-18 are merged; IR-19
+replaced this plan as an active contract with the living documentation set.\
 **Prepared:** 2026-09-14.\
 **Baseline:** commit `7f05d1f`. Re-check the current branch before implementing.\
 **Evidence:** [architecture, UX, correctness and performance review](app-review-2026-09-14.html).\
-**Audience:** agents implementing individual PRs and the owner reviewing them.
+**Audience:** readers tracing the 2026 reliability sequence and its evidence.
 
 ## 0. Start here
 
@@ -13,10 +14,13 @@ repairing and improving the existing application, not a proposal to regenerate i
 Keep the useful domain models, parsing, port seams, fakes, process integration and
 terminal lifecycle. Refactor the coordination layer around explicit ownership.
 
-### Reading order for an implementing agent
+> **Historical:** this file no longer governs implementation order or current behavior.
+> Start with [`../AGENTS.md`](../AGENTS.md), [`product.md`](product.md),
+> [`../ARCHITECTURE.md`](../ARCHITECTURE.md), and [`testing.md`](testing.md).
 
-1. Read the current `AGENTS.md` instructions and follow their required reading order:
-   `REQUIREMENTS.md`, `PLAN.md`, `ARCHITECTURE.md`, then `AGENTS.md`.
+### Original reading order for an implementing agent
+
+1. Read the contributor instructions and current product/architecture/testing contracts.
 2. Read the report's executive recommendation and the findings assigned to your PR.
 3. Read this plan's shared contracts, your PR, its dependencies, and its acceptance
    tests. Read the adjacent PRs before changing a shared interface.
@@ -104,30 +108,30 @@ initial approach described here.
 
 ## 2. PR order and dependencies
 
-All statuses start as **not started**. Size is relative implementation/review effort,
-not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
+Size is the original relative implementation/review effort: S = narrow, M = one
+subsystem, L = cross-cutting invariant. Status links record the merged work.
 
 | PR | Priority | Title / delivered outcome | Hard dependencies | Size | Status |
 |---|---|---|---|---|---|
-| [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | [Open — PR #11](https://github.com/killertux/smart-review/pull/11) |
-| [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | [Open — PR #12](https://github.com/killertux/smart-review/pull/12) |
-| [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | Implemented |
+| [IR-01](#ir-01-prevent-excluded-content-and-request-bodies-from-leaking) | P1 | Outbound content policy and safe diagnostic logging | None | M | [Merged — PR #11](https://github.com/killertux/smart-review/pull/11) |
+| [IR-02](#ir-02-make-llm-fallback-lazy-and-account-for-every-attempt) | P1 | One intended LLM request, lazy fallback, correct usage | None | S | [Merged — PR #12](https://github.com/killertux/smart-review/pull/12) |
+| [IR-03](#ir-03-enforce-effective-model-settings-and-request-budgets) | P1 | Enforced model settings and complete payload budgets | IR-02 | M | [Merged — PR #13](https://github.com/killertux/smart-review/pull/13) |
 | [IR-04](#ir-04-preserve-draft-anchors-and-active-composers) | P1 | Original anchors and unsaved writing survive reloads | None | M | [Merged — PR #14](https://github.com/killertux/smart-review/pull/14) |
 | [IR-05](#ir-05-own-pr-state-and-jobs-with-a-review-session) | P1 | PR/session isolation and stale-result rejection | IR-04 | L | [Merged — PR #15](https://github.com/killertux/smart-review/pull/15) |
-| [IR-06](#ir-06-make-user-storage-atomic-durable-and-recoverable) | P1 foundation | Atomic writes, durable chat, recoverable indexes | IR-05 | L | [Open — PR #16](https://github.com/killertux/smart-review/pull/16) |
-| [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | In progress (`ir-07-remote-mutations`) |
-| [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | In progress (`ir-08-cancellation-progress`) |
+| [IR-06](#ir-06-make-user-storage-atomic-durable-and-recoverable) | P1 foundation | Atomic writes, durable chat, recoverable indexes | IR-05 | L | [Merged — PR #16](https://github.com/killertux/smart-review/pull/16) |
+| [IR-07](#ir-07-model-remote-mutations-and-unknown-outcomes-explicitly) | P1 | Publish/reply reconciliation and truthful dry-run | IR-05, IR-06 | L | [Merged — PR #17](https://github.com/killertux/smart-review/pull/17) |
+| [IR-08](#ir-08-cancel-real-work-and-bound-progress-delivery) | P1 | Real cancellation, bounded progress, worker recovery | IR-02, IR-05, IR-07 | M | [Merged — PR #18](https://github.com/killertux/smart-review/pull/18) |
 | [IR-09](#ir-09-unify-layout-focus-hit-testing-and-visible-selection) | P1 | Input reaches the visible target and correct diff line | IR-04, IR-05 | M | [Merged — PR #20](https://github.com/killertux/smart-review/pull/20) |
 | [IR-10](#ir-10-ship-real-pr-tabs-and-complete-checks-and-discussion) | P1 | Reachable Overview, Files, Checks, Discussion and Ask | IR-05, IR-07, IR-09 | L | [Merged — PR #21](https://github.com/killertux/smart-review/pull/21) |
-| [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | In progress (`ir-11-executable-review-order`) |
+| [IR-11](#ir-11-make-the-review-order-executable-everywhere) | P1 | File, hunk, tree and scrolling honor the selected order | IR-05, IR-09 | M | Merged — [#22](https://github.com/killertux/smart-review/pull/22), [#23](https://github.com/killertux/smart-review/pull/23), [#24](https://github.com/killertux/smart-review/pull/24) |
 | [IR-12](#ir-12-unify-context-identity-caching-and-evidence-attribution) | P2 | Same inspectable context and correct file evidence | IR-01, IR-03, IR-05 | L | [Merged — PR #25](https://github.com/killertux/smart-review/pull/25) |
-| [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | [Open — PR #26](https://github.com/killertux/smart-review/pull/26) |
+| [IR-13](#ir-13-isolate-git-workspaces-and-use-explicit-revision-identities) | P1 adapter correctness | Correct merge base, app-owned Git data, collision-free identity | IR-05, IR-06 | L | [Merged — PR #26](https://github.com/killertux/smart-review/pull/26) |
 | [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | [Merged — PR #27](https://github.com/killertux/smart-review/pull/27) |
-| [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Implemented locally (`ir-15-terminal-harness`) |
-| [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Implemented locally; owner walkthrough pending |
-| [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Implemented |
-| [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | Implemented |
-| [IR-19](#ir-19-replace-milestone-docs-with-a-small-living-product-contract) | P3 | Accurate product, architecture and testing documentation | IR-01 through IR-18 | M | Not started |
+| [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | [Merged — PR #28](https://github.com/killertux/smart-review/pull/28) |
+| [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | [Merged — PR #29](https://github.com/killertux/smart-review/pull/29) |
+| [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | [Merged — PR #30](https://github.com/killertux/smart-review/pull/30) |
+| [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | [Merged — PR #31](https://github.com/killertux/smart-review/pull/31) |
+| [IR-19](#ir-19-replace-milestone-docs-with-a-small-living-product-contract) | P3 | Accurate product, architecture and testing documentation | IR-01 through IR-18 | M | Implemented in `ir-19-living-docs`; review pending |
 
 ### Execution notes
 
@@ -1754,31 +1758,43 @@ stops overriding current behavior or forcing redundant test gates.
 
 ### Implementation steps
 
-1. [ ] Build the new product and architecture docs from the corrected code, not by
+1. [x] Build the new product and architecture docs from the corrected code, not by
    compressing old prose. Include a real module map and a representative action/job/
    save/mutation data flow.
-2. [ ] Specify durable versus disposable storage, migration/recovery behavior, actual
+2. [x] Specify durable versus disposable storage, migration/recovery behavior, actual
    cancellation guarantees, unknown mutation outcomes and AI inference limitations.
-3. [ ] Resolve proposed decisions with the owner. Distinguish adopted choices from
+3. [x] Resolve proposed decisions with the owner. Distinguish adopted choices from
    unresolved retention/confirmation/portability options; do not mark them decided by
    copying implementation defaults.
-4. [ ] Preserve historical requirement/decision IDs through an archive or compact legacy
+4. [x] Preserve historical requirement/decision IDs through an archive or compact legacy
    index so existing test comments, issues and PRs stay interpretable. Do not renumber.
-5. [ ] Recommended migration: move old `REQUIREMENTS.md` and `PLAN.md` into an explicitly
-   historical `docs/archive/` location with a banner, then remove active-root links.
-   If the owner prefers Git history alone, retain a small ID index. Record the chosen
-   approach and fix all links in the same change.
-6. [ ] Update `AGENTS.md` reading order and testing commands. Remove the completed
+5. [x] The owner chose Git history plus [`docs/legacy-ids.md`](legacy-ids.md) instead of
+   archiving the full `REQUIREMENTS.md` and `PLAN.md`. Root links were removed in the
+   same change.
+6. [x] Update `AGENTS.md` reading order and testing commands. Remove the completed
    milestone-order mandate and the requirement to update the retired specification.
    Keep dependency approval, no-unsafe/panic rules, IO boundaries, privacy, confirmation,
    terminal restoration and no-commit/push-without-request rules.
-7. [ ] Update README, CI comments, validator help, generated docs and source doc links
+7. [x] Update README, CI comments, validator help, generated docs and source doc links
    that still refer to “arriving in M1/M2,” fake tabs or cache-as-chat-storage.
-8. [ ] Preserve this improvement plan as an implementation record with actual PR links,
+8. [x] Preserve this improvement plan as an implementation record with actual PR links,
    evidence and unresolved follow-ups. Once complete, mark it historical too; do not
    create another permanent competing source of current functionality.
-9. [ ] Check relative links, generated keymap parity and configuration examples against
+9. [x] Check relative links, generated keymap parity and configuration examples against
    the binary. Run the exact README quick-start/manual workflow with a fixture.
+
+**IR-19 owner decisions (2026-09-21):** preserve retired FR/NFR/ARCH/DEV/DEP/DEC IDs
+through a compact index plus Git history rather than full archived specifications. Accept
+the shipped DEC-7, DEC-9–DEC-14 and DEC-18 choices, retire milestone-priority DEC-8,
+and leave paid new-head re-analysis (DEC-15) explicitly open.
+
+**IR-19 verification (2026-09-21):** `scripts/validate/all.sh` passed the new hermetic
+Markdown link/fragment check, format, Clippy with warnings denied, 1,144 Rust tests plus
+11 snapshots (8 opt-in performance tests ignored), and all six named terminal/process
+smoke contracts. Generated keymap parity passed inside the Rust suite; the documented
+configuration defaults/effective-limit rules match `src/config.rs`. The README's isolated
+build-and-smoke rehearsal is therefore executable without an account, credential, network
+call, or user repository. No snapshot changed.
 
 ### Required checks
 

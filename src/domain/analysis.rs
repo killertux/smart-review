@@ -6,7 +6,7 @@
 //! - **the model's output is untrusted input.** It is prose wrapped around JSON,
 //!   sometimes fenced, sometimes with an extra key, sometimes with a file that is not
 //!   in the diff. Parsing is therefore tolerant per entry — the same lesson the model
-//!   catalog taught at M2a — and normalization is what makes the document *safe to
+//!   model catalog — and normalization is what makes the document *safe to
 //!   display*: every path it mentions is checked against the diff, and anything that
 //!   is not there is dropped with a warning rather than rendered as a link to a file
 //!   that does not exist (FR-4.1).

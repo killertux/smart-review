@@ -3,9 +3,8 @@
 //! Left: the persistent segments — mode, focus, repository, pull request, model
 //! and draft count. Right: the newest notification, or the key hints.
 //!
-//! The segments that need M1/M2 data render an em dash placeholder rather than
-//! disappearing, so the layout does not shift when the features land and the
-//! absence of a value is visible instead of implied.
+//! Segments without a current value render an em dash rather than disappearing, so
+//! the layout remains stable and absence is visible instead of implied.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -19,7 +18,7 @@ use crate::tui::diff_view::DiffView;
 use crate::tui::keymap::Mode;
 use crate::tui::theme::{Theme, element};
 
-/// Rendered where a value exists in a later milestone.
+/// Rendered where the current view has no value.
 const PLACEHOLDER: &str = "—";
 
 /// Renders the status line.
@@ -93,7 +92,7 @@ fn persistent_spans(app: &App, theme: &Theme, background: Style) -> Vec<Span<'st
         // comparison rather than a leap of faith (FR-3.5).
         Span::styled(order_positions_label(app), background),
         Span::styled(format!("· {} ", model_label(app)), background),
-        // The order and the analysis are what a reviewer is looking at in M2, so
+        // The order and analysis are what a reviewer is looking at, so
         // they get the columns the diff source and the model do not need (FR-3.5).
         Span::styled(analysis_label(app), background),
         // FR-5.4: what the conversation has cost so far, in the same place the analysis
@@ -101,7 +100,7 @@ fn persistent_spans(app: &App, theme: &Theme, background: Style) -> Vec<Span<'st
         // segment on every screen would be noise.
         Span::styled(chat_label(app), background),
         // FR-6.1: what is staged for this pull request. The column existed as a
-        // placeholder from M1 and now says something: a count that is visible without
+        // placeholder and now says something: a count that is visible without
         // opening the panel, and brightened only when there is work to publish.
         Span::styled(
             drafts_label(app).0,

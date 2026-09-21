@@ -3,9 +3,8 @@
 //! Secrets never reach this module's callers: nothing here filters content, so
 //! callers must not log keys, tokens or file contents (NFR-3.1).
 //!
-//! A hand-rolled logger keeps the dependency list to what M0 approved. If the
-//! project adopts `tracing` (PLAN.md §5), this module is the only thing that has
-//! to change.
+//! A small logger keeps content redaction and file rotation in one place. Replacing it
+//! with another logging backend would not change call sites.
 
 use std::fmt;
 use std::io::Write;

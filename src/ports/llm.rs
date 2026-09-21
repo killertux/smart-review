@@ -11,9 +11,8 @@
 //!   populated only when a backend actually returns one, and the UI says nothing
 //!   about a trace otherwise.
 //!
-//! M2a uses [`LlmPort::complete`] for the picker's connection check, which is the
-//! only way to know a selection works before spending an analysis on it. M2b uses
-//! [`LlmPort::stream`] for the analysis itself.
+//! [`LlmPort::complete`] performs the picker's connection check before an analysis
+//! request; [`LlmPort::stream`] serves analysis and chat.
 
 use std::fmt;
 
@@ -225,7 +224,7 @@ pub enum LlmError {
     },
 }
 
-/// A streamed delta, handed to the caller as it arrives (M2b).
+/// A streamed delta, handed to the caller as it arrives.
 pub type DeltaHandler<'a> = dyn FnMut(&str) + Send + 'a;
 
 /// Anything that can talk to an LLM provider.

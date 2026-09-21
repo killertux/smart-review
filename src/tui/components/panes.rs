@@ -1,8 +1,6 @@
 //! The main panes.
 //!
-//! In M0 they describe what is coming and report the running configuration, so
-//! the shell is honest rather than a fake. M1 replaces the left pane with the
-//! pull request list and the right one with the diff.
+//! The body is either the pull request list or the five-tab review screen.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

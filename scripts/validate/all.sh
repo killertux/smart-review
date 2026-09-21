@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the shared Rust gates once, then run the small terminal/process smoke contracts
 # in parallel. Set SMART_REVIEW_FULL_VALIDATION=1 to retain the historical broad PTY
-# suite while IR-18's deterministic coverage is reviewed.
+# suite as an opt-in migration oracle.
 
 set -uo pipefail
 
@@ -16,6 +16,9 @@ python3 "$ROOT/scripts/validate/test_harness.py" || exit 1
 HARNESS_FINISHED="$(python3 -c 'import time; print(time.monotonic_ns())')"
 HARNESS_MS="$(( (HARNESS_FINISHED - HARNESS_STARTED) / 1000000 ))"
 RUST_TEST_MS="${SMART_REVIEW_RUST_TEST_MS:-}"
+
+printf '\n== documentation ==\n'
+python3 "$ROOT/scripts/validate/docs.py" || exit 1
 
 if [ "${SMART_REVIEW_SKIP_CARGO:-0}" != "1" ]; then
   printf '\n== shared Cargo gates ==\n'

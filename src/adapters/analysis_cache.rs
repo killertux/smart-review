@@ -1,9 +1,10 @@
 //! The on-disk analysis cache (FR-4.3, FR-4.2).
 //!
-//! Layout: `<home>/cache/analysis/<host>/<owner>/<name>/pr-<N>/<digest>.json` for an
-//! analysis, and `plan.json` beside it for the manual review-plan overrides. One
-//! directory per pull request is what makes DEC-15 implementable: the UI has to find
-//! an analysis made for an *older* commit, and listing a directory is how it does.
+//! Analyses use `<home>/cache/analysis/<host>/<owner>/<name>/pr-<N>/<digest>.json`.
+//! Durable manual order and review progress use the same subject layout under
+//! `<home>/reviews/`, with migration from the legacy cache-side `plan.json`. One
+//! analysis directory per pull request keeps older-head entries discoverable for any
+//! future DEC-15 flow.
 //!
 //! Two properties matter more than speed here:
 //!

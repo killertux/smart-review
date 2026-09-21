@@ -1,8 +1,8 @@
 //! The forge port: everything the application needs from GitHub (ARCH-2).
 //!
-//! One trait, implemented by the `gh` CLI adapter in M1 and by nothing else in
-//! v1. Every method takes a [`Cancel`] because every one of them runs a process
-//! that the user must be able to abandon (NFR-1.4).
+//! One trait, implemented by the `gh` CLI adapter in production and by fakes in tests.
+//! Every method takes a [`Cancel`] because every one can run work that the user must
+//! be able to abandon (NFR-1.4).
 
 use crate::domain::diff::Patch;
 use crate::domain::draft::Draft;

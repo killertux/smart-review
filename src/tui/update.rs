@@ -969,8 +969,8 @@ fn toggle_split(app: &mut App) -> Effect {
 ///
 /// A remote diff comes from `gh pr diff`, which always emits three lines of context
 /// and never filters whitespace. Flipping the label would tell the user the pane is
-/// showing something it is not, so in M1 these keys explain rather than lie; M2's
-/// workspace re-diffs locally, where both settings are real.
+/// showing something it is not, so unavailable toggles explain rather than lie; a
+/// workspace re-diff can apply both settings for real.
 /// Cycles the diff context: 3 → 10 → 0 (FR-3.2).
 ///
 /// The change is a *re-read*, not a re-render: the context lines are produced by git,
@@ -1686,7 +1686,7 @@ fn context_command(app: &mut App, argument: &str) -> Effect {
     }
     if argument.is_empty() {
         // FR-4.6's inspector: what an analysis would send. A number still means the
-        // diff's own context, which is the M1 meaning of the same word (FR-3.2) — and
+        // diff's own context (FR-3.2) — and
         // the difference is stated rather than guessed at, because `:context 6` and
         // `:context` doing two different things is worth one sentence.
         if app.context_bundle().is_some() {

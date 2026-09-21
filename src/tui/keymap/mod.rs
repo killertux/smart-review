@@ -29,7 +29,7 @@ pub enum Mode {
     Search,
     /// A popup owns the keyboard.
     Popup,
-    /// Line or range selection (M1).
+    /// Line or range selection.
     Visual,
 }
 
@@ -329,9 +329,8 @@ pub enum KeymapError {
 
 /// The default bindings, compiled in (FR-8.3).
 ///
-/// Deliberately absent: a plain `q` to quit. `REQUIREMENTS.md` reserves `q` for
-/// "go back" once there are screens to go back from (FR-3.4), so quitting is
-/// bound to `<C-c>`, `<leader>q` and `:q`.
+/// Deliberately absent: a plain `q` to quit. Avoiding an accidental single-key exit
+/// keeps quitting explicit through `<C-c>`, `<leader>q` and `:q`.
 pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::Global, "<C-c>", "app.quit"),
     (Scope::Global, "?", "app.help"),

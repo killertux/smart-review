@@ -228,7 +228,7 @@ impl GhCliForge {
     /// A `gh api graphql` command with the query as one argument.
     ///
     /// The query is one argv element, never assembled from a shell string: it contains
-    /// newlines and braces, and the same rule as M1's `-f q=` applies (FR-1.3).
+    /// newlines and braces, following the same argv-only query rule (FR-1.3).
     fn graphql_spec(&self, query: &str) -> CommandSpec {
         CommandSpec::new(&self.program)
             .args(["api", "graphql", "-f"])

@@ -47,7 +47,7 @@ pub struct GitCli {
     program: PathBuf,
     cwd: Option<PathBuf>,
     /// Where managed worktrees are created. Absent until the composition root
-    /// wires it in, which is what keeps the M1 detection path working unchanged.
+    /// wires it in, keeping repository detection independent of workspace creation.
     worktrees_root: Option<PathBuf>,
 }
 
