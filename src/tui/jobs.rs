@@ -193,6 +193,10 @@ pub enum Job {
         number: u64,
         /// The head commit, which the cache is keyed by.
         head_sha: String,
+        /// Display options captured before the background projection starts.
+        options: DiffOptions,
+        /// Immutable review context folded into the worker-built projection.
+        view: Box<ViewContext>,
     },
     /// Fetch the model catalog (FR-4.7).
     Catalog {
@@ -225,8 +229,8 @@ pub enum Job {
         number: u64,
         /// The head commit, which the cached diff is keyed by.
         head_sha: String,
-        /// The flags that produced it, also part of the cache key.
-        options: DiffOptions,
+        /// Immutable review context folded into the worker-built projection.
+        view: Box<ViewContext>,
     },
     /// Read whatever is already stored for a pull request (FR-4.3).
     LoadAnalysis {
@@ -332,7 +336,51 @@ pub enum Job {
     },
 }
 
+/// State known before a diff job starts and needed to prepare its first drawable view.
+#[derive(Debug, Clone, Default)]
+pub struct ViewContext {
+    pub head_sha: String,
+    pub comments: Vec<crate::domain::pr::ReviewComment>,
+    pub plan: Option<crate::domain::plan::Plan>,
+}
+
 impl Job {
+    /// Stable non-content label used by job timing records (NFR-5.3, IR-17).
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::SaveState { .. } => "save-state",
+            Self::ValidateContextPath { .. } => "validate-context-path",
+            Self::LoadDraft { .. } => "load-draft",
+            Self::SaveDraft { .. } => "save-draft",
+            Self::DeleteDraft { .. } => "delete-draft",
+            Self::Detect => "detect-environment",
+            Self::CachedList { .. } => "load-cached-list",
+            Self::List { .. } => "list-pull-requests",
+            Self::Count { .. } => "count-pull-requests",
+            Self::Detail { .. } => "pull-request-detail",
+            Self::Patch { .. } => "remote-patch",
+            Self::Catalog { .. } => "model-catalog",
+            Self::Workspace { .. } => "ensure-workspace",
+            Self::ModelCheck { .. } => "model-check",
+            Self::CleanWorkspaces { .. } => "clean-workspaces",
+            Self::LocalPatch { .. } => "local-patch",
+            Self::LoadAnalysis { .. } => "load-analysis",
+            Self::GatherContext { .. } => "gather-context",
+            Self::RunAnalysis { .. } => "run-analysis",
+            Self::SavePlan { .. } => "save-plan",
+            Self::LoadChat { .. } => "load-chat",
+            Self::GatherChat { .. } => "gather-chat-context",
+            Self::AskChat { .. } => "ask-chat",
+            Self::SubmitReview { .. } => "submit-review",
+            Self::Report { .. } => "doctor-report",
+            Self::PostReply { .. } => "post-reply",
+            Self::PostConversation { .. } => "post-conversation",
+            Self::ResolveThread { .. } => "resolve-thread",
+            Self::RecoverMutations { .. } => "recover-mutations",
+        }
+    }
+
     /// Which slot the job occupies.
     #[must_use]
     pub fn slot(&self) -> Slot {
@@ -455,8 +503,8 @@ pub enum Outcome {
     Detail(Box<FetchOutcome<PullRequestDetail>>),
     /// A diff arrived, or the cached one did.
     Patch {
-        /// The diff.
-        outcome: Box<FetchOutcome<Patch>>,
+        /// The diff with its expensive immutable display projection already prepared.
+        outcome: Box<FetchOutcome<crate::tui::diff_view::DiffView>>,
         /// Where it was read from (FR-3.2).
         source: DiffSource,
         /// The revision the patch job requested.
@@ -565,6 +613,82 @@ pub enum Outcome {
     },
     /// The job was replaced or abandoned before it finished.
     Abandoned,
+}
+
+fn prepared_patch(
+    outcome: FetchOutcome<Patch>,
+    source: DiffSource,
+    head_sha: &str,
+    options: DiffOptions,
+    view: &ViewContext,
+) -> Outcome {
+    Outcome::Patch {
+        outcome: Box::new(prepare_view(outcome, options, view)),
+        source,
+        head_sha: head_sha.to_owned(),
+    }
+}
+
+fn prepare_view(
+    outcome: FetchOutcome<Patch>,
+    options: DiffOptions,
+    context: &ViewContext,
+) -> FetchOutcome<crate::tui::diff_view::DiffView> {
+    let build = |patch| {
+        crate::tui::diff_view::DiffView::new_with_context(
+            patch,
+            options.context,
+            options.ignore_whitespace,
+            Some(&context.head_sha),
+            context.plan.clone(),
+            context.comments.clone(),
+        )
+    };
+    match outcome {
+        FetchOutcome::Fresh(patch) => FetchOutcome::Fresh(build(patch)),
+        FetchOutcome::Offline { value, reason } => FetchOutcome::Offline {
+            value: build(value),
+            reason,
+        },
+    }
+}
+
+impl Outcome {
+    const fn result_label(&self) -> &'static str {
+        match self {
+            Self::EnvironmentFailed(_) | Self::Failed(_) | Self::MutationFailed { .. } => "failed",
+            Self::Abandoned => "cancelled",
+            _ => "ok",
+        }
+    }
+
+    fn count_label(&self) -> String {
+        match self {
+            Self::Patch { outcome, .. } => {
+                format!(" files={}", outcome.value().patch.files.len())
+            }
+            Self::Context { bundle, .. } | Self::ChatGathered { bundle, .. } => format!(
+                " segments={} included={}",
+                bundle.segments.len(),
+                bundle
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.included)
+                    .count()
+            ),
+            Self::Page(page) => format!(" pull_requests={}", page.value().items.len()),
+            Self::Checks(checks) => format!(" checks={}", checks.len()),
+            Self::WorkspacesCleaned {
+                removed,
+                kept,
+                failed,
+            } => format!(
+                " removed={removed} kept={kept} failed_count={}",
+                failed.len()
+            ),
+            _ => String::new(),
+        }
+    }
 }
 
 /// Something a running job wants the interface to know now (FR-4.4).
@@ -765,12 +889,13 @@ impl Executor {
                 Ok(outcome) => Outcome::Detail(Box::new(outcome)),
                 Err(error) => Outcome::Failed(error.to_string()),
             },
-            Job::Patch { number, head_sha } => match prs.load_patch(*number, head_sha, cancel) {
-                Ok(outcome) => Outcome::Patch {
-                    outcome: Box::new(outcome),
-                    source: DiffSource::Forge,
-                    head_sha: head_sha.clone(),
-                },
+            Job::Patch {
+                number,
+                head_sha,
+                options,
+                view,
+            } => match prs.load_patch(*number, head_sha, cancel) {
+                Ok(outcome) => prepared_patch(outcome, DiffSource::Forge, head_sha, *options, view),
                 Err(error) => Outcome::Failed(error.to_string()),
             },
             // A local diff is read from the worktree rather than from the forge, and
@@ -780,8 +905,8 @@ impl Executor {
                 request,
                 number,
                 head_sha,
-                options,
-            } => self.local_patch(&prs, request, *number, head_sha, *options, cancel),
+                view,
+            } => self.local_patch(&prs, request, *number, head_sha, view, cancel),
             // Reading what is stored, gathering what would be sent, and asking for
             // the analysis: all three need the repository, the clock and the cache,
             // which is exactly what the executor holds (FR-4.3, FR-4.6).
@@ -798,7 +923,15 @@ impl Executor {
                 }
             }
             Job::GatherContext { request, intent } => {
+                sink.send(ProgressUpdate::Analysis(AnalysisProgress::Stage(format!(
+                    "reading {} changed file(s) in bounded Git batches",
+                    request.context.identity.changed_paths.len()
+                ))));
                 let (bundle, _) = self.analyst().gather(request, cancel);
+                sink.send(ProgressUpdate::Analysis(AnalysisProgress::Stage(format!(
+                    "prepared {} context segment(s)",
+                    bundle.segments.len()
+                ))));
                 Outcome::Context {
                     bundle: Box::new(bundle),
                     intent: *intent,
@@ -1127,15 +1260,20 @@ impl Executor {
         request: &DiffRequest,
         number: u64,
         head_sha: &str,
-        options: DiffOptions,
+        view: &ViewContext,
         cancel: &Cancel,
     ) -> Outcome {
+        let options = request.options;
         // Cache first, with the flags in the key: re-opening a file with the
         // same toggles must not re-run git (FR-3.2).
         match prs.cached_patch_with(number, head_sha, options, DiffSource::Worktree) {
             Ok(Some(cached)) if !cached.stale => {
                 return Outcome::Patch {
-                    outcome: Box::new(FetchOutcome::Fresh(cached.value)),
+                    outcome: Box::new(prepare_view(
+                        FetchOutcome::Fresh(cached.value),
+                        options,
+                        view,
+                    )),
                     source: DiffSource::Worktree,
                     head_sha: head_sha.to_owned(),
                 };
@@ -1161,7 +1299,7 @@ impl Executor {
                 let patch = crate::domain::diff::parse_patch(&text);
                 let _ = prs.store_local_patch(number, head_sha, options, &patch);
                 Outcome::Patch {
-                    outcome: Box::new(FetchOutcome::Fresh(patch)),
+                    outcome: Box::new(prepare_view(FetchOutcome::Fresh(patch), options, view)),
                     source: DiffSource::Worktree,
                     head_sha: head_sha.to_owned(),
                 }
@@ -1171,10 +1309,14 @@ impl Executor {
             Err(error) => {
                 match prs.cached_patch_with(number, head_sha, options, DiffSource::Worktree) {
                     Ok(Some(cached)) => Outcome::Patch {
-                        outcome: Box::new(FetchOutcome::Offline {
-                            value: cached.value,
-                            reason: error.to_string(),
-                        }),
+                        outcome: Box::new(prepare_view(
+                            FetchOutcome::Offline {
+                                value: cached.value,
+                                reason: error.to_string(),
+                            },
+                            options,
+                            view,
+                        )),
                         source: DiffSource::Worktree,
                         head_sha: head_sha.to_owned(),
                     },
@@ -1669,6 +1811,7 @@ impl JobRunner {
     /// Runs one job on a worker thread.
     fn start(&mut self, id: u64, owner: JobOwner, job: Job) {
         let slot = job.slot();
+        let kind = job.kind();
         // Every job gets a flag; a report simply never blocks long enough for it to
         // matter, and giving one class of job no handle would mean a special case in
         // the code that cancels.
@@ -1690,6 +1833,7 @@ impl JobRunner {
         let spawned = std::thread::Builder::new()
             .name(format!("smart-review-job-{id}"))
             .spawn(move || {
+                let started = Instant::now();
                 // A job that unwinds would never send a completion, and its slot
                 // would be occupied for the rest of the session: four such workers
                 // and nothing is ever fetched again, with nothing on screen to say
@@ -1730,6 +1874,16 @@ impl JobRunner {
                 } else {
                     outcome
                 };
+
+                logging::log(
+                    Level::Info,
+                    format!(
+                        "job id={id} kind={kind} duration_ms={} result={}{}",
+                        started.elapsed().as_millis(),
+                        outcome.result_label(),
+                        outcome.count_label()
+                    ),
+                );
 
                 let _ = sender.send(Completion {
                     job: id,
@@ -2727,6 +2881,8 @@ mod tests {
         runner.submit(Job::Patch {
             number: 1,
             head_sha: "abc".to_owned(),
+            options: DiffOptions::default(),
+            view: Box::new(ViewContext::default()),
         });
         runner.submit(Job::Report {
             context: Box::new(context()),
@@ -2739,6 +2895,53 @@ mod tests {
         assert_eq!(runner.queue.len(), 1, "the fifth waits its turn");
 
         let _ = wait_for_completion(&mut runner);
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_four_jobs_and_rapid_navigation_workload() {
+        let (mut runner, forge) = runner_with(Duration::from_millis(25));
+        runner.submit(Job::List {
+            query: PrQuery::default(),
+        });
+        runner.submit(Job::Count {
+            query: PrQuery::default(),
+        });
+        runner.submit(Job::Detail { number: 1 });
+        runner.submit(Job::Patch {
+            number: 1,
+            head_sha: "abc".to_owned(),
+            options: DiffOptions::default(),
+            view: Box::new(ViewContext::default()),
+        });
+        assert_eq!(runner.running.len(), MAX_IN_FLIGHT);
+
+        let started = Instant::now();
+        let mut newest = 0;
+        for _ in 0..20 {
+            newest = runner.submit(Job::List {
+                query: PrQuery::default(),
+            });
+        }
+        let completions = wait_for_job(&mut runner, newest);
+        let elapsed = started.elapsed();
+        let stale_pages = completions
+            .iter()
+            .filter(|completion| {
+                completion.job != newest && matches!(completion.outcome, Outcome::Page(_))
+            })
+            .count();
+        eprintln!(
+            "IR17_METRIC profile={} workload=four_jobs_rapid_navigation replacements=20 duration_ms={} cancelled={} stale_pages={stale_pages}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            elapsed.as_millis(),
+            forge.cancelled(),
+        );
+        assert_eq!(stale_pages, 0);
     }
 
     /// A job whose body panics, to prove the slot is not lost.

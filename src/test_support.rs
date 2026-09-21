@@ -446,6 +446,46 @@ impl crate::ports::workspace::WorkspacePort for FakeWorkspace {
             })
     }
 
+    fn read_files(
+        &self,
+        _repo: &Path,
+        rev: &str,
+        paths: &[String],
+        max_file_bytes: u64,
+        max_total_bytes: usize,
+        _cancel: &crate::ports::Cancel,
+    ) -> Result<Vec<crate::ports::workspace::FileRead>, crate::ports::workspace::WorkspaceError>
+    {
+        self.record("read_files");
+        let mut retained = 0usize;
+        Ok(paths
+            .iter()
+            .map(|path| {
+                let outcome = self.files.get(&format!("{rev}:{path}")).map_or(
+                    crate::ports::workspace::FileReadOutcome::Missing,
+                    |bytes| {
+                        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_file_bytes {
+                            crate::ports::workspace::FileReadOutcome::Oversize {
+                                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                            }
+                        } else if retained.saturating_add(bytes.len()) > max_total_bytes {
+                            crate::ports::workspace::FileReadOutcome::BudgetExceeded {
+                                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                            }
+                        } else {
+                            retained = retained.saturating_add(bytes.len());
+                            crate::ports::workspace::FileReadOutcome::Content(bytes.clone())
+                        }
+                    },
+                );
+                crate::ports::workspace::FileRead {
+                    path: path.clone(),
+                    outcome,
+                }
+            })
+            .collect())
+    }
+
     fn list_files(
         &self,
         _repo: &Path,

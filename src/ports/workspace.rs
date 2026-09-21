@@ -166,6 +166,32 @@ pub struct WorkspaceEntry {
     pub legacy_cleanup: Option<String>,
 }
 
+/// One object requested through a bounded Git batch read (IR-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRead {
+    /// Repository-relative path, echoed in request order.
+    pub path: String,
+    /// What Git established before source bytes were accepted.
+    pub outcome: FileReadOutcome,
+}
+
+/// Bounded result of reading one revision:path object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileReadOutcome {
+    /// A blob no larger than the caller's limit.
+    Content(Vec<u8>),
+    /// No object exists at that revision and path.
+    Missing,
+    /// The blob exists but is larger than the per-file source limit.
+    Oversize { bytes: u64 },
+    /// The blob fit individually but retaining it would exceed the batch budget.
+    BudgetExceeded { bytes: u64 },
+    /// The object is not a blob (for example a submodule commit).
+    NotBlob { kind: String },
+    /// This one object could not be read; other batch entries may still be usable.
+    Unreadable { reason: String },
+}
+
 /// Anything that can describe and materialise the checkout the app reviews.
 pub trait WorkspacePort: std::fmt::Debug + Send + Sync {
     /// Inspects the directory the app was started in.
@@ -213,6 +239,59 @@ pub trait WorkspacePort: std::fmt::Debug + Send + Sync {
         path: &str,
         cancel: &Cancel,
     ) -> Result<Vec<u8>, WorkspaceError>;
+
+    /// Reads many objects through one bounded adapter operation (IR-17).
+    ///
+    /// Implementations inspect object type and size before buffering content. The
+    /// default preserves fake/alternative adapters while the Git adapter overrides it
+    /// with `git cat-file --batch-*`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Cancelled`] promptly, or a batch-wide adapter error.
+    fn read_files(
+        &self,
+        repo: &std::path::Path,
+        rev: &str,
+        paths: &[String],
+        max_file_bytes: u64,
+        max_total_bytes: usize,
+        cancel: &Cancel,
+    ) -> Result<Vec<FileRead>, WorkspaceError> {
+        let mut reads = Vec::with_capacity(paths.len());
+        let mut retained = 0usize;
+        for path in paths {
+            if cancel.is_cancelled() {
+                return Err(WorkspaceError::Cancelled);
+            }
+            let outcome = match self.read_file(repo, rev, path, cancel) {
+                Ok(bytes) if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_file_bytes => {
+                    FileReadOutcome::Oversize {
+                        bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    }
+                }
+                Ok(bytes) if retained.saturating_add(bytes.len()) > max_total_bytes => {
+                    FileReadOutcome::BudgetExceeded {
+                        bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    }
+                }
+                Ok(bytes) => {
+                    retained = retained.saturating_add(bytes.len());
+                    FileReadOutcome::Content(bytes)
+                }
+                Err(WorkspaceError::NotFound { .. }) => FileReadOutcome::Missing,
+                Err(WorkspaceError::Cancelled) => return Err(WorkspaceError::Cancelled),
+                Err(error) => FileReadOutcome::Unreadable {
+                    reason: error.to_string(),
+                },
+            };
+            reads.push(FileRead {
+                path: path.clone(),
+                outcome,
+            });
+        }
+        Ok(reads)
+    }
 
     /// Lists every file tracked at a revision, for the file tree (FR-4.6).
     ///

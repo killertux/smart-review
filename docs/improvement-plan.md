@@ -125,7 +125,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-14](#ir-14-move-io-out-of-the-ui-and-order-background-saves) | P2 responsiveness | Pure reducer/rendering and ordered asynchronous persistence | IR-05, IR-06, IR-07, IR-08 | L | [Merged — PR #27](https://github.com/killertux/smart-review/pull/27) |
 | [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Implemented locally (`ir-15-terminal-harness`) |
 | [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Implemented locally; owner walkthrough pending |
-| [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Not started |
+| [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Implemented |
 | [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | Not started |
 | [IR-19](#ir-19-replace-milestone-docs-with-a-small-living-product-contract) | P3 | Accurate product, architecture and testing documentation | IR-01 through IR-18 | M | Not started |
 
@@ -1560,36 +1560,36 @@ gathering does not create one Git process per changed file.
 
 ### Implementation steps
 
-1. [ ] Capture a reproducible before baseline in release mode on a named reference
+1. [x] Capture a reproducible before baseline in release mode on a named reference
    machine: actual reducer+draw, input-to-frame latency, first usable diff, context
    gather duration, peak memory, process count and idle frame count. Also record warm
    debug behavior for developer ergonomics. Do not compare unlike profiles.
-2. [ ] Consolidate the loop into a bounded event/progress drain, reduction and one
+2. [x] Consolidate the loop into a bounded event/progress drain, reduction and one
    necessary draw. Use dirty state plus animation/deadline scheduling; cap waits to
    meet background presentation deadlines even while a key prefix is pending.
-3. [ ] Preserve confirmation visibility: a publish preview must have been rendered
+3. [x] Preserve confirmation visibility: a publish preview must have been rendered
    before its confirmation input can dispatch. Redraw optimization must not erase
    this state-machine boundary.
-4. [ ] Cache completed chat-message layout keyed by message revision, width and theme.
+4. [x] Cache completed chat-message layout keyed by message revision, width and theme.
    Lay out only necessary viewport content and the changing stream tail. Respect
    explicit follow-tail versus user-scrolled-up state.
-5. [ ] Incrementally/coalescedly update analysis preview instead of reparsing complete
+5. [x] Incrementally/coalescedly update analysis preview instead of reparsing complete
    partial JSON on every idle draw. Keep authoritative final normalization unchanged.
-6. [ ] Prepare expensive pure diff projections in bounded background work; keep terminal
+6. [x] Prepare expensive pure diff projections in bounded background work; keep terminal
    drawing on its owning thread. Avoid initial build+comment rebuild duplication and
    build split rows only when needed.
-7. [ ] Cache totals, stable row anchors and effective-order position maps. Invalidate
+7. [x] Cache totals, stable row anchors and effective-order position maps. Invalidate
    by actual revision/options/comments, not every frame.
-8. [ ] Batch Git object reads from the app-owned repository, using an existing Git batch
+8. [x] Batch Git object reads from the app-owned repository, using an existing Git batch
    interface behind the workspace adapter. Check blob sizes/types before buffering,
    enforce IR-01 eligibility, and stop promptly on cancellation. Avoid unbounded
    parallel `git show` as a substitute for batching.
-9. [ ] Release superseded view/context buffers and cap retained state. Track memory of
+9. [x] Release superseded view/context buffers and cap retained state. Track memory of
    diff projections, raw/parsed analysis and chat layouts separately.
-10. [ ] Add structured timings per job/phase with identity, duration, outcome and counts,
+10. [x] Add structured timings per job/phase with identity, duration, outcome and counts,
     never contents. Report useful progress counts for context/workspace phases and
     elapsed time for unknown-duration provider work; do not invent progress percentages.
-11. [ ] Replace the rows-only “thousand frames” assertion with actual meaningful draw/
+11. [x] Replace the rows-only “thousand frames” assertion with actual meaningful draw/
     reducer measurements. Keep algorithmic/property assertions deterministic and
     machine timing thresholds broad enough for CI variation.
 
@@ -1628,6 +1628,10 @@ slow frames hidden by a rows-only benchmark, unfair input scheduling or excessiv
 
 **Gates:** shared gates, correctness fixtures, opt-in reproducible performance runner
 and reviewed p50/p95/memory/process-count results.
+
+**Measurement record (2026-09-21):** [`docs/performance/ir-17.md`](performance/ir-17.md)
+records the named reference machine, honest before-baseline limitations, warm release and
+debug results, memory scope, process counts and the exact opt-in runner command.
 
 ---
 

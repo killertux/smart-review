@@ -19,8 +19,8 @@ use crate::domain::diff::RelPath;
 use crate::logging::{self, Level};
 use crate::ports::Cancel;
 use crate::ports::workspace::{
-    DiffRequest, Remote, RepoInfo, Workspace, WorkspaceEntry, WorkspaceError, WorkspacePort,
-    WorkspaceRequest,
+    DiffRequest, FileRead, FileReadOutcome, Remote, RepoInfo, Workspace, WorkspaceEntry,
+    WorkspaceError, WorkspacePort, WorkspaceRequest,
 };
 
 /// Distinguishes concurrent revision ignore checks in this process.
@@ -395,6 +395,83 @@ impl WorkspacePort for GitCli {
         }
     }
 
+    fn read_files(
+        &self,
+        repo: &Path,
+        rev: &str,
+        paths: &[String],
+        max_file_bytes: u64,
+        max_total_bytes: usize,
+        cancel: &Cancel,
+    ) -> std::result::Result<Vec<FileRead>, WorkspaceError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (mut outcomes, candidates) = batch_candidates(rev, paths);
+        if candidates.is_empty() {
+            return Ok(paths
+                .iter()
+                .cloned()
+                .zip(outcomes)
+                .map(|(path, outcome)| FileRead { path, outcome })
+                .collect());
+        }
+
+        let input = batch_input(candidates.iter().map(|(_, spec)| spec.as_str()));
+        let check = CommandSpec::new(&self.program)
+            .args([
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ])
+            .current_dir(repo)
+            .stdin_bytes(input);
+        let checked = self
+            .runner
+            .run_checked(&check, cancel)
+            .map_err(ProcessError::into_workspace)?;
+        if checked.stdout_truncated {
+            return Err(WorkspaceError::Failed(
+                "Git's object metadata exceeded the bounded output limit; reduce the context file set and retry"
+                    .to_owned(),
+            ));
+        }
+        let (content, content_cap) = inspect_batch_metadata(
+            &candidates,
+            &checked.stdout,
+            max_file_bytes,
+            max_total_bytes,
+            &mut outcomes,
+        )?;
+
+        if !content.is_empty() {
+            let input = batch_input(content.iter().map(|(_, spec, _)| *spec));
+            let command = CommandSpec::new(&self.program)
+                .args(["cat-file", "--batch"])
+                .current_dir(repo)
+                .stdin_bytes(input)
+                .output_cap(content_cap.max(1024));
+            let output = self
+                .runner
+                .run_checked(&command, cancel)
+                .map_err(ProcessError::into_workspace)?;
+            if output.stdout_truncated {
+                return Err(WorkspaceError::Failed(
+                    "Git's bounded object batch was truncated; lower `llm.max_file_bytes` and retry"
+                        .to_owned(),
+                ));
+            }
+            parse_batch_content(&output.stdout_bytes, &content, &mut outcomes)?;
+        }
+
+        Ok(paths
+            .iter()
+            .cloned()
+            .zip(outcomes)
+            .map(|(path, outcome)| FileRead { path, outcome })
+            .collect())
+    }
+
     fn list_files(
         &self,
         repo: &Path,
@@ -490,6 +567,145 @@ impl WorkspacePort for GitCli {
         self.delete_head_ref(&store, repo, number, cancel);
         Ok(())
     }
+}
+
+fn batch_input<'a>(specs: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
+    let mut input = Vec::new();
+    for spec in specs {
+        input.extend_from_slice(spec.as_bytes());
+        input.push(b'\n');
+    }
+    input
+}
+
+fn batch_candidates(rev: &str, paths: &[String]) -> (Vec<FileReadOutcome>, Vec<(usize, String)>) {
+    // The line-oriented protocol cannot represent a literal newline in an object
+    // expression. Fail only that path closed rather than changing what Git reads.
+    let outcomes = paths
+        .iter()
+        .map(|path| {
+            if path.contains(['\n', '\r']) {
+                FileReadOutcome::Unreadable {
+                    reason: "the path contains a newline unsupported by Git's batch protocol"
+                        .to_owned(),
+                }
+            } else {
+                FileReadOutcome::Missing
+            }
+        })
+        .collect();
+    let candidates = paths
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| !path.contains(['\n', '\r']))
+        .map(|(index, path)| (index, format!("{rev}:{path}")))
+        .collect();
+    (outcomes, candidates)
+}
+
+type BatchObject<'a> = (usize, &'a str, usize);
+type BatchPlan<'a> = (Vec<BatchObject<'a>>, usize);
+
+fn inspect_batch_metadata<'a>(
+    candidates: &'a [(usize, String)],
+    metadata: &str,
+    max_file_bytes: u64,
+    max_total_bytes: usize,
+    outcomes: &mut [FileReadOutcome],
+) -> Result<BatchPlan<'a>, WorkspaceError> {
+    let metadata = metadata.lines().collect::<Vec<_>>();
+    if metadata.len() != candidates.len() {
+        return Err(WorkspaceError::Failed(format!(
+            "Git returned metadata for {} of {} requested objects; retry the context gather",
+            metadata.len(),
+            candidates.len()
+        )));
+    }
+    let mut content = Vec::new();
+    let mut cap = 0usize;
+    let mut retained = 0usize;
+    for ((index, spec), line) in candidates.iter().zip(metadata) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.last() == Some(&"missing") {
+            continue;
+        }
+        let (Some(kind), Some(size)) = (
+            fields.get(fields.len().saturating_sub(2)),
+            fields.last().and_then(|size| size.parse::<u64>().ok()),
+        ) else {
+            outcomes[*index] = FileReadOutcome::Unreadable {
+                reason: "Git returned malformed object metadata".to_owned(),
+            };
+            continue;
+        };
+        if *kind != "blob" {
+            outcomes[*index] = FileReadOutcome::NotBlob {
+                kind: (*kind).to_owned(),
+            };
+        } else if size > max_file_bytes {
+            outcomes[*index] = FileReadOutcome::Oversize { bytes: size };
+        } else {
+            let size = usize::try_from(size).unwrap_or(usize::MAX);
+            if retained.saturating_add(size) > max_total_bytes {
+                outcomes[*index] = FileReadOutcome::BudgetExceeded {
+                    bytes: u64::try_from(size).unwrap_or(u64::MAX),
+                };
+            } else {
+                retained = retained.saturating_add(size);
+                cap = cap.saturating_add(size).saturating_add(128);
+                content.push((*index, spec.as_str(), size));
+            }
+        }
+    }
+    Ok((content, cap))
+}
+
+fn parse_batch_content(
+    output: &[u8],
+    requested: &[(usize, &str, usize)],
+    outcomes: &mut [FileReadOutcome],
+) -> Result<(), WorkspaceError> {
+    let mut cursor = 0usize;
+    for (index, _, expected_size) in requested {
+        let Some(end) = output[cursor..].iter().position(|byte| *byte == b'\n') else {
+            return Err(WorkspaceError::Failed(
+                "Git ended an object batch before its header; retry the context gather".to_owned(),
+            ));
+        };
+        let header_end = cursor + end;
+        let header = std::str::from_utf8(&output[cursor..header_end]).map_err(|_| {
+            WorkspaceError::Failed("Git returned a non-UTF-8 object header".to_owned())
+        })?;
+        let actual_size = header
+            .split_whitespace()
+            .last()
+            .and_then(|size| size.parse::<usize>().ok())
+            .ok_or_else(|| {
+                WorkspaceError::Failed("Git returned a malformed object header".to_owned())
+            })?;
+        if actual_size != *expected_size {
+            return Err(WorkspaceError::Failed(
+                "Git changed an object between metadata and content reads; retry the context gather"
+                    .to_owned(),
+            ));
+        }
+        cursor = header_end.saturating_add(1);
+        let content_end = cursor.saturating_add(actual_size);
+        let Some(bytes) = output.get(cursor..content_end) else {
+            return Err(WorkspaceError::Failed(
+                "Git ended an object batch before its content; retry the context gather".to_owned(),
+            ));
+        };
+        outcomes[*index] = FileReadOutcome::Content(bytes.to_vec());
+        cursor = content_end;
+        if output.get(cursor) != Some(&b'\n') {
+            return Err(WorkspaceError::Failed(
+                "Git returned malformed object framing; retry the context gather".to_owned(),
+            ));
+        }
+        cursor += 1;
+    }
+    Ok(())
 }
 
 /// `git version 2.43.0` → `2.43.0`; anything else is passed through.

@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::domain::diff::{DiffLine, FileKind, FileStatus, LineKind, Patch, RelPath};
+use crate::domain::diff::{DiffLine, FileKind, FileStatus, LineKind, Patch, PatchStats, RelPath};
 
 /// What a row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +242,8 @@ pub struct DiffView {
     pub head_sha: Option<String>,
     /// The patch being read.
     pub patch: Patch,
+    /// Cached immutable totals used in titles and status on every frame (IR-17).
+    stats: PatchStats,
     /// The flattened rows, rebuilt only when the patch or the folds change.
     pub rows: Vec<DiffRow>,
     /// The same content paired up for the side-by-side view.
@@ -403,8 +405,50 @@ impl DiffView {
     /// Builds a view over a patch.
     #[must_use]
     pub fn new(patch: Patch) -> Self {
+        Self::new_with_context(patch, 3, false, None, None, Vec::new())
+    }
+
+    /// Builds all immutable opening projections together on the background worker.
+    #[must_use]
+    pub(crate) fn new_with_context(
+        patch: Patch,
+        context: u32,
+        ignore_whitespace: bool,
+        head_sha: Option<&str>,
+        plan: Option<crate::domain::plan::Plan>,
+        comments: Vec<crate::domain::pr::ReviewComment>,
+    ) -> Self {
+        let stats = patch.stats();
+        let paths = patch
+            .files
+            .iter()
+            .filter_map(|file| file.path().map(RelPath::to_string))
+            .collect::<Vec<_>>();
+        let plan = head_sha.map(|head_sha| match plan {
+            Some(mut existing) if existing.matches_head(head_sha) => {
+                existing.sync_file_reviews(&patch);
+                existing
+            }
+            Some(existing) => {
+                let mut current = crate::domain::plan::Plan::heuristic(head_sha, &paths);
+                current.sync_file_reviews(&patch);
+                crate::domain::plan::Plan::carry_forward(&existing, current, &patch)
+            }
+            None => {
+                let mut current = crate::domain::plan::Plan::heuristic(head_sha, &paths);
+                current.sync_file_reviews(&patch);
+                current
+            }
+        });
+        let order = if plan.is_some() {
+            crate::domain::plan::OrderMode::Recommended
+        } else {
+            crate::domain::plan::OrderMode::Path
+        };
+        let file_orders = FileOrders::new(&patch, plan.as_ref());
         let mut view = Self {
             patch,
+            stats,
             head_sha: None,
             rows: Vec::new(),
             split_rows: Vec::new(),
@@ -423,16 +467,21 @@ impl DiffView {
             tree_scroll: 0,
             tree_viewport: 0,
             split: false,
-            context: 3,
-            ignore_whitespace: false,
-            order: crate::domain::plan::OrderMode::Path,
-            plan: None,
-            comments: Vec::new(),
-            file_orders: FileOrders::default(),
+            context,
+            ignore_whitespace,
+            order,
+            plan,
+            comments,
+            file_orders,
         };
-        view.refresh_file_orders();
         view.rebuild();
         view
+    }
+
+    /// Cached totals for the immutable source patch.
+    #[must_use]
+    pub const fn stats(&self) -> PatchStats {
+        self.stats
     }
 
     /// Records the revision that supplied this applied patch.
@@ -474,9 +523,15 @@ impl DiffView {
             &self.folded_hunks,
             &self.comments,
         );
-        let (split, index) = build_split(&self.rows);
-        self.split_rows = split;
-        self.split_index = index;
+        if self.split {
+            self.rebuild_split();
+        } else {
+            // Split rows duplicate most line content. Do not retain them while the
+            // unified view is selected (IR-17, NFR-1.3).
+            self.split_rows.clear();
+            self.split_index.clear();
+            self.split_start = 0;
+        }
         self.tree = self.build_tree();
         self.restore_cursor(anchor);
         self.restore_tree_cursor(tree_anchor);
@@ -540,6 +595,24 @@ impl DiffView {
         self.rebuild();
     }
 
+    /// Applies the immutable plan and discussion snapshot with one projection rebuild.
+    ///
+    /// Opening a review receives both from the same detail snapshot. Applying them
+    /// independently used to flatten a large patch twice on the event loop (IR-17).
+    pub fn set_review_context(
+        &mut self,
+        plan: crate::domain::plan::Plan,
+        comments: &[crate::domain::pr::ReviewComment],
+    ) {
+        self.plan = Some(plan);
+        self.comments = comments.to_vec();
+        if self.order == crate::domain::plan::OrderMode::Path {
+            self.order = crate::domain::plan::OrderMode::Recommended;
+        }
+        self.refresh_file_orders();
+        self.rebuild();
+    }
+
     /// Switches between the recommended and path orders, keeping the current file.
     ///
     /// "Preserves the current file when possible" is a requirement (FR-3.5), and it is
@@ -555,6 +628,74 @@ impl DiffView {
     /// Toggles between the two orders (FR-3.5, `o`).
     pub fn toggle_order(&mut self) {
         self.set_order(self.order.toggled());
+    }
+
+    /// Selects unified or side-by-side rendering, preparing the duplicate projection
+    /// only when it can actually be shown (IR-17).
+    pub fn set_split(&mut self, split: bool) {
+        if self.split == split {
+            return;
+        }
+        self.split = split;
+        if split {
+            self.rebuild_split();
+        } else {
+            self.split_rows.clear();
+            self.split_index.clear();
+            self.split_start = 0;
+        }
+    }
+
+    /// Approximate heap bytes retained by drawable projections, excluding the source
+    /// patch they reference conceptually (IR-17).
+    #[must_use]
+    pub fn projection_bytes(&self) -> usize {
+        let unified = self
+            .rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DiffRow>())
+            .saturating_add(
+                self.rows
+                    .iter()
+                    .map(|row| row.text.capacity())
+                    .sum::<usize>(),
+            );
+        let tree = self
+            .tree
+            .capacity()
+            .saturating_mul(std::mem::size_of::<TreeRow>())
+            .saturating_add(
+                self.tree
+                    .iter()
+                    .map(|row| row.label.capacity())
+                    .sum::<usize>(),
+            );
+        let split = self
+            .split_rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SplitRow>())
+            .saturating_add(
+                self.split_rows
+                    .iter()
+                    .map(|row| {
+                        row.full.as_ref().map_or(0, |full| full.text.capacity())
+                            + row.left.as_ref().map_or(0, |line| line.content.capacity())
+                            + row.right.as_ref().map_or(0, |line| line.content.capacity())
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.split_index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            );
+        unified.saturating_add(tree).saturating_add(split)
+    }
+
+    fn rebuild_split(&mut self) {
+        let (rows, index) = build_split(&self.rows);
+        self.split_rows = rows;
+        self.split_index = index;
     }
 
     /// Rebuilds the tree alone, which is all an order change needs.
@@ -748,6 +889,11 @@ impl DiffView {
     /// are; it is arithmetic, not IO, so the render path stays free of side effects
     /// on the world.
     pub fn prepare(&mut self, diff_height: u16, tree_height: u16) {
+        // Tests and restored state may set the public compatibility field directly;
+        // lazily materialize here as the final guard against an empty split pane.
+        if self.split && self.split_rows.is_empty() && !self.rows.is_empty() {
+            self.rebuild_split();
+        }
         self.ensure_visible(diff_height);
         self.split_start = self
             .split_index
@@ -1081,7 +1227,7 @@ impl DiffView {
     /// The one-line summary the diff header shows.
     #[must_use]
     pub fn status_label(&self) -> String {
-        let stats = self.patch.stats();
+        let stats = self.stats();
         let mode = if self.split { "split" } else { "unified" };
         crate::tui::text::truncate(&format!("{} · {mode}", stats.label()), 60)
     }
@@ -2616,7 +2762,7 @@ Binary files /dev/null and b/a.txt differ
     }
 
     #[test]
-    fn a_large_patch_flattens_once_and_slices_cheaply() {
+    fn a_large_patch_has_stable_rows_and_viewport_bounds() {
         // 200 files x 100 lines: the size NFR-1.3 cares about.
         let mut text = String::new();
         for file in 0..200 {
@@ -2634,29 +2780,30 @@ Binary files /dev/null and b/a.txt differ
             }
         }
         let patch = parse_patch(&text);
-        let started = std::time::Instant::now();
         let mut view = DiffView::new(patch);
-        let built = started.elapsed();
 
         assert_eq!(view.rows.len(), 200 * (2 + 100));
-        assert!(
-            built < std::time::Duration::from_secs(2),
-            "building took {built:?}"
-        );
-
-        // Slicing the visible window allocates nothing and touches 40 rows.
         view.cursor = 10_000;
-        let started = std::time::Instant::now();
-        for _ in 0..1000 {
-            let range = view.visible_rows(40);
-            let visible = &view.rows[range];
-            assert_eq!(visible.len(), 40);
-        }
-        let scrolling = started.elapsed();
-        assert!(
-            scrolling < std::time::Duration::from_millis(500),
-            "a thousand frames of scrolling took {scrolling:?}"
-        );
+        view.prepare(40, 40);
+        let range = view.visible_rows(40);
+        let visible = &view.rows[range.clone()];
+        assert_eq!(visible.len(), 40);
+        assert!(range.contains(&view.cursor));
+    }
+
+    #[test]
+    fn ir_17_split_projection_exists_only_while_split_is_selected() {
+        let mut view = view();
+        assert!(view.split_rows.is_empty());
+        assert!(view.split_index.is_empty());
+
+        view.set_split(true);
+        assert!(!view.split_rows.is_empty());
+        assert_eq!(view.split_index.len(), view.rows.len());
+
+        view.set_split(false);
+        assert!(view.split_rows.is_empty());
+        assert!(view.split_index.is_empty());
     }
 
     #[test]

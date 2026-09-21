@@ -1200,6 +1200,47 @@ mod tests {
     }
 
     #[test]
+    fn ir_17_git_objects_are_batch_read_and_sized_before_buffering() {
+        let (fixture, _base, head) = fixture();
+        let root = fixture.path().join("worktrees");
+        let git = adapter(&fixture, &root);
+        let cancel = Cancel::new();
+        git.ensure(&request(&fixture, &head), &cancel)
+            .expect("created");
+
+        let paths = vec!["src/lib.rs".to_owned(), "src/gone.rs".to_owned()];
+        let reads = git
+            .read_files(&fixture.clone, &head, &paths, 8, 1024, &cancel)
+            .expect("batch metadata and content");
+        assert_eq!(reads.len(), 2);
+        assert!(matches!(
+            reads[0].outcome,
+            crate::ports::workspace::FileReadOutcome::Oversize { .. }
+        ));
+        assert_eq!(
+            reads[1].outcome,
+            crate::ports::workspace::FileReadOutcome::Missing
+        );
+
+        let content = git
+            .read_files(&fixture.clone, &head, &paths[..1], 1024, 1024, &cancel)
+            .expect("bounded blob content");
+        let crate::ports::workspace::FileReadOutcome::Content(bytes) = &content[0].outcome else {
+            panic!("expected blob content, got {:?}", content[0].outcome);
+        };
+        assert!(String::from_utf8_lossy(bytes).contains("pub fn two()"));
+
+        let repeated = vec!["src/lib.rs".to_owned(), "src/lib.rs".to_owned()];
+        let bounded = git
+            .read_files(&fixture.clone, &head, &repeated, 1024, bytes.len(), &cancel)
+            .expect("bounded retained content");
+        assert!(matches!(
+            bounded[1].outcome,
+            crate::ports::workspace::FileReadOutcome::BudgetExceeded { .. }
+        ));
+    }
+
+    #[test]
     fn binary_files_survive_the_round_trip_through_git_show() {
         let (fixture, _base, _) = fixture();
         // A PNG header: invalid UTF-8, which a lossy decode would mangle.

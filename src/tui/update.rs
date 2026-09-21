@@ -942,8 +942,8 @@ fn toggle_split(app: &mut App) -> Effect {
         app.notice(NoticeLevel::Warn, "open a pull request first");
         return Effect::None;
     };
-    view.split = !view.split;
-    let split = view.split;
+    let split = !view.split;
+    view.set_split(split);
 
     if split && width > 0 && width < crate::tui::components::review::SPLIT_MIN_WIDTH {
         app.notice(

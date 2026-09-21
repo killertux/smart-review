@@ -141,9 +141,9 @@ fn running_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
         return lines;
     }
 
-    // The JSON is still incomplete, so parse whatever has arrived whole and show it
-    // in the same shape the completed analysis will have (FR-4.4).
-    let preview = crate::domain::analysis::preview(text);
+    // The JSON is still incomplete. The mutable frame preparation coalesces projection
+    // updates, so spinner-only draws do not reparse the complete growing buffer.
+    let preview = app.analysis_preview();
     if preview.is_empty() {
         // Nothing usable yet (prose before the object, or a token cut where a partial
         // parse cannot read it). Show the raw tail, as before.

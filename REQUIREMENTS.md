@@ -768,8 +768,8 @@ Default bindings (all remappable; the generated [`docs/keymaps.md`](docs/keymaps
 ## 6. Non-functional requirements
 
 **NFR-1.1 Startup** — first render < 300 ms with warm cache, < 1.5 s cold on a 300-PR repo; `--version`/`--help` < 50 ms.
-**NFR-1.2 Responsiveness** — the event loop MUST NOT block > 50 ms. All IO is job-based (ARCH-5).
-**NFR-1.3 Large inputs** — 10 000-line diffs and 400-file diffs remain usable (virtualized rendering, no full re-layout per frame); memory should stay under ~300 MB for such a PR, excluding cached JSON.
+**NFR-1.2 Responsiveness** — the event loop MUST NOT block > 50 ms. All IO is job-based (ARCH-5). While background work is active, completion/progress polling MUST be capped below that deadline even when a key-prefix timeout is pending. The loop MUST draw only dirty or animated state, at most once per reduction pass; a confirmation opened by one pass is drawn before the next input is read.
+**NFR-1.3 Large inputs** — 10 000-line diffs and 400-file diffs remain usable (virtualized rendering, no full re-layout per frame); memory should stay under ~300 MB for such a PR, excluding cached JSON. Expensive immutable diff projections MUST be prepared off the event-loop thread. Duplicate split projections and completed chat layouts MUST be bounded and retained only while their revision/width/theme remains applicable. Context object reads MUST check type and size before buffering and retain source bytes only up to a configured-context-sized bound.
 **NFR-1.4 Cancellation** — every long operation is cancellable within 200 ms of `Esc`.
 **NFR-2.1 Portability** — Linux and macOS are tier 1 (CI runs on Linux for now; the macOS CI job was removed until the pty steps are portable — see DEC-22). Terminal support: any xterm-compatible terminal with 256-color; truecolor used when detected.
 **NFR-2.2 Dependencies on the environment** — requires `git` ≥ 2.30 and `gh` ≥ 2.40 on `PATH`; absence is a clean, explained failure, never a crash.
@@ -782,7 +782,7 @@ Default bindings (all remappable; the generated [`docs/keymaps.md`](docs/keymaps
 **NFR-4.2 Terminal integrity** — the terminal is restored on normal exit, error exit, panic and SIGINT/SIGTERM.
 **NFR-5.1 Maintainability** — `cargo fmt` clean; `cargo clippy -- -D warnings` clean; no file over ~800 lines without justification; domain/application unit-test coverage of branches that encode requirements.
 **NFR-5.2 Testability** — ports have fakes; time and randomness injected; no test performs network IO or requires `gh` (adapter contract tests are opt-in behind a feature/env var). The PTY scenario driver MUST fail on an unmet ready/step wait, an unexpected child exit, mismatched steps or its global deadline; each step's wait observes cells redrawn after that step rather than stale text from an earlier frame. CI runs the shared Rust gates and build once, then runs feature validators in explicit `--scenarios-only` mode against that binary.
-**NFR-5.3 Observability** — tracing spans per job (`job id`, kind, duration, result); log level from config.
+**NFR-5.3 Observability** — structured timing records per job (`job id`, kind, duration, result and non-content counts); log level from config. Logs MUST NOT contain source, prompt, response or credential contents.
 
 ---
 
