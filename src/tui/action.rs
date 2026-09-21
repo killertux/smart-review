@@ -4,9 +4,8 @@
 //! from this single table, so the documented shortcuts can never drift from the
 //! behaviour (FR-7.3).
 //!
-//! Only actions M0 actually implements live here. A binding naming something
-//! outside this table is reported as a warning at startup rather than silently
-//! doing nothing.
+//! Every registered binding names an implemented action. An id outside this table is
+//! reported at startup rather than silently doing nothing.
 
 /// How actions are grouped in the help popup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,9 +22,9 @@ pub enum Group {
     Diff,
     /// Changing the look.
     Theme,
-    /// Talking about a pull request (M3).
+    /// Talking about a pull request.
     Chat,
-    /// Writing, reviewing and publishing a review (M4).
+    /// Writing, reviewing and publishing a review.
     Review,
 }
 

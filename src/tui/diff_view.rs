@@ -280,16 +280,13 @@ pub struct DiffView {
     /// Whether the split (side-by-side) view is asked for. Whether it can be
     /// *shown* is a width question, answered at draw time (DEC-4).
     pub split: bool,
-    /// How many lines of context the diff was produced with (FR-3.2). Read-only in
-    /// M1: a remote diff always carries three, and M2's local re-diff is what makes
-    /// it adjustable.
+    /// How many lines of context the diff was produced with (FR-3.2). A remote diff
+    /// carries its fetched context; local re-diffing makes it adjustable.
     pub context: u32,
-    /// Whether the diff was produced with whitespace ignored. Read-only in M1, for
-    /// the same reason as [`Self::context`].
+    /// Whether the local diff was produced with whitespace ignored.
     pub ignore_whitespace: bool,
     /// The reviews and comments GitHub already has, grouped by the line they are on
-    /// (FR-6.4). Read-only in v1: replying is M5, and drawing them where they belong
-    /// is what makes the diff readable next to a discussion about it.
+    /// (FR-6.4). Replies and thread state changes are routed through the review UI.
     pub comments: Vec<crate::domain::pr::ReviewComment>,
     /// Which order the tree is in (FR-3.5).
     pub order: crate::domain::plan::OrderMode,

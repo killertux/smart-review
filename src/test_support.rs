@@ -385,7 +385,7 @@ impl FakeWorkspace {
     /// The calls made so far, in order.
     #[allow(
         dead_code,
-        reason = "used by the M2a tests that assert what the app asked the workspace for"
+        reason = "used by tests that assert what the app asked the workspace for"
     )]
     pub(crate) fn calls(&self) -> Vec<String> {
         self.calls
@@ -541,7 +541,7 @@ impl crate::ports::workspace::WorkspacePort for FakeWorkspace {
 ///
 /// Built with the real `git` on purpose: the workspace adapter's whole job is to
 /// drive git's refspecs and worktree machinery, and a fake would only test the fake.
-/// It panics rather than skipping when git is missing: M2a is *about* driving git, so
+/// It panics rather than skipping when git is missing: these tests are *about* driving git, so
 /// a test that quietly returns when the fixture cannot be built is a test that cannot
 /// fail, and this one did exactly that once already.
 #[derive(Debug)]

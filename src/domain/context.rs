@@ -244,7 +244,7 @@ pub enum SegmentKind {
     Diff,
     /// A changed file's content at head.
     File,
-    /// Something the user added (`:context add`, M3).
+    /// Something the user added with `:context add`.
     UserFile,
 }
 

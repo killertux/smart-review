@@ -439,7 +439,7 @@ fn shell_styles(p: &Palette) -> Vec<(&'static str, Style)> {
     ]
 }
 
-/// Reading: diffs, the file tree, the list's markers (FR-7.7's M1 list).
+/// Reading: diffs, the file tree and list markers (FR-7.7).
 fn reading_styles(p: &Palette) -> Vec<(&'static str, Style)> {
     let Palette {
         fg,

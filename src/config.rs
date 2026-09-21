@@ -6,10 +6,8 @@
 //! 1. **The app always starts.** Every key is read individually, so one malformed
 //!    value costs that key only — the rest of the file still applies (FR-8.6).
 //! 2. **Nothing is silently lost.** Unknown keys are reported as warnings and are
-//!    left in place when the document is written back. Comments are *not*
-//!    preserved by this implementation; comment-preserving writes need
-//!    `toml_edit` (see DEC-19 in `REQUIREMENTS.md`), which is why configuration
-//!    is never written back in M0.
+//!    left in place when the `toml_edit` document is written back. Comments, key
+//!    order and unrelated settings survive model-selection changes (DEC-19).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

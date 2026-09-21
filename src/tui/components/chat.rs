@@ -365,7 +365,7 @@ fn footer_for(message: &Message, theme: &Theme, app: &App) -> Vec<Line<'static>>
     if !message.references.is_empty() {
         // The references are what makes an answer jumpable (FR-5.1). They are named as
         // paths the diff knows, and the jump itself is `:plan`/`<Enter>` on the tree —
-        // a click on a path is M5's `<C-click>` (§5.5).
+        // Path text is not itself a click target; evidence jumps are explicit actions.
         let in_diff = message
             .references
             .iter()

@@ -65,9 +65,8 @@ enum Step {
 
 /// What the reducer wants the event loop to do next.
 ///
-/// Actions are mutually exclusive in M0: the only action that keeps a pending
-/// sequence is the leader menu, and the only ones that need the loop are a theme
-/// change (persist it) and `:doctor` (probe off the event loop).
+/// The reducer performs no IO. It returns one effect for the event loop to route to
+/// persistence, terminal handling, or a typed background job.
 #[derive(Clone, PartialEq, Default)]
 pub enum Effect {
     /// Nothing to do; the pending key sequence is finished with.
@@ -324,12 +323,12 @@ fn effect_name(effect: &Effect) -> String {
 /// The focused pane (FR-7.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Pane {
-    /// The pull request list (M1).
+    /// The pull request list.
     #[default]
     PullRequests,
-    /// The diff and review pane (M1).
+    /// The diff and review pane.
     Diff,
-    /// The chat pane (M3, FR-5.1).
+    /// The chat pane (FR-5.1).
     Chat,
 }
 

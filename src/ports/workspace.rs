@@ -1,9 +1,8 @@
 //! The workspace port (FR-3.1, FR-3.2, FR-4.6, ARCH-2).
 //!
-//! M1 only detected where it was running. M2a adds the rest: materialising a pull
-//! request as a managed worktree, diffing it locally with the toggles the review
-//! screen offers, and reading a file *at the pull request's revision* rather than
-//! from whatever the worktree happens to contain (FR-4.6).
+//! It detects repository context, materialises a pull request as a managed worktree,
+//! diffs it locally with the review toggles, and reads files *at the pull request's
+//! revision* rather than from mutable worktree contents (FR-4.6).
 //!
 //! Two decisions are visible in the types:
 //!

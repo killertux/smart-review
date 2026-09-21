@@ -14,8 +14,8 @@
 //!   cancels the first and the first's answer is discarded by job id rather than
 //!   painting a stale list over a fresh one.
 //!
-//! Process-bound work runs on plain threads, not async tasks: `gh` and `git` block,
-//! and a runtime would only add a dependency before M2 needs one for the LLM.
+//! Process-bound work runs on plain threads because `gh` and `git` block; provider
+//! adapters use the async runtime only at their own boundary.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

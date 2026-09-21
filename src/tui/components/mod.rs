@@ -126,8 +126,8 @@ pub(crate) fn height_for(lines: usize) -> u16 {
 /// Lays a left-aligned and a right-aligned group of spans on one row.
 ///
 /// Widths are counted in characters rather than columns, which is exact for the
-/// ASCII content used here and avoids another dependency. Text containing wide
-/// characters would need `unicode-width` (PLAN.md §5).
+/// ASCII-only shell labels passed here. User/content text uses display-width-aware
+/// layout elsewhere.
 pub(crate) fn padded_line(
     left: Vec<Span<'static>>,
     right: Vec<Span<'static>>,

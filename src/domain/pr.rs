@@ -490,9 +490,8 @@ pub struct PullRequestDetail {
     pub conversation: Vec<ConversationComment>,
     /// The merge base of base and head, resolved with `git` (Appendix A).
     ///
-    /// `None` in remote-only mode, which is all M1 has: `gh` cannot report
-    /// `baseRefOid` (verified on 2.45) and resolving it needs the local workspace
-    /// that M2 creates.
+    /// `None` in remote-only mode: `gh` cannot report `baseRefOid` (verified on 2.45),
+    /// so resolving it needs the local workspace.
     pub base_sha: Option<String>,
 }
 

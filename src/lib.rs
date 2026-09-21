@@ -12,8 +12,8 @@
 //! `adapters` → `ports`. Nothing in `domain` or `application` may import
 //! `ratatui`, `crossterm`, or spawn processes.
 //!
-//! Requirements are tracked in `REQUIREMENTS.md`; the reference for each item is
-//! written in the doc comment of the code that implements it.
+//! Historical requirement IDs are indexed in `docs/legacy-ids.md`; current behavior
+//! is documented in `docs/product.md`.
 
 // Tests are allowed to unwrap and to print; production code is not (see `[lints]`).
 #![cfg_attr(

@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut target = app
         .repo
         .clone()
-        .unwrap_or_else(|| "repository: auto-detect (M1)".to_owned());
+        .unwrap_or_else(|| "repository: auto-detect".to_owned());
     if let Some(pull_request) = app.requested_pr {
         let _ = write!(target, " #{pull_request}");
     }

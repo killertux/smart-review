@@ -1,21 +1,7 @@
 //! Ports: the traits the rest of the application depends on (ARCH-2).
 //!
-//! Only the ports M0 actually exercises are declared here. Everything else
-//! arrives with the milestone that needs it, so the crate never carries an empty
-//! abstraction:
-//!
-//! | Port | Milestone |
-//! |---|---|
-//! | [`Clock`] | M0 |
-//! | [`ConfigStore`] | M0 |
-//! | [`StateStore`] | M0 |
-//! | [`Cancel`] | M1 |
-//! | [`ForgePort`] | M1 |
-//! | [`CacheStore`] | M1 |
-//! | [`WorkspacePort`] | M1 (detection) / M2a (worktrees, local diff) |
-//! | [`ModelCatalogPort`] | M2a |
-//! | [`SecretStore`] | M2a |
-//! | [`LlmPort`] | M2a (connection check) / M2b (analysis) |
+//! Each port represents a real external boundary with an adapter and test fake. The
+//! crate deliberately avoids traits that merely wrap internal implementation details.
 
 pub mod analysis;
 pub mod cache;
@@ -60,8 +46,8 @@ pub trait Clock: std::fmt::Debug + Send + Sync {
 
 /// Reads the user's configuration (FR-8.2).
 ///
-/// Writing configuration back arrives in M2 together with comment-preserving
-/// edits (DEC-19); M0 never rewrites the user's file.
+/// Model-selection write-back uses the preserved configuration document rather than
+/// this read-oriented port (DEC-19).
 pub trait ConfigStore: std::fmt::Debug {
     /// Reads the file, applying built-in defaults for anything missing.
     ///

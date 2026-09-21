@@ -410,11 +410,6 @@ fn tool_check(name: &'static str, program: &str, args: &[&str]) -> Check {
     }
 }
 
-/// `gh` is not used until M1.
-///
-/// Reporting it as a warning keeps `--check` exit code 1 ("degraded, will still
-/// work") on a fresh machine or a CI runner, which is the truth for M0: nothing
-/// the shell does needs GitHub. It becomes a failure once M1 depends on it.
 /// The repository detection resolved, or the reason it did not (FR-1.1).
 fn repository_check(context: &Context) -> Check {
     if let Some(error) = &context.environment_error {
@@ -490,15 +485,14 @@ fn llm_check(context: &Context) -> Check {
         return Check {
             name: "llm",
             status: Status::Warn,
-            detail: "no model configured ([llm.active] is absent); the model picker arrives in M2"
-                .to_owned(),
+            detail: "no model configured; use the in-app model picker with `<leader>m`".to_owned(),
         };
     };
     Check {
         name: "llm",
         status: Status::Ok,
         detail: format!(
-            "{}/{} (key presence is checked when the model picker lands in M2)",
+            "{}/{} (open the model picker to verify key presence and connection)",
             active.provider, active.model
         ),
     }
