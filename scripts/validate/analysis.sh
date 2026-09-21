@@ -584,8 +584,8 @@ fi
 echo good >"$TMP/mode"
 HOME_SMALL="$TMP/home-small"
 MAX_CONTEXT=6000 make_home "$HOME_SMALL"
-SCREEN="$(run_tui "$HOME_SMALL" ':pr 141\r~ a~ a~:context\r~:q\r' 'worktree · [AMDR]~Nothing has been sent yet~Money now rounds half up~elided~' "$TMP/small.log")"
-if shown "$TMP/small.log" "elided|truncated|reduced"; then
+SCREEN="$(run_tui "$HOME_SMALL" ':pr 141\r~ a~ a~:context\r~:q\r' 'worktree · [AMDR]~Nothing has been sent yet~Money now rounds half up~AGENTS.md was used as the repository~' "$TMP/small.log")"
+if shown "$TMP/small.log" "full file body|elided|truncated|reduced"; then
   ok "a budget that does not fit is reported rather than hidden"
 else
   bad "the budget did not report what it dropped"
