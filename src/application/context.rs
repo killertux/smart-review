@@ -264,10 +264,10 @@ mod identity_tests {
             "a full-file retention cap must not filter canonical diff hunks"
         );
         assert!(gathered.bundle.segments.iter().any(|segment| {
-            segment
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("bounded source-read budget"))
+            segment.detail.as_deref().is_some_and(|detail| {
+                detail.contains("full file body was elided")
+                    && detail.contains("bounded source-read budget")
+            })
         }));
     }
 
@@ -935,7 +935,7 @@ fn classify_representation(
         }
         Some(FileReadOutcome::BudgetExceeded { bytes }) => {
             skipped.push(format!(
-                "{path} at {revision}: {}",
+                "{path} at {revision}: full file body was elided because {}",
                 read_failure(
                     &FileReadOutcome::BudgetExceeded { bytes: *bytes },
                     eligibility.policy
