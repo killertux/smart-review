@@ -361,6 +361,14 @@ def main() -> int:
                 termios.TIOCSWINSZ,
                 struct.pack("HHHH", rows, cols, 0, 0),
             )
+            try:
+                # A headless PTY has no foreground process group for the kernel to
+                # notify portably. Emulate a real terminal resize for the session
+                # owned by this driver instead of relying on platform behaviour.
+                os.killpg(process.pid, signal.SIGWINCH)
+            except ProcessLookupError:
+                failure = f"the child exited before resize step {index}"
+                break
             capture.replay.resize(cols, rows)
             matched, reached_eof = wait_for(
                 master,
