@@ -218,7 +218,9 @@ if command -v python3 >/dev/null 2>&1; then
 
   # Prove the screen was painted at all, otherwise the checks below would pass
   # vacuously on an empty render.
-  if grep -q 'smart-review' "$TMP_HOME/shell-tui-screen.log" && grep -q 'NORMAL' "$TMP_HOME/shell-tui-screen.log"; then
+  if python3 "$ROOT/scripts/validate/screen.py" --cols 120 --rows 40 \
+      --path "$TMP_HOME/shell-tui.log" --when 'smart-review[\s\S]*NORMAL|NORMAL[\s\S]*smart-review' \
+      >/dev/null 2>&1; then
     ok "the interface painted the header and the status line"
   else
     bad "the interface rendered nothing"

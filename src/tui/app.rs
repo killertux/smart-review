@@ -4118,6 +4118,7 @@ impl App {
                         .as_ref()
                         .and_then(|detail| detail.base_sha.clone())
                 }),
+            local_content: self.checkout().is_some(),
             changed_paths,
             added: self.chat.added.clone(),
             policy: *policy,
@@ -7530,6 +7531,7 @@ mod tests {
             crate::application::context::ContextIdentity {
                 head_sha: "abc123".to_owned(),
                 base_sha: None,
+                local_content: false,
                 changed_paths: Vec::new(),
                 added: Vec::new(),
                 policy: crate::domain::context::BundlePolicy::default(),
@@ -8420,6 +8422,71 @@ mod tests {
         ));
         app.open_review(crate::test_support::sample_detail(), DiffView::new(patch));
         (dir, app)
+    }
+
+    #[test]
+    fn ir_17_workspace_arrival_invalidates_remote_only_context_before_send() {
+        let (_dir, mut app) = draft_app();
+        if let Some(detail) = app.detail.as_mut() {
+            detail.base_sha = Some("base123".to_owned());
+        }
+        let patch = app.review.as_ref().expect("review").patch.clone();
+        app.apply_context_patch(patch);
+        let policy = crate::domain::context::BundlePolicy::default();
+        let remote_identity = app.context_identity(&policy);
+        assert!(!remote_identity.local_content);
+        let remote_bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "remote-only estimate",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &policy,
+        );
+        app.apply_context(
+            remote_bundle,
+            crate::application::analysis::AnalysisIntent::Estimate,
+            remote_identity,
+        );
+
+        app.workspace = Some(crate::ports::workspace::Workspace {
+            path: std::path::PathBuf::from("/tmp/local-context"),
+            base_sha: "base123".to_owned(),
+            head_sha: "abc123".to_owned(),
+            reused: false,
+        });
+
+        assert!(
+            app.take_context_bundle_for_current_head().is_none(),
+            "the confirmation covered a remote-only bundle and cannot authorize a send"
+        );
+        let local_identity = app.context_identity(&policy);
+        assert!(local_identity.local_content);
+        let detail = app.detail.clone().expect("detail");
+        let spec = app.context_spec(&detail, policy);
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        workspace.files.insert(
+            "abc123:AGENTS.md".to_owned(),
+            b"local convention sentinel".to_vec(),
+        );
+        workspace.files.insert(
+            "abc123:src/domain/amount.rs".to_owned(),
+            b"local amount sentinel".to_vec(),
+        );
+        workspace.files.insert(
+            "base123:src/domain/money.rs".to_owned(),
+            b"pub fn round(cents: i64) -> i64 { cents }".to_vec(),
+        );
+        workspace.files.insert(
+            "abc123:src/domain/money.rs".to_owned(),
+            b"pub fn round(cents: i64) -> i64 { (cents + 5) / 10 * 10 }".to_vec(),
+        );
+
+        let gathered =
+            crate::application::context::gather(&workspace, &spec, &crate::ports::Cancel::new());
+        let provider_prompt = crate::domain::analysis::user_prompt(&gathered.bundle.text);
+        assert!(provider_prompt.contains("local convention sentinel"));
+        assert!(provider_prompt.contains("local amount sentinel"));
+        assert!(provider_prompt.contains("(cents + 5) / 10 * 10"));
     }
 
     #[test]

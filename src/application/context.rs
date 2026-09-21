@@ -34,6 +34,9 @@ pub struct ContextIdentity {
     /// The base/merge-base revision used for old-side diff content, when local context
     /// is available.
     pub base_sha: Option<String>,
+    /// Whether revision contents and repository eligibility can be read locally.
+    /// A remote-only estimate must not remain valid after its workspace arrives.
+    pub local_content: bool,
     /// Canonical changed paths in patch order.
     pub changed_paths: Vec<String>,
     /// Extra head-revision files the user explicitly requested.
@@ -86,11 +89,12 @@ impl ContextIdentity {
     #[must_use]
     pub fn fingerprint(&self) -> String {
         let mut parts = vec![
-            "context-v1".to_owned(),
+            "context-v2".to_owned(),
             self.head_sha.clone(),
             self.base_sha
                 .clone()
                 .unwrap_or_else(|| "unavailable".to_owned()),
+            self.local_content.to_string(),
             self.policy.max_context_tokens.to_string(),
             self.policy.max_file_bytes.to_string(),
             self.policy.reduced_context_lines.to_string(),
@@ -161,6 +165,7 @@ mod identity_tests {
         let base = ContextIdentity {
             head_sha: "head".to_owned(),
             base_sha: Some("base".to_owned()),
+            local_content: true,
             changed_paths: vec!["src/main.rs".to_owned()],
             added: vec!["docs/design.md".to_owned()],
             policy: BundlePolicy::default(),
@@ -172,6 +177,10 @@ mod identity_tests {
             },
             ContextIdentity {
                 base_sha: Some("other-base".to_owned()),
+                ..base.clone()
+            },
+            ContextIdentity {
+                local_content: false,
                 ..base.clone()
             },
             ContextIdentity {
@@ -215,6 +224,94 @@ mod identity_tests {
             vec!["read_files", "read_files"],
             "file count must not become process count"
         );
+    }
+
+    #[test]
+    fn ir_17_source_retention_cap_keeps_later_file_hunks_in_the_diff() {
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/early.rs b/src/early.rs\n--- a/src/early.rs\n+++ b/src/early.rs\n@@ -1 +1 @@\n-old early\n+new early\n\
+             diff --git a/src/late.rs b/src/late.rs\n--- a/src/late.rs\n+++ b/src/late.rs\n@@ -1 +1 @@\n-old late\n+late diff sentinel\n",
+        );
+        let policy = BundlePolicy {
+            max_context_tokens: 600,
+            max_file_bytes: 4 * 1024,
+            ..BundlePolicy::default()
+        };
+        let source = TestSource {
+            detail: crate::test_support::sample_detail(),
+            patch,
+            checkout: Checkout {
+                path: std::path::PathBuf::from("/fake"),
+                head_sha: "head".to_owned(),
+                base_sha: "base".to_owned(),
+            },
+            policy,
+        };
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        for revision in ["base", "head"] {
+            workspace
+                .files
+                .insert(format!("{revision}:src/early.rs"), vec![b'e'; 2_200]);
+            workspace
+                .files
+                .insert(format!("{revision}:src/late.rs"), vec![b'l'; 300]);
+        }
+
+        let gathered = gather(&workspace, &source, &Cancel::new());
+
+        assert!(
+            gathered.bundle.text.contains("+late diff sentinel"),
+            "a full-file retention cap must not filter canonical diff hunks"
+        );
+        assert!(gathered.bundle.segments.iter().any(|segment| {
+            segment
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("bounded source-read budget"))
+        }));
+    }
+
+    #[test]
+    fn fr_4_6_oversized_first_convention_remains_authoritative() {
+        let source = TestSource {
+            detail: crate::test_support::sample_detail(),
+            patch: crate::domain::diff::parse_patch(""),
+            checkout: Checkout {
+                path: std::path::PathBuf::from("/fake"),
+                head_sha: "head".to_owned(),
+                base_sha: "base".to_owned(),
+            },
+            policy: BundlePolicy {
+                max_file_bytes: 1_024,
+                ..BundlePolicy::default()
+            },
+        };
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        workspace
+            .files
+            .insert("head:AGENTS.md".to_owned(), vec![b'a'; 2_048]);
+        workspace.files.insert(
+            "head:CLAUDE.md".to_owned(),
+            b"lower-priority convention sentinel".to_vec(),
+        );
+
+        let gathered = gather(&workspace, &source, &Cancel::new());
+
+        assert!(gathered.bundle.text.contains("## AGENTS.md ("));
+        assert!(
+            !gathered
+                .bundle
+                .text
+                .contains("lower-priority convention sentinel")
+        );
+        assert!(gathered.bundle.segments.iter().any(|segment| {
+            segment.kind == SegmentKind::Conventions
+                && segment.label == "AGENTS.md"
+                && segment
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("per-file limit"))
+        }));
     }
 
     #[test]
@@ -379,9 +476,13 @@ pub fn gather(
         skipped,
     } = changed_content(source, &paths, eligibility, &reads);
 
-    let (conventions, convention_label) = match source.checkout() {
+    let ConventionSelection {
+        files: conventions,
+        label: convention_label,
+        decision: convention_decision,
+    } = match source.checkout() {
         Some(checkout) => conventions(checkout, &reads, head_eligibility),
-        None => (Vec::new(), None),
+        None => ConventionSelection::default(),
     };
 
     let mut notes = ignores.notes();
@@ -413,8 +514,8 @@ pub fn gather(
 
     let metadata = crate::application::analysis::render_metadata(source.detail());
     let commits = crate::application::analysis::render_commits(source.detail());
-    for (label, bytes) in &conventions {
-        decisions.push(decide_path(label, Some(bytes), head_eligibility));
+    if let Some(decision) = convention_decision {
+        decisions.push(decision);
     }
     let inputs = BundleInputs {
         metadata: &metadata,
@@ -832,6 +933,20 @@ fn classify_representation(
             });
             None
         }
+        Some(FileReadOutcome::BudgetExceeded { bytes }) => {
+            skipped.push(format!(
+                "{path} at {revision}: {}",
+                read_failure(
+                    &FileReadOutcome::BudgetExceeded { bytes: *bytes },
+                    eligibility.policy
+                )
+            ));
+            // The metadata batch established that this is an eligible, bounded blob.
+            // Only its full body missed the retention cap; filtering its diff would
+            // reverse the documented diff-before-file-body priority.
+            decisions.push(decide_path(path, None, eligibility));
+            None
+        }
         Some(other) => {
             skipped.push(format!(
                 "{path} at {revision}: {}",
@@ -894,28 +1009,66 @@ fn decide_path(path: &str, bytes: Option<&[u8]>, eligibility: Eligibility<'_>) -
     }
 }
 
+#[derive(Default)]
+struct ConventionSelection {
+    files: Vec<(String, Vec<u8>)>,
+    label: Option<String>,
+    decision: Option<PathDecision>,
+}
+
 /// Reads the first convention file that exists (FR-4.6).
 fn conventions(
     checkout: &Checkout,
     reads: &BatchReads,
     eligibility: Eligibility<'_>,
-) -> (Vec<(String, Vec<u8>)>, Option<String>) {
+) -> ConventionSelection {
     for name in CONVENTION_FILES {
         if eligibility.error.is_some() || eligibility.ignored.contains(*name) {
-            return (
-                vec![((*name).to_owned(), Vec::new())],
-                Some((*name).to_owned()),
-            );
+            return ConventionSelection {
+                files: vec![((*name).to_owned(), Vec::new())],
+                label: Some((*name).to_owned()),
+                decision: Some(decide_path(name, None, eligibility)),
+            };
         }
-        let Some(FileReadOutcome::Content(bytes)) = reads.get(&checkout.head_sha, name) else {
-            continue;
-        };
-        if !bytes.is_empty() {
-            return (
-                vec![((*name).to_owned(), bytes.clone())],
-                Some((*name).to_owned()),
-            );
+        match reads.get(&checkout.head_sha, name) {
+            Some(FileReadOutcome::Missing) | None => {}
+            Some(FileReadOutcome::Content(bytes)) => {
+                return ConventionSelection {
+                    files: vec![((*name).to_owned(), bytes.clone())],
+                    label: Some((*name).to_owned()),
+                    decision: Some(decide_path(name, Some(bytes), eligibility)),
+                };
+            }
+            Some(FileReadOutcome::Oversize { bytes }) => {
+                return ConventionSelection {
+                    files: vec![((*name).to_owned(), Vec::new())],
+                    label: Some((*name).to_owned()),
+                    decision: Some(PathDecision {
+                        path: (*name).to_owned(),
+                        disposition: Disposition::Placeholder {
+                            reason: format!(
+                                "{} over the {} KiB per-file limit",
+                                crate::domain::context::human_bytes(*bytes),
+                                eligibility.policy.max_file_bytes / 1024
+                            ),
+                        },
+                    }),
+                };
+            }
+            Some(other) => {
+                return ConventionSelection {
+                    files: vec![((*name).to_owned(), Vec::new())],
+                    label: Some((*name).to_owned()),
+                    decision: Some(PathDecision::omitted(
+                        *name,
+                        format!(
+                            "repository conventions were not read: {}",
+                            read_failure(other, eligibility.policy)
+                        ),
+                    )),
+                };
+            }
         }
     }
-    (Vec::new(), None)
+    ConventionSelection::default()
 }
