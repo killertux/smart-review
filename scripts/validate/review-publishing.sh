@@ -301,6 +301,51 @@ else
   cat "$TMP/build.log" | tail -20
 fi
 
+if validation_smoke_only; then
+  step "smoke: confirmed publish payload"
+  HOME_SMOKE="$TMP/home-smoke"
+  home_for "$HOME_SMOKE"
+  : >"$FAKE/argv.txt"
+  FRAMES="$TMP/publish-smoke.log"
+  run_tui "$HOME_SMOKE" \
+    "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~ rr~a~\r" \
+    "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~review posted" \
+    "$FRAMES" >/dev/null
+  if shown "$FRAMES" "approve — this unblocks the pull request" \
+      && shown "$FRAMES" "the rounding is hidden behind a magic ten"; then
+    ok "the immutable preview showed the verdict and comment before publishing"
+  else
+    bad "the publish preview did not show the confirmed payload"
+  fi
+  if [ "$(count_calls 'pulls/141/reviews')" = "1" ] \
+      && [ "$(count_calls 'POST')" = "1" ]; then
+    ok "the confirmed review used exactly one mutating call"
+  else
+    bad "the confirmed review was not one mutation"
+  fi
+  if check_json "$FAKE/review.json" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["event"] == "APPROVE", body
+assert len(body["comments"]) == 1, body
+assert body["comments"][0]["path"] == "src/domain/money.rs", body
+assert body["comments"][0]["body"] == "the rounding is hidden behind a magic ten", body
+assert body.get("commit_id"), body
+PY
+  then
+    ok "the adapter received the exact confirmed review payload"
+  else
+    bad "the adapter payload differed from the preview"
+    cat "$TMP/check.log"
+  fi
+  if [ -f "$TMP/driver.failed" ]; then
+    bad "the publish PTY smoke did not reach its expected screen state"
+  fi
+  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 step "2/8 a comment is staged on a line of the diff"
 HOME_ONE="$TMP/home-one"
 home_for "$HOME_ONE"

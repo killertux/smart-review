@@ -126,7 +126,7 @@ not a time estimate: S = narrow, M = one subsystem, L = cross-cutting invariant.
 | [IR-15](#ir-15-make-the-terminal-harness-trustworthy-and-remove-repeated-gates) | P2 high leverage | Fail-fast waits, incremental replay, single CI gates | None; coordinate with IR-09/10 | M | Implemented locally (`ir-15-terminal-harness`) |
 | [IR-16](#ir-16-integrate-a-concise-guided-review-into-the-file-workflow) | P2 product | Brief, per-file what/why/verify, plan and human progress | IR-03, IR-10, IR-11, IR-12 | L | Implemented locally; owner walkthrough pending |
 | [IR-17](#ir-17-optimize-measured-runtime-and-context-hotspots) | P2 performance | Prepared views, coalesced frames, batched object reads | IR-08, IR-11, IR-13, IR-14, IR-16 | L | Implemented |
-| [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | Not started |
+| [IR-18](#ir-18-consolidate-deterministic-scenarios-and-a-small-pty-smoke-suite) | P2 tests | Fast scenario coverage and minimal meaningful PTY contracts | IR-15, IR-17 (and their prerequisites) | M | Implemented |
 | [IR-19](#ir-19-replace-milestone-docs-with-a-small-living-product-contract) | P3 | Accurate product, architecture and testing documentation | IR-01 through IR-18 | M | Not started |
 
 ### Execution notes
@@ -1657,35 +1657,35 @@ assert useful invariants instead of mirroring handlers or merely finding header 
 
 ### Implementation steps
 
-1. [ ] Inventory existing tests and validators by behavior, not historical milestone.
+1. [x] Inventory existing tests and validators by behavior, not historical milestone.
    Map every retained gate to a requirement/finding; identify duplicate setup and
    assertions that never exercise the claimed interval or user action.
-2. [ ] Consolidate a minimal deterministic runner around real actions, reducers, job
+2. [x] Consolidate a minimal deterministic runner around real actions, reducers, job
    outcomes and TestBackend rendering. Use injected time and controlled queues/futures
    to release work in any order without real seconds of sleeping.
-3. [ ] Keep domain/property tests at their lowest effective layer. Do not move every
+3. [x] Keep domain/property tests at their lowest effective layer. Do not move every
    small pure assertion into a full application scenario.
-4. [ ] Reuse the regression schedules added by IR-01–17. Test the composed paths through
+4. [x] Reuse the regression schedules added by IR-01–17. Test the composed paths through
    action → effect → fake port → completion → frame, including persistence destinations.
-5. [ ] Require observability of the meaningful state: current subject, focused input,
+5. [x] Require observability of the meaningful state: current subject, focused input,
    displayed source anchor, outgoing request counts, document version and mutation
    state. Avoid test-only production shortcuts bypassing actual routing.
-6. [ ] Keep snapshots focused on stable representative screens and edge geometry. Strip
+6. [x] Keep snapshots focused on stable representative screens and edge geometry. Strip
    machine-specific paths via production path-shortening behavior; do not hide genuine
    layout changes with permissive text normalization.
-7. [ ] Replace historical all-feature PTY repetition with a small set of named smoke
+7. [x] Replace historical all-feature PTY repetition with a small set of named smoke
    contracts: startup/restore, key+mouse decoding, remote→local transition, provider
    stream/cancel, publish/reply/dry-run payload, external editor, resize.
-8. [ ] Keep default Rust unit/scenario tests free of network, real credentials, `gh` and
+8. [x] Keep default Rust unit/scenario tests free of network, real credentials, `gh` and
    real repositories. Local Git/HTTP/PTY adapter contracts must be explicit opt-in
    validator invocations; `--all-features` alone must not enable live tests.
-9. [ ] Make live provider/GitHub contracts separately opt-in and read-only by default.
+9. [x] Make live provider/GitHub contracts separately opt-in and read-only by default.
    Sandbox mutation tests require the owner's explicit target/authorization. Do not
    use real accounts to establish routine correctness.
-10. [ ] Decommission old duplicate validator coverage only after the replacement has
+10. [x] Decommission old duplicate validator coverage only after the replacement has
     demonstrated the same assertions and useful failure behavior. Keep historical
     wrappers for transition if needed, then simplify commands in IR-19.
-11. [ ] Record warm test and smoke timings in CI summaries. Investigate regressions by
+11. [x] Record warm test and smoke timings in CI summaries. Investigate regressions by
     stage; do not make nextest/a new framework a prerequisite when the bottleneck is
     unconditional PTY waiting.
 
@@ -1715,6 +1715,15 @@ tests matched a filter, a fake bypassing real routing, or broad PTY sleeps retur
 **Gates:** shared gates, coverage migration map, named smoke and CI timing comparison.
 Keep warm Rust tests around the existing sub-5-second reference target when practical;
 set a separate measured smoke budget after IR-15 rather than promising an invented one.
+
+**Coverage and measurement record (2026-09-21):**
+[`docs/testing/ir-18.md`](testing/ir-18.md) maps every mandatory journey to retained
+deterministic regressions and each named wiring contract to its smoke validator. On the
+reference M1 Pro, the event-driven smoke suite takes 9.6 seconds versus 34.9 seconds for
+the historical broad validators. The warm Rust command takes 11.3 seconds (10.4
+seconds reported test-body time); isolation identified fake-`gh` process contracts as
+the roughly nine-second stage, so they remain visible in CI rather than being deleted
+without replacement.
 
 ---
 

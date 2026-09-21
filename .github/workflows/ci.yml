@@ -52,7 +52,11 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: |
+          started="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          cargo test --all-features
+          finished="$(python3 -c 'import time; print(time.monotonic_ns())')"
+          echo "SMART_REVIEW_RUST_TEST_MS=$(( (finished - started) / 1000000 ))" >>"$GITHUB_ENV"
 
       - name: Build
         run: cargo build
@@ -86,13 +90,13 @@ jobs:
             grep -qE 'gh auth login|not a git repository|--repo|cli.github.com' /tmp/check.txt
           fi
 
-      # Cargo's gates already passed above. The aggregate runner therefore executes
-      # only the independent black-box feature scenarios, in parallel, with local
-      # fake forge/catalog/model services and reconstructed PTY screens.
-      - name: Milestone validation
+      # Cargo's deterministic gates already passed above. The aggregate runner now
+      # executes only IR-18's named wiring smoke contracts against that binary, with
+      # temporary repositories, fake services and reconstructed PTY screens.
+      - name: Named wiring smoke
         env:
           SMART_REVIEW_VALIDATION_OUTPUT: ${{ runner.temp }}/smart-review-validation
-        run: bash scripts/validate/all.sh --scenarios-only
+        run: bash scripts/validate/all.sh --smoke-only
 
       - name: Upload validator failure captures
         if: failure()

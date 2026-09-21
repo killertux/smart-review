@@ -16,6 +16,7 @@ sys.path.insert(0, str(HERE))
 sys.dont_write_bytecode = True
 
 import screen  # noqa: E402
+import drive  # noqa: E402
 
 
 REPRESENTATIVE = (
@@ -72,6 +73,14 @@ class ReplayTests(unittest.TestCase):
 
 
 class DriverTests(unittest.TestCase):
+    def test_ir_18_resize_steps_are_explicit_and_validated(self) -> None:
+        self.assertEqual(
+            drive.resize_steps("79x23=terminal too small~160x40=smart-review"),
+            [(79, 23, "terminal too small"), (160, 40, "smart-review")],
+        )
+        with self.assertRaises(ValueError):
+            drive.resize_steps("79-by-23")
+
     def run_driver(
         self,
         child: str,
@@ -316,6 +325,29 @@ class ValidatorModeTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "1")
+
+    def test_ir_18_smoke_only_mode_selects_the_small_pty_contracts(self) -> None:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; validation_mode --smoke-only; printf "%s:%s" '
+                '"$SMART_REVIEW_SKIP_CARGO" "$SMART_REVIEW_SMOKE_ONLY"',
+                "bash",
+                str(HERE / "common.sh"),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1:1")
+
+    def test_ir_18_default_aggregate_runs_smoke_not_historical_repetition(self) -> None:
+        aggregate = (HERE / "all.sh").read_text(encoding="utf-8")
+        self.assertIn('VALIDATOR_MODE="--smoke-only"', aggregate)
+        self.assertIn("SMART_REVIEW_FULL_VALIDATION", aggregate)
+        self.assertNotIn('bash "$ROOT/scripts/validate/$feature.sh" --scenarios-only', aggregate)
 
     def test_ir_15_unknown_validator_mode_fails(self) -> None:
         result = subprocess.run(

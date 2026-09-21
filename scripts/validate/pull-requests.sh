@@ -196,6 +196,33 @@ else
   tail -20 "$TMP/pull-requests-build.log"
 fi
 
+if validation_smoke_only; then
+  step "smoke: key and mouse decoding reach the visible diff target"
+  FAKE="$TMP/fake-gh"
+  make_fake_gh "$FAKE"
+  HOME_CLICK="$TMP/home-click"
+  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;9M~:q\r' \
+    'impl Invoice~A docs/logo\.png~' "$FAKE" "$TMP/pull-requests-click.log")"
+  if printf '%s' "$SCREEN" | saw "A docs/logo.png"; then
+    ok "a decoded key command opens the review and an SGR mouse click selects its row"
+  else
+    bad "the key/mouse smoke did not reach the clicked file"
+    printf '%s\n' "$SCREEN" | tail -10
+  fi
+  AFTER="$(git status --porcelain --ignored=no | sort)"
+  if [ "$BEFORE" = "$AFTER" ] && [ ! -e "$ROOT/.smart-review" ]; then
+    ok "the smoke wrote nothing into the repository"
+  else
+    bad "the smoke modified the repository"
+  fi
+  if [ -f "$TMP/driver.failed" ]; then
+    bad "the PTY smoke did not reach its expected screen state"
+  fi
+  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 # ---------------------------------------------------------------------------
 step "4/6 environment detection without a repository or a forge"
 DETECT_HOME="$TMP/detect"

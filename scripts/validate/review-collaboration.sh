@@ -341,6 +341,64 @@ else
   tail -20 "$TMP/build.log"
 fi
 
+if validation_smoke_only; then
+  step "smoke: reply, external editor and dry-run boundaries"
+  HOME_SMOKE="$TMP/home-smoke"
+  home_for "$HOME_SMOKE"
+  : >"$FAKE/argv.txt"
+  REPLY_FRAMES="$TMP/reply-smoke.log"
+  run_tui "$HOME_SMOKE" \
+    "$OPEN~$ON_THREAD~r~agreed, fixed in the follow-up\r~\r~q" \
+    "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~comment posted~" \
+    "$REPLY_FRAMES" >/dev/null
+  if [ "$(count_calls 'comments/9001/replies')" = "1" ] \
+      && [ "$(cat "$FAKE/reply-posted.txt" 2>/dev/null)" = "agreed, fixed in the follow-up" ]; then
+    ok "the confirmed reply reached its thread once with the previewed body"
+  else
+    bad "the reply smoke did not reach the intended thread payload"
+  fi
+
+  EDITOR_FRAMES="$TMP/editor-smoke.log"
+  EDITOR="$FAKE/editor" run_tui "$HOME_SMOKE" \
+    "$OPEN~$LINES~c~before the editor~\005~\r~q" \
+    'from the worktree~M src/domain/money~comment on src/domain/money.rs:2~~composer updated from \$EDITOR~1 draft~' \
+    "$EDITOR_FRAMES" >/dev/null
+  if shown "$EDITOR_FRAMES" 'composer updated from \$EDITOR' \
+      && grep -Rqs 'before the editor\|finished in editor' "$HOME_SMOKE/drafts"; then
+    ok "the external editor restored the terminal and returned text to the same composer"
+  else
+    bad "the external-editor smoke did not preserve the composer"
+  fi
+
+  HOME_DRY="$TMP/home-dry"
+  home_for "$HOME_DRY"
+  cat >>"$HOME_DRY/config.toml" <<'EOF'
+
+[forge]
+dry_run = true
+EOF
+  : >"$FAKE/argv.txt"
+  DRY_FRAMES="$TMP/dry-smoke.log"
+  run_tui "$HOME_DRY" \
+    "$OPEN~$ON_THREAD~r~a dry run reply\r~\r~\e~ pt~y~~ pc~c~a dry run comment\r~\r~\e" \
+    "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~Enter records~dry run: nothing was posted~~resolve this thread~nothing changed on GitHub~~conversation · #141~~post · #141~dry run: nothing was posted~" \
+    "$DRY_FRAMES" >/dev/null
+  if [ "$(count_calls 'POST')" = "0" ] \
+      && grep -q 'comments/9001/replies' "$HOME_DRY/logs/dry-run.log" 2>/dev/null \
+      && grep -q 'resolveReviewThread' "$HOME_DRY/logs/dry-run.log" 2>/dev/null \
+      && grep -q 'issues/141/comments' "$HOME_DRY/logs/dry-run.log" 2>/dev/null; then
+    ok "dry-run dispatched nothing and recorded every exact mutation command"
+  else
+    bad "the dry-run smoke either posted or lost a mutation command"
+  fi
+  if [ -f "$TMP/driver.failed" ]; then
+    bad "a collaboration PTY smoke did not reach its expected screen state"
+  fi
+  printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+
 step "2/12 the discussion GitHub already has is drawn where it belongs"
 HOME_ONE="$TMP/home-one"
 home_for "$HOME_ONE"

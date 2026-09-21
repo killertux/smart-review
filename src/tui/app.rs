@@ -6880,6 +6880,49 @@ mod tests {
         effect
     }
 
+    fn scenario_command(scenario: &mut crate::tui::test_support::Scenario, command: &str) {
+        scenario.press(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE));
+        for character in command.chars() {
+            scenario.press(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        scenario.press(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ir_18_action_effect_out_of_order_completion_and_frame_are_composed() {
+        let (_dir, app) = app();
+        let mut scenario = crate::tui::test_support::Scenario::new(app);
+
+        scenario_command(&mut scenario, "doctor");
+        assert_eq!(scenario.effect(), &Effect::RunDoctor);
+        scenario.route_with_fake(10, |job| {
+            assert!(matches!(job, jobs::Job::Report { .. }));
+            Outcome::Failed("old failure; run :doctor again".to_owned())
+        });
+
+        scenario_command(&mut scenario, "doctor");
+        assert_eq!(scenario.effect(), &Effect::RunDoctor);
+        scenario.route_with_fake(11, |job| {
+            assert!(matches!(job, jobs::Job::Report { .. }));
+            Outcome::Failed("current failure; run :doctor again".to_owned())
+        });
+
+        assert_eq!(scenario.release(10), None, "the superseded job is ignored");
+        let stale_frame = scenario.frame(80, 24);
+        assert!(!stale_frame.contains("old failure"));
+
+        assert_eq!(scenario.release(11), None);
+        assert_eq!(
+            scenario
+                .app()
+                .latest_notice()
+                .map(|notice| notice.text.as_str()),
+            Some("current failure; run :doctor again")
+        );
+        let current_frame = scenario.frame(80, 24);
+        assert!(current_frame.contains("current failure"));
+    }
+
     #[test]
     fn starts_in_normal_mode_with_nothing_open() {
         let (_dir, app) = app();
@@ -8580,6 +8623,73 @@ mod tests {
     }
 
     #[test]
+    fn ir_18_old_session_patch_context_chat_and_workspace_results_are_discarded() {
+        let (_dir, mut app) = draft_app();
+        app.environment = Some(crate::test_support::environment());
+        app.enter_review_session(141);
+        let older = app.review_session().cloned().expect("A session");
+        app.enter_review_session(142);
+        let bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "old A context",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &crate::domain::context::BundlePolicy::default(),
+        );
+        let outcomes = vec![
+            Outcome::Patch {
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(DiffView::new(
+                    crate::domain::diff::parse_patch(""),
+                ))),
+                source: crate::domain::diff::DiffSource::Forge,
+                head_sha: "a-head".to_owned(),
+            },
+            Outcome::Context {
+                bundle: Box::new(bundle),
+                intent: crate::application::analysis::AnalysisIntent::Estimate,
+                identity: crate::application::context::ContextIdentity {
+                    head_sha: "a-head".to_owned(),
+                    base_sha: None,
+                    local_content: false,
+                    changed_paths: Vec::new(),
+                    added: Vec::new(),
+                    policy: crate::domain::context::BundlePolicy::default(),
+                },
+            },
+            Outcome::ChatLoaded {
+                sessions: Vec::new(),
+                session: None,
+                missing: Some("old-a-chat".to_owned()),
+            },
+            Outcome::Workspace(Box::new(crate::ports::workspace::Workspace {
+                path: std::path::PathBuf::from("/tmp/old-a-workspace"),
+                base_sha: "a-base".to_owned(),
+                head_sha: "a-head".to_owned(),
+                reused: false,
+            })),
+        ];
+
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let effect = app.apply_completion(Completion {
+                job: u64::try_from(index).unwrap_or_default() + 1,
+                progress_through: 0,
+                owner: jobs::JobOwner::Review(older.clone()),
+                outcome,
+            });
+            assert_eq!(effect, None);
+        }
+
+        assert!(app.review.is_none());
+        assert!(app.workspace.is_none());
+        assert!(app.panel.bundle.is_none());
+        assert!(app.chat.sessions.is_empty());
+        assert_eq!(
+            app.review_session().map(|session| session.subject_pr),
+            Some(142)
+        );
+    }
+
+    #[test]
     fn ir_05_a_new_revision_invalidates_the_previous_sessions_work() {
         let (_dir, mut app) = draft_app();
         app.environment = Some(crate::test_support::environment());
@@ -8815,6 +8925,68 @@ mod tests {
         assert_eq!(composer.anchor(), Some(&anchor));
         assert_eq!(composer.head_sha.as_deref(), Some("h1"));
         assert_eq!(app.mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn ir_18_a_late_draft_load_cannot_replace_an_active_composer() {
+        let (_dir, mut app) = draft_app();
+        press(&mut app, "}");
+        press(&mut app, "jjjj");
+        press(&mut app, "c");
+        app.drafts
+            .composer
+            .as_mut()
+            .expect("composer")
+            .input
+            .insert_str("private words in progress");
+        let mut stored = crate::domain::draft::Draft::new(141, app.now());
+        stored.set_body("older stored body", app.now());
+        app.record_draft_load_job(7);
+
+        assert_eq!(
+            app.apply_completion(Completion {
+                job: 7,
+                progress_through: 0,
+                owner: jobs::JobOwner::Global,
+                outcome: Outcome::DraftLoaded {
+                    pr: 141,
+                    draft: Some(Box::new(stored)),
+                },
+            }),
+            Some(Effect::LoadMutations)
+        );
+
+        assert_eq!(
+            app.drafts
+                .composer
+                .as_ref()
+                .map(|composer| composer.input.text()),
+            Some("private words in progress")
+        );
+        assert_ne!(app.drafts.draft.body.as_deref(), Some("older stored body"));
+    }
+
+    #[test]
+    fn ir_18_a_late_draft_save_cannot_acknowledge_newer_writing() {
+        let (_dir, mut app) = draft_app();
+        app.drafts.revision = 2;
+        app.drafts.dirty = true;
+        app.record_draft_save_job(8);
+
+        assert_eq!(
+            app.apply_completion(Completion {
+                job: 8,
+                progress_through: 0,
+                owner: jobs::JobOwner::Global,
+                outcome: Outcome::DraftSaved {
+                    revision: 1,
+                    reload_after: false,
+                },
+            }),
+            None
+        );
+        assert!(app.drafts.dirty, "revision 1 cannot certify revision 2");
+        assert_eq!(app.drafts.save_job, 0);
     }
 
     #[test]
