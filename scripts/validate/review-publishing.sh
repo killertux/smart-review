@@ -419,7 +419,14 @@ else
   bad "the payload is not what the modal showed"
   cat "$TMP/check.log"
 fi
-if [ -f "$(draft_file "$HOME_TWO")" ]; then
+PUBLISHED_DRAFT="$(draft_file "$HOME_TWO")"
+# The success notice is reduced before the ordered background delete reaches disk.
+# Wait for that durable postcondition rather than racing it on fast machines.
+for _ in $(seq 1 40); do
+  [ ! -f "$PUBLISHED_DRAFT" ] && break
+  sleep 0.05
+done
+if [ -f "$PUBLISHED_DRAFT" ]; then
   bad "the published draft is still on disk, so it would be sent twice"
 else
   ok "the draft is cleared once the review is posted"

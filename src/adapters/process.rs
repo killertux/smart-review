@@ -17,7 +17,7 @@
 //!   (FR-6.5), and the caller is told so.
 
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -71,6 +71,8 @@ pub struct CommandSpec {
     cwd: Option<PathBuf>,
     mutating: bool,
     sensitive_args: Vec<usize>,
+    stdin: Option<Arc<[u8]>>,
+    output_cap: Option<usize>,
 }
 
 impl CommandSpec {
@@ -83,6 +85,8 @@ impl CommandSpec {
             cwd: None,
             mutating: false,
             sensitive_args: Vec::new(),
+            stdin: None,
+            output_cap: None,
         }
     }
 
@@ -129,6 +133,20 @@ impl CommandSpec {
     #[must_use]
     pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
+        self
+    }
+
+    /// Supplies bytes on standard input without ever including them in diagnostics.
+    #[must_use]
+    pub fn stdin_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(Arc::from(bytes.into()));
+        self
+    }
+
+    /// Overrides the captured output bound for a command with a known safe budget.
+    #[must_use]
+    pub fn output_cap(mut self, bytes: usize) -> Self {
+        self.output_cap = Some(bytes);
         self
     }
 
@@ -507,38 +525,7 @@ impl ProcessRunner {
         }
 
         let started = Instant::now();
-        let (mut command, starts_new_session) = command_for(spec);
-        if let Some(dir) = &spec.cwd {
-            command.current_dir(dir);
-        }
-        let mut child = {
-            let mut attempts = 0;
-            loop {
-                command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                match command.spawn() {
-                    Ok(child) => break child,
-                    Err(source) => {
-                        attempts += 1;
-                        if is_text_file_busy(&source) && attempts < SPAWN_ATTEMPTS {
-                            thread::sleep(SPAWN_BACKOFF);
-                            continue;
-                        }
-                        return Err(match source.kind() {
-                            std::io::ErrorKind::NotFound => ProcessError::NotFound {
-                                program: program.clone(),
-                            },
-                            _ => ProcessError::Spawn {
-                                program: program.clone(),
-                                source,
-                            },
-                        });
-                    }
-                }
-            }
-        };
+        let (mut child, starts_new_session) = spawn_command(spec, &program)?;
 
         // A process can spawn helpers which inherit its process group. Unix creates a
         // child-owned group before exec, so cancellation and timeout can stop that group
@@ -546,9 +533,15 @@ impl ProcessRunner {
         #[cfg(unix)]
         let group = starts_new_session.then(|| OwnedProcessGroup::from_child(&child));
 
+        let mut stdin_writer = spec.stdin.as_ref().and_then(|bytes| {
+            let mut pipe = child.stdin.take()?;
+            let bytes = Arc::clone(bytes);
+            Some(thread::spawn(move || pipe.write_all(&bytes)))
+        });
+
         // Read both pipes on their own threads: a child that fills one pipe while
         // we block on the other would otherwise deadlock.
-        let cap = self.output_cap;
+        let cap = spec.output_cap.unwrap_or(self.output_cap);
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let stdout_reader = stdout_pipe.map(|pipe| thread::spawn(move || read_capped(pipe, cap)));
@@ -569,6 +562,7 @@ impl ProcessRunner {
                 #[cfg(not(unix))]
                 terminate(&mut child);
                 let _ = child.wait();
+                let _ = join_writer(stdin_writer.take());
                 return Err(ProcessError::Cancelled {
                     command: spec.diagnostic(),
                 });
@@ -579,6 +573,7 @@ impl ProcessRunner {
                 #[cfg(not(unix))]
                 terminate(&mut child);
                 let _ = child.wait();
+                let _ = join_writer(stdin_writer.take());
                 return Err(ProcessError::Timeout {
                     command: spec.diagnostic(),
                     timeout,
@@ -589,6 +584,11 @@ impl ProcessRunner {
 
         let (stdout, stdout_truncated) = join_reader(stdout_reader, GRACE);
         let (stderr, stderr_truncated) = join_reader(stderr_reader, GRACE);
+        if status.success()
+            && let Some(Err(source)) = join_writer(stdin_writer.take())
+        {
+            return Err(ProcessError::Spawn { program, source });
+        }
 
         Ok(Output {
             status,
@@ -657,6 +657,58 @@ impl ProcessRunner {
             stderr: output.stderr_tail(),
         })
     }
+}
+
+fn spawn_command(
+    spec: &CommandSpec,
+    program: &str,
+) -> Result<(std::process::Child, bool), ProcessError> {
+    let (mut command, starts_new_session) = command_for(spec);
+    if let Some(dir) = &spec.cwd {
+        command.current_dir(dir);
+    }
+    let mut attempts = 0;
+    loop {
+        command
+            .stdin(if spec.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match command.spawn() {
+            Ok(child) => return Ok((child, starts_new_session)),
+            Err(source) => {
+                attempts += 1;
+                if is_text_file_busy(&source) && attempts < SPAWN_ATTEMPTS {
+                    thread::sleep(SPAWN_BACKOFF);
+                    continue;
+                }
+                return Err(match source.kind() {
+                    std::io::ErrorKind::NotFound => ProcessError::NotFound {
+                        program: program.to_owned(),
+                    },
+                    _ => ProcessError::Spawn {
+                        program: program.to_owned(),
+                        source,
+                    },
+                });
+            }
+        }
+    }
+}
+
+fn join_writer(
+    writer: Option<thread::JoinHandle<std::io::Result<()>>>,
+) -> Option<std::io::Result<()>> {
+    writer.map(|writer| {
+        writer.join().unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "the standard-input writer thread stopped unexpectedly",
+            ))
+        })
+    })
 }
 
 /// Builds the process command, isolating Unix children before they can spawn helpers.
@@ -881,6 +933,14 @@ mod tests {
         assert!(!output.dry_run);
         assert_eq!(output.stdout.trim(), "hello");
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn ir_17_standard_input_is_piped_without_entering_the_command_diagnostic() {
+        let spec = shell("cat").stdin_bytes(b"private object request\n".to_vec());
+        let output = runner().run_checked(&spec, &Cancel::new()).unwrap();
+        assert_eq!(output.stdout, "private object request\n");
+        assert!(!spec.diagnostic().contains("private object request"));
     }
 
     #[test]

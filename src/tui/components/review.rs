@@ -889,7 +889,7 @@ fn tree_title(view: &DiffView) -> String {
         "{}{} ({}){}",
         view.order.label(),
         provenance,
-        view.patch.stats().files,
+        view.stats().files,
         progress,
     )
 }
@@ -1057,7 +1057,7 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App, view: &DiffView) {
 /// The diff pane's title: what is being looked at, and the mode.
 fn diff_title(theme: &Theme, view: &DiffView, width: u16, app: &App) -> String {
     let _ = width;
-    let stats = view.patch.stats();
+    let stats = view.stats();
     let mode = if view.split && app.terminal_width() >= SPLIT_MIN_WIDTH {
         "split"
     } else if view.split {

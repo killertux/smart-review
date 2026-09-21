@@ -539,6 +539,10 @@ pub struct PanelState {
     pub pending_stored_intent: Option<AnalysisIntent>,
     /// The text that has streamed in (FR-4.4).
     pub stream: StreamBuffer,
+    /// Coalesced display-only projection of the incomplete JSON stream (IR-17).
+    pub preview: crate::domain::analysis::Preview,
+    /// Stream length at the last preview parse.
+    pub preview_bytes: usize,
     /// The first visible line of the panel, for j/k scrolling (FR-4.4).
     pub scroll: usize,
     /// What normalization corrected (FR-4.1).
@@ -1300,10 +1304,6 @@ impl App {
             // view; later detail refreshes leave an already-applied view unchanged.
             view.set_head_sha(detail.summary.head_sha.clone());
         }
-        // FR-6.4: what GitHub already says about these lines, drawn under them. Set
-        // here rather than in the caller because this is the one place where the detail
-        // and the diff are both in hand.
-        view.set_comments(&detail.comments);
         self.detail = Some(detail);
         let head_sha = self
             .detail
@@ -1314,6 +1314,7 @@ impl App {
             .panel
             .plan
             .take()
+            .or_else(|| view.plan.clone())
             .unwrap_or_else(|| crate::domain::plan::Plan::heuristic(head_sha, &view.paths()));
         if plan.matches_head(head_sha) {
             plan.sync_file_reviews(&view.patch);
@@ -1323,7 +1324,13 @@ impl App {
             plan = crate::domain::plan::Plan::carry_forward(&plan, current, &view.patch);
         }
         self.panel.plan = Some(plan.clone());
-        view.set_plan(Some(plan));
+        // Plan ordering and discussion rows are one immutable opening snapshot. Build
+        // their projection together rather than flattening the patch once for each.
+        if let Some(detail) = self.detail.as_ref()
+            && (view.plan.as_ref() != Some(&plan) || view.comments != detail.comments)
+        {
+            view.set_review_context(plan, &detail.comments);
+        }
         if opening {
             self.load_context_files();
         }
@@ -1861,17 +1868,24 @@ impl App {
             } if job == self.patch_job => {
                 let load_analysis = job == self.context_patch_job;
                 if load_analysis {
-                    self.apply_context_patch(outcome.value().clone());
+                    self.apply_context_patch(outcome.value().patch.clone());
                 }
                 let patch_effect = self.apply_patch(*outcome, source, head_sha);
-                if load_analysis && patch_effect == Effect::LoadDraft {
-                    Some(Effect::LoadAnalysisAndDraft)
+                if load_analysis {
+                    Some(if patch_effect == Effect::LoadDraft {
+                        Effect::LoadAnalysisAndDraft
+                    } else {
+                        // Workspace arrival changes the context identity from remote-only
+                        // to local. Re-read that identity's cache after the canonical local
+                        // patch lands rather than leaving the earlier remote miss in force.
+                        Effect::LoadAnalysis
+                    })
                 } else {
                     Some(patch_effect)
                 }
             }
             Outcome::Patch { outcome, .. } if job == self.context_patch_job => {
-                self.apply_context_patch(outcome.into_value());
+                self.apply_context_patch(outcome.into_value().patch);
                 Some(Effect::LoadAnalysis)
             }
             Outcome::Catalog(load) if job == self.catalog_job => {
@@ -2268,6 +2282,7 @@ impl App {
         self.chat.awaiting_confirmation = None;
         self.chat.stream.clear();
         self.chat.scroll = 0;
+        self.chat.tail_paused = false;
         self.chat_bundle = None;
         self.chat_bundle_for = None;
         self.chat.input.clear();
@@ -3393,6 +3408,9 @@ impl App {
         self.chat.sessions = sessions;
         if let Some(session) = session {
             self.chat.session = Some(*session);
+            self.chat.scroll = 0;
+            self.chat.tail_paused = false;
+            self.chat.layouts.borrow_mut().clear();
             // The estimate belongs to the conversation that was open when it was made.
             self.chat.estimate = None;
         }
@@ -3466,7 +3484,9 @@ impl App {
         // landing.
         if is_current {
             self.chat.stream.clear();
-            self.chat.scroll = 0;
+            if !self.chat.tail_paused {
+                self.chat.scroll = 0;
+            }
         }
     }
 
@@ -4041,7 +4061,9 @@ impl App {
                 self.chat.status = ChatStatus::Streaming { stage };
                 // The newest text is what the user is waiting for, so the pane follows
                 // it down unless they have scrolled up to read something else.
-                self.chat.scroll = 0;
+                if !self.chat.tail_paused {
+                    self.chat.scroll = 0;
+                }
             }
         }
     }
@@ -4103,6 +4125,7 @@ impl App {
                         .as_ref()
                         .and_then(|detail| detail.base_sha.clone())
                 }),
+            local_content: self.checkout().is_some(),
             changed_paths,
             added: self.chat.added.clone(),
             policy: *policy,
@@ -4711,20 +4734,15 @@ impl App {
     /// Applies a fetched or cached patch (FR-3.3).
     fn apply_patch(
         &mut self,
-        outcome: FetchOutcome<crate::domain::diff::Patch>,
+        outcome: FetchOutcome<DiffView>,
         source: DiffSource,
         head_sha: String,
     ) -> Effect {
         self.diff_source = source;
         self.diff_offline = outcome.offline_reason().map(|_| "offline".to_owned());
-        let patch = outcome.into_value();
-        let mut view = DiffView::with_options(
-            patch,
-            self.config.review.context_lines,
-            self.config.review.ignore_whitespace,
-        );
+        let mut view = outcome.into_value();
         view.set_head_sha(head_sha);
-        let files = view.patch.stats();
+        let files = view.stats();
         let load_draft = self.detail.as_ref().is_some_and(|detail| {
             !self.drafts.open || self.drafts.draft.pr != detail.summary.number
         });
@@ -5100,8 +5118,10 @@ impl App {
                 let step = usize::try_from(delta.abs() * 3).unwrap_or(3);
                 if delta < 0 {
                     self.chat.scroll = self.chat.scroll.saturating_add(step);
+                    self.chat.tail_paused = true;
                 } else {
                     self.chat.scroll = self.chat.scroll.saturating_sub(step);
+                    self.chat.tail_paused = self.chat.scroll > 0;
                 }
             }
         }
@@ -5184,6 +5204,7 @@ impl App {
             // box, which is the only thing there that can be edited.
             Pane::Chat => {
                 self.chat.scroll = 0;
+                self.chat.tail_paused = false;
                 self.focus_target = FocusTarget::ChatInput;
             }
         }
@@ -5394,11 +5415,16 @@ impl App {
     ///
     /// The reducer never reads the clock itself, so this is how "now" reaches it —
     /// and how a test can render the same frame twice.
-    pub fn set_now(&mut self, now_unix_secs: u64) {
+    pub fn set_now(&mut self, now_unix_secs: u64) -> bool {
+        let changed = self.now_unix_secs != now_unix_secs;
         if self.started_at == 0 {
             self.started_at = now_unix_secs;
         }
         self.now_unix_secs = now_unix_secs;
+        changed
+            && (self.opening.is_some()
+                || self.panel.state.is_running()
+                || self.chat.status.is_running())
     }
 
     /// How many keys the configuration document holds, including the ones this
@@ -5644,17 +5670,34 @@ impl App {
         }
     }
 
-    /// Expires old notifications.
-    pub fn tick(&mut self) {
+    /// Whether the configured key-sequence deadline has actually elapsed.
+    ///
+    /// The runtime may wake earlier to present background progress (IR-17), so a poll
+    /// timeout is no longer proof that an ambiguous key sequence should fire.
+    #[must_use]
+    pub fn timeout_due(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Advances animations and expires old notifications.
+    ///
+    /// Returns whether the visible frame changed, allowing the event loop to avoid an
+    /// idle redraw when no notice expired and no operation is animated (IR-17).
+    pub fn tick(&mut self) -> bool {
         // The indicator's spinner is driven from here: the loop already calls this once
         // per iteration, which is exactly the cadence an animation wants.
-        self.spinner = self.spinner.wrapping_add(1);
-        self.tick_at(Instant::now());
+        let animated = self.opening.is_some();
+        if animated {
+            self.spinner = self.spinner.wrapping_add(1);
+        }
+        self.tick_at(Instant::now()) || animated
     }
 
     /// Expiry with the clock passed in, so it is testable.
-    pub(crate) fn tick_at(&mut self, now: Instant) {
+    pub(crate) fn tick_at(&mut self, now: Instant) -> bool {
+        let before = self.notices.len();
         self.notices.retain(|notice| notice.is_live(now));
+        self.notices.len() != before
     }
 
     /// Handles one key press (FR-7.1, FR-7.2).
@@ -6693,6 +6736,7 @@ impl App {
 
     /// Renders a frame (FR-7.8).
     pub fn render(&mut self, frame: &mut Frame<'_>) {
+        self.refresh_analysis_preview();
         let area = frame.area();
         if layout::is_too_small(area) {
             self.geometry = Geometry::default();
@@ -6731,6 +6775,37 @@ impl App {
         components::status_line::render(frame, rows[3], self);
         components::command_line::render(frame, rows[4], self);
         components::render_overlay(frame, area, self);
+    }
+
+    /// Reprojects partial analysis JSON at bounded byte intervals rather than parsing
+    /// the entire growing document for every animation frame (IR-17).
+    fn refresh_analysis_preview(&mut self) {
+        const FIRST_PREVIEW_BYTES: usize = 128;
+        const PREVIEW_STEP_BYTES: usize = 1024;
+
+        let text = self.panel.stream.text();
+        if text.len() < self.panel.preview_bytes {
+            self.panel.preview = crate::domain::analysis::Preview::default();
+            self.panel.preview_bytes = 0;
+        }
+        let threshold = if self.panel.preview_bytes == 0 {
+            1
+        } else if self.panel.preview.is_empty() {
+            FIRST_PREVIEW_BYTES
+        } else {
+            PREVIEW_STEP_BYTES
+        };
+        if text.len().saturating_sub(self.panel.preview_bytes) < threshold {
+            return;
+        }
+        self.panel.preview = crate::domain::analysis::preview(text);
+        self.panel.preview_bytes = text.len();
+    }
+
+    /// The latest coalesced partial-analysis projection.
+    #[must_use]
+    pub fn analysis_preview(&self) -> &crate::domain::analysis::Preview {
+        &self.panel.preview
     }
 }
 
@@ -7463,6 +7538,7 @@ mod tests {
             crate::application::context::ContextIdentity {
                 head_sha: "abc123".to_owned(),
                 base_sha: None,
+                local_content: false,
                 changed_paths: Vec::new(),
                 added: Vec::new(),
                 policy: crate::domain::context::BundlePolicy::default(),
@@ -7737,6 +7813,286 @@ mod tests {
         );
         app.set_review(DiffView::new(patch));
         (dir, app)
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_large_diff_draw_workload() {
+        let (dir, mut app) = list_app();
+        let mut source = String::new();
+        for file in 0..400 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut source,
+                format_args!(
+                    "diff --git a/dir{file}/f.rs b/dir{file}/f.rs\n--- a/dir{file}/f.rs\n+++ b/dir{file}/f.rs\n@@ -1,12 +1,12 @@\n"
+                ),
+            );
+            for line in 0..12 {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut source,
+                    format_args!("-old {file} {line}\n+new {file} {line}\n"),
+                );
+            }
+        }
+
+        let prepare_started = std::time::Instant::now();
+        let view = crate::tui::diff_view::DiffView::new_with_context(
+            crate::domain::diff::parse_patch(&source),
+            3,
+            false,
+            Some("reference-head"),
+            None,
+            Vec::new(),
+        );
+        let prepare = prepare_started.elapsed();
+        let projection_bytes = view.projection_bytes();
+        app.set_review(view);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50))
+            .expect("test terminal");
+        let first_started = std::time::Instant::now();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("first reference draw");
+        let first = first_started.elapsed();
+
+        let mut samples = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let started = std::time::Instant::now();
+            if let Some(view) = app.review.as_mut() {
+                view.move_by(1);
+            }
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("reference draw");
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[samples.len() * 95 / 100];
+        eprintln!(
+            "IR17_METRIC profile={} workload=large_diff files=400 diff_lines=9600 prepare_us={} first_draw_us={} input_to_frame_p50_us={} input_to_frame_p95_us={} frames={} projection_bytes={projection_bytes}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            prepare.as_micros(),
+            first.as_micros(),
+            p50.as_micros(),
+            p95.as_micros(),
+            samples.len()
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn ir_17_partial_analysis_projection_is_coalesced_between_draws() {
+        let (_dir, mut app) = app();
+        let first = format!(
+            "{{\"brief\":\"{}\",\"inferred_purpose\":\"purpose\"",
+            "a".repeat(160)
+        );
+        app.panel.stream.push(&first);
+        app.refresh_analysis_preview();
+        let parsed = app.panel.preview_bytes;
+        assert_eq!(parsed, first.len());
+
+        app.panel.stream.push(",\"coverage\":{");
+        app.refresh_analysis_preview();
+        assert_eq!(
+            app.panel.preview_bytes, parsed,
+            "a small delta does not reparse the complete partial document"
+        );
+
+        app.panel.stream.push(&" ".repeat(1024));
+        app.refresh_analysis_preview();
+        assert!(app.panel.preview_bytes > parsed);
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_streamed_analysis_workload() {
+        let (_dir, mut app) = app();
+        let answer = format!(
+            "{{\"brief\":\"{}\",\"inferred_purpose\":\"{}\",\"risk_areas\":[]}}",
+            "large streamed summary ".repeat(1_500),
+            "review intent ".repeat(1_500),
+        );
+        let started = std::time::Instant::now();
+        let mut deltas = 0usize;
+        for chunk in answer.as_bytes().chunks(128) {
+            let delta = std::str::from_utf8(chunk).expect("ASCII fixture");
+            app.panel.stream.push(delta);
+            app.refresh_analysis_preview();
+            deltas += 1;
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "IR17_METRIC profile={} workload=streamed_analysis source_bytes={} retained_stream_bytes={} deltas={deltas} projection_updates_through_bytes={} duration_us={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            answer.len(),
+            app.panel.stream.text().len(),
+            app.panel.preview_bytes,
+            elapsed.as_micros(),
+        );
+        assert!(app.panel.stream.text().len() <= MAX_STREAM_BYTES);
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_dense_discussion_workload() {
+        let (dir, mut app) = list_app();
+        let mut source = String::new();
+        for file in 0..100 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut source,
+                format_args!(
+                    "diff --git a/src/f{file}.rs b/src/f{file}.rs\n--- a/src/f{file}.rs\n+++ b/src/f{file}.rs\n@@ -1,20 +1,20 @@\n"
+                ),
+            );
+            for line in 0..20 {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut source,
+                    format_args!("-old {line}\n+new {line}\n"),
+                );
+            }
+        }
+        let comments = (0..1_000u64)
+            .map(|index| crate::domain::pr::ReviewComment {
+                id: index + 1,
+                author: "reviewer".to_owned(),
+                path: format!("src/f{}.rs", index % 100),
+                line: Some(index % 20 + 1),
+                side: Some("RIGHT".to_owned()),
+                body: format!("discussion {index}: verify this behavior"),
+                created_at: crate::domain::time::from_unix_secs(1),
+                in_reply_to: None,
+                diff_hunk: None,
+                url: None,
+                thread_id: Some(format!("thread-{index}")),
+                resolved: index % 3 == 0,
+                outdated: false,
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let view = DiffView::new_with_context(
+            crate::domain::diff::parse_patch(&source),
+            3,
+            false,
+            Some("reference-head"),
+            None,
+            comments,
+        );
+        let prepare = started.elapsed();
+        let projected_rows = view.rows.len();
+        let projection_bytes = view.projection_bytes();
+        app.set_review(view);
+        app.drafts.draft.comments = (0..1_000u32)
+            .map(|index| {
+                crate::domain::draft::DraftComment::new(
+                    format!("src/f{}.rs", index % 100),
+                    crate::domain::draft::Side::New,
+                    index % 20 + 1,
+                    None,
+                    format!("draft marker {index}"),
+                )
+                .expect("valid dense draft marker")
+            })
+            .collect();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50))
+            .expect("test terminal");
+        let draw_started = std::time::Instant::now();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("dense draw");
+        eprintln!(
+            "IR17_METRIC profile={} workload=dense_discussions comments=1000 draft_markers=1000 projected_rows={projected_rows} prepare_us={} first_draw_us={} projection_bytes={projection_bytes}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            prepare.as_micros(),
+            draw_started.elapsed().as_micros(),
+        );
+        drop(dir);
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_unicode_split_workload() {
+        let (dir, mut app) = list_app();
+        let long = "東京🙂naïve—wide".repeat(24);
+        let mut source = String::from(
+            "diff --git a/src/unicode.rs b/src/unicode.rs\n--- a/src/unicode.rs\n+++ b/src/unicode.rs\n@@ -1,400 +1,400 @@\n",
+        );
+        for line in 0..400 {
+            let _ = std::fmt::Write::write_fmt(
+                &mut source,
+                format_args!("-old {line} {long}\n+new {line} {long}\n"),
+            );
+        }
+        let started = std::time::Instant::now();
+        let mut view = DiffView::new_with_context(
+            crate::domain::diff::parse_patch(&source),
+            3,
+            false,
+            Some("reference-head"),
+            None,
+            Vec::new(),
+        );
+        view.set_split(true);
+        let prepare = started.elapsed();
+        let projection_bytes = view.projection_bytes();
+        app.set_review(view);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 50))
+            .expect("test terminal");
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let started = std::time::Instant::now();
+            terminal
+                .draw(|frame| app.render(frame))
+                .expect("Unicode split draw");
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "IR17_METRIC profile={} workload=unicode_split source_bytes={} prepare_us={} draw_p50_us={} draw_p95_us={} projection_bytes={projection_bytes}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            source.len(),
+            prepare.as_micros(),
+            samples[samples.len() / 2].as_micros(),
+            samples[samples.len() * 95 / 100].as_micros(),
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn ir_17_scrolling_up_pauses_chat_follow_tail_during_streaming() {
+        let (_dir, mut app, _store) = chat_app();
+        app.chat.status = crate::tui::chat::ChatStatus::Streaming {
+            stage: "answering".to_owned(),
+        };
+        app.chat.scroll = 7;
+        app.chat.tail_paused = true;
+        app.apply_chat_progress(crate::application::chat::Progress::Delta(
+            "more text".to_owned(),
+        ));
+        assert_eq!(app.chat.scroll, 7);
+
+        app.chat.tail_paused = false;
+        app.apply_chat_progress(crate::application::chat::Progress::Delta(
+            " at the tail".to_owned(),
+        ));
+        assert_eq!(app.chat.scroll, 0);
     }
 
     #[test]
@@ -8035,7 +8391,9 @@ mod tests {
             owner: crate::tui::jobs::JobOwner::Global,
             job: app.patch_job,
             outcome: crate::tui::jobs::Outcome::Patch {
-                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(DiffView::new(
+                    patch,
+                ))),
                 source: crate::domain::diff::DiffSource::Worktree,
                 head_sha: "head".to_owned(),
             },
@@ -8047,6 +8405,32 @@ mod tests {
         assert_eq!(app.mode(), Mode::Insert);
         press(&mut app, "why?");
         assert_eq!(app.chat.input.text(), "why?");
+    }
+
+    #[test]
+    fn fr_4_3_local_patch_refresh_reloads_the_workspace_keyed_analysis() {
+        let (_dir, mut app) = draft_app();
+        app.drafts.open = true;
+        app.drafts.draft.pr = 141;
+        app.patch_job = 41;
+        app.context_patch_job = 41;
+        app.diff_loading = true;
+        let patch = app.review.as_ref().expect("review").patch.clone();
+
+        let effect = app.apply_completion(crate::tui::jobs::Completion {
+            progress_through: 0,
+            owner: crate::tui::jobs::JobOwner::Global,
+            job: 41,
+            outcome: crate::tui::jobs::Outcome::Patch {
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(DiffView::new(
+                    patch,
+                ))),
+                source: crate::domain::diff::DiffSource::Worktree,
+                head_sha: "abc123".to_owned(),
+            },
+        });
+
+        assert_eq!(effect, Some(Effect::LoadAnalysis));
     }
 
     /// An app with a two-file patch open, whose second file is the one to comment on.
@@ -8071,6 +8455,71 @@ mod tests {
         ));
         app.open_review(crate::test_support::sample_detail(), DiffView::new(patch));
         (dir, app)
+    }
+
+    #[test]
+    fn ir_17_workspace_arrival_invalidates_remote_only_context_before_send() {
+        let (_dir, mut app) = draft_app();
+        if let Some(detail) = app.detail.as_mut() {
+            detail.base_sha = Some("base123".to_owned());
+        }
+        let patch = app.review.as_ref().expect("review").patch.clone();
+        app.apply_context_patch(patch);
+        let policy = crate::domain::context::BundlePolicy::default();
+        let remote_identity = app.context_identity(&policy);
+        assert!(!remote_identity.local_content);
+        let remote_bundle = crate::domain::context::build(
+            &crate::domain::context::BundleInputs {
+                metadata: "remote-only estimate",
+                ..crate::domain::context::BundleInputs::default()
+            },
+            &policy,
+        );
+        app.apply_context(
+            remote_bundle,
+            crate::application::analysis::AnalysisIntent::Estimate,
+            remote_identity,
+        );
+
+        app.workspace = Some(crate::ports::workspace::Workspace {
+            path: std::path::PathBuf::from("/tmp/local-context"),
+            base_sha: "base123".to_owned(),
+            head_sha: "abc123".to_owned(),
+            reused: false,
+        });
+
+        assert!(
+            app.take_context_bundle_for_current_head().is_none(),
+            "the confirmation covered a remote-only bundle and cannot authorize a send"
+        );
+        let local_identity = app.context_identity(&policy);
+        assert!(local_identity.local_content);
+        let detail = app.detail.clone().expect("detail");
+        let spec = app.context_spec(&detail, policy);
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        workspace.files.insert(
+            "abc123:AGENTS.md".to_owned(),
+            b"local convention sentinel".to_vec(),
+        );
+        workspace.files.insert(
+            "abc123:src/domain/amount.rs".to_owned(),
+            b"local amount sentinel".to_vec(),
+        );
+        workspace.files.insert(
+            "base123:src/domain/money.rs".to_owned(),
+            b"pub fn round(cents: i64) -> i64 { cents }".to_vec(),
+        );
+        workspace.files.insert(
+            "abc123:src/domain/money.rs".to_owned(),
+            b"pub fn round(cents: i64) -> i64 { (cents + 5) / 10 * 10 }".to_vec(),
+        );
+
+        let gathered =
+            crate::application::context::gather(&workspace, &spec, &crate::ports::Cancel::new());
+        let provider_prompt = crate::domain::analysis::user_prompt(&gathered.bundle.text);
+        assert!(provider_prompt.contains("local convention sentinel"));
+        assert!(provider_prompt.contains("local amount sentinel"));
+        assert!(provider_prompt.contains("(cents + 5) / 10 * 10"));
     }
 
     #[test]
@@ -8348,7 +8797,9 @@ mod tests {
             owner: crate::tui::jobs::JobOwner::Global,
             job: app.patch_job,
             outcome: crate::tui::jobs::Outcome::Patch {
-                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(patch)),
+                outcome: Box::new(crate::application::prs::FetchOutcome::Fresh(DiffView::new(
+                    patch,
+                ))),
                 source: crate::domain::diff::DiffSource::Worktree,
                 head_sha: "h2".to_owned(),
             },
@@ -8356,8 +8807,8 @@ mod tests {
 
         assert_eq!(
             effect,
-            Some(Effect::None),
-            "a same-review refresh does not reload disk state"
+            Some(Effect::LoadAnalysis),
+            "a same-review refresh reloads analysis state but not the draft"
         );
         let composer = app.drafts.composer.as_ref().expect("writing survives");
         assert_eq!(composer.input.text(), "keep this exact sentence");
@@ -8387,7 +8838,7 @@ mod tests {
             "diff --git a/src/domain/money.rs b/src/domain/money.rs\n--- a/src/domain/money.rs\n+++ b/src/domain/money.rs\n@@ -1,3 +1,3 @@\n pub fn round(cents: i64) -> i64 {\n-    cents\n+    (cents + 5) / 10 * 10\n }\n",
         );
         let _ = app.apply_patch(
-            crate::application::prs::FetchOutcome::Fresh(patch),
+            crate::application::prs::FetchOutcome::Fresh(DiffView::new(patch)),
             crate::domain::diff::DiffSource::Worktree,
             "h2".to_owned(),
         );

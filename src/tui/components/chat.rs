@@ -153,42 +153,63 @@ fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &App, chat: &ChatStat
     let mut lines: Vec<Line<'static>> = Vec::new();
     if chat.sessions.is_empty() && chat.session.is_none() {
         lines.extend(opening_lines(chat, app, theme));
+    } else {
+        lines = visible_message_lines(chat, width, usize::from(area.height), theme, app);
     }
-    for line in chat.messages() {
-        match line {
-            ChatLine::Stored(index) => {
-                if let Some(session) = &chat.session
-                    && let Some(message) = session.messages.get(index)
-                {
-                    lines.extend(message_lines(message, width, theme, app));
-                    lines.push(Line::default());
-                }
-            }
-            ChatLine::Streaming => {
-                lines.extend(streaming_lines(chat, width, theme));
-                lines.push(Line::default());
-            }
-            ChatLine::Failed => {
-                lines.extend(failed_lines(chat, theme));
-                lines.push(Line::default());
-            }
-        }
-    }
-
-    let height = usize::from(area.height);
-    // The scroll is measured from the bottom, because a conversation is read at its
-    // end: without a scroll the newest thing said is what the user wants to see.
-    let offset = lines
-        .len()
-        .saturating_sub(height)
-        .saturating_sub(chat.scroll);
-    let visible: Vec<Line<'static>> = lines.into_iter().skip(offset).take(height).collect();
     frame.render_widget(
-        Paragraph::new(visible)
+        Paragraph::new(lines)
             .style(theme.style(element::BG))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+/// Lays out only enough messages to cover the requested viewport and bottom-relative
+/// scroll offset. Completed Markdown bodies come from the width/theme cache (IR-17).
+fn visible_message_lines(
+    chat: &ChatState,
+    width: usize,
+    height: usize,
+    theme: &Theme,
+    app: &App,
+) -> Vec<Line<'static>> {
+    let mut skipped = 0;
+    let mut skipped_tail = Vec::new();
+    let mut reversed = Vec::with_capacity(height);
+    for item in chat.messages().into_iter().rev() {
+        let mut block = match item {
+            ChatLine::Stored(index) => chat.session.as_ref().map_or_else(Vec::new, |session| {
+                session
+                    .messages
+                    .get(index)
+                    .map_or_else(Vec::new, |message| {
+                        cached_message_lines(chat, &session.id, index, message, width, theme, app)
+                    })
+            }),
+            ChatLine::Streaming => streaming_lines(chat, width, theme),
+            ChatLine::Failed => failed_lines(chat, theme),
+        };
+        block.push(Line::default());
+        for line in block.into_iter().rev() {
+            if skipped < chat.scroll {
+                skipped += 1;
+                skipped_tail.push(line);
+                continue;
+            }
+            reversed.push(line);
+            if reversed.len() == height {
+                reversed.reverse();
+                return reversed;
+            }
+        }
+    }
+    reversed.reverse();
+    // If the requested bottom offset reaches above the start, clamp exactly like the
+    // old full-vector projection: show the first viewport rather than blank space.
+    skipped_tail.reverse();
+    let room = height.saturating_sub(reversed.len());
+    reversed.extend(skipped_tail.into_iter().take(room));
+    reversed
 }
 
 /// What an empty pane says, which is the whole of chat's discoverability.
@@ -277,7 +298,28 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, app: &App, chat: &ChatState) {
 }
 
 /// One stored message, as lines.
-fn message_lines(message: &Message, width: usize, theme: &Theme, app: &App) -> Vec<Line<'static>> {
+fn cached_message_lines(
+    chat: &ChatState,
+    session: &str,
+    index: usize,
+    message: &Message,
+    width: usize,
+    theme: &Theme,
+    app: &App,
+) -> Vec<Line<'static>> {
+    let mut lines =
+        chat.layouts
+            .borrow_mut()
+            .layout(session, index, width, &app.theme_request, || {
+                message_body_lines(message, width, theme)
+            });
+    lines.extend(footer_for(message, theme, app));
+    lines
+}
+
+/// Immutable body of one stored message; footers stay cheap and reflect current app
+/// state while this width/theme-dependent part is cached.
+fn message_body_lines(message: &Message, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match message.role {
         Role::User => {
@@ -314,7 +356,6 @@ fn message_lines(message: &Message, width: usize, theme: &Theme, app: &App) -> V
             }
         }
     }
-    lines.extend(footer_for(message, theme, app));
     lines
 }
 
@@ -551,5 +592,87 @@ mod tests {
         );
         chat.awaiting_confirmation = Some("why?".to_owned());
         assert_eq!(compose_rows(&chat), 3, "the confirmation takes the box");
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_long_chat_layout_workload() {
+        let home = crate::test_support::temp_home();
+        let cli = crate::cli::Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(home.path().to_path_buf()),
+            log_level: None,
+            check: false,
+            dry_run: false,
+        };
+        let startup = crate::Startup::load(&cli).expect("startup");
+        let app = App::new(startup).expect("app");
+        let mut chat = ChatState::default();
+        let mut session = crate::domain::chat::Session::new(
+            "reference",
+            "github.com/acme/service",
+            7,
+            "head",
+            "reference-model",
+            None,
+            1,
+        );
+        let body = concat!(
+            "### Result\n\n",
+            "This is a stored answer with **Markdown**, `code`, and a Unicode path ",
+            "`src/naïve/東京.rs:42`.\n\n",
+            "- verify the behavior\n- keep the viewport stable\n"
+        )
+        .repeat(24);
+        for turn in 0..240u64 {
+            session.messages.push(crate::domain::chat::Message::user(
+                format!("question {turn}: what changed?"),
+                turn,
+            ));
+            session
+                .messages
+                .push(crate::domain::chat::Message::assistant(
+                    body.clone(),
+                    turn,
+                    None,
+                    Vec::new(),
+                ));
+        }
+        let bytes = session
+            .messages
+            .iter()
+            .map(|message| message.text.len())
+            .sum::<usize>();
+        chat.session = Some(session);
+
+        let cold_started = std::time::Instant::now();
+        let cold = visible_message_lines(&chat, 116, 20, &app.theme, &app);
+        let cold_elapsed = cold_started.elapsed();
+        let mut samples = Vec::with_capacity(300);
+        for _ in 0..300 {
+            let started = std::time::Instant::now();
+            let visible = visible_message_lines(&chat, 116, 20, &app.theme, &app);
+            assert_eq!(visible.len(), cold.len());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "IR17_METRIC profile={} workload=long_chat messages=480 retained_text_bytes={bytes} cold_layout_us={} warm_layout_p50_us={} warm_layout_p95_us={} cached_layouts={} cached_layout_text_bytes={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            cold_elapsed.as_micros(),
+            samples[samples.len() / 2].as_micros(),
+            samples[samples.len() * 95 / 100].as_micros(),
+            chat.layouts.borrow().len(),
+            chat.layouts.borrow().retained_text_bytes(),
+        );
     }
 }

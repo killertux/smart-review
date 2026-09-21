@@ -25,9 +25,8 @@ const PLACEHOLDER: &str = "—";
 /// Renders the status line.
 pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
-    let failed = app
-        .latest_notice()
-        .is_some_and(|notice| notice.level == NoticeLevel::Error);
+    let notice = app.latest_notice();
+    let failed = notice.is_some_and(|notice| notice.level == NoticeLevel::Error);
 
     let background = match app.mode() {
         Mode::Command | Mode::Search => theme.style(element::STATUS_COMMAND),
@@ -36,19 +35,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         _ => theme.style(element::STATUS_NORMAL),
     };
 
-    let left = if failed {
-        // An error is the next action, not decoration. Keep the mode and focus for
-        // orientation, but give the provider/forge reason the row it needs instead of
-        // truncating it behind file and plan-position metadata (FR-9.1).
-        vec![
-            Span::styled(format!(" {} ", app.mode().label()), background),
-            Span::styled(format!("{} ", app.focus().label()), background),
-        ]
-    } else {
-        persistent_spans(app, theme, background)
-    };
-
-    let right = match app.latest_notice() {
+    let persistent = persistent_spans(app, theme, background);
+    let right = match notice {
         Some(notice) => vec![Span::styled(
             format!("{} ", notice.text),
             notice_style(theme, notice.level),
@@ -58,11 +46,28 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             theme.style(element::MUTED),
         )],
     };
+    let notice_would_be_clipped = notice.is_some()
+        && span_width(&persistent).saturating_add(span_width(&right)) > usize::from(area.width);
+    let left = if failed || notice_would_be_clipped {
+        // A notice is the next action, not decoration. Keep the mode and focus for
+        // orientation, but give the result/reason the row it needs instead of
+        // truncating it behind file and plan-position metadata (FR-7.6, FR-9.1).
+        vec![
+            Span::styled(format!(" {} ", app.mode().label()), background),
+            Span::styled(format!("{} ", app.focus().label()), background),
+        ]
+    } else {
+        persistent
+    };
 
     frame.render_widget(
         Paragraph::new(padded_line(left, right, area.width)).style(background),
         area,
     );
+}
+
+fn span_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 fn persistent_spans(app: &App, theme: &Theme, background: Style) -> Vec<Span<'static>> {

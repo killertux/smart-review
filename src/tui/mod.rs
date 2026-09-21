@@ -37,6 +37,7 @@ pub(crate) mod test_support;
 
 use std::io::Write;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::Startup;
 use crate::application::analysis::AnalysisIntent;
@@ -49,6 +50,35 @@ use crate::ports::{Clock, StateStore};
 use crate::tui::jobs::{Executor, Job, JobRunner, Outcome};
 pub use app::{App, Effect, Overlay, Pane};
 pub use keymap::Mode;
+
+/// Maximum time background progress can wait before the reducer sees it (IR-17).
+const BACKGROUND_POLL: Duration = Duration::from_millis(32);
+/// Spinner cadence. Progress can redraw faster, but an otherwise quiet job does not
+/// justify repainting the terminal on every background poll.
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct FrameState {
+    dirty: bool,
+}
+
+impl FrameState {
+    const fn initial() -> Self {
+        Self { dirty: true }
+    }
+
+    fn mark(&mut self) {
+        self.dirty = true;
+    }
+
+    fn mark_if(&mut self, changed: bool) {
+        self.dirty |= changed;
+    }
+
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+}
 
 /// Runs the interface until the user quits.
 ///
@@ -83,42 +113,16 @@ pub fn run(startup: Startup) -> Result<()> {
     let mut terminal = terminal::TerminalGuard::enter(app.mouse_enabled())?;
     let mut runner = JobRunner::new(workspace, probe, catalog, llm, state_store.clone(), request);
 
-    // Detection is a job, not a startup step: it runs `gh auth status`, which reaches
-    // the network, and the first frame must not wait for it (NFR-1.1).
-    //
-    // Submitted through `apply` rather than directly, so its job id is recorded: the
-    // completion is matched against that id, and a result nobody recorded is dropped
-    // (which is exactly what happened while this was a bare `runner.submit`).
-    apply(
-        Effect::DetectEnvironment,
-        &mut app,
-        state_store.as_ref(),
-        &mut runner,
-        &mut terminal,
-    );
+    schedule_initial_jobs(&mut app, state_store.as_ref(), &mut runner, &mut terminal);
 
-    // A model configured in an earlier run is resolved from the cache, if there is
-    // one: the status line can then name it, and `:model show` can say what is wrong
-    // with it, without the 4 MB catalog fetch that the picker asks for when it opens
-    // (FR-4.7 keeps the network for an explicit request). When there is no cache the
-    // fetch follows by itself, because a user who has already chosen a model should
-    // not have to open a picker to make the app notice — see `catalog_unavailable`.
-    if app.config.llm.active.is_some() {
-        let _ = apply(
-            Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::CacheOnly),
-            &mut app,
-            state_store.as_ref(),
-            &mut runner,
-            &mut terminal,
-        );
-    }
-
+    let mut frame_state = FrameState::initial();
+    let mut next_animation = Instant::now();
     while !app.should_quit() {
-        app.set_now(clock.now_unix_secs());
-        terminal.draw(|frame| app.render(frame))?;
-        app.tick();
+        frame_state.mark_if(app.set_now(clock.now_unix_secs()));
 
-        // Results from background jobs, then whatever they asked for next.
+        // Bounded background drain, reduction, then at most one draw. Progress and
+        // completions are collected before input so the visible frame is the state the
+        // next key will act on (IR-17).
         let (queued, background_changed) = drain_completions(
             &mut app,
             &mut runner,
@@ -138,28 +142,42 @@ pub fn run(startup: Startup) -> Result<()> {
             &mut runner,
             &mut terminal,
         );
-        // A result from a job changes the screen, and the frame above was drawn before
-        // it arrived. Without a second draw that change waits for the next event to be
-        // seen — which is not a cosmetic delay: pressing a key in between means acting
-        // on a screen that no longer describes the state. It is how a question that had
-        // been gathered and priced reached the provider without its confirmation ever
-        // being on screen.
-        if background_changed {
+        frame_state.mark_if(background_changed);
+        schedule_state_save(&mut app, &mut runner);
+
+        let now = Instant::now();
+        if now >= next_animation {
+            frame_state.mark_if(app.tick());
+            next_animation = now + ANIMATION_INTERVAL;
+        }
+        if frame_state.take() {
             terminal.draw(|frame| app.render(frame))?;
         }
 
-        let effect = if event::poll(app.poll_timeout())? {
+        let timeout = loop_poll_timeout(&app, runner.is_busy(), next_animation, Instant::now());
+        let effect = if event::poll(timeout)? {
             match event::read()? {
                 event::Event::Key(key) if key.kind != event::KeyEventKind::Release => {
+                    frame_state.mark();
                     app.on_key(key)
                 }
-                event::Event::Mouse(mouse) => app.on_mouse(mouse),
+                event::Event::Mouse(mouse) => {
+                    frame_state.mark();
+                    app.on_mouse(mouse)
+                }
                 // Resizing needs no handling: the next draw reads the new size, and
-                // the app keeps no cached geometry (FR-7.8).
+                // the app keeps no cached geometry (FR-7.8), but it does need a draw.
+                event::Event::Resize(_, _) => {
+                    frame_state.mark();
+                    Effect::None
+                }
                 _ => Effect::None,
             }
-        } else {
+        } else if app.timeout_due(Instant::now()) {
+            frame_state.mark();
             app.on_timeout()
+        } else {
+            Effect::None
         };
 
         let queued = apply(
@@ -179,11 +197,6 @@ pub fn run(startup: Startup) -> Result<()> {
         // A change that the reducer could not write itself — the one-time opt-in of
         // FR-4.6 is the one that matters — is written here, where the store is.
         schedule_state_save(&mut app, &mut runner);
-        // The effects above may have changed the screen too, and they are applied after
-        // the event that asked for them. Drawing here rather than at the top of the next
-        // iteration means what the key press did is on screen before the loop can block
-        // again — the same reason the background draw exists.
-        terminal.draw(|frame| app.render(frame))?;
     }
 
     if !runner.flush_persistence(std::time::Duration::from_secs(2)) {
@@ -195,6 +208,48 @@ pub fn run(startup: Startup) -> Result<()> {
     runner.cancel_all();
     logging::log(Level::Info, "shutting down normally");
     Ok(())
+}
+
+fn schedule_initial_jobs(
+    app: &mut App,
+    state_store: &dyn StateStore,
+    runner: &mut JobRunner,
+    terminal: &mut terminal::TerminalGuard,
+) {
+    // Detection reaches the network and the first frame must not wait for it. Going
+    // through `apply` records the id used to reject stale completion (NFR-1.1).
+    let _ = apply(
+        Effect::DetectEnvironment,
+        app,
+        state_store,
+        runner,
+        terminal,
+    );
+    // Resolve an earlier model selection from cache without an implicit network fetch.
+    if app.config.llm.active.is_some() {
+        let _ = apply(
+            Effect::LoadCatalog(crate::ports::catalog::CatalogPolicy::CacheOnly),
+            app,
+            state_store,
+            runner,
+            terminal,
+        );
+    }
+}
+
+/// Chooses the next wake-up without letting a long key-prefix deadline hide progress.
+fn loop_poll_timeout(
+    app: &App,
+    background_busy: bool,
+    next_animation: Instant,
+    now: Instant,
+) -> Duration {
+    let mut timeout = app.poll_timeout();
+    if background_busy {
+        timeout = timeout.min(BACKGROUND_POLL);
+        timeout = timeout.min(next_animation.saturating_duration_since(now));
+    }
+    timeout.max(Duration::from_millis(1))
 }
 
 /// Submits the latest state snapshot after reducer effects have settled.
@@ -474,6 +529,11 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
     let number = detail.summary.number;
     let head_sha = detail.summary.head_sha.clone();
     let options = app.diff_options;
+    let view = jobs::ViewContext {
+        head_sha: head_sha.clone(),
+        comments: detail.comments.clone(),
+        plan: app.panel.plan.clone(),
+    };
 
     // Which source answers depends on whether the code is on disk yet (FR-3.2). The
     // forge is always the fallback: a worktree that cannot be built must not mean a
@@ -488,11 +548,13 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
             }),
             number,
             head_sha: head_sha.clone(),
-            options,
+            view: Box::new(view.clone()),
         },
         _ => Job::Patch {
             number,
             head_sha: head_sha.clone(),
+            options,
+            view: Box::new(view.clone()),
         },
     };
     let id = runner.submit_owned(review_job_owner(app), job);
@@ -512,7 +574,7 @@ fn reload_diff(app: &mut App, runner: &mut JobRunner, pending_effects: &mut Vec<
                 }),
                 number,
                 head_sha: head_sha.clone(),
-                options: crate::ports::workspace::DiffOptions::default(),
+                view: Box::new(view),
             },
         );
     }
@@ -1238,4 +1300,85 @@ pub(crate) fn executor_for(
         },
         dry_run: app.dry_run,
     })))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    fn app() -> (crate::test_support::TempHome, App) {
+        let home = crate::test_support::temp_home();
+        let cli = crate::cli::Cli {
+            repo: None,
+            pr: None,
+            path: None,
+            remote: None,
+            config: None,
+            theme: None,
+            home: Some(home.path().to_path_buf()),
+            log_level: None,
+            check: false,
+            dry_run: false,
+        };
+        let startup = crate::Startup::load(&cli).expect("startup");
+        (home, App::new(startup).expect("app"))
+    }
+
+    #[test]
+    fn ir_17_background_work_caps_a_long_key_prefix_wait() {
+        let (_home, app) = app();
+        let now = Instant::now();
+        let timeout = loop_poll_timeout(&app, true, now + ANIMATION_INTERVAL, now);
+        assert!(
+            timeout <= BACKGROUND_POLL,
+            "progress waits only {timeout:?}"
+        );
+    }
+
+    #[test]
+    fn ir_17_an_early_background_wake_does_not_fire_a_key_deadline() {
+        let (_home, mut app) = app();
+        app.deadline = Some(Instant::now() + Duration::from_millis(500));
+        assert!(!app.timeout_due(Instant::now()));
+    }
+
+    #[test]
+    fn ir_17_idle_wakes_do_not_request_redundant_frames() {
+        let mut state = FrameState::initial();
+        let mut draws = usize::from(state.take());
+        for _ in 0..1_000 {
+            draws += usize::from(state.take());
+        }
+        assert_eq!(draws, 1);
+
+        state.mark();
+        assert!(state.take(), "a reducer change requests exactly one frame");
+        assert!(!state.take());
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_idle_and_prefix_workload() {
+        let (_home, mut app) = app();
+        let now = Instant::now();
+        app.deadline = Some(now + Duration::from_millis(500));
+        let poll = loop_poll_timeout(&app, true, now + ANIMATION_INTERVAL, now);
+        let mut state = FrameState::initial();
+        let mut draws = usize::from(state.take());
+        for _ in 0..1_000 {
+            draws += usize::from(state.take());
+        }
+        eprintln!(
+            "IR17_METRIC profile={} workload=idle_prefix idle_wakes=1000 draws={draws} active_poll_cap_ms={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            poll.as_millis(),
+        );
+        assert_eq!(draws, 1);
+        assert_eq!(poll, BACKGROUND_POLL);
+        assert!(!app.timeout_due(now));
+    }
 }

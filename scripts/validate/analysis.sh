@@ -326,7 +326,7 @@ make_home "$HOME_MAIN"
 step "2/6 the first analysis"
 # `<leader>a` twice: the first press is the FR-4.6 opt-in notice, the second sends.
 FRAMES="$TMP/confirm.log"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Nothing has been sent yet~' "$FRAMES")"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'worktree · [AMDR]~Nothing has been sent yet~' "$FRAMES")"
 if [ ! -s "$TMP/requests.jsonl" ]; then
   ok "the first press sent nothing at all"
 else
@@ -347,7 +347,7 @@ fi
 # below are about this run's requests.
 FRAMES="$TMP/analysis.log"
 : >"$TMP/requests.jsonl"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~ a~:q\r' 'money\.rs~Nothing has been sent yet~Money now rounds half up~' "$FRAMES")"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~ a~:q\r' 'worktree · [AMDR]~Nothing has been sent yet~Money now rounds half up~' "$FRAMES")"
 if shown "$FRAMES" "Money now rounds half up"; then
   ok "the analysis panel shows the summary"
 else
@@ -415,7 +415,7 @@ PASS=$((PASS + $(printf '%s\n' "$WIRE" | grep -c '^  PASS')))
 FAIL=$((FAIL + $(printf '%s\n' "$WIRE" | grep -c '^  FAIL')))
 
 step "4/6 the ordered review"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Money now rounds half up~' "$TMP/order.log")"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'analysed~Money now rounds half up~' "$TMP/order.log")"
 if printf '%s' "$SCREEN" | grep -q "recommended order"; then
   ok "the tree is in the recommended order"
 else
@@ -432,7 +432,7 @@ if shown "$TMP/order.log" "arithmetic everythi"; then
 else
   bad "the group rationale is missing"
 fi
-if printf '%s' "$SCREEN" | grep -q "plan ·\|/2 plan"; then
+if shown "$TMP/order.log" "[0-9]+/[0-9]+ plan.*[0-9]+/[0-9]+ path"; then
   ok "both orders' positions are shown"
 else
   bad "the positions in both orders are missing"
@@ -442,7 +442,7 @@ fi
 # exposes only validated evidence. Marking progress writes the durable plan document.
 GUIDED_LOG="$TMP/guided.log"
 SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~gg~e~m~:q\r' \
-  'money\.rs~Money now rounds half up~~M src/domain/money\.rs~Evidence 1~✓M money\.rs~' \
+  'analysed~Money now rounds half up~~M src/domain/money\.rs~Evidence 1~✓M money\.rs~' \
   "$GUIDED_LOG")"
 if shown "$GUIDED_LOG" "What.*rounds half up" \
   && shown "$GUIDED_LOG" "Why · inferred" \
@@ -471,7 +471,7 @@ else
   bad "the reviewed marker was not stored in the durable plan"
 fi
 # `o` switches to the path order and says so.
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~o~:q\r' 'money\.rs~Money now rounds half up~~path order~' "$TMP/order-toggle.log")"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~\e~o~:q\r' 'analysed~Money now rounds half up~~path order~' "$TMP/order-toggle.log")"
 if printf '%s' "$SCREEN" | grep -q "path order"; then
   ok "o switches to the path order"
 else
@@ -484,7 +484,7 @@ step "5/6 a cache hit with no network, and what the analysis corrected"
 stop_child "$LLM_PID"
 LLM_PID=""
 : >"$TMP/requests.jsonl"
-SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'money\.rs~Money now rounds half up~' "$TMP/cached.log")"
+SCREEN="$(run_tui "$HOME_MAIN" ':pr 141\r~ a~:q\r' 'analysed~Money now rounds half up~' "$TMP/cached.log")"
 if shown "$TMP/cached.log" "Money now rounds half up"; then
   ok "the cached analysis is used with the provider down"
 else
@@ -534,7 +534,7 @@ make_home "$HOME_REPAIR"
 # Wait for the completed panel's retry marker: quitting on the stream alone would
 # cancel the reducer transition that records the retry for the durable UI log.
 SCREEN="$(run_tui "$HOME_REPAIR" ':pr 141\r~ a~ a~:q\r' \
-  'money\.rs~Nothing has been sent yet~This analysis needed a second attempt~' \
+  'worktree · [AMDR]~Nothing has been sent yet~This analysis needed a second attempt~' \
   "$TMP/repair.log")"
 if shown "$TMP/repair.log" "Finance reported a rounding drift"; then
   ok "prose was repaired into a usable analysis"
@@ -562,7 +562,7 @@ fi
 echo prose >"$TMP/mode"
 HOME_BAD="$TMP/home-bad"
 make_home "$HOME_BAD"
-SCREEN="$(run_tui "$HOME_BAD" ':pr 141\r~ a~ a~:q\r' 'money\.rs~Nothing has been sent yet~could not be used~' "$TMP/bad.log")"
+SCREEN="$(run_tui "$HOME_BAD" ':pr 141\r~ a~ a~:q\r' 'worktree · [AMDR]~Nothing has been sent yet~could not be used~' "$TMP/bad.log")"
 if shown "$TMP/bad.log" "could not be used"; then
   ok "an unusable answer is reported with its reason"
 else
@@ -584,8 +584,8 @@ fi
 echo good >"$TMP/mode"
 HOME_SMALL="$TMP/home-small"
 MAX_CONTEXT=6000 make_home "$HOME_SMALL"
-SCREEN="$(run_tui "$HOME_SMALL" ':pr 141\r~ a~ a~:context\r~:q\r' 'money\.rs~Nothing has been sent yet~Money now rounds half up~AGENTS\.md~' "$TMP/small.log")"
-if shown "$TMP/small.log" "elided|truncated|reduced"; then
+SCREEN="$(run_tui "$HOME_SMALL" ':pr 141\r~ a~ a~:context\r~:q\r' 'worktree · [AMDR]~Nothing has been sent yet~Money now rounds half up~AGENTS.md was used as the repository~' "$TMP/small.log")"
+if shown "$TMP/small.log" "full file body|elided|truncated|reduced"; then
   ok "a budget that does not fit is reported rather than hidden"
 else
   bad "the budget did not report what it dropped"

@@ -883,6 +883,7 @@ mod tests {
                 identity: crate::application::context::ContextIdentity {
                     head_sha: "abc123".to_owned(),
                     base_sha: Some("base123".to_owned()),
+                    local_content: true,
                     changed_paths: vec!["src/money.rs".to_owned()],
                     added: Vec::new(),
                     policy: BundlePolicy::default(),

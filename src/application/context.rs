@@ -20,7 +20,7 @@ use crate::domain::context::{
 use crate::domain::diff::Patch;
 use crate::domain::pr::PullRequestDetail;
 use crate::ports::Cancel;
-use crate::ports::workspace::WorkspacePort;
+use crate::ports::workspace::{FileReadOutcome, WorkspacePort};
 
 /// The immutable inputs that determine the context a provider can receive (IR-12).
 ///
@@ -34,6 +34,9 @@ pub struct ContextIdentity {
     /// The base/merge-base revision used for old-side diff content, when local context
     /// is available.
     pub base_sha: Option<String>,
+    /// Whether revision contents and repository eligibility can be read locally.
+    /// A remote-only estimate must not remain valid after its workspace arrives.
+    pub local_content: bool,
     /// Canonical changed paths in patch order.
     pub changed_paths: Vec<String>,
     /// Extra head-revision files the user explicitly requested.
@@ -86,11 +89,12 @@ impl ContextIdentity {
     #[must_use]
     pub fn fingerprint(&self) -> String {
         let mut parts = vec![
-            "context-v1".to_owned(),
+            "context-v2".to_owned(),
             self.head_sha.clone(),
             self.base_sha
                 .clone()
                 .unwrap_or_else(|| "unavailable".to_owned()),
+            self.local_content.to_string(),
             self.policy.max_context_tokens.to_string(),
             self.policy.max_file_bytes.to_string(),
             self.policy.reduced_context_lines.to_string(),
@@ -123,11 +127,45 @@ fn fingerprint(text: &str) -> String {
 mod identity_tests {
     use super::*;
 
+    struct TestSource {
+        detail: PullRequestDetail,
+        patch: Patch,
+        checkout: Checkout,
+        policy: BundlePolicy,
+    }
+
+    impl ContextSource for TestSource {
+        fn changed_paths(&self) -> Vec<String> {
+            self.patch
+                .files
+                .iter()
+                .filter_map(|file| file.path().map(ToString::to_string))
+                .collect()
+        }
+
+        fn detail(&self) -> &PullRequestDetail {
+            &self.detail
+        }
+
+        fn patch(&self) -> Option<&Patch> {
+            Some(&self.patch)
+        }
+
+        fn checkout(&self) -> Option<&Checkout> {
+            Some(&self.checkout)
+        }
+
+        fn policy(&self) -> &BundlePolicy {
+            &self.policy
+        }
+    }
+
     #[test]
     fn ir_12_context_identity_changes_for_additions_revisions_and_budget() {
         let base = ContextIdentity {
             head_sha: "head".to_owned(),
             base_sha: Some("base".to_owned()),
+            local_content: true,
             changed_paths: vec!["src/main.rs".to_owned()],
             added: vec!["docs/design.md".to_owned()],
             policy: BundlePolicy::default(),
@@ -142,6 +180,10 @@ mod identity_tests {
                 ..base.clone()
             },
             ContextIdentity {
+                local_content: false,
+                ..base.clone()
+            },
+            ContextIdentity {
                 policy: BundlePolicy {
                     max_context_tokens: 1,
                     ..BundlePolicy::default()
@@ -152,6 +194,189 @@ mod identity_tests {
         for variant in variants {
             assert_ne!(base.fingerprint(), variant.fingerprint());
         }
+    }
+
+    #[test]
+    fn ir_17_context_reads_one_bounded_batch_per_revision() {
+        let source = TestSource {
+            detail: crate::test_support::sample_detail(),
+            patch: crate::domain::diff::parse_patch(
+                "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n\
+                 diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-c\n+d\n",
+            ),
+            checkout: Checkout {
+                path: std::path::PathBuf::from("/fake"),
+                head_sha: "head".to_owned(),
+                base_sha: "base".to_owned(),
+            },
+            policy: BundlePolicy::default(),
+        };
+        let workspace = crate::test_support::FakeWorkspace::default();
+        let ignores = RevisionIgnores::default();
+        let _reads = batch_reads(
+            &workspace,
+            &source,
+            ignores.eligibility(&source.policy),
+            &Cancel::new(),
+        );
+        assert_eq!(
+            workspace.calls(),
+            vec!["read_files", "read_files"],
+            "file count must not become process count"
+        );
+    }
+
+    #[test]
+    fn ir_17_source_retention_cap_keeps_later_file_hunks_in_the_diff() {
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/early.rs b/src/early.rs\n--- a/src/early.rs\n+++ b/src/early.rs\n@@ -1 +1 @@\n-old early\n+new early\n\
+             diff --git a/src/late.rs b/src/late.rs\n--- a/src/late.rs\n+++ b/src/late.rs\n@@ -1 +1 @@\n-old late\n+late diff sentinel\n",
+        );
+        let policy = BundlePolicy {
+            max_context_tokens: 600,
+            max_file_bytes: 4 * 1024,
+            ..BundlePolicy::default()
+        };
+        let source = TestSource {
+            detail: crate::test_support::sample_detail(),
+            patch,
+            checkout: Checkout {
+                path: std::path::PathBuf::from("/fake"),
+                head_sha: "head".to_owned(),
+                base_sha: "base".to_owned(),
+            },
+            policy,
+        };
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        for revision in ["base", "head"] {
+            workspace
+                .files
+                .insert(format!("{revision}:src/early.rs"), vec![b'e'; 2_200]);
+            workspace
+                .files
+                .insert(format!("{revision}:src/late.rs"), vec![b'l'; 300]);
+        }
+
+        let gathered = gather(&workspace, &source, &Cancel::new());
+
+        assert!(
+            gathered.bundle.text.contains("+late diff sentinel"),
+            "a full-file retention cap must not filter canonical diff hunks"
+        );
+        assert!(gathered.bundle.segments.iter().any(|segment| {
+            segment.detail.as_deref().is_some_and(|detail| {
+                detail.contains("full file body was elided")
+                    && detail.contains("bounded source-read budget")
+            })
+        }));
+    }
+
+    #[test]
+    fn fr_4_6_oversized_first_convention_remains_authoritative() {
+        let source = TestSource {
+            detail: crate::test_support::sample_detail(),
+            patch: crate::domain::diff::parse_patch(""),
+            checkout: Checkout {
+                path: std::path::PathBuf::from("/fake"),
+                head_sha: "head".to_owned(),
+                base_sha: "base".to_owned(),
+            },
+            policy: BundlePolicy {
+                max_file_bytes: 1_024,
+                ..BundlePolicy::default()
+            },
+        };
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        workspace
+            .files
+            .insert("head:AGENTS.md".to_owned(), vec![b'a'; 2_048]);
+        workspace.files.insert(
+            "head:CLAUDE.md".to_owned(),
+            b"lower-priority convention sentinel".to_vec(),
+        );
+
+        let gathered = gather(&workspace, &source, &Cancel::new());
+
+        assert!(gathered.bundle.text.contains("## AGENTS.md ("));
+        assert!(
+            !gathered
+                .bundle
+                .text
+                .contains("lower-priority convention sentinel")
+        );
+        assert!(gathered.bundle.segments.iter().any(|segment| {
+            segment.kind == SegmentKind::Conventions
+                && segment.label == "AGENTS.md"
+                && segment
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("per-file limit"))
+        }));
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_batched_context_workload() {
+        let mut patch_text = String::new();
+        let mut workspace = crate::test_support::FakeWorkspace::default();
+        for index in 0..400 {
+            let path = format!("src/file-{index:03}.rs");
+            let _ = std::fmt::Write::write_fmt(
+                &mut patch_text,
+                format_args!(
+                    "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old {index}\n+new {index}\n"
+                ),
+            );
+            let bytes = if index % 50 == 0 {
+                vec![b'x'; 48 * 1024]
+            } else if index % 75 == 0 {
+                vec![0, 1, 2, 3]
+            } else {
+                format!("pub fn item_{index}() {{}}\n").into_bytes()
+            };
+            workspace
+                .files
+                .insert(format!("base:{path}"), bytes.clone());
+            workspace.files.insert(format!("head:{path}"), bytes);
+        }
+        let source = TestSource {
+            detail: crate::test_support::sample_detail(),
+            patch: crate::domain::diff::parse_patch(&patch_text),
+            checkout: Checkout {
+                path: std::path::PathBuf::from("/fake"),
+                head_sha: "head".to_owned(),
+                base_sha: "base".to_owned(),
+            },
+            policy: BundlePolicy {
+                max_context_tokens: 10_000,
+                max_file_bytes: 32 * 1024,
+                reduced_context_lines: 1,
+            },
+        };
+        let started = std::time::Instant::now();
+        let gathered = gather(&workspace, &source, &Cancel::new());
+        let elapsed = started.elapsed();
+        let calls = workspace.calls();
+        let batches = calls.iter().filter(|call| *call == "read_files").count();
+        let expected_git_processes = batches.saturating_mul(2);
+        let retained_source_bytes = gathered
+            .files
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>();
+        eprintln!(
+            "IR17_METRIC profile={} workload=batched_context files=400 batch_operations={batches} expected_git_processes={expected_git_processes} retained_source_bytes={retained_source_bytes} bundle_bytes={} segments={} duration_us={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            gathered.bundle.bytes(),
+            gathered.bundle.segments.len(),
+            elapsed.as_micros(),
+        );
+        assert_eq!(batches, 2, "one batch per represented revision");
+        assert!(retained_source_bytes <= source.policy.max_bytes().saturating_mul(2));
     }
 }
 
@@ -244,18 +469,24 @@ pub fn gather(
     let ignores = revision_ignores(workspace, source.checkout(), &paths, cancel);
     let eligibility = ignores.eligibility(source.policy());
     let head_eligibility = eligibility.head;
+    let reads = batch_reads(workspace, source, eligibility, cancel);
     let ChangedContent {
         files,
         mut decisions,
         skipped,
-    } = changed_content(workspace, source, &paths, eligibility, cancel);
+    } = changed_content(source, &paths, eligibility, &reads);
 
-    let (conventions, convention_label) = match source.checkout() {
-        Some(checkout) => conventions(workspace, checkout, cancel),
-        None => (Vec::new(), None),
+    let ConventionSelection {
+        files: conventions,
+        label: convention_label,
+        decision: convention_decision,
+    } = match source.checkout() {
+        Some(checkout) => conventions(checkout, &reads, head_eligibility),
+        None => ConventionSelection::default(),
     };
 
     let mut notes = ignores.notes();
+    notes.extend(reads.errors.iter().cloned());
     if source.checkout().is_none() {
         notes.push(
             "no local workspace: the changed files' contents are not in the bundle. \
@@ -283,8 +514,8 @@ pub fn gather(
 
     let metadata = crate::application::analysis::render_metadata(source.detail());
     let commits = crate::application::analysis::render_commits(source.detail());
-    for (label, bytes) in &conventions {
-        decisions.push(decide_path(label, Some(bytes), head_eligibility));
+    if let Some(decision) = convention_decision {
+        decisions.push(decision);
     }
     let inputs = BundleInputs {
         metadata: &metadata,
@@ -302,14 +533,7 @@ pub fn gather(
     };
     let mut bundle = build(&inputs, source.policy());
 
-    append_added_files(
-        workspace,
-        source,
-        head_eligibility,
-        cancel,
-        &mut bundle,
-        &mut notes,
-    );
+    append_added_files(source, head_eligibility, &reads, &mut bundle, &mut notes);
 
     for note in notes {
         bundle.segments.push(Segment {
@@ -385,17 +609,128 @@ struct ChangedContent {
 
 #[derive(Clone, Copy)]
 struct ClassificationContext<'a> {
-    workspace: &'a dyn WorkspacePort,
-    checkout: &'a Checkout,
-    cancel: &'a Cancel,
+    reads: &'a BatchReads,
+}
+
+#[derive(Default)]
+struct BatchReads {
+    values: std::collections::BTreeMap<(String, String), FileReadOutcome>,
+    errors: Vec<String>,
+}
+
+impl BatchReads {
+    fn get(&self, revision: &str, path: &str) -> Option<&FileReadOutcome> {
+        self.values.get(&(revision.to_owned(), path.to_owned()))
+    }
+}
+
+fn batch_reads(
+    workspace: &dyn WorkspacePort,
+    source: &dyn ContextSource,
+    eligibility: RevisionEligibility<'_>,
+    cancel: &Cancel,
+) -> BatchReads {
+    let Some(checkout) = source.checkout() else {
+        return BatchReads::default();
+    };
+    let mut base = Vec::new();
+    let mut head = Vec::new();
+    let mut base_seen = BTreeSet::new();
+    let mut head_seen = BTreeSet::new();
+    for path in CONVENTION_FILES {
+        push_unique(&mut head, &mut head_seen, (*path).to_owned());
+    }
+    if let Some(patch) = source.patch() {
+        for file in &patch.files {
+            if let Some(path) = &file.old_path {
+                push_unique(&mut base, &mut base_seen, path.to_string());
+            }
+            if let Some(path) = &file.new_path {
+                push_unique(&mut head, &mut head_seen, path.to_string());
+            }
+        }
+    } else {
+        for path in source.changed_paths() {
+            push_unique(&mut head, &mut head_seen, path);
+        }
+    }
+    for path in source.added() {
+        push_unique(&mut head, &mut head_seen, path.clone());
+    }
+    base.retain(|path| representation_is_readable(path, eligibility.base));
+    head.retain(|path| representation_is_readable(path, eligibility.head));
+
+    let mut reads = BatchReads::default();
+    read_revision_batch(
+        workspace,
+        checkout,
+        &checkout.base_sha,
+        &base,
+        source.policy(),
+        cancel,
+        &mut reads,
+    );
+    if !cancel.is_cancelled() {
+        read_revision_batch(
+            workspace,
+            checkout,
+            &checkout.head_sha,
+            &head,
+            source.policy(),
+            cancel,
+            &mut reads,
+        );
+    }
+    reads
+}
+
+fn push_unique(paths: &mut Vec<String>, seen: &mut BTreeSet<String>, path: String) {
+    if seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+fn representation_is_readable(path: &str, eligibility: Eligibility<'_>) -> bool {
+    eligibility.error.is_none()
+        && !eligibility.ignored.contains(path)
+        && !crate::domain::context::is_secret_path(path)
+}
+
+fn read_revision_batch(
+    workspace: &dyn WorkspacePort,
+    checkout: &Checkout,
+    revision: &str,
+    paths: &[String],
+    policy: &BundlePolicy,
+    cancel: &Cancel,
+    reads: &mut BatchReads,
+) {
+    match workspace.read_files(
+        &checkout.path,
+        revision,
+        paths,
+        policy.max_file_bytes,
+        policy.max_bytes(),
+        cancel,
+    ) {
+        Ok(results) => {
+            for result in results {
+                reads
+                    .values
+                    .insert((revision.to_owned(), result.path), result.outcome);
+            }
+        }
+        Err(error) => reads.errors.push(format!(
+            "could not batch-read source objects at {revision}: {error}"
+        )),
+    }
 }
 
 fn changed_content(
-    workspace: &dyn WorkspacePort,
     source: &dyn ContextSource,
     paths: &[String],
     eligibility: RevisionEligibility<'_>,
-    cancel: &Cancel,
+    reads: &BatchReads,
 ) -> ChangedContent {
     let mut content = ChangedContent {
         files: Vec::new(),
@@ -411,11 +746,7 @@ fn changed_content(
         }));
         return content;
     };
-    let classification = ClassificationContext {
-        workspace,
-        checkout,
-        cancel,
-    };
+    let classification = ClassificationContext { reads };
     if let Some(patch) = source.patch() {
         for file in &patch.files {
             if let Some(path) = &file.old_path {
@@ -462,28 +793,43 @@ fn changed_content(
 }
 
 fn append_added_files(
-    workspace: &dyn WorkspacePort,
     source: &dyn ContextSource,
     eligibility: Eligibility<'_>,
-    cancel: &Cancel,
+    reads: &BatchReads,
     bundle: &mut Bundle,
     notes: &mut Vec<String>,
 ) {
     for path in source.added() {
+        if eligibility.error.is_some()
+            || eligibility.ignored.contains(path)
+            || crate::domain::context::is_secret_path(path)
+        {
+            bundle.push_user_file_with_decision(
+                path,
+                &[],
+                source.policy(),
+                Some(decide_path(path, None, eligibility)),
+            );
+            continue;
+        }
         let Some(checkout) = source.checkout() else {
             notes.push(format!(
                 "could not add {path}: there is no local workspace to read it from"
             ));
             continue;
         };
-        match workspace.read_file(&checkout.path, &checkout.head_sha, path, cancel) {
-            Ok(bytes) => bundle.push_user_file_with_decision(
+        match reads.get(&checkout.head_sha, path) {
+            Some(FileReadOutcome::Content(bytes)) => bundle.push_user_file_with_decision(
                 path,
-                &bytes,
+                bytes,
                 source.policy(),
-                Some(decide_path(path, Some(&bytes), eligibility)),
+                Some(decide_path(path, Some(bytes), eligibility)),
             ),
-            Err(error) => notes.push(format!("could not add {path}: {error}")),
+            Some(other) => notes.push(format!(
+                "could not add {path}: {}",
+                read_failure(other, source.policy())
+            )),
+            None => notes.push(format!("could not add {path}: source object was not read")),
         }
     }
 }
@@ -569,22 +915,75 @@ fn classify_representation(
         decisions.push(decide_path(path, None, eligibility));
         return None;
     }
-    match context
-        .workspace
-        .read_file(&context.checkout.path, revision, path, context.cancel)
-    {
-        Ok(bytes) => {
-            decisions.push(decide_path(path, Some(&bytes), eligibility));
-            Some(bytes)
+    match context.reads.get(revision, path) {
+        Some(FileReadOutcome::Content(bytes)) => {
+            decisions.push(decide_path(path, Some(bytes), eligibility));
+            Some(bytes.clone())
         }
-        Err(error) => {
-            skipped.push(format!("{path} at {revision}: {error}"));
+        Some(FileReadOutcome::Oversize { bytes }) => {
+            decisions.push(PathDecision {
+                path: path.to_owned(),
+                disposition: Disposition::Placeholder {
+                    reason: format!(
+                        "{} over the {} KiB per-file limit",
+                        crate::domain::context::human_bytes(*bytes),
+                        eligibility.policy.max_file_bytes / 1024
+                    ),
+                },
+            });
+            None
+        }
+        Some(FileReadOutcome::BudgetExceeded { bytes }) => {
+            skipped.push(format!(
+                "{path} at {revision}: full file body was elided because {}",
+                read_failure(
+                    &FileReadOutcome::BudgetExceeded { bytes: *bytes },
+                    eligibility.policy
+                )
+            ));
+            // The metadata batch established that this is an eligible, bounded blob.
+            // Only its full body missed the retention cap; filtering its diff would
+            // reverse the documented diff-before-file-body priority.
+            decisions.push(decide_path(path, None, eligibility));
+            None
+        }
+        Some(other) => {
+            skipped.push(format!(
+                "{path} at {revision}: {}",
+                read_failure(other, eligibility.policy)
+            ));
             decisions.push(PathDecision::omitted(
                 path,
                 "content could not be read to verify its size and type",
             ));
             None
         }
+        None => {
+            skipped.push(format!("{path} at {revision}: source object was not read"));
+            decisions.push(PathDecision::omitted(
+                path,
+                "content could not be read to verify its size and type",
+            ));
+            None
+        }
+    }
+}
+
+fn read_failure(outcome: &FileReadOutcome, policy: &BundlePolicy) -> String {
+    match outcome {
+        FileReadOutcome::Missing => "the path does not exist at this revision".to_owned(),
+        FileReadOutcome::Oversize { bytes } => format!(
+            "{} exceeds the {} KiB per-file limit",
+            crate::domain::context::human_bytes(*bytes),
+            policy.max_file_bytes / 1024
+        ),
+        FileReadOutcome::BudgetExceeded { bytes } => format!(
+            "{} was not retained because the bounded source-read budget was full",
+            crate::domain::context::human_bytes(*bytes)
+        ),
+        FileReadOutcome::NotBlob { kind } => format!("Git object is {kind}, not a file blob"),
+        FileReadOutcome::Unreadable { reason } => reason.clone(),
+        FileReadOutcome::Content(_) => "source object is available".to_owned(),
     }
 }
 
@@ -610,20 +1009,66 @@ fn decide_path(path: &str, bytes: Option<&[u8]>, eligibility: Eligibility<'_>) -
     }
 }
 
+#[derive(Default)]
+struct ConventionSelection {
+    files: Vec<(String, Vec<u8>)>,
+    label: Option<String>,
+    decision: Option<PathDecision>,
+}
+
 /// Reads the first convention file that exists (FR-4.6).
 fn conventions(
-    workspace: &dyn WorkspacePort,
     checkout: &Checkout,
-    cancel: &Cancel,
-) -> (Vec<(String, Vec<u8>)>, Option<String>) {
+    reads: &BatchReads,
+    eligibility: Eligibility<'_>,
+) -> ConventionSelection {
     for name in CONVENTION_FILES {
-        let Ok(bytes) = workspace.read_file(&checkout.path, &checkout.head_sha, name, cancel)
-        else {
-            continue;
-        };
-        if !bytes.is_empty() {
-            return (vec![((*name).to_owned(), bytes)], Some((*name).to_owned()));
+        if eligibility.error.is_some() || eligibility.ignored.contains(*name) {
+            return ConventionSelection {
+                files: vec![((*name).to_owned(), Vec::new())],
+                label: Some((*name).to_owned()),
+                decision: Some(decide_path(name, None, eligibility)),
+            };
+        }
+        match reads.get(&checkout.head_sha, name) {
+            Some(FileReadOutcome::Missing) | None => {}
+            Some(FileReadOutcome::Content(bytes)) => {
+                return ConventionSelection {
+                    files: vec![((*name).to_owned(), bytes.clone())],
+                    label: Some((*name).to_owned()),
+                    decision: Some(decide_path(name, Some(bytes), eligibility)),
+                };
+            }
+            Some(FileReadOutcome::Oversize { bytes }) => {
+                return ConventionSelection {
+                    files: vec![((*name).to_owned(), Vec::new())],
+                    label: Some((*name).to_owned()),
+                    decision: Some(PathDecision {
+                        path: (*name).to_owned(),
+                        disposition: Disposition::Placeholder {
+                            reason: format!(
+                                "{} over the {} KiB per-file limit",
+                                crate::domain::context::human_bytes(*bytes),
+                                eligibility.policy.max_file_bytes / 1024
+                            ),
+                        },
+                    }),
+                };
+            }
+            Some(other) => {
+                return ConventionSelection {
+                    files: vec![((*name).to_owned(), Vec::new())],
+                    label: Some((*name).to_owned()),
+                    decision: Some(PathDecision::omitted(
+                        *name,
+                        format!(
+                            "repository conventions were not read: {}",
+                            read_failure(other, eligibility.policy)
+                        ),
+                    )),
+                };
+            }
         }
     }
-    (Vec::new(), None)
+    ConventionSelection::default()
 }

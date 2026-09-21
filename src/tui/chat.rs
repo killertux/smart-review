@@ -13,6 +13,66 @@ use crate::domain::chat::{Session, SessionMeta, Totals};
 use crate::tui::app::StreamBuffer;
 use crate::tui::input::TextInput;
 
+/// Completed message layouts retained for the active width/theme only (IR-17).
+#[derive(Debug, Default)]
+pub(crate) struct ChatLayoutCache {
+    session: String,
+    width: usize,
+    theme: String,
+    entries: std::collections::BTreeMap<usize, Vec<ratatui::text::Line<'static>>>,
+}
+
+const MAX_CACHED_LAYOUTS: usize = 256;
+
+impl ChatLayoutCache {
+    pub(crate) fn layout(
+        &mut self,
+        session: &str,
+        index: usize,
+        width: usize,
+        theme: &str,
+        build: impl FnOnce() -> Vec<ratatui::text::Line<'static>>,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        if self.session != session || self.width != width || self.theme != theme {
+            session.clone_into(&mut self.session);
+            self.width = width;
+            theme.clone_into(&mut self.theme);
+            self.entries.clear();
+        }
+        if let Some(lines) = self.entries.get(&index) {
+            return lines.clone();
+        }
+        let lines = build();
+        if self.entries.len() >= MAX_CACHED_LAYOUTS
+            && let Some(oldest) = self.entries.keys().next().copied()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(index, lines.clone());
+        lines
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.session.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_text_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .flatten()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.len())
+            .sum()
+    }
+}
+
 /// What the pane is doing (FR-5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ChatStatus {
@@ -84,6 +144,10 @@ pub struct ChatState {
     pub input: TextInput,
     /// How far up the conversation is scrolled, in lines from the bottom.
     pub scroll: usize,
+    /// Whether the user deliberately scrolled away from the streaming tail.
+    pub tail_paused: bool,
+    /// Width/theme keyed layouts for immutable completed messages (IR-17).
+    pub(crate) layouts: std::cell::RefCell<ChatLayoutCache>,
     /// The text that has streamed in for the answer in flight (FR-5.2).
     pub stream: StreamBuffer,
     /// The question in flight, kept so a retry can repeat it (FR-5.2).
@@ -216,6 +280,8 @@ impl ChatState {
         self.estimate = None;
         self.dropped = 0;
         self.scroll = 0;
+        self.tail_paused = false;
+        self.layouts.borrow_mut().clear();
         self.listing = false;
     }
 }
@@ -392,5 +458,27 @@ mod tests {
             "the failure is drawn, after the conversation"
         );
         assert_eq!(chat.messages().last(), Some(&ChatLine::Failed));
+    }
+
+    #[test]
+    fn ir_17_completed_layouts_are_reused_and_invalidated_by_width() {
+        let mut cache = ChatLayoutCache::default();
+        let mut builds = 0;
+        let first = cache.layout("session", 0, 80, "dark", || {
+            builds += 1;
+            vec![ratatui::text::Line::from("laid out")]
+        });
+        let second = cache.layout("session", 0, 80, "dark", || {
+            builds += 1;
+            Vec::new()
+        });
+        assert_eq!(first, second);
+        assert_eq!(builds, 1, "an unchanged frame reuses completed Markdown");
+
+        let _ = cache.layout("session", 0, 100, "dark", || {
+            builds += 1;
+            Vec::new()
+        });
+        assert_eq!(builds, 2, "a width change invalidates wrapping");
     }
 }
