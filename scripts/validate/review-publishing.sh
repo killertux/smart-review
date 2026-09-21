@@ -315,10 +315,29 @@ if validation_smoke_only; then
   HOME_SMOKE="$TMP/home-smoke"
   home_for "$HOME_SMOKE"
   : >"$FAKE/argv.txt"
+  PUBLISHED_DRAFT="$(draft_file "$HOME_SMOKE")"
+  STAGE_FRAMES="$TMP/publish-smoke-stage.log"
+  run_tui "$HOME_SMOKE" \
+    "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~:q\r" \
+    "from the worktree~M src/domain/money~comment on~1 comment staged~" \
+    "$STAGE_FRAMES" >/dev/null
+  if [ -f "$PUBLISHED_DRAFT" ] && check_json "$PUBLISHED_DRAFT" <<'PY'
+import json, sys
+draft = json.load(open(sys.argv[1]))
+assert len(draft.get("comments", [])) == 1, draft
+assert draft["comments"][0]["body"] == "the rounding is hidden behind a magic ten", draft
+PY
+  then
+    ok "the staged comment is durable before publishing"
+  else
+    bad "the staged comment was not persisted before publishing"
+    cat "$TMP/check.log" 2>/dev/null
+  fi
+
   FRAMES="$TMP/publish-smoke.log"
-  DRIVE_SETTLE=1 run_tui "$HOME_SMOKE" \
-    "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~ rr~a~\r" \
-    "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~review posted" \
+  run_tui "$HOME_SMOKE" \
+    "$OPEN~ rr~a~\r~\e~:q\r" \
+    "1 draft~publish review~approve —~review posted~~" \
     "$FRAMES" >/dev/null
   if shown "$FRAMES" \
       "approve — this unblocks the pull request[\\s\\S]*the rounding is hidden behind a magic ten|the rounding is hidden behind a magic ten[\\s\\S]*approve — this unblocks the pull request"; then
@@ -347,7 +366,6 @@ PY
     bad "the adapter payload differed from the preview"
     cat "$TMP/check.log"
   fi
-  PUBLISHED_DRAFT="$(draft_file "$HOME_SMOKE")"
   if wait_until_absent "$PUBLISHED_DRAFT"; then
     ok "the published draft is durably cleared"
   else
@@ -436,9 +454,9 @@ HOME_TWO="$TMP/home-two"
 home_for "$HOME_TWO"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/publish.log"
-SCREEN="$(DRIVE_SETTLE=1 run_tui "$HOME_TWO" \
-  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~review posted" \
+SCREEN="$(run_tui "$HOME_TWO" \
+  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r~\e~:q\r" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~review posted~~" \
   "$FRAMES")"
 if shown "$FRAMES" "approve — this unblocks the pull request"; then
   ok "the modal names the verdict it is about to give"
