@@ -1,6 +1,6 @@
 # Smart Review — Requirements Specification
 
-**Status:** Draft v1.0 (DEC-1 … DEC-6, DEC-16, DEC-17, DEC-19, DEC-20, DEC-21 resolved; DEC-7 … DEC-15 and DEC-18 pending, each with a proposed default). M0–M5 are implemented: the shell, browsing and diffs, the workspace and model configuration, analysis and chat, review publishing, thread replies/resolution, PR conversation comments, checked documentation, and release packaging. The generated `docs/keymaps.md` is the exact default keymap.
+**Status:** Draft v1.0 (DEC-1 … DEC-6, DEC-16, DEC-17, DEC-19 … DEC-23 resolved; DEC-7 … DEC-15 and DEC-18 pending, each with a proposed default). M0–M5 are implemented: the shell, browsing and diffs, the workspace and model configuration, analysis and chat, review publishing, thread replies/resolution, PR conversation comments, checked documentation, and release packaging. The generated `docs/keymaps.md` is the exact default keymap.
 **Scope:** v1 (MVP) + post-v1 backlog
 **Source of truth:** this file. If code and this file disagree, the file wins or the file is updated in the same change.
 
@@ -56,7 +56,7 @@ Reviewing a PR in a browser tab is context-poor: the reviewer cannot easily see 
 | **Merge base** | `git merge-base <base> <head>`; the diff of a PR is defined as `merge_base..head` (git's `A...B`). |
 | **Workspace** | The on-disk checkout of a PR head that the app creates and owns. |
 | **File diff / hunk / line** | Parsed representation of a unified diff. A line carries `Side::{Old,New}`. |
-| **Analysis** | The LLM's structured output for a PR: summary, intent, risks, review plan, per-file notes. |
+| **Analysis** | The LLM's structured output for a PR: concise brief, inferred purpose, risks, semantic review steps, per-file guidance and coverage. |
 | **Review plan** | The Analysis' ordered grouping of changed files into a review sequence. |
 | **Draft** | A review that exists only locally: decision + body + inline comments, not yet published. |
 | **Decision** | One of `Approve`, `RequestChanges`, `Comment`. |
@@ -186,7 +186,7 @@ Acceptance criteria:
 - [ ] `:copy-path` (and a bindable action) copies the current file path via OSC 52 with a message if unsupported.
 
 **FR-3.5 Layer-ordered view** — MUST — M2 — *see DEC-10*
-The diff MUST be re-orderable using the LLM review plan (FR-4.2) with a clearly-labelled toggle between `path order` and `recommended order`, plus a heuristic fallback ordering (path/name rules) when no analysis exists.
+The diff MUST be re-orderable using the LLM review plan (FR-4.2) with a clearly-labelled toggle between `path order` and `recommended order`, plus a heuristic fallback ordering (path/name rules) when no analysis exists. AI plans use contextual, human-named semantic steps; contracts, migrations or documentation may lead when they establish intent, and tests may accompany the behavior they verify rather than always appearing last (DEC-23).
 Acceptance criteria:
 - [ ] Toggling order preserves the current file when possible and shows both orders' file positions.
 - [ ] Reordering never mutates the underlying diff model and never re-runs git.
@@ -194,18 +194,23 @@ Acceptance criteria:
 ### FR-4 LLM analysis
 
 **FR-4.1 Analysis output** — MUST — M2 — *DEC-2 `[DECIDED]`: analysis + chat, no agentic tool loop in v1*
-One request MUST produce a structured Analysis: `summary` (what changed), `intent` (why, inferred), `risk_areas[]`, `review_plan[]` (ordered groups with rationale and file lists), `per_file_notes[]`, `suggested_questions[]`, plus `model`, `prompt_version`, `head_sha`, `created_at`, `token_usage`. The schema is in Appendix B; it MUST be validated before use.
+One request MUST produce a structured Analysis: `brief` (approximately two concise sentences), `inferred_purpose` (separate from the author's description), `risk_areas[]`, `review_plan[]` (human-named ordered steps with rationale and file lists), `per_file_notes[]` (`what_changed`, inferred `why`, concrete `verify` checks and evidence references), `suggested_questions[]`, `coverage`, plus `model`, `prompt_version`, `head_sha`, `created_at`, `token_usage`. The schema is in §7.1; it MUST be validated before use. The prompt asks for compact fields, but excess useful output is retained in an expandable/scrollable view rather than silently discarded.
 Acceptance criteria:
 - [ ] Malformed/partial JSON is repaired once, then reported as a failed analysis with the raw text viewable — never silently dropped or panicked on.
 - [ ] Unknown files referenced by the LLM are ignored with a warning; changed files missing from the plan are appended in path order under an "unclassified" group.
 - [ ] Every claim about a file is attributable to a path present in the diff.
+- [ ] Evidence coordinates are validated against the supplied patch; an invalid coordinate degrades to an explicit file-level reference with a warning, and an unknown file is dropped.
+- [ ] Overview visibly separates the AI brief, inferred purpose, semantic plan, coverage/limitations and suggested questions. Files keeps compact `What / Why (inferred) / Verify` guidance beside the current code, with an expanded view and honest missing/truncated states.
+- [ ] A suggested question populates Ask for editing but never sends until the user explicitly submits it.
 
 **FR-4.2 Review plan & ordering** — MUST — M2
-The plan groups changed files by architectural role. For a DDD-style repo the expected shape is domain → application → infrastructure → interfaces/config → tests/docs. Grouping MUST be derived from the analysis, not hard-coded, with the heuristic classifier only as fallback.
+The plan groups changed files into semantic review steps derived from the change. Grouping MUST be derived from the analysis, not hard-coded, with the architectural path classifier only as fallback. Every changed file remains visible exactly once.
 Acceptance criteria:
 - [ ] The plan panel explains *why* each group is reviewed in that position.
 - [ ] The user can override the order manually (move group up/down, pin file to group) and the override wins and persists per PR.
 - [ ] `o` toggles recommended vs path order (FR-3.5).
+- [ ] Human progress is explicit per file: `not reviewed`, `reviewed`, or `needs revisit`; analysis completion and cursor movement never change it.
+- [ ] Progress is stored durably with a stable file-change fingerprint. A new head carries a marker only for a provably unchanged change; changed reviewed files become `needs revisit`. Manual ordering is retained only when compatible, otherwise reset with an explanation (DEC-23).
 
 **FR-4.3 Caching & invalidation** — MUST — M2
 Analysis MUST be cached per `(repo, pr, head_sha, provider, model, thinking settings, prompt_version)`.
@@ -315,6 +320,7 @@ Acceptance criteria:
 Publishing MUST be explicit, confirmed, and atomic from the user's perspective.
 Acceptance criteria:
 - [ ] A publish modal shows the decision, the body, and every inline comment verbatim before sending.
+- [ ] Opening the preview and mutating GitHub are separate actions: `<leader>rr` opens the modal, then one clearly labelled `Enter` Publish/Post action sends exactly the immutable content shown (DEC-23).
 - [ ] With inline comments present, publishing MUST use a **batched** review so the PR receives one review, not N comments. `gh pr review` only supports `--approve/--request-changes/--comment --body` (verified on gh 2.45). *Implementation note (M4):* the batch is one `POST /repos/{owner}/{repo}/pulls/{N}/reviews` carrying `event`, `body`, `commit_id` and every comment, sent with `gh api --input <file>`, rather than the GraphQL pair DEC-3 originally recorded. One request means "one review" cannot half-happen; the payload is built by `serde_json`, so no user text is ever escaped by hand; and the response carries the review's URL for the status line. A list of GraphQL input objects cannot be passed as a variable over argv, which is what the two-call route would have required. DEC-3's decision (one batched review, inline comments in v1) is unchanged — only its recorded route. See Appendix A.
 - [ ] `gh pr review` is used only when there are no inline comments; the adapter exposes both paths behind one `submit_review` port method.
 - [ ] Double-submit is prevented (in-flight guard + idempotency); the button is disabled after success.
@@ -785,27 +791,28 @@ Default bindings (all remappable; the generated [`docs/keymaps.md`](docs/keymaps
 ### 7.1 Analysis document (cached JSON; also the LLM's required output schema)
 ```json
 {
-  "version": 1,
-  "prompt_version": 1,
+  "version": 2,
+  "prompt_version": 2,
   "model": "deepseek/deepseek-chat",
   "head_sha": "9f2ac1e…",
   "created_at": "2026-01-01T00:00:00Z",
   "token_usage": { "prompt": 0, "completion": 0 },
-  "summary": "string (what changed, ≤ 6 sentences)",
-  "intent": "string (inferred goal and motivation)",
+  "brief": "string (what changed, approximately two concise sentences)",
+  "inferred_purpose": "string (inferred goal and motivation; not the author's description)",
   "risk_areas": [
     { "title": "Rounding in Money arithmetic", "severity": "high|medium|low", "files": ["src/domain/money.rs"], "why": "string" }
   ],
   "review_plan": [
-    { "order": 1, "group": "domain", "rationale": "string", "files": ["src/domain/invoice.rs"] }
+    { "order": 1, "group": "Understand the contract", "rationale": "one sentence", "files": ["docs/billing.md"] }
   ],
   "per_file_notes": [
-    { "path": "src/domain/invoice.rs", "change": "string", "notes": "string", "review_focus": ["string"] }
+    { "path": "src/domain/invoice.rs", "what_changed": "string", "why": "inferred string", "verify": ["concrete check"], "evidence": [ { "path": "src/domain/invoice.rs", "side": "new", "line": 31, "label": "string" } ] }
   ],
-  "suggested_questions": ["string"]
+  "suggested_questions": ["string"],
+  "coverage": { "analyzed_files": ["src/domain/invoice.rs"], "truncated_files": [], "limitations": [] }
 }
 ```
-Rules: unknown fields tolerated; `review_plan[].files` MUST be a subset of the changed files after normalization (unknowns dropped with a warning; missing files appended to an `unclassified` group); `version` enables migrations.
+Rules: unknown fields tolerated; legacy v1 `summary`/`intent`/per-file names remain readable aliases; `review_plan[].files` MUST be a subset of the changed files after normalization (unknowns dropped with a warning; missing files appended to an `unclassified` group); evidence paths and optional side/line coordinates are validated against the patch; `version` enables migrations.
 
 ### 7.2 Draft document
 ```json
@@ -816,7 +823,7 @@ Rules: unknown fields tolerated; `review_plan[].files` MUST be a subset of the c
 
 ### 7.3 Prompt contract (normative properties, wording is free)
 - System prompt: role (senior reviewer), output format (the JSON schema above, no prose outside JSON for analysis), grounding rules (only claim what is in the provided context and name the file when asserting), language (mirror the PR's language), and the repository conventions extracted from `AGENTS.md`.
-- Analysis is requested once for the whole PR; per-file explanation is a separate, smaller request (FR-4.1 granularity, M2).
+- Analysis is requested once for the whole PR and includes concise per-file guidance in that same structured answer; opening/expanding guidance never makes another paid request.
 - **The analysis is one streamed request, and a repair is a second one** (M2b): the first answer is normalized against the diff, and only a failure to parse triggers the retry, which quotes the reason and the previous text. A model that answers with prose is a normal event, so the raw text is kept and shown (`:analyze raw`) whether or not the retry worked.
 - Chat uses a separate system prompt: cite file paths for claims, admit uncertainty, prefer asking for a file when the context lacks it (only if tool use is enabled), never fabricate line numbers.
 - Every request records `prompt_version`; changing prompt semantics bumps it and invalidates cache.
@@ -939,6 +946,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | **DEC-20** | `?` was listed both as help and as backward search. Which wins? | **Help.** `?` is the TUI convention for the keybinding popup and the app already shows `? help` in its status line. Backward search entry is dropped; `N` repeats a search backwards, and `/` re-opens the prompt. Recorded because the same key cannot mean two things and silently picking one later would change a habit. | FR-7.3, FR-7.4, the §5.4 keymap. |
 | **DEC-21** | Are the diff options a submenu popup or leader continuations? | **Continuations**: `<leader>d s`, `<leader>d c`, `<leader>d w`. The keymap engine already resolves multi-key sequences and the leader menu lists them, so a popup would add a mode for no gain. The cost is that `<leader>d` alone does nothing (like vim's `g`), which the leader menu makes discoverable. | FR-3.2, FR-3.3, FR-7.2, the §5.4 keymap. |
 | **DEC-22** | *(decided)* Is macOS kept in CI alongside Ubuntu? | **Not for now.** The feature validators only run on Ubuntu because they need GNU `script`, so the macOS job ran only fmt/clippy/test/build and added wall-clock without covering the scenario gates. CI is a single Ubuntu `tests` job until the pty steps are portable. | NFR-2.1, the CI workflow. |
+| **DEC-23** | *(decided)* How does guided review group work, preserve human progress and confirm publication? | **Contextual semantic steps; fingerprint-bound markers; one explicit Publish/Post action after preview.** Steps may pair implementation and tests or lead with contracts/migrations when that helps understanding. Reviewed state carries to a new head only for an identical file-change fingerprint; changed reviewed files need revisit. `<leader>rr` (or finishing a reply composer) opens immutable preview, then one clearly labelled `Enter` sends it. | FR-3.5, FR-4.1–4.3, FR-6.3–6.5, durable review state and key help. |
 
 ### 11.1 Decision log
 | Date | ID | Decision | By |
@@ -952,6 +960,7 @@ Each milestone is "done" when its FR acceptance criteria pass, tests exist, and 
 | — | DEC-19 (decided) | Config write-back in M2a needs `toml_edit` to preserve comments; recorded here so the dependency is approved with the M2 batch rather than discovered mid-implementation. | — |
 | M5 | DEC-16 | PR conversation comments, existing-thread replies, and resolve/reopen ship; the owner selected the REST/GraphQL split that matches GitHub's API surfaces. | owner |
 | 2026-09-12 | DEC-22 (decided) | macOS CI removed for now: the feature validators need GNU `script` and only ran on Ubuntu, so the macOS job added time without covering the scenario gates. CI is a single Ubuntu `tests` job. | owner |
+| 2026-09-18 | DEC-23 (decided) | Guided review uses semantic multi-file steps, carries explicit human markers only across identical file-change fingerprints, and sends from an immutable preview with one explicit Publish/Post action. | owner |
 
 ---
 

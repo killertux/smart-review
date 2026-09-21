@@ -34,7 +34,7 @@
 | **M0** | Skeleton, rules, CI | `smart-review` opens a themed TUI shell: status line, placeholder panes, modes, `?` help, `<leader>` menu, `:theme`, `:q`. `--version`, `--check`. | `scripts/validate/shell.sh` + manual demo | FR-7.1–7.4, 7.6–7.8, 8.1–8.3, 9.1, 9.2 | ratatui, crossterm, clap, serde, toml, thiserror, anyhow |
 | **M1** | PR browsing & diff reading | Inside a clone: list PRs, filter/search, open one, read metadata + full diff with vim navigation, mouse support, cached. | `scripts/validate/pull-requests.sh` + manual demo | FR-1.1–1.3, 2.1–2.4, 3.2–3.4, 7.5, 7.7, 9.3 | serde_json, `time` (or chrono), unicode-width |
 | **M2a** | Workspace + model configuration | Read a PR from a managed worktree (local diff, context and whitespace toggles), and pick provider/model/thinking + paste a key **in the TUI**, with the choice verified against the provider. | `scripts/validate/workspace-models.sh` + manual demo | FR-3.1, 3.2 (local), 4.5, 4.7, 4.8 | llm, tokio, reqwest, toml_edit |
-| **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/analysis.sh` (35 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
+| **M2b** | LLM analysis + ordered review | Press `<leader>a` twice: the analysis streams into a panel and the tree reorders to the plan it returned; `o` toggles path order. Restart: cache hit, no network. | `scripts/validate/analysis.sh` (40 checks) + manual demo | FR-3.5, 4.1–4.4, 4.6 | none new |
 | **M3** | Chat | A persistent, streaming chat per PR grounded in the context bundle, with `:context` inspection. | `scripts/validate/chat.sh` + manual demo | FR-5.1–5.4 | none new |
 | **M4** | Review publishing | Stage inline comments, review the publish modal, submit one batched review to GitHub; `--dry-run` writes the commands it would run to `logs/dry-run.log`. | `scripts/validate/review-publishing.sh` + manual demo against a sandbox PR | FR-6.1–6.5, 3.3 (existing discussion) | none new |
 | **M5** | Polish & release | Visual ranges, replies/resolution, PR conversation comments, `$EDITOR`, checked docs and tagged Linux/macOS releases. | `scripts/validate/review-collaboration.sh` + manual demo | backlog + NFR polish | no new crates |
@@ -213,22 +213,23 @@ names the active model.
 
 **Goal:** the product's differentiator.
 
-**Runnable artifact:** on the PR from M2a, press `<leader>a`: the first press shows what would be sent and waits, the second streams the answer into a panel and reorders the file tree to the plan the analysis returned (domain → tests → unclassified in the validator's fixture). Press `o` to read the same files in path order. Restart and re-open: cache hit, no network.
+**Runnable artifact:** on the PR from M2a, press `<leader>a`: the first press shows what would be sent and waits, the second streams the answer into a panel and reorders the file tree to contextual semantic steps. Overview shows the brief, inferred purpose, plan and coverage; Files keeps compact What / Why (inferred) / Verify guidance beside the code. Press `e` to expand it, `m` to mark human progress, and `o` to compare path order. Restart and re-open: analysis is a cache hit and human progress comes from durable review state, with no network.
 
 **Work items**
 - [x] Analysis request/response: strict JSON schema + normalize (unknown paths dropped with warning, missing files appended as `unclassified`), one repair retry, raw text viewable on failure (FR-4.1, §7.1).
 - [x] Analysis cache keyed by `(repo, pr, head_sha, provider, model, thinking, prompt_version)`, atomic writes, stale marking on head change (FR-4.3, DEC-15).
 - [x] Context bundle builder: metadata + commits + diff + changed files at head + `AGENTS.md`/`CLAUDE.md`/`README.md`, redaction of `.env*`/ignored/oversize/binary, truncation order, token estimate, `:context` inspector + opt-in notice (FR-4.6).
 - [x] Review plan UI: groups with rationale, recommended vs path order toggle, manual overrides persisted per PR (FR-3.5, FR-4.2, DEC-10 default).
+- [x] IR-16 guided review: prompt/schema v2, contextual human-named steps, compact/expanded per-file guidance, validated evidence jumps, suggested-question compose, explicit fingerprint-bound human progress, coverage/limitations and provenance (FR-3.5, FR-4.1–4.4, FR-5.3, DEC-23).
 - [x] Tests: analysis normalization/repair, cache key sensitivity to thinking, context truncation/redaction, cancellation and superseded-job discard.
-- [x] `scripts/validate/analysis.sh`: 35 checks, driven end to end against a scripted OpenAI-compatible provider (`scripts/validate/fake_llm.py`), including what the app actually sent.
+- [x] `scripts/validate/analysis.sh`: 40 checks, driven end to end against a scripted OpenAI-compatible provider (`scripts/validate/fake_llm.py`), including what the app actually sent, semantic plan rendering, expanded evidence and durable human progress.
 
 **Notes on what M2b decided, where it is not obvious from the requirements**
 - **`.gitignore` is enforced by construction.** Only paths that exist in the head revision are considered for the bundle (`git ls-tree`), so an ignored file is not a candidate in the first place; a `.env` that somebody committed by accident is caught by the secret denylist on top of that. The validator asserts on the wire that such a file never reaches the provider.
 - **The truncation order is implemented for the first two steps.** Per-file elision and diff context reduction are done and tested; "oldest chat turns dropped" waits for chat (M3) because there are no turns yet.
 - **The corrections and the repair flag are stored with the document.** They describe the answer rather than the run, so a cache hit reports them exactly as the run that wrote them did (FR-4.1).
 - **The passthrough route was wrong, and is fixed here.** `LLMBackend::OpenAI` speaks the Responses API (`/responses`), which most OpenAI-compatible providers do not implement; the passthrough now builds the crate's generic compatible provider, whose endpoint is `/chat/completions`. Appendix B records it. This was found by the validator, not by review.
-- **The analysis panel does not scroll yet.** It is capped at the terminal height and shows its key hints and its notices first, with `:plan` and `:context` as the escape hatches for what does not fit. Chat (M3) is where the panel gets real scrolling, and the panel was ordered so that the parts with another home come last.
+- **AI ordering remains advice; human progress remains human.** The plan may pair tests with implementation or lead with a contract/migration. Every changed file stays visible, `o` exposes path order, and only `m` changes reviewed/revisit state. A new head carries a marker only when the file-change fingerprint is identical.
 
 **FR coverage:** FR-3.5, 4.1–4.4, 4.6.
 **Crates to approve:** none new.
@@ -273,7 +274,7 @@ names the active model.
 
 **Goal:** finish the job — leave a real, correctly-formed review on GitHub without ever posting something by accident.
 
-**Runnable artifact:** `c` on a diff line opens the composer; two comments land in the draft panel (`<leader>rd`); `<leader>rr` opens the publish modal showing the decision, the body and every comment verbatim; `Enter` twice posts **one** review to GitHub; the draft is cleared and the status line says what was sent. `--dry-run` records the exact `gh` calls in `logs/dry-run.log` instead.
+**Runnable artifact:** `c` on a diff line opens the composer; two comments land in the draft panel (`<leader>rd`); `<leader>rr` opens the publish modal showing the decision, the body and every comment verbatim; one explicitly labelled `Enter` Publish action posts **one** review to GitHub; the draft is cleared and the status line says what was sent. `--dry-run` records the exact `gh` calls in `logs/dry-run.log` instead.
 
 **Work items**
 - [x] Draft model + persistence per PR: decision, body, inline comments with side/line/range (FR-6.1, §7.2). Kept at `<home>/drafts/…`, not under `cache/`.
@@ -292,7 +293,7 @@ names the active model.
 - **A dry run is a property of the runner, not of a feature.** A call says whether it mutates; the runner records mutating calls instead of running them. A forgotten mark fails *visibly* (the call runs during a dry run) rather than invisibly (a real call that silently does not happen). Reads still run: a dry run that could not read would have nothing to describe. `git fetch` is deliberately not marked: it writes only into this application's own ref namespace, and holding it back would mean the app could not show a diff at all.
 - **The draft is the UI's document and the service keeps none of it.** `Drafts` is handed a document to write or send; the reducer owns the draft and sets a `dirty` flag, and the loop writes. This is what makes the key that opens the composer instant whatever the disk is doing, and it is why `:draft export`, `:draft list` and even the `:workspace` listing became effects.
 - **Enter stages a comment where it sends a question in the chat pane.** The two compose boxes look alike; the difference is what the key costs. Staging is local and reversible, sending a question is paid for. A modifier adds a line in both, so the muscle memory transfers.
-- **Publishing takes two Enters.** The first arms, the second sends: a modal that both shows and does it on one keypress makes reading it optional, and this is the only surface that can put words on the internet.
+- **Preview and mutation are separate actions.** `<leader>rr` opens the immutable preview and one clearly labelled `Enter` publishes it; finishing a reply/comment composer likewise opens preview before one `Enter` posts. This keeps confirmation explicit without an unlabeled arming keypress (DEC-23).
 - **A failed publish keeps the draft and says so in the modal**, not only in a notice that expires. That is the moment the draft matters most, and the moment a modal that closed itself would leave the user unsure whether anything had been posted.
 - **A comment whose line is no longer in the diff is not drawn.** Attaching an outdated comment to the nearest line would look like a comment about *that* line — a worse lie than an omission. The tab's count still includes it.
 - **The failure message names the most informative error.** The same rule M3 arrived at for providers applies to the forge: GitHub's own sentence, translated (`"Can not approve your own pull request"` → "this pull request is yours, so GitHub will not let you approve it").

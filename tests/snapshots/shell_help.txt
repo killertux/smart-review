@@ -1,4 +1,4 @@
- smart┌ Help  [27/82] ───────────────────────────────────────────────────────────────────────┐rvice
+ smart┌ Help  [27/84] ───────────────────────────────────────────────────────────────────────┐rvice
 │ filt│ APP                                                                                  │     │
 │ sear│   <C-c>, <Space>q, q  Quit smart-review                                              │     │
 ┌ no r│   <Space>?, ?         Show the help popup                                            │─────┐
@@ -11,6 +11,7 @@
 │     │   ·                   Dismiss the current notification                               │     │
 │     │   <Space>m            Choose the provider, model and thinking settings               │     │
 │     │   <Space>a            Analyse the pull request, or open the analysis                 │     │
+│     │   e                   Expand or collapse current-file guidance (e)                   │     │
 │     │   K                   Move the selected review-plan group up                         │     │
 │     │   J                   Move the selected review-plan group down                       │     │
 │     │   ·                   Fetch the next page of pull requests                           │     │
@@ -24,7 +25,6 @@
 │     │   <C-u>               Move half a screen up                                          │     │
 │     │   <C-f>               Move a screen down                                             │     │
 │     │   <C-b>               Move a screen up                                               │     │
-│     │   <Esc>, h            Close the review, or clear the search and filters              │     │
-└─────│ PANES                                                                                │─────┘
- POPUP│   <Tab>, <Tab> (inser…Focus the next pane                                            │mands
+└─────│   <Esc>, h            Close the review, or clear the search and filters              │─────┘
+ POPUP│ PANES                                                                                │mands
       └──────────────────────────────────────────────────────────────────────────────────────┘

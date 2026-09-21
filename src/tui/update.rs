@@ -113,6 +113,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "app.command",
         "Review order: :plan move <file> <group> | reset | path",
     ),
+    (
+        "evidence",
+        "app.command",
+        "Jump to current-file analysis evidence: :evidence <n>",
+    ),
     ("version", "app.version", "Show the version"),
 ];
 
@@ -173,6 +178,7 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
         "review.conversation" => app.open_conversation(),
         "review.comment_conversation" => app.start_conversation_comment(),
         "review.publish" => app.open_publish(),
+        "review.cycle_progress" => cycle_review_progress(app),
         "review.remove" => app.remove_staged(),
         "review.cycle_discussion_filter" => {
             app.discussion.cycle_filter();
@@ -195,6 +201,10 @@ pub fn dispatch(app: &mut App, id: &str) -> Effect {
             } else {
                 start_analysis(app, "")
             }
+        }
+        "analysis.toggle_guidance" => {
+            app.toggle_file_guidance();
+            Effect::None
         }
         "app.leader_menu" => {
             app.open_overlay(Overlay::Leader);
@@ -296,6 +306,8 @@ fn files_only_action(id: &str) -> bool {
     matches!(
         id,
         "review.comment_line"
+            | "review.cycle_progress"
+            | "analysis.toggle_guidance"
             | "review.range"
             | "review.edit_composer"
             | "diff.next_hunk"
@@ -309,6 +321,35 @@ fn files_only_action(id: &str) -> bool {
             | "diff.toggle_order"
             | "review.copy_path"
     )
+}
+
+/// Cycles an explicit human marker for the current file (IR-16).
+fn cycle_review_progress(app: &mut App) -> Effect {
+    let Some(path) = app
+        .review
+        .as_ref()
+        .and_then(crate::tui::diff_view::DiffView::current_path)
+        .map(ToString::to_string)
+    else {
+        app.notice(NoticeLevel::Warn, "put the cursor in a changed file first");
+        return Effect::None;
+    };
+    let Some(plan) = app.plan_mut() else {
+        app.notice(NoticeLevel::Warn, "the review plan is not ready yet");
+        return Effect::None;
+    };
+    let next = plan.review_status(&path).next();
+    if !plan.set_review_status(&path, next) {
+        app.notice(
+            NoticeLevel::Warn,
+            "this file has no durable review fingerprint; refresh the diff and try again",
+        );
+        return Effect::None;
+    }
+    let saved = plan.clone();
+    app.after_plan_change();
+    app.notice(NoticeLevel::Info, format!("{path}: {}", next.label()));
+    Effect::SavePlan(Box::new(saved))
 }
 
 /// Selects a real pull-request tab without manufacturing a second view state.
@@ -442,6 +483,19 @@ fn dispatch_list(app: &mut App, id: &str) -> Effect {
             Effect::None
         }
         "nav.up" | "nav.down" | "nav.top" | "nav.bottom" => {
+            if app.review.is_some()
+                && app.review_tab() == crate::tui::app::ReviewTab::Files
+                && app.panel.guidance_expanded
+            {
+                match id {
+                    "nav.up" => app.scroll_file_guidance(-1),
+                    "nav.down" => app.scroll_file_guidance(1),
+                    "nav.top" => app.panel.guidance_scroll = 0,
+                    "nav.bottom" => app.panel.guidance_scroll = usize::MAX,
+                    _ => {}
+                }
+                return Effect::None;
+            }
             if app.review.is_some() && app.review_tab() == crate::tui::app::ReviewTab::Checks {
                 move_check_selection(app, id);
                 return Effect::None;
@@ -1116,6 +1170,11 @@ pub fn command(app: &mut App, input: &str) -> Effect {
         "chat" => chat_command(app, argument),
         "analyze" => start_analysis(app, argument),
         "plan" => plan_command(app, argument),
+        "evidence" => {
+            let number = argument.parse::<usize>().unwrap_or(1).max(1);
+            app.jump_to_current_evidence(number);
+            Effect::None
+        }
         "theme" => match argument {
             "" => dispatch(app, "app.theme_picker"),
             "reload" => app.reload_theme(),
@@ -1539,9 +1598,28 @@ fn chat_command(app: &mut App, argument: &str) -> Effect {
             app.select_review_tab(crate::tui::app::ReviewTab::Ask);
             Effect::RetryChat
         }
+        "suggested" => {
+            let number = rest.parse::<usize>().unwrap_or(1);
+            let Some(question) = app
+                .analysis_panel()
+                .and_then(|panel| panel.questions.get(number.saturating_sub(1)).cloned())
+            else {
+                app.command_error(format!(
+                    "there is no suggested question {number}; open Overview to see the available questions"
+                ));
+                return Effect::None;
+            };
+            app.select_review_tab(crate::tui::app::ReviewTab::Ask);
+            app.chat.input.set_text(question);
+            app.notice(
+                NoticeLevel::Info,
+                "suggested question copied into Ask; edit it, then Enter sends it",
+            );
+            Effect::None
+        }
         other => {
             app.command_error(format!(
-                "{other} is not a chat command; use new, list, open <id>, export [md|json] or retry"
+                "{other} is not a chat command; use new, list, open <id>, export [md|json], retry or suggested <n>"
             ));
             Effect::None
         }
@@ -2303,6 +2381,47 @@ mod tests {
         assert_eq!(panel.risks.len(), 1);
         assert_eq!(app.analysis_warnings(), ["one file was unclassified"]);
         assert_eq!(app.analysis_state(), &crate::tui::app::AnalysisState::Ready);
+    }
+
+    #[test]
+    fn ir_16_a_suggested_question_populates_ask_without_sending() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        app.panel.analysis = Some(Box::new(crate::test_support::stored_analysis("abc123")));
+
+        let effect = command(&mut app, "chat suggested 1");
+
+        assert_eq!(
+            effect,
+            Effect::None,
+            "populating input cannot start a paid job"
+        );
+        assert_eq!(app.review_tab(), crate::tui::app::ReviewTab::Ask);
+        assert_eq!(app.chat.input.text(), "Documented?");
+    }
+
+    #[test]
+    fn ir_16_marking_a_file_is_explicit_and_returns_a_durable_plan_write() {
+        let (_dir, mut app) = app_ready_to_analyse();
+        assert_eq!(
+            app.plan()
+                .expect("heuristic plan")
+                .review_status("src/domain/money.rs"),
+            crate::domain::plan::ReviewStatus::NotReviewed
+        );
+
+        let Effect::SavePlan(plan) = dispatch(&mut app, "review.cycle_progress") else {
+            panic!("the marker must be persisted")
+        };
+        assert_eq!(
+            plan.review_status("src/domain/money.rs"),
+            crate::domain::plan::ReviewStatus::Reviewed
+        );
+        assert_eq!(
+            app.plan()
+                .expect("plan remains active")
+                .review_status("src/domain/money.rs"),
+            crate::domain::plan::ReviewStatus::Reviewed
+        );
     }
 
     #[test]

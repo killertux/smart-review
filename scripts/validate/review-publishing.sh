@@ -282,7 +282,7 @@ draft_file() {
 #            written: `jj` alone landed on a header and the composer refused.
 #   COMMENT  `c`, type, Enter — staged, which is local and reversible
 #   PANEL    ` rd`, the staged comments
-#   MODAL    ` rr`, then `a` to choose approve, then Enter twice
+#   MODAL    ` rr`, then `a` to choose approve, then one explicit Enter to publish
 OPEN=':pr 141\r'
 # Opening waits for the stable local-diff notice. Waiting for the earlier GitHub frame
 # was both racy (it can be replaced between PTY reads) and wrong for navigation: the
@@ -377,8 +377,8 @@ home_for "$HOME_TWO"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/publish.log"
 SCREEN="$(run_tui "$HOME_TWO" \
-  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r~\r" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~Enter again~review posted" \
+  "$OPEN~$LINES~c~the rounding is hidden behind a magic ten\r~j~c~and this file has no callers\r~ rr~a~\r" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~~comment on~2 comments staged~publish review~approve —~review posted" \
   "$FRAMES")"
 if shown "$FRAMES" "approve — this unblocks the pull request"; then
   ok "the modal names the verdict it is about to give"
@@ -432,8 +432,8 @@ printf '1' >"$FAKE/fail_review"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/refused.log"
 SCREEN="$(run_tui "$HOME_THREE" \
-  "$OPEN~$LINES~c~please take another look\r~ rr~a~\r~\r" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~is yours" \
+  "$OPEN~$LINES~c~please take another look\r~ rr~a~\r" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~is yours" \
   "$FRAMES")"
 if shown "$FRAMES" "is yours"; then
   ok "your own pull request is explained rather than quoted"
@@ -480,7 +480,7 @@ EOF
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/dry.log"
 SCREEN="$(run_tui "$HOME_DRY" \
-  "$OPEN~$LINES~c~a dry run must not post this\r~ rr~\r\r~\e" \
+  "$OPEN~$LINES~c~a dry run must not post this\r~ rr~\r~\e" \
   "from the worktree~M src/domain/money~comment on~1 comment staged~Enter records~dry run: nothing was sent~" \
   "$FRAMES")"
 if [ "$(count_calls 'pulls/141/reviews')" != "0" ]; then
@@ -505,7 +505,7 @@ else
   bad "a dry run cleared the draft"
 fi
 
-step "8/8 the second Enter sends once"
+step "8/8 the explicit Publish action sends once"
 if records_duplicate_review_dispatch; then
   ok "the call ledger detects a deliberately duplicated review dispatch"
 else
@@ -520,8 +520,8 @@ rm -f "$FAKE/review-held" "$REVIEW_STEPS/step-9.sent"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/slow.log"
 SCREEN="$(DRIVE_STEP_NOTIFY="$REVIEW_STEPS" run_tui "$HOME_SLOW" \
-  "$OPEN~$LINES~c~one review only please\r~ rr~a~\r~\r~\r~q" \
-  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~Enter again~sending~review posted~" \
+  "$OPEN~$LINES~c~one review only please\r~ rr~a~\r~\r~q" \
+  "from the worktree~M src/domain/money~comment on~1 comment staged~publish review~approve —~sending~~review posted" \
   "$FRAMES")"
 if [ -f "$FAKE/review-held" ]; then
   ok "the fake held the accepted review while the extra Enter was sent"
@@ -530,7 +530,7 @@ else
 fi
 POSTS="$(count_calls 'pulls/141/reviews')"
 if [ "$POSTS" = "1" ]; then
-  ok "pressing Enter again while it was in flight posted nothing more"
+  ok "pressing Enter while Publish was in flight posted nothing more"
 else
   bad "in-flight Enter posted the review $POSTS times"
 fi

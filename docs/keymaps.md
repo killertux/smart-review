@@ -19,6 +19,7 @@ These are the compiled-in defaults. Add overrides to `${SMART_REVIEW_HOME:-~/.sm
 | `notice.clear` | — | — | Dismiss the current notification |
 | `app.model_picker` | `<leader>m` | `normal` | Choose the provider, model and thinking settings |
 | `app.analyze_panel` | `<leader>a` | `normal` | Analyse the pull request, or open the analysis |
+| `analysis.toggle_guidance` | `e` | `normal` | Expand or collapse current-file guidance (e) |
 | `plan.move_up` | `K` | `normal` | Move the selected review-plan group up |
 | `plan.move_down` | `J` | `normal` | Move the selected review-plan group down |
 | `app.load_more` | — | — | Fetch the next page of pull requests |
@@ -113,6 +114,7 @@ These are the compiled-in defaults. Add overrides to `${SMART_REVIEW_HOME:-~/.sm
 | `review.comment_conversation` | `<leader>pw` | `normal` | Write a comment on the conversation |
 | `review.drafts` | `<leader>rd` | `normal` | Show the staged comments (<leader>rd) |
 | `review.publish` | `<leader>rr` | `normal` | Publish the staged review (<leader>rr) |
+| `review.cycle_progress` | `m` | `normal` | Mark this file reviewed / needs revisit (m) |
 | `review.remove` | `x` | `popup` | Remove the selected staged comment (x) |
 | `review.cycle_discussion_filter` | `f` | `normal` | Cycle Discussion: all, open, resolved, outdated (f) |
 

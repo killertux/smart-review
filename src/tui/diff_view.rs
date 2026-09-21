@@ -678,6 +678,24 @@ impl DiffView {
         })
     }
 
+    /// Explicit human review state for a canonical path (IR-16).
+    #[must_use]
+    pub fn review_status(&self, path: &str) -> crate::domain::plan::ReviewStatus {
+        self.plan
+            .as_ref()
+            .map_or(crate::domain::plan::ReviewStatus::NotReviewed, |plan| {
+                plan.review_status(path)
+            })
+    }
+
+    /// Human progress shown in the file-tree title.
+    #[must_use]
+    pub fn review_progress(&self) -> Option<(usize, usize, usize)> {
+        self.plan
+            .as_ref()
+            .map(crate::domain::plan::Plan::review_progress)
+    }
+
     /// The split row that shows the cursor, and the rows after it.
     ///
     /// The renderer walks this instead of the unified rows when the side-by-side
@@ -886,6 +904,37 @@ impl DiffView {
                 .position(|row| matches!(row.kind, TreeKind::File { index: i } if i == index))
                 .unwrap_or(self.tree_cursor);
         }
+    }
+
+    /// Jumps to validated analysis evidence, falling back to the file banner.
+    pub fn goto_evidence(
+        &mut self,
+        path: &str,
+        side: Option<crate::domain::draft::Side>,
+        line: Option<u32>,
+    ) -> bool {
+        let Some(file) = self.patch.files.iter().position(|file| {
+            file.path()
+                .is_some_and(|candidate| candidate.as_str() == path)
+        }) else {
+            return false;
+        };
+        let target = match (side, line) {
+            (Some(crate::domain::draft::Side::Old), Some(line)) => self
+                .rows
+                .iter()
+                .position(|row| row.file == file && row.old_line == Some(line)),
+            (Some(crate::domain::draft::Side::New), Some(line)) => self
+                .rows
+                .iter()
+                .position(|row| row.file == file && row.new_line == Some(line)),
+            _ => None,
+        };
+        self.goto_file(file);
+        if let Some(target) = target {
+            self.cursor = target;
+        }
+        true
     }
 
     /// Fold or unfold the hunk under the cursor (FR-3.3).
@@ -1903,6 +1952,8 @@ Binary files /dev/null and b/docs/logo.png differ
                 },
             ],
             overridden: false,
+            file_reviews: Vec::new(),
+            override_invalidated: false,
         }
     }
 

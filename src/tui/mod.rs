@@ -582,6 +582,7 @@ fn apply_analysis_effect(
                 return true;
             };
             app.panel.state = app::AnalysisState::Gathering;
+            app.panel.started_at = app.now_unix_secs();
             let id = runner.submit_owned(
                 review_job_owner(app),
                 jobs::Job::GatherContext {
@@ -1092,7 +1093,6 @@ fn apply_draft_effect(effect: &Effect, app: &mut App, runner: &mut JobRunner) ->
             } else if app.drafts.job != 0 {
                 runner.cancel(jobs::Slot::Review);
             }
-            app.drafts.armed = false;
             app.notice(
                 app::NoticeLevel::Warn,
                 "cancelling the request; its result will determine whether it can be retried",

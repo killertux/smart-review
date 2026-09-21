@@ -25,16 +25,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::diff::Patch;
+use crate::domain::draft::Side;
 
 /// The prompt version. Bumping it invalidates every cached analysis (FR-4.3).
 ///
 /// Change this when the *meaning* of the request changes: the schema, the grounding
 /// rules, or the ordering the plan is asked for. Reworded instructions that ask for the
 /// same thing do not need it.
-pub const PROMPT_VERSION: u32 = 1;
+pub const PROMPT_VERSION: u32 = 2;
 
 /// The document version, for migrations (§7.1).
-pub const ANALYSIS_VERSION: u32 = 1;
+pub const ANALYSIS_VERSION: u32 = 2;
 
 /// The group that catches files the plan did not mention (FR-4.1).
 pub const UNCLASSIFIED: &str = "unclassified";
@@ -109,14 +110,48 @@ pub struct FileNote {
     /// Which file.
     pub path: String,
     /// What changed in it.
+    #[serde(default, alias = "change")]
+    pub what_changed: String,
+    /// Why this file changed, explicitly an inference rather than author-provided fact.
+    #[serde(default, alias = "notes")]
+    pub why: String,
+    /// Concrete things to verify. The prompt asks for at most two; excess model output
+    /// is retained for the expanded view rather than silently discarded.
+    #[serde(default, alias = "review_focus")]
+    pub verify: Vec<String>,
+    /// Validated source references supporting this guidance.
     #[serde(default)]
-    pub change: String,
-    /// What to look at.
+    pub evidence: Vec<Evidence>,
+}
+
+/// A validated source location supporting an analysis claim (IR-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    /// Canonical changed-file path.
+    pub path: String,
+    /// Side of the patch, when the model supplied a coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<Side>,
+    /// Validated line number, when the referenced line exists in the patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Short explanation of what the reference supports.
     #[serde(default)]
-    pub notes: String,
-    /// The specific things to check.
+    pub label: String,
+}
+
+/// What the model could and could not cover (IR-16).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Changed files the model says it analyzed, normalized to canonical paths.
     #[serde(default)]
-    pub review_focus: Vec<String>,
+    pub analyzed_files: Vec<String>,
+    /// Changed files whose source was truncated or unavailable.
+    #[serde(default)]
+    pub truncated_files: Vec<String>,
+    /// Other explicit limits on the answer.
+    #[serde(default)]
+    pub limitations: Vec<String>,
 }
 
 /// Token accounting for one analysis (§7.1).
@@ -156,10 +191,12 @@ pub struct Analysis {
     /// What the request cost, when the provider said.
     #[serde(default)]
     pub token_usage: AnalysisUsage,
-    /// What changed, in a few sentences.
-    pub summary: String,
-    /// Why, inferred from the diff, the commits and the conventions.
-    pub intent: String,
+    /// What changed, in approximately two concise sentences.
+    #[serde(alias = "summary")]
+    pub brief: String,
+    /// Why, inferred from the diff, commits and conventions rather than copied from the author.
+    #[serde(alias = "intent")]
+    pub inferred_purpose: String,
     /// What deserves attention.
     #[serde(default)]
     pub risk_areas: Vec<RiskArea>,
@@ -172,6 +209,9 @@ pub struct Analysis {
     /// Questions worth asking the author.
     #[serde(default)]
     pub suggested_questions: Vec<String>,
+    /// Explicit coverage and limitations for this answer.
+    #[serde(default)]
+    pub coverage: Coverage,
 }
 
 impl Analysis {
@@ -245,12 +285,15 @@ impl std::fmt::Display for ParseFailure {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct RawAnalysis {
-    summary: Option<String>,
-    intent: Option<String>,
+    #[serde(alias = "summary")]
+    brief: Option<String>,
+    #[serde(alias = "intent")]
+    inferred_purpose: Option<String>,
     risk_areas: Vec<serde_json::Value>,
     review_plan: Vec<serde_json::Value>,
     per_file_notes: Vec<serde_json::Value>,
     suggested_questions: Vec<serde_json::Value>,
+    coverage: Option<RawCoverage>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -275,9 +318,30 @@ struct RawGroup {
 #[serde(default)]
 struct RawNote {
     path: Option<String>,
-    change: Option<String>,
-    notes: Option<String>,
-    review_focus: Vec<serde_json::Value>,
+    #[serde(alias = "change")]
+    what_changed: Option<String>,
+    #[serde(alias = "notes")]
+    why: Option<String>,
+    #[serde(alias = "review_focus")]
+    verify: Vec<serde_json::Value>,
+    evidence: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawEvidence {
+    path: Option<String>,
+    side: Option<String>,
+    line: Option<serde_json::Value>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RawCoverage {
+    analyzed_files: Vec<serde_json::Value>,
+    truncated_files: Vec<serde_json::Value>,
+    limitations: Vec<serde_json::Value>,
 }
 
 /// Which paths the diff actually contains, and where each one leads.
@@ -288,6 +352,7 @@ struct RawNote {
 pub struct PathIndex {
     paths: BTreeSet<String>,
     aliases: BTreeMap<String, BTreeSet<String>>,
+    lines: BTreeMap<String, (BTreeSet<u32>, BTreeSet<u32>)>,
 }
 
 impl PathIndex {
@@ -325,6 +390,15 @@ impl PathIndex {
             let Some(canonical) = file.path().map(ToString::to_string) else {
                 continue;
             };
+            let entry = index.lines.entry(canonical.clone()).or_default();
+            for line in file.hunks.iter().flat_map(|hunk| &hunk.lines) {
+                if let Some(number) = line.old_line {
+                    entry.0.insert(number);
+                }
+                if let Some(number) = line.new_line {
+                    entry.1.insert(number);
+                }
+            }
             if let Some(old) = &file.old_path {
                 let old = old.as_str().to_owned();
                 if old != canonical {
@@ -386,6 +460,15 @@ impl PathIndex {
             return unique_alias(&self.aliases, without_patch_prefix);
         }
         None
+    }
+
+    /// Whether a coordinate exists on a changed line or its visible context.
+    #[must_use]
+    pub fn contains_line(&self, path: &str, side: Side, line: u32) -> bool {
+        self.lines.get(path).is_some_and(|(old, new)| match side {
+            Side::Old => old.contains(&line),
+            Side::New => new.contains(&line),
+        })
     }
 }
 
@@ -494,8 +577,8 @@ pub fn preview(text: &str) -> Preview {
         })
         .unwrap_or_default();
     Preview {
-        summary: string_field(&object, "summary"),
-        intent: string_field(&object, "intent"),
+        summary: first_string_field(&object, &["brief", "summary"]),
+        intent: first_string_field(&object, &["inferred_purpose", "intent"]),
         risks,
         plan,
         questions,
@@ -510,6 +593,13 @@ fn string_field(object: &serde_json::Value, key: &str) -> String {
         .map(str::trim)
         .unwrap_or_default()
         .to_owned()
+}
+
+fn first_string_field(object: &serde_json::Value, keys: &[&str]) -> String {
+    keys.iter()
+        .map(|key| string_field(object, key))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default()
 }
 
 /// Rebuilds a balanced JSON object from a possibly-truncated answer.
@@ -679,18 +769,19 @@ pub fn normalize(
             reason: format!("the JSON object did not match the analysis shape: {error}"),
         })?;
 
-    let summary = raw.summary.unwrap_or_default().trim().to_owned();
-    let intent = raw.intent.unwrap_or_default().trim().to_owned();
-    if summary.is_empty() {
-        warnings.push("the analysis stated no summary".to_owned());
+    let brief = raw.brief.unwrap_or_default().trim().to_owned();
+    let inferred_purpose = raw.inferred_purpose.unwrap_or_default().trim().to_owned();
+    if brief.is_empty() {
+        warnings.push("the analysis stated no brief".to_owned());
     }
-    if intent.is_empty() {
-        warnings.push("the analysis inferred no intent".to_owned());
+    if inferred_purpose.is_empty() {
+        warnings.push("the analysis inferred no purpose".to_owned());
     }
 
     let risk_areas = normalize_risks(&raw.risk_areas, index, &mut warnings);
     let mut review_plan = normalize_plan(&raw.review_plan, index, &mut warnings);
     let per_file_notes = normalize_notes(&raw.per_file_notes, index, &mut warnings);
+    let coverage = normalize_coverage(raw.coverage.as_ref(), index, &mut warnings);
     let suggested_questions = raw
         .suggested_questions
         .iter()
@@ -702,15 +793,15 @@ pub fn normalize(
     // The safety net below adds every unplaced file, so an object the model left
     // empty would otherwise be dressed up as a complete analysis of all of them. It
     // is checked before the net is cast, against what the model actually said.
-    if summary.is_empty()
-        && intent.is_empty()
+    if brief.is_empty()
+        && inferred_purpose.is_empty()
         && risk_areas.is_empty()
         && per_file_notes.is_empty()
         && review_plan.is_empty()
     {
         return Err(ParseFailure {
-            reason: "the answer's JSON object said nothing: no summary, no intent, no risks, \
-                     no notes and no review plan"
+            reason: "the answer's JSON object said nothing: no brief, no inferred purpose, no \
+                     risks, no file guidance and no review plan"
                 .to_owned(),
         });
     }
@@ -727,12 +818,13 @@ pub fn normalize(
         head_sha: head_sha.to_owned(),
         created_at: created_at.to_owned(),
         token_usage: usage,
-        summary,
-        intent,
+        brief,
+        inferred_purpose,
         risk_areas,
         review_plan,
         per_file_notes,
         suggested_questions,
+        coverage,
     };
     Ok(Normalized { analysis, warnings })
 }
@@ -859,12 +951,7 @@ fn normalize_plan(
             ));
             continue;
         };
-        let name = group
-            .group
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase()
-            .replace(' ', "-");
+        let name = group.group.unwrap_or_default().trim().to_owned();
         if name.is_empty() {
             warnings.push(format!(
                 "review plan step {} had no group name",
@@ -897,7 +984,8 @@ fn normalize_plan(
             continue;
         }
 
-        if let Some(existing) = positions.get(&name).copied() {
+        let identity = name.to_lowercase();
+        if let Some(existing) = positions.get(&identity).copied() {
             let group = &mut groups[existing];
             for file in files {
                 if !group.files.contains(&file) {
@@ -906,7 +994,7 @@ fn normalize_plan(
             }
             continue;
         }
-        positions.insert(name.clone(), groups.len());
+        positions.insert(identity, groups.len());
         groups.push(PlanGroup {
             order,
             group: name,
@@ -956,27 +1044,34 @@ fn normalize_notes(
             ));
             continue;
         };
-        let focus = note
-            .review_focus
+        let verify = note
+            .verify
             .iter()
             .filter_map(|value| value.as_str())
             .map(|text| text.trim().to_owned())
             .filter(|text| !text.is_empty())
             .collect();
+        let evidence = normalize_evidence(&note.evidence, index, &path, warnings);
         let entry = FileNote {
             path: path.clone(),
-            change: note.change.unwrap_or_default().trim().to_owned(),
-            notes: note.notes.unwrap_or_default().trim().to_owned(),
-            review_focus: focus,
+            what_changed: note.what_changed.unwrap_or_default().trim().to_owned(),
+            why: note.why.unwrap_or_default().trim().to_owned(),
+            verify,
+            evidence,
         };
         // A second note for the same file (the model sometimes repeats itself) is
         // merged rather than dropped, because both halves usually say something.
         if let Some(existing) = out.iter_mut().find(|entry| entry.path == path) {
-            existing.change = join_sentences(&existing.change, &entry.change);
-            existing.notes = join_sentences(&existing.notes, &entry.notes);
-            for item in entry.review_focus {
-                if !existing.review_focus.contains(&item) {
-                    existing.review_focus.push(item);
+            existing.what_changed = join_sentences(&existing.what_changed, &entry.what_changed);
+            existing.why = join_sentences(&existing.why, &entry.why);
+            for item in entry.verify {
+                if !existing.verify.contains(&item) {
+                    existing.verify.push(item);
+                }
+            }
+            for evidence in entry.evidence {
+                if !existing.evidence.contains(&evidence) {
+                    existing.evidence.push(evidence);
                 }
             }
             continue;
@@ -985,6 +1080,120 @@ fn normalize_notes(
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+}
+
+fn normalize_evidence(
+    raw: &[serde_json::Value],
+    index: &PathIndex,
+    note_path: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<Evidence> {
+    let mut out = Vec::new();
+    for (position, value) in raw.iter().enumerate() {
+        let Ok(reference) = serde_json::from_value::<RawEvidence>(value.clone()) else {
+            warnings.push(format!(
+                "evidence {} for {note_path} was not in the expected shape and was dropped",
+                position + 1
+            ));
+            continue;
+        };
+        let Some(path) = reference
+            .path
+            .as_deref()
+            .and_then(|path| index.resolve(path))
+        else {
+            warnings.push(format!(
+                "evidence {} for {note_path} named {}, which is not in this change",
+                position + 1,
+                reference.path.as_deref().unwrap_or("<no path>")
+            ));
+            continue;
+        };
+        let side = reference.side.as_deref().and_then(Side::parse);
+        let line = reference
+            .line
+            .as_ref()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| u32::try_from(line).ok());
+        let coordinate = match (side, line) {
+            (Some(side), Some(line)) if index.contains_line(&path, side, line) => {
+                (Some(side), Some(line))
+            }
+            (None, None) => (None, None),
+            _ => {
+                warnings.push(format!(
+                    "evidence {} for {note_path} named an unavailable coordinate in {path}; the file link remains available",
+                    position + 1
+                ));
+                (None, None)
+            }
+        };
+        let evidence = Evidence {
+            path,
+            side: coordinate.0,
+            line: coordinate.1,
+            label: reference.label.unwrap_or_default().trim().to_owned(),
+        };
+        if !out.contains(&evidence) {
+            out.push(evidence);
+        }
+    }
+    out
+}
+
+fn normalize_coverage(
+    raw: Option<&RawCoverage>,
+    index: &PathIndex,
+    warnings: &mut Vec<String>,
+) -> Coverage {
+    let Some(raw) = raw else {
+        warnings.push("the analysis stated no coverage or limitations".to_owned());
+        return Coverage::default();
+    };
+    let analyzed_files = normalize_path_list(
+        &raw.analyzed_files,
+        index,
+        "coverage analyzed_files",
+        warnings,
+    );
+    let truncated_files = normalize_path_list(
+        &raw.truncated_files,
+        index,
+        "coverage truncated_files",
+        warnings,
+    );
+    let limitations = raw
+        .limitations
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Coverage {
+        analyzed_files,
+        truncated_files,
+        limitations,
+    }
+}
+
+fn normalize_path_list(
+    raw: &[serde_json::Value],
+    index: &PathIndex,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    for value in raw {
+        match value.as_str().and_then(|path| index.resolve(path)) {
+            Some(path) if !paths.contains(&path) => paths.push(path),
+            Some(_) => {}
+            None => warnings.push(format!(
+                "{label} named {value}, which is not in this change"
+            )),
+        }
+    }
+    paths
 }
 
 /// Joins two sentences with a space, keeping the first when the second is empty.
@@ -1053,22 +1262,33 @@ pub fn system_prompt(conventions: Option<&str>) -> String {
          Answer with one JSON object and nothing else: no prose before it, no markdown \
          fence, no commentary after it. Its shape is:\n\
          {\n  \
-         \"summary\": \"what changed, at most 6 sentences\",\n  \
-         \"intent\": \"the goal and motivation you infer\",\n  \
+         \"brief\": \"what changed, approximately two concise sentences\",\n  \
+         \"inferred_purpose\": \"the goal and motivation you infer; do not copy the author's description\",\n  \
          \"risk_areas\": [{\"title\": \"...\", \"severity\": \"high|medium|low\", \
          \"files\": [\"path\"], \"why\": \"...\"}],\n  \
-         \"review_plan\": [{\"order\": 1, \"group\": \"domain\", \"rationale\": \"why this \
-         group is read at this point\", \"files\": [\"path\"]}],\n  \
-         \"per_file_notes\": [{\"path\": \"...\", \"change\": \"...\", \"notes\": \"...\", \
-         \"review_focus\": [\"...\"]}],\n  \
-         \"suggested_questions\": [\"...\"]\n}\n\
+         \"review_plan\": [{\"order\": 1, \"group\": \"short human action-oriented step name\", \
+         \"rationale\": \"one sentence explaining why this step comes now\", \"files\": [\"path\"]}],\n  \
+         \"per_file_notes\": [{\"path\": \"...\", \"what_changed\": \"one short sentence\", \
+         \"why\": \"one short inferred reason\", \"verify\": [\"up to two concrete checks\"], \
+         \"evidence\": [{\"path\": \"...\", \"side\": \"old|new\", \"line\": 1, \
+         \"label\": \"what this supports\"}]}],\n  \
+         \"suggested_questions\": [\"...\"],\n  \
+         \"coverage\": {\"analyzed_files\": [\"path\"], \"truncated_files\": [\"path\"], \
+         \"limitations\": [\"...\"]}\n}\n\
          \n\
          Rules:\n\
          - Use only the file paths given to you, spelled exactly as they appear. A path \
          you were not given does not exist for you.\n\
-         - Every file in the change must appear in exactly one review_plan group. Order \
-         the groups so that the reader understands the change before judging it: the \
-         parts the rest depends on come first, and tests and documentation come last.\n\
+         - Every file in the change must appear in exactly one review_plan step. Choose \
+         a dependency and understanding sequence that fits this pull request. Contracts, \
+         examples, design notes or migrations may lead when they establish intent; tests \
+         may accompany the behavior they explain. Put generated or purely mechanical \
+         changes later, but keep them visibly included.\n\
+         - Keep the brief, inferred purpose, step rationale, what_changed and why fields \
+         concise. Preserve useful detail in checks, evidence, risks and limitations.\n\
+         - Give every per-file note up to two concrete verify items and cite only evidence \
+         coordinates that appear in the supplied diff. Omit a coordinate when only the \
+         file, not a specific line, supports the claim.\n\
          - Name a file whenever you assert something about code.\n\
          - Ground every claim in the provided context. If the context does not answer \
          something, say so in `suggested_questions` instead of guessing.\n\
@@ -1139,8 +1359,8 @@ mod tests {
     }
 
     const GOOD: &str = r#"{
-        "summary": "Billing now rounds half-up.",
-        "intent": "Fix a rounding bug reported by finance.",
+        "brief": "Billing now rounds half-up.",
+        "inferred_purpose": "Fix a rounding bug reported by finance.",
         "risk_areas": [{"title": "Rounding", "severity": "high",
                         "files": ["src/domain/money.rs"], "why": "money arithmetic"}],
         "review_plan": [
@@ -1149,23 +1369,30 @@ mod tests {
             {"order": 1, "group": "domain", "rationale": "rules first",
              "files": ["src/domain/money.rs", "src/domain/invoice.rs"]}
         ],
-        "per_file_notes": [{"path": "src/domain/money.rs", "change": "rounding",
-                            "notes": "check the sign", "review_focus": ["negative totals"]}],
-        "suggested_questions": ["Is the rounding rule documented?"]
+        "per_file_notes": [{"path": "src/domain/money.rs", "what_changed": "rounding",
+                            "why": "check the sign", "verify": ["negative totals"],
+                            "evidence": [{"path": "src/domain/money.rs",
+                                          "label": "rounding implementation"}]}],
+        "suggested_questions": ["Is the rounding rule documented?"],
+        "coverage": {"analyzed_files": ["src/domain/money.rs", "src/domain/invoice.rs",
+                                          "src/application/billing.rs"],
+                     "truncated_files": [], "limitations": ["tests were not analyzed"]}
     }"#;
 
     #[test]
     fn a_good_answer_normalizes_into_the_document() {
         let normalized = normalize_text(GOOD).expect("parses");
         let analysis = normalized.analysis;
-        assert_eq!(analysis.summary, "Billing now rounds half-up.");
+        assert_eq!(analysis.brief, "Billing now rounds half-up.");
         assert_eq!(analysis.model, "deepseek/deepseek-chat");
         assert_eq!(analysis.head_sha, "abc123");
         assert_eq!(analysis.prompt_version, PROMPT_VERSION);
         assert_eq!(analysis.version, ANALYSIS_VERSION);
         assert_eq!(analysis.risk_areas.len(), 1);
         assert_eq!(analysis.risk_areas[0].severity, Severity::High);
-        assert_eq!(analysis.per_file_notes[0].review_focus, ["negative totals"]);
+        assert_eq!(analysis.per_file_notes[0].verify, ["negative totals"]);
+        assert_eq!(analysis.per_file_notes[0].evidence.len(), 1);
+        assert_eq!(analysis.coverage.analyzed_files.len(), 3);
         // The only warning is the honest one: the fixture's plan never mentions the
         // test file, and saying so is the point of the safety net.
         assert_eq!(normalized.warnings.len(), 1, "{:?}", normalized.warnings);
@@ -1195,7 +1422,7 @@ mod tests {
              more detail."
         );
         let analysis = normalize_text(&text).expect("parses").analysis;
-        assert_eq!(analysis.summary, "Billing now rounds half-up.");
+        assert_eq!(analysis.brief, "Billing now rounds half-up.");
     }
 
     #[test]
@@ -1203,8 +1430,8 @@ mod tests {
         let text = r#"{"summary": "added a function that returns {}", "intent": "x",
                        "per_file_notes": [{"path": "src/domain/money.rs", "notes": "a { b"}]}"#;
         let analysis = normalize_text(text).expect("parses").analysis;
-        assert_eq!(analysis.summary, "added a function that returns {}");
-        assert_eq!(analysis.per_file_notes[0].notes, "a { b");
+        assert_eq!(analysis.brief, "added a function that returns {}");
+        assert_eq!(analysis.per_file_notes[0].why, "a { b");
     }
 
     #[test]
@@ -1306,10 +1533,50 @@ mod tests {
         let domains: Vec<&PlanGroup> = analysis
             .review_plan
             .iter()
-            .filter(|group| group.group == "domain")
+            .filter(|group| group.group.eq_ignore_ascii_case("domain"))
             .collect();
         assert_eq!(domains.len(), 1, "{:?}", analysis.review_plan);
         assert_eq!(domains[0].files.len(), 2);
+    }
+
+    #[test]
+    fn ir_16_contextual_steps_preserve_contract_first_and_paired_test_plans() {
+        let text = r#"{"brief":"b","inferred_purpose":"p",
+            "review_plan":[
+              {"order":1,"group":"Understand the contract","rationale":"intent first",
+               "files":["docs/contract.md"]},
+              {"order":2,"group":"Change and verify billing","rationale":"behavior with proof",
+               "files":["src/domain/money.rs","tests/billing.rs"]},
+              {"order":3,"group":"Apply the migration","rationale":"data follows contract",
+               "files":["src/application/billing.rs"]}],
+            "coverage":{"analyzed_files":["docs/contract.md","src/domain/money.rs",
+                                             "tests/billing.rs","src/application/billing.rs"],
+                        "truncated_files":[],"limitations":[]}}"#;
+        let index = PathIndex::from_paths(
+            [
+                "docs/contract.md",
+                "src/domain/money.rs",
+                "tests/billing.rs",
+                "src/application/billing.rs",
+            ]
+            .map(str::to_owned),
+        );
+        let analysis = normalize(
+            text,
+            &index,
+            "provider/model",
+            "head",
+            "2026-01-01T00:00:00Z",
+            AnalysisUsage::default(),
+        )
+        .expect("normalizes")
+        .analysis;
+        assert_eq!(analysis.review_plan[0].group, "Understand the contract");
+        assert_eq!(
+            analysis.review_plan[1].files,
+            ["src/domain/money.rs", "tests/billing.rs"]
+        );
+        assert_eq!(analysis.review_plan[2].group, "Apply the migration");
     }
 
     #[test]
@@ -1370,12 +1637,12 @@ mod tests {
         let text = r#"{"intent": "i", "per_file_notes": [{"path": "src/domain/money.rs",
             "notes": "n"}]}"#;
         let normalized = normalize_text(text).expect("parses");
-        assert!(normalized.analysis.summary.is_empty());
+        assert!(normalized.analysis.brief.is_empty());
         assert!(
             normalized
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("no summary"))
+                .any(|warning| warning.contains("no brief"))
         );
     }
 
@@ -1471,8 +1738,12 @@ mod tests {
         let prompt = system_prompt(Some("Always use thiserror for errors."));
         for required in [
             "one JSON object",
+            "brief",
+            "inferred_purpose",
             "review_plan",
             "per_file_notes",
+            "evidence",
+            "coverage",
             "suggested_questions",
             "spelled exactly as they appear",
             "Graund every claim",
@@ -1481,8 +1752,70 @@ mod tests {
             assert!(prompt.contains(&needle), "missing {needle:?} in {prompt}");
         }
         assert!(prompt.contains("Always use thiserror"), "{prompt}");
+        assert!(prompt.contains("tests may accompany"), "{prompt}");
+        assert!(
+            !prompt.contains("tests and documentation come last"),
+            "{prompt}"
+        );
         // Without conventions there is no dangling heading.
         assert!(!system_prompt(None).contains("repository's own conventions"));
+    }
+
+    #[test]
+    fn ir_16_evidence_coordinates_are_validated_without_losing_the_file_link() {
+        let patch = crate::domain::diff::parse_patch(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let index = PathIndex::from_patch(&patch);
+        let normalized = normalize(
+            r#"{"brief":"b","inferred_purpose":"p",
+                "per_file_notes":[{"path":"src/a.rs","what_changed":"w","why":"y",
+                  "verify":["one","two","retained detail"],
+                  "evidence":[{"path":"src/a.rs","side":"new","line":1,"label":"valid"},
+                              {"path":"src/a.rs","side":"new","line":99,"label":"bad line"},
+                              {"path":"src/missing.rs","label":"bad path"}]}],
+                "coverage":{"analyzed_files":["src/a.rs"],"truncated_files":[],"limitations":[]}}"#,
+            &index,
+            "provider/model",
+            "head",
+            "2026-01-01T00:00:00Z",
+            AnalysisUsage::default(),
+        )
+        .expect("normalizes");
+        let note = &normalized.analysis.per_file_notes[0];
+        assert_eq!(note.verify.len(), 3, "useful excess detail is retained");
+        assert_eq!(note.evidence.len(), 2, "the unknown file is dropped");
+        assert_eq!(note.evidence[0].line, Some(1));
+        assert_eq!(
+            note.evidence[1].line, None,
+            "invalid coordinates degrade to a file link"
+        );
+        assert!(
+            normalized
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unavailable coordinate"))
+        );
+        assert!(
+            normalized
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not in this change"))
+        );
+    }
+
+    #[test]
+    fn ir_16_legacy_fields_remain_readable_but_the_prompt_version_invalidates_the_cache() {
+        let analysis = normalize_text(
+            r#"{"summary":"legacy brief","intent":"legacy purpose",
+                "per_file_notes":[{"path":"src/domain/money.rs","change":"changed",
+                                   "notes":"reason","review_focus":["check"]}]}"#,
+        )
+        .expect("legacy aliases normalize")
+        .analysis;
+        assert_eq!(analysis.brief, "legacy brief");
+        assert_eq!(analysis.per_file_notes[0].verify, ["check"]);
+        assert_eq!(analysis.prompt_version, 2);
     }
 
     #[test]
@@ -1524,7 +1857,7 @@ mod tests {
             "review_plan": [{"order": 1, "group": "domain", "rationale": "r",
                              "files": ["src/domain/money.rs"], "confidence": 0.9}]}"#;
         let analysis = normalize_text(text).expect("parses").analysis;
-        assert_eq!(analysis.summary, "s");
+        assert_eq!(analysis.brief, "s");
     }
 
     #[test]
@@ -1532,7 +1865,7 @@ mod tests {
         let analysis = normalize_text(GOOD).expect("parses").analysis;
         let label = analysis.provenance(chrono::Utc::now());
         assert!(label.contains("deepseek/deepseek-chat"), "{label}");
-        assert!(label.contains("prompt v1"), "{label}");
+        assert!(label.contains("prompt v2"), "{label}");
         assert!(
             label.split(" · ").count() == 3,
             "model, version and age: {label}"

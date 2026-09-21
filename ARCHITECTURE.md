@@ -128,6 +128,15 @@ crossterm event ─▶ App::on_key ─▶ Keymap::resolve ─▶ update::dispatc
    entry with no dispatch arm falls through to the catch-all, which a test
    catches.
 
+Guided review keeps AI output and human state separate (IR-16). `domain::analysis`
+normalizes untrusted prompt-v2 output and validates evidence against the immutable
+patch; `application::analysis` projects compact Overview/Files view data. Human file
+markers and manual order live in `domain::plan`, keyed by stable file-change
+fingerprints. The analysis answer remains disposable under `cache/analysis`, while the
+plan/markers are atomically persisted under the durable review root and survive cache
+eviction. Rendering and marker actions remain pure state transitions; `Effect::SavePlan`
+is applied by the loop.
+
 ## 5. Concurrency
 
 M0 is deliberately synchronous except for one job, so the loop is a plain

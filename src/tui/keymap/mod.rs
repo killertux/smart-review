@@ -398,6 +398,7 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
     (Scope::In(Mode::Search), "<Esc>", "search.close"),
     (Scope::In(Mode::Normal), "<leader>m", "app.model_picker"),
     (Scope::In(Mode::Normal), "<leader>a", "app.analyze_panel"),
+    (Scope::In(Mode::Normal), "e", "analysis.toggle_guidance"),
     // `o` toggles the review order (FR-3.5); it is unbound elsewhere, and it is what
     // the requirement names.
     (Scope::In(Mode::Normal), "o", "diff.toggle_order"),
@@ -463,6 +464,7 @@ pub const DEFAULT_BINDINGS: &[(Scope, &str, &str)] = &[
         "review.comment_conversation",
     ),
     (Scope::In(Mode::Normal), "<leader>rr", "review.publish"),
+    (Scope::In(Mode::Normal), "m", "review.cycle_progress"),
     // The decision keys, as §5.4 lists them (FR-6.1). They stage a verdict rather than
     // sending one: the modal is still what publishes.
     (Scope::In(Mode::Normal), "<leader>ra", "review.approve"),

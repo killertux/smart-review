@@ -37,8 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # it names files that are in the diff, it names one that is not (so the warning path
 # is exercised), and it puts the two real files in a deliberate order.
 GOOD = {
-    "summary": "Money now rounds half up, and the invoice total uses it.",
-    "intent": "Finance reported a rounding drift on large invoices.",
+    "brief": "Money now rounds half up, and the invoice total uses it.",
+    "inferred_purpose": "Finance reported a rounding drift on large invoices.",
     "risk_areas": [
         {
             "title": "Rounding in Money arithmetic",
@@ -56,13 +56,13 @@ GOOD = {
     "review_plan": [
         {
             "order": 1,
-            "group": "domain",
+            "group": "Understand rounding",
             "rationale": "the arithmetic everything else depends on",
             "files": ["src/domain/money.rs"],
         },
         {
             "order": 2,
-            "group": "tests",
+            "group": "Verify half-cent behavior",
             "rationale": "the tests that pin the new rounding down",
             "files": ["tests/money.rs"],
         },
@@ -70,12 +70,25 @@ GOOD = {
     "per_file_notes": [
         {
             "path": "src/domain/money.rs",
-            "change": "rounds half up instead of half even",
-            "notes": "check the negative case: -0.5 must not round to zero",
-            "review_focus": ["negative amounts", "half-cent cases"],
+            "what_changed": "rounds half up instead of half even",
+            "why": "check the negative case: -0.5 must not round to zero",
+            "verify": ["negative amounts", "half-cent cases"],
+            "evidence": [
+                {
+                    "path": "src/domain/money.rs",
+                    "side": "new",
+                    "line": 2,
+                    "label": "the new rounding expression",
+                }
+            ],
         }
     ],
     "suggested_questions": ["Is the rounding rule documented for finance?"],
+    "coverage": {
+        "analyzed_files": ["src/domain/money.rs", "tests/money.rs"],
+        "truncated_files": ["src/domain/generated.rs"],
+        "limitations": ["the generated file was too large for full source context"],
+    },
 }
 
 # A chat answer, with the two things the chat checker looks for: a reference to a file

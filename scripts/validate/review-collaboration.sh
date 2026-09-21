@@ -370,8 +370,8 @@ step "4/12 replying answers the comment, in one call, with the words typed"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/reply.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$ON_THREAD~r~agreed, fixed in the follow-up\r~\r~\r~q" \
-  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~Enter again sends it to GitHub~comment posted~" \
+  "$OPEN~$ON_THREAD~r~agreed, fixed in the follow-up\r~\r~q" \
+  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~comment posted~" \
   "$FRAMES")"
 if shown "$FRAMES" 'reply on src/domain/money.rs:2 \(new\)'; then
   ok "the composer says which comment is being answered"
@@ -483,8 +483,8 @@ step "8/12 a failed reply keeps the words in the modal"
 printf '1' >"$FAKE/fail_reply"
 FRAMES="$TMP/reply-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~$ON_THREAD~r~this must not be lost\r~\r~\r~q" \
-  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~Enter again sends it to GitHub~comment is still here~" \
+  "$OPEN~$ON_THREAD~r~this must not be lost\r~\r~q" \
+  "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~post · #141~comment is still here~" \
   "$FRAMES")"
 if shown "$FRAMES" "the comment is still here"; then
   ok "the modal says the comment was kept"
@@ -508,8 +508,8 @@ step "9/12 the conversation is readable, and a comment on it reaches the issue"
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/conversation.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~ pc~c~thanks, looking at it now\r~\r~\r~q" \
-  "from the worktree~conversation · #141~~post · #141~Enter again sends it to GitHub~comment posted~" \
+  "$OPEN~ pc~c~thanks, looking at it now\r~\r~q" \
+  "from the worktree~conversation · #141~~post · #141~comment posted~" \
   "$FRAMES")"
 if shown "$FRAMES" "This came out of the incident on Tuesday."; then
   ok "the conversation panel shows what has been said"
@@ -532,8 +532,8 @@ step "10/12 a refused conversation comment says so and keeps the words"
 printf '1' >"$FAKE/fail_conversation"
 FRAMES="$TMP/conversation-failed.log"
 SCREEN="$(run_tui "$HOME_ONE" \
-  "$OPEN~ pc~c~please keep this\r~\r~\r~q" \
-  "from the worktree~conversation · #141~~post · #141~Enter again sends it to GitHub~comment is still here~" \
+  "$OPEN~ pc~c~please keep this\r~\r~q" \
+  "from the worktree~conversation · #141~~post · #141~comment is still here~" \
   "$FRAMES")"
 if shown "$FRAMES" "comment is still here"; then
   ok "a refused comment is kept rather than lost"
@@ -560,7 +560,7 @@ EOF
 : >"$FAKE/argv.txt"
 FRAMES="$TMP/dry.log"
 SCREEN="$(run_tui "$HOME_DRY" \
-  "$OPEN~$ON_THREAD~r~a dry run reply\r~\r\r~\e~ pt~y~~ pc~c~a dry run comment\r~\r\r~\e" \
+  "$OPEN~$ON_THREAD~r~a dry run reply\r~\r~\e~ pt~y~~ pc~c~a dry run comment\r~\r~\e" \
   "from the worktree~M src/domain/money~reply on src/domain/money.rs:2~Enter records~dry run: nothing was posted~~resolve this thread~nothing changed on GitHub~~conversation · #141~~post · #141~dry run: nothing was posted~" \
   "$FRAMES")"
 if [ "$(count_calls 'comments/9001/replies')" != "0" ]; then

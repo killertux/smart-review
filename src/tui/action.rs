@@ -304,6 +304,12 @@ pub const ACTIONS: &[ActionDef] = &[
         hint: false,
     },
     ActionDef {
+        id: "analysis.toggle_guidance",
+        description: "Expand or collapse current-file guidance (e)",
+        group: Group::App,
+        hint: false,
+    },
+    ActionDef {
         id: "plan.move_up",
         description: "Move the selected review-plan group up",
         group: Group::App,
@@ -438,6 +444,12 @@ pub const ACTIONS: &[ActionDef] = &[
     ActionDef {
         id: "review.publish",
         description: "Publish the staged review (\u{3c}leader\u{3e}rr)",
+        group: Group::Review,
+        hint: false,
+    },
+    ActionDef {
+        id: "review.cycle_progress",
+        description: "Mark this file reviewed / needs revisit (m)",
         group: Group::Review,
         hint: false,
     },

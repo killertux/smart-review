@@ -39,6 +39,8 @@ pub struct ReviewLayout {
     pub content: Rect,
     /// The file tree.
     pub tree: Rect,
+    /// Compact or expanded current-file guidance above the code.
+    pub guidance: Option<Rect>,
     /// The visible diff rows.
     pub diff: Rect,
     /// The optional inline comment composer.
@@ -49,16 +51,27 @@ pub struct ReviewLayout {
 
 /// Calculates the review frame's rectangles once (IR-09).
 #[must_use]
-pub fn layout(area: Rect, chat_open: bool, composing: bool) -> ReviewLayout {
+pub fn layout(area: Rect, chat_open: bool, composing: bool, guidance_height: u16) -> ReviewLayout {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).split(area);
     let (body, chat) = super::chat::chat_split(rows[1], chat_open);
     let columns =
         Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(20)]).split(body);
-    let (diff, composer) = super::drafts::composer_split(columns[1], composing);
+    let (file_body, composer) = super::drafts::composer_split(columns[1], composing);
+    let (guidance, diff) = if guidance_height == 0 {
+        (None, file_body)
+    } else {
+        let rows = Layout::vertical([
+            Constraint::Length(guidance_height.min(file_body.height.saturating_sub(3))),
+            Constraint::Min(3),
+        ])
+        .split(file_body);
+        (Some(rows[0]), rows[1])
+    };
     ReviewLayout {
         tabs: rows[0],
         content: rows[1],
         tree: columns[0],
+        guidance,
         diff,
         composer,
         chat,
@@ -71,14 +84,26 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let layout = app
-        .review_layout()
-        .unwrap_or_else(|| layout(area, false, app.drafts().is_composing()));
+    let layout = app.review_layout().unwrap_or_else(|| {
+        layout(
+            area,
+            false,
+            app.drafts().is_composing(),
+            if app.current_file_guidance().is_some() {
+                7
+            } else {
+                0
+            },
+        )
+    });
     render_tabs(frame, layout.tabs, app);
     match app.review_tab() {
         ReviewTab::Overview => render_overview(frame, layout.content, app),
         ReviewTab::Files => {
             render_tree(frame, layout.tree, app, view);
+            if let Some(guidance) = layout.guidance {
+                render_file_guidance(frame, guidance, app);
+            }
             render_diff(frame, layout.diff, app, view);
             if let Some(composer_area) = layout.composer
                 && let Some(composer) = app.drafts().composer.as_ref()
@@ -98,6 +123,201 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         }
         ReviewTab::Ask => super::chat::render(frame, layout.content, app),
+    }
+}
+
+/// Concise What / Why (inferred) / Verify guidance beside the current code (IR-16).
+fn render_file_guidance(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let Some(guidance) = app.current_file_guidance() else {
+        return;
+    };
+    let theme = &app.theme;
+    let width = usize::from(area.width.saturating_sub(4)).max(1);
+    let lines = if app.panel.guidance_expanded {
+        expanded_guidance_lines(&guidance, theme, width)
+    } else {
+        compact_guidance_lines(&guidance, theme, width)
+    };
+    let visible = usize::from(area.height.saturating_sub(2)).max(1);
+    let scroll = app
+        .panel
+        .guidance_scroll
+        .min(lines.len().saturating_sub(visible));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::new().borders(Borders::ALL).title(format!(
+                " guide · {} · e: {}{} ",
+                guidance.path,
+                if app.panel.guidance_expanded {
+                    "collapse"
+                } else {
+                    "expand"
+                },
+                if app.panel.guidance_expanded {
+                    " · j/k: scroll"
+                } else {
+                    ""
+                },
+            )))
+            .style(theme.style(element::BG))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        area,
+    );
+}
+
+fn compact_guidance_lines(
+    guidance: &crate::application::analysis::FileGuidance,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let what = present_or(
+        &guidance.what_changed,
+        "not supplied for this file; open the full analysis for coverage details",
+    );
+    let why = present_or(
+        &guidance.inferred_why,
+        "not inferred from the available context",
+    );
+    let verify = if guidance.verify.is_empty() {
+        "no concrete check supplied".to_owned()
+    } else {
+        guidance.verify.join(" · ")
+    };
+    [
+        (" What ", what, 7),
+        (" Why · inferred ", why, 17),
+        (" Verify ", verify.as_str(), 9),
+    ]
+    .into_iter()
+    .map(|(label, body, reserved)| {
+        Line::from(vec![
+            Span::styled(label, theme.style(element::TITLE)),
+            Span::styled(
+                text::truncate(body, width.saturating_sub(reserved)),
+                theme.style(element::FG),
+            ),
+        ])
+    })
+    .collect()
+}
+
+fn expanded_guidance_lines(
+    guidance: &crate::application::analysis::FileGuidance,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    push_guidance_text(
+        &mut lines,
+        theme,
+        "What",
+        present_or(
+            &guidance.what_changed,
+            "not supplied for this file; open the full analysis for coverage details",
+        ),
+        width,
+    );
+    push_guidance_text(
+        &mut lines,
+        theme,
+        "Why · inferred",
+        present_or(
+            &guidance.inferred_why,
+            "not inferred from the available context",
+        ),
+        width,
+    );
+    append_verification_lines(&mut lines, guidance, theme, width);
+    if guidance.truncated {
+        lines.push(Line::from(Span::styled(
+            " Source was truncated; treat this guidance as partial.",
+            theme.style(element::NOTICE_WARN),
+        )));
+    }
+    append_evidence_lines(&mut lines, guidance, theme, width);
+    lines
+}
+
+fn append_verification_lines(
+    lines: &mut Vec<Line<'static>>,
+    guidance: &crate::application::analysis::FileGuidance,
+    theme: &Theme,
+    width: usize,
+) {
+    if guidance.verify.is_empty() {
+        push_guidance_text(lines, theme, "Verify", "no concrete check supplied", width);
+        return;
+    }
+    for (index, check) in guidance.verify.iter().enumerate() {
+        push_guidance_text(lines, theme, &format!("Verify {}", index + 1), check, width);
+    }
+}
+
+fn append_evidence_lines(
+    lines: &mut Vec<Line<'static>>,
+    guidance: &crate::application::analysis::FileGuidance,
+    theme: &Theme,
+    width: usize,
+) {
+    if guidance.evidence.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " Evidence: none supplied or no coordinate survived validation.",
+            theme.style(element::MUTED),
+        )));
+        return;
+    }
+    for (index, evidence) in guidance.evidence.iter().enumerate() {
+        let coordinate = match (evidence.side, evidence.line) {
+            (Some(side), Some(line)) => format!("{}:{line}", side.label()),
+            _ => "file".to_owned(),
+        };
+        let label = evidence
+            .label
+            .is_empty()
+            .then(String::new)
+            .unwrap_or_else(|| format!(" — {}", evidence.label));
+        push_guidance_text(
+            lines,
+            theme,
+            &format!("Evidence {}", index + 1),
+            &format!(
+                "{} ({coordinate}){label} · :evidence {}",
+                evidence.path,
+                index + 1
+            ),
+            width,
+        );
+    }
+}
+
+fn present_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() { fallback } else { value }
+}
+
+fn push_guidance_text(
+    lines: &mut Vec<Line<'static>>,
+    theme: &Theme,
+    label: &str,
+    body: &str,
+    width: usize,
+) {
+    let prefix = format!(" {label} ");
+    let prefix_width = text::width(&prefix);
+    let body_width = width.saturating_sub(prefix_width).max(1);
+    let wrapped = text::wrap(body, body_width);
+    for (index, row) in wrapped.into_iter().enumerate() {
+        if index == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), theme.style(element::TITLE)),
+                Span::styled(row, theme.style(element::FG)),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("{}{row}", " ".repeat(prefix_width)),
+                theme.style(element::FG),
+            )));
+        }
     }
 }
 
@@ -196,6 +416,34 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
     let theme = &app.theme;
+    let width = usize::from(area.width.saturating_sub(2));
+    let mut lines = overview_header_lines(detail, theme, width);
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " Guided review",
+        theme.style(element::TITLE),
+    )));
+    if let Some(analysis) = app.analysis_panel() {
+        append_analysis_overview(&mut lines, app, detail, &analysis, theme, width);
+    } else {
+        append_missing_analysis(&mut lines, app, theme);
+    }
+    let scroll = app.tab_scroll.min(lines.len().saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::new().borders(Borders::ALL).title(" overview "))
+            .style(theme.style(element::BG))
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+fn overview_header_lines(
+    detail: &crate::domain::pr::PullRequestDetail,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             format!(" {} ", detail.summary.title),
@@ -235,39 +483,134 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, app: &App) {
             theme.style(element::MUTED),
         )));
     } else {
-        lines.extend(crate::tui::markdown::render(
-            &detail.body,
-            usize::from(area.width.saturating_sub(2)),
-            theme,
-        ));
+        lines.extend(crate::tui::markdown::render(&detail.body, width, theme));
     }
-    lines.push(Line::default());
+    lines
+}
+
+fn append_analysis_overview(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    detail: &crate::domain::pr::PullRequestDetail,
+    analysis: &crate::application::analysis::PanelModel,
+    theme: &Theme,
+    width: usize,
+) {
     lines.push(Line::from(Span::styled(
-        " Analysis",
-        theme.style(element::TITLE),
+        " Review brief · AI",
+        theme.style(element::ACCENT),
     )));
-    let analysis = if app.analysis_state().is_running() {
-        " Analysis is running; press Esc to cancel."
-    } else if app.analysis_panel().is_some() {
-        " Analysis is available; press <leader>a to read it."
+    lines.extend(crate::tui::markdown::render(
+        &analysis.summary,
+        width,
+        theme,
+    ));
+    lines.push(Line::from(Span::styled(
+        " Purpose · inferred",
+        theme.style(element::ACCENT),
+    )));
+    lines.extend(crate::tui::markdown::render(&analysis.intent, width, theme));
+    append_reading_plan(lines, analysis, theme);
+    append_coverage(lines, detail, analysis, theme);
+    append_suggested_questions(lines, analysis, theme);
+    if let Some(provenance) = app.analysis_provenance() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {provenance} · {} · {}",
+                app.analysis_state().label(),
+                if app.analysis_is_stale() {
+                    "stale"
+                } else {
+                    "current"
+                }
+            ),
+            theme.style(element::MUTED),
+        )));
+    }
+}
+
+fn append_reading_plan(
+    lines: &mut Vec<Line<'static>>,
+    analysis: &crate::application::analysis::PanelModel,
+    theme: &Theme,
+) {
+    lines.push(Line::from(Span::styled(
+        " Reading plan",
+        theme.style(element::ACCENT),
+    )));
+    for step in &analysis.steps {
+        lines.push(Line::from(format!(
+            " {}. {} — {}",
+            step.order, step.name, step.rationale
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", step.files.join(" · ")),
+            theme.style(element::MUTED),
+        )));
+    }
+}
+
+fn append_coverage(
+    lines: &mut Vec<Line<'static>>,
+    detail: &crate::domain::pr::PullRequestDetail,
+    analysis: &crate::application::analysis::PanelModel,
+    theme: &Theme,
+) {
+    let changed = usize::try_from(detail.summary.changed_files).unwrap_or(usize::MAX);
+    lines.push(Line::from(Span::styled(
+        format!(
+            " Coverage: {} / {changed} file(s) explicitly analyzed · {} truncated",
+            analysis.analyzed_files.len(),
+            analysis.truncated_files.len()
+        ),
+        if analysis.truncated_files.is_empty() {
+            theme.style(element::MUTED)
+        } else {
+            theme.style(element::NOTICE_WARN)
+        },
+    )));
+    for limitation in &analysis.limitations {
+        lines.push(Line::from(Span::styled(
+            format!("  limitation: {limitation}"),
+            theme.style(element::NOTICE_WARN),
+        )));
+    }
+}
+
+fn append_suggested_questions(
+    lines: &mut Vec<Line<'static>>,
+    analysis: &crate::application::analysis::PanelModel,
+    theme: &Theme,
+) {
+    if analysis.questions.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        " Suggested questions (populate Ask; never auto-send)",
+        theme.style(element::ACCENT),
+    )));
+    for (index, question) in analysis.questions.iter().enumerate() {
+        lines.push(Line::from(format!(
+            "  {}. {} · :chat suggested {}",
+            index + 1,
+            question,
+            index + 1
+        )));
+    }
+}
+
+fn append_missing_analysis(lines: &mut Vec<Line<'static>>, app: &App, theme: &Theme) {
+    let message = if app.analysis_state().is_running() {
+        " Analysis is running; Files remains usable and Esc cancels."
     } else if app.active_model.is_some() {
-        " No analysis yet; press <leader>a to generate one."
+        " No analysis yet; press <leader>a to generate guided review."
     } else {
-        " Select a model with <leader>m before generating analysis."
+        " Select a model with <leader>m; Files, Checks, Discussion and drafts remain available."
     };
     lines.push(Line::from(Span::styled(
-        analysis,
+        message,
         theme.style(element::MUTED),
     )));
-    let scroll = app.tab_scroll.min(lines.len().saturating_sub(1));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::new().borders(Borders::ALL).title(" overview "))
-            .style(theme.style(element::BG))
-            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
-            .wrap(ratatui::widgets::Wrap { trim: false }),
-        area,
-    );
 }
 
 /// Renders the forge's individual check records, including a truthful empty state.
@@ -533,11 +876,21 @@ fn tree_title(view: &DiffView) -> String {
     let provenance = view
         .order_provenance()
         .map_or_else(String::new, |source| format!(" · {source}"));
+    let progress = view
+        .review_progress()
+        .map_or_else(String::new, |(done, revisit, total)| {
+            if revisit == 0 {
+                format!(" · {done}/{total} reviewed")
+            } else {
+                format!(" · {done}/{total} reviewed · {revisit} revisit")
+            }
+        });
     format!(
-        "{}{} ({})",
+        "{}{} ({}){}",
         view.order.label(),
         provenance,
-        view.patch.stats().files
+        view.patch.stats().files,
+        progress,
     )
 }
 
@@ -622,8 +975,14 @@ fn tree_line(
             } else {
                 ""
             };
+            let progress = file
+                .and_then(crate::domain::diff::FileDiff::path)
+                .map_or("□", |path| view.review_status(path.as_str()).marker());
             Line::from(vec![
-                Span::styled(format!(" {indent}{cursor}{marker}{folded}"), tint(style)),
+                Span::styled(
+                    format!(" {indent}{cursor}{progress}{marker}{folded}"),
+                    tint(style),
+                ),
                 Span::styled(" ".to_owned(), base),
                 Span::styled(
                     text::pad(&row.label, 17),
@@ -712,15 +1071,6 @@ fn diff_title(theme: &Theme, view: &DiffView, width: u16, app: &App) -> String {
     // that is not true (FR-3.2).
     let title = format!(" {} · {} · ctx {} ", stats.label(), mode, view.context);
     let mut title = title;
-    // The analysis's note about the file on screen, where the user already is. It is
-    // truncated hard: the panel is where the full text lives, and a header that grows
-    // without bound stops being a header.
-    if let Some(note) = app.current_file_note() {
-        let _ = std::fmt::Write::write_fmt(
-            &mut title,
-            format_args!("· {} ", text::truncate(&note, 40)),
-        );
-    }
     if app.diff_loading {
         title.push_str("· loading… ");
     }
@@ -1060,7 +1410,11 @@ index 1a2b3c4..5d6e7f8 100644
         let rendered = draw(&mut app, 120, 30);
         // The pane names the order it is in, which is what the toggle changes
         // (FR-3.5).
-        assert!(rendered.contains("path order · patch (1)"), "{rendered}");
+        assert!(
+            rendered.contains("recommended order · rules (1)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("□M invoice.rs"), "{rendered}");
         assert!(rendered.contains("invoice.rs"), "{rendered}");
         assert!(rendered.contains("unified"), "{rendered}");
         assert!(
@@ -1109,6 +1463,71 @@ index 1a2b3c4..5d6e7f8 100644
         let rendered = draw(&mut app, 160, 24);
         // FR-4.1: what the analysis said about this file, where the reader already is.
         assert!(rendered.contains("check the sign"), "{rendered}");
+    }
+
+    #[test]
+    fn ir_16_compact_guidance_keeps_code_visible_at_80_by_24() {
+        let (_dir, mut app) = app_with_analysed_patch();
+        let rendered = draw(&mut app, 80, 24);
+        assert!(rendered.contains("What"), "{rendered}");
+        assert!(rendered.contains("Why · inferred"), "{rendered}");
+        assert!(rendered.contains("Verify"), "{rendered}");
+        assert!(
+            rendered.contains("@@ -1,1"),
+            "code remains the main surface: {rendered}"
+        );
+        assert!(rendered.contains("e: expand"), "{rendered}");
+    }
+
+    #[test]
+    fn ir_16_expanded_guidance_shows_validated_evidence_and_scroll_hint() {
+        let (_dir, mut app) = app_with_analysed_patch();
+        app.panel.guidance_expanded = true;
+        let rendered = draw(&mut app, 120, 30);
+        assert!(rendered.contains("Evidence 1"), "{rendered}");
+        assert!(rendered.contains("new rounding rule"), "{rendered}");
+        assert!(rendered.contains(":evidence 1"), "{rendered}");
+        assert!(rendered.contains("j/k: scroll"), "{rendered}");
+    }
+
+    #[test]
+    fn ir_16_missing_note_and_truncated_source_are_visible_not_invented() {
+        let (_dir, mut app) = app_with_analysed_patch();
+        let stored = app.panel.analysis.as_mut().expect("analysis");
+        stored.analysis.per_file_notes.clear();
+        stored
+            .analysis
+            .coverage
+            .truncated_files
+            .push("src/domain/money.rs".to_owned());
+        app.panel.guidance_expanded = true;
+        let rendered = draw(&mut app, 120, 30);
+        assert!(
+            rendered.contains("not supplied for this file"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Source was truncated"), "{rendered}");
+        assert!(rendered.contains("Evidence: none supplied"), "{rendered}");
+    }
+
+    #[test]
+    fn ir_16_overview_separates_ai_brief_inference_plan_and_coverage() {
+        let (_dir, mut app) = app_with_analysed_patch();
+        app.select_review_tab(ReviewTab::Overview);
+        let rendered = draw(&mut app, 120, 36);
+        for expected in [
+            "Review brief · AI",
+            "Purpose · inferred",
+            "Reading plan",
+            "Coverage: 2 / 2",
+            "Suggested questions",
+            ":chat suggested 1",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
     }
 
     #[test]

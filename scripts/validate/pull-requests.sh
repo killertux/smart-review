@@ -333,7 +333,7 @@ else
     bad "the mode-only placeholder is missing"
   fi
 
-  if printf '%s' "$SCREEN" | grep -q "patch (4)"; then
+  if printf '%s' "$SCREEN" | grep -q "rules (4)"; then
     ok "the file tree lists every changed file, rename included"
   else
     bad "the file tree did not list the files"
@@ -343,7 +343,7 @@ else
   # `}` moves to the next file banner and `j` moves a line, so the status line's
   # file label is what proves the cursor travelled.
   HOME_NAV="$TMP/home-nav"
-  SCREEN="$(run_tui "$HOME_NAV" '\r~}}~:q\r' 'impl Invoice~M scripts/build\.sh~' "$FAKE" "$TMP/pull-requests-nav.log")"
+  SCREEN="$(run_tui "$HOME_NAV" '\r~}~}~}~:q\r' 'impl Invoice~A docs/logo\.png~R old/name\.rs~M scripts/build\.sh~' "$FAKE" "$TMP/pull-requests-nav.log")"
   if printf '%s' "$SCREEN" | saw "M scripts/build.sh"; then
     ok "file navigation moves the cursor and the status line names the file"
   else
@@ -386,7 +386,7 @@ else
 
   # And a click lands on the row it was aimed at: the second file in the tree.
   HOME_CLICK="$TMP/home-click"
-  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;5M' 'impl Invoice~A docs/logo\.png' "$FAKE" "$TMP/pull-requests-click.log")"
+  SCREEN="$(run_tui "$HOME_CLICK" ':pr 141\r~\033[<0;8;9M' 'impl Invoice~A docs/logo\.png' "$FAKE" "$TMP/pull-requests-click.log")"
   if printf '%s' "$SCREEN" | saw "A docs/logo.png"; then
     ok "a click on a tree row opens that file"
   else

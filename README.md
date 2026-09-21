@@ -55,6 +55,8 @@ Inside the app:
 | `y` | copy the current file path (OSC 52) |
 | `<leader>m` | choose the provider, model and thinking settings |
 | `<leader>a` | analyse the pull request, or open the analysis |
+| `e` (Files) | expand/collapse current-file What / Why / Verify guidance |
+| `m` (Files) | cycle explicit human progress: reviewed / needs revisit / not reviewed |
 | `<leader>c` | open Ask, the grounded chat destination |
 | `Enter` | send the question (`Alt-Enter` or `Ctrl-J` adds a line) |
 | `<C-r>` | repeat the last question |
@@ -63,7 +65,7 @@ Inside the app:
 | `<C-e>` | open the comment composer in `$EDITOR` |
 | `v` / `V` | mark one end of a range, then move and press `c` |
 | `<leader>rd` | the staged comments: `j`/`k` walk them, `x` removes one |
-| `<leader>rr` | publish the review: the modal shows it verbatim, `Enter` twice sends |
+| `<leader>rr` | preview the review verbatim; one labelled `Enter` Publish action sends |
 | `r` / `<leader>pr` | reply to the thread under the diff cursor |
 | `<leader>pt` | resolve or reopen that thread (it asks first) |
 | `<leader>pc` / `<leader>pw` | view / write on the pull request conversation |
@@ -86,8 +88,8 @@ Inside the app:
 
 `:help`, `:doctor`, `:pr 141`, `:filter author:alice`, `:clear-filters`,
 `:sort updated desc`, `:load-more`, `:copy-path`, `:theme <name>|next|reload`,
-`:analyze [--force|raw]`, `:plan [reset|path|move <file> <group>]`,
-`:context [add|remove <path>]`, `:chat [new|list|open <id>|export [md|json]|retry]`,
+`:analyze [--force|raw]`, `:plan [reset|path|move <file> <group>]`, `:evidence <n>`,
+`:context [add|remove <path>]`, `:chat [new|list|open <id>|export [md|json]|retry|suggested <n>]`,
 `:draft [list|remove <n>|clear|decision <d>|body <text>|export [md|json]]`,
 `:model [show]`, `:key [clear <provider>]`, `:catalog [refresh]`,
 `:workspace [clean [--all]]`, `:set ui.timeoutlen=250`, `:keymap`, `:version`.
@@ -102,7 +104,7 @@ marked `●` in the diff gutter, listed by `<leader>rd` (where `x` removes one),
 as you write them in `~/.smart-review/drafts/` — a draft is the one thing here that
 cannot be fetched again, so it does not live under `cache/`. `<leader>rr` opens the
 publish modal: the decision, the body and every comment, verbatim, and nothing is sent
-until you press `Enter` twice. A review with inline comments goes to GitHub in **one**
+until you use its clearly labelled `Enter` Publish action. A review with inline comments goes to GitHub in **one**
 request, so it arrives as a single review rather than as N notifications; a failure
 leaves the draft exactly where it was and says what GitHub said, in words. Threads that
 are already on the pull request are drawn under the lines they are about: `r` writes a
@@ -131,13 +133,18 @@ Opening a pull request fetches its detail and then its diff, so the wait shows a
 centred indicator naming the pull request, which step it is on and how long it has
 been going; `Esc` gives up on it.
 
-`<leader>a` asks the chosen model to read the pull request and say what changed, why,
-what is risky and in what order the files should be read. The first press for a
+`<leader>a` asks the chosen model for a concise PR brief, an explicitly inferred purpose,
+risks and a contextual sequence of human-named review steps. The first press for a
 repository shows what would be sent — the estimate, and the list of files, included
 and not — and sends nothing until you press it again. The answer streams into a panel,
-and the file tree reorders to the plan it returned; `o` reads the same files in path
-order, `J`/`K` move a group, and `:plan move <file> <group>` pins a file, with your
-order saved beside the analysis. A `.env`, credential-like path, ignored path, binary
+Overview shows the brief, plan, coverage/limitations and suggested questions. Files keeps
+compact What / Why (inferred) / Verify guidance beside the current code; `e` expands its
+checks and validated evidence, and `:evidence 1` jumps to a cited coordinate. Suggested
+questions populate Ask for editing and never auto-send. The file tree reorders to the plan;
+`o` reads the same files in path order, `J`/`K` move a group, and `:plan move <file> <group>`
+pins a file. `m` changes human review progress explicitly. That marker is stored outside
+the cache with a file-change fingerprint: a new head keeps only provably unchanged work,
+while changed reviewed files become `needs revisit`. A `.env`, credential-like path, ignored path, binary
 or file over `max_file_bytes` cannot contribute content through either its full body or
 its diff. Both old and new names of a rename are checked; `:context` lists the actual
 filtered payload and explains exclusions. If repository eligibility cannot be checked,
