@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the incremental terminal replay and PTY driver (IR-15)."""
+"""Regression tests for the incremental terminal replay and PTY driver (IR-15, IR-18)."""
 
 from __future__ import annotations
 
@@ -80,6 +80,50 @@ class DriverTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             drive.resize_steps("79-by-23")
+
+    def test_ir_18_consecutive_resizes_are_acknowledged_before_the_next(self) -> None:
+        child = r'''
+import fcntl, os, struct, sys, termios, time, tty
+tty.setraw(0)
+
+def size():
+    rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+    return cols, rows
+
+last = size()
+os.write(1, b"\x1b[2J\x1b[HREADY")
+seen = 0
+deadline = time.monotonic() + 2
+while seen < 2 and time.monotonic() < deadline:
+    current = size()
+    if current != last:
+        last = current
+        seen += 1
+        os.write(1, f"\x1b[2J\x1b[HSIZE {current[0]}x{current[1]}".encode())
+    time.sleep(0.005)
+if seen != 2:
+    raise SystemExit(3)
+open(sys.argv[1], "w", encoding="utf-8").write(f"{last[0]}x{last[1]}")
+os.read(0, 1)
+'''
+        result, capture, received = self.run_driver(
+            child,
+            "--ready",
+            "READY",
+            "--step-timeout",
+            "1",
+            "--settle",
+            "0.03",
+            "--resize-steps",
+            "20x6=SIZE 20x6~30x7=SIZE 30x7",
+            "--keys",
+            "x",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(received.read_text(encoding="utf-8"), "30x7")
+        raw = capture.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("SIZE 20x6", raw)
+        self.assertIn("SIZE 30x7", raw)
 
     def run_driver(
         self,

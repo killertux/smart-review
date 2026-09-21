@@ -363,8 +363,10 @@ if validation_smoke_only; then
     "$OPEN~$LINES~c~before the editor~\005~\r~q" \
     'from the worktree~M src/domain/money~comment on src/domain/money.rs:2~~composer updated from \$EDITOR~1 draft~' \
     "$EDITOR_FRAMES" >/dev/null
-  if shown "$EDITOR_FRAMES" 'composer updated from \$EDITOR' \
-      && grep -Rqs 'before the editor\|finished in editor' "$HOME_SMOKE/drafts"; then
+  if shown "$EDITOR_FRAMES" \
+      'before the editor[\s\S]*finished in editor|finished in editor[\s\S]*before the editor' \
+      && grep -Rqs 'before the editor' "$HOME_SMOKE/drafts" \
+      && grep -Rqs 'finished in editor' "$HOME_SMOKE/drafts"; then
     ok "the external editor restored the terminal and returned text to the same composer"
   else
     bad "the external-editor smoke did not preserve the composer"
@@ -472,7 +474,8 @@ else
   bad "the editor did not return to the comment composer"
   printf '%s\n' "$SCREEN" | tail -12
 fi
-if grep -Rqs 'before the editor\|finished in editor' "$HOME_ONE/drafts"; then
+if grep -Rqs 'before the editor' "$HOME_ONE/drafts" \
+    && grep -Rqs 'finished in editor' "$HOME_ONE/drafts"; then
   ok "the draft contains the text the editor wrote"
 else
   bad "the editor's text was not staged with the comment"

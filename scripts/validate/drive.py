@@ -375,6 +375,20 @@ def main() -> int:
                 )
             if reached_eof and not failure:
                 failure = f"the child exited during resize step {index}"
+            if not failure:
+                # A visible frame proves the resize was handled, but its final writes
+                # may still be queued. Serialise acknowledgements so a following
+                # TIOCSWINSZ cannot be coalesced with work from this one.
+                quiet, reached_eof = settle(
+                    master, capture, arguments.settle, step_deadline()
+                )
+                if reached_eof:
+                    failure = f"the child exited after resize step {index}"
+                elif not quiet:
+                    failure = (
+                        f"resize step {index} ({cols}x{rows}) did not become quiet "
+                        "before its deadline"
+                    )
 
         for index, (keys, pattern) in enumerate(zip(key_groups, wait_groups), start=1):
             if failure:
