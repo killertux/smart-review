@@ -84,6 +84,24 @@ pub mod element {
     pub const DIFF_STALE: &str = "diff.stale";
     /// A folded hunk or directory summary row.
     pub const DIFF_FOLDED: &str = "diff.folded";
+    /// A source-code comment.
+    pub const SYNTAX_COMMENT: &str = "syntax.comment";
+    /// A language keyword or operator.
+    pub const SYNTAX_KEYWORD: &str = "syntax.keyword";
+    /// A string literal.
+    pub const SYNTAX_STRING: &str = "syntax.string";
+    /// A numeric literal.
+    pub const SYNTAX_NUMBER: &str = "syntax.number";
+    /// A type, constructor or module name.
+    pub const SYNTAX_TYPE: &str = "syntax.type";
+    /// A function or method name.
+    pub const SYNTAX_FUNCTION: &str = "syntax.function";
+    /// A named constant or label.
+    pub const SYNTAX_CONSTANT: &str = "syntax.constant";
+    /// A property, attribute or markup tag.
+    pub const SYNTAX_PROPERTY: &str = "syntax.property";
+    /// A variable or parameter.
+    pub const SYNTAX_VARIABLE: &str = "syntax.variable";
     /// A directory in the file tree.
     pub const TREE_DIR: &str = "tree.dir";
     /// An unchanged file in the tree.
@@ -159,6 +177,15 @@ pub const KNOWN_ELEMENTS: &[&str] = &[
     element::DIFF_LINE_NUMBER,
     element::DIFF_STALE,
     element::DIFF_FOLDED,
+    element::SYNTAX_COMMENT,
+    element::SYNTAX_KEYWORD,
+    element::SYNTAX_STRING,
+    element::SYNTAX_NUMBER,
+    element::SYNTAX_TYPE,
+    element::SYNTAX_FUNCTION,
+    element::SYNTAX_CONSTANT,
+    element::SYNTAX_PROPERTY,
+    element::SYNTAX_VARIABLE,
     element::TREE_DIR,
     element::TREE_FILE,
     element::TREE_MODIFIED,
@@ -442,6 +469,7 @@ fn shell_styles(p: &Palette) -> Vec<(&'static str, Style)> {
 /// Reading: diffs, the file tree and list markers (FR-7.7).
 fn reading_styles(p: &Palette) -> Vec<(&'static str, Style)> {
     let Palette {
+        bg,
         fg,
         accent,
         muted,
@@ -454,8 +482,7 @@ fn reading_styles(p: &Palette) -> Vec<(&'static str, Style)> {
         error,
         ..
     } = *p;
-
-    vec![
+    let mut styles = vec![
         (
             element::DIFF_ADD,
             Style::default().bg(added_background).fg(added_foreground),
@@ -524,6 +551,45 @@ fn reading_styles(p: &Palette) -> Vec<(&'static str, Style)> {
         (element::CHAT_STOPPED, Style::default().fg(warn)),
         (element::CHAT_REFERENCE, Style::default().fg(ok)),
         (element::CHAT_INPUT, Style::default().fg(fg)),
+    ];
+    styles.extend(syntax_styles(bg, fg));
+    styles
+}
+
+fn syntax_styles(background: Color, foreground: Color) -> Vec<(&'static str, Style)> {
+    let colors = if is_dark(background) {
+        [
+            Color::Rgb(0x8b, 0x94, 0x9e),
+            Color::Rgb(0xff, 0x7b, 0x72),
+            Color::Rgb(0xa5, 0xd6, 0xff),
+            Color::Rgb(0x79, 0xc0, 0xff),
+            Color::Rgb(0xff, 0xa6, 0x57),
+            Color::Rgb(0xd2, 0xa8, 0xff),
+            Color::Rgb(0x79, 0xc0, 0xff),
+            Color::Rgb(0x7e, 0xe7, 0x87),
+        ]
+    } else {
+        [
+            Color::Rgb(0x6e, 0x77, 0x81),
+            Color::Rgb(0xcf, 0x22, 0x2e),
+            Color::Rgb(0x0a, 0x30, 0x69),
+            Color::Rgb(0x05, 0x50, 0xae),
+            Color::Rgb(0x95, 0x38, 0x00),
+            Color::Rgb(0x82, 0x50, 0xdf),
+            Color::Rgb(0x05, 0x50, 0xae),
+            Color::Rgb(0x11, 0x63, 0x29),
+        ]
+    };
+    vec![
+        (element::SYNTAX_COMMENT, Style::default().fg(colors[0])),
+        (element::SYNTAX_KEYWORD, Style::default().fg(colors[1])),
+        (element::SYNTAX_STRING, Style::default().fg(colors[2])),
+        (element::SYNTAX_NUMBER, Style::default().fg(colors[3])),
+        (element::SYNTAX_TYPE, Style::default().fg(colors[4])),
+        (element::SYNTAX_FUNCTION, Style::default().fg(colors[5])),
+        (element::SYNTAX_CONSTANT, Style::default().fg(colors[6])),
+        (element::SYNTAX_PROPERTY, Style::default().fg(colors[7])),
+        (element::SYNTAX_VARIABLE, Style::default().fg(foreground)),
     ]
 }
 

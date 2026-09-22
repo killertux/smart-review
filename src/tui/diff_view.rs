@@ -248,6 +248,8 @@ pub struct DiffView {
     pub rows: Vec<DiffRow>,
     /// The same content paired up for the side-by-side view.
     pub split_rows: Vec<SplitRow>,
+    /// Theme-independent syntax ranges prepared off the render path.
+    syntax: crate::tui::syntax::SyntaxHighlights,
     /// For each unified row, the split row that shows it.
     split_index: Vec<usize>,
     /// The first split row rendered in the most recent frame (IR-09).
@@ -402,7 +404,7 @@ impl DiffView {
     /// Builds a view over a patch.
     #[must_use]
     pub fn new(patch: Patch) -> Self {
-        Self::new_with_context(patch, 3, false, None, None, Vec::new())
+        Self::new_with_context(patch, 3, false, None, None, Vec::new(), None)
     }
 
     /// Builds all immutable opening projections together on the background worker.
@@ -414,8 +416,10 @@ impl DiffView {
         head_sha: Option<&str>,
         plan: Option<crate::domain::plan::Plan>,
         comments: Vec<crate::domain::pr::ReviewComment>,
+        cancel: Option<&crate::ports::Cancel>,
     ) -> Self {
         let stats = patch.stats();
+        let syntax = crate::tui::syntax::SyntaxHighlights::for_patch(&patch, cancel);
         let paths = patch
             .files
             .iter()
@@ -449,6 +453,7 @@ impl DiffView {
             head_sha: None,
             rows: Vec::new(),
             split_rows: Vec::new(),
+            syntax,
             split_index: Vec::new(),
             split_start: 0,
             tree: Vec::new(),
@@ -473,6 +478,23 @@ impl DiffView {
         };
         view.rebuild();
         view
+    }
+
+    /// Semantic syntax ranges for one side of a source line.
+    #[must_use]
+    pub(crate) fn syntax_spans(
+        &self,
+        file: usize,
+        side: crate::domain::draft::Side,
+        line: u32,
+    ) -> &[crate::tui::syntax::SyntaxSpan] {
+        self.syntax.spans(file, side, line)
+    }
+
+    /// Whether syntax highlighting reached its bounded per-patch work limit.
+    #[must_use]
+    pub(crate) const fn syntax_limited(&self) -> bool {
+        self.syntax.limited()
     }
 
     /// Cached totals for the immutable source patch.
@@ -686,7 +708,10 @@ impl DiffView {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<usize>()),
             );
-        unified.saturating_add(tree).saturating_add(split)
+        unified
+            .saturating_add(tree)
+            .saturating_add(split)
+            .saturating_add(self.syntax.projection_bytes())
     }
 
     fn rebuild_split(&mut self) {

@@ -45,6 +45,7 @@ src/
     process.rs          bounded argv-based child execution
   tui/
     app.rs              owned UI/session state and completion reducer
+    syntax.rs           bounded Tree-sitter parsing into semantic diff spans
     update.rs           decoded action dispatch
     jobs.rs             slots, worker queue, cancellation, effect/job mapping
     components/         pure Ratatui rendering
@@ -85,6 +86,11 @@ effects, and draws at most once per reduction pass. Active work caps polling at 
 At most four jobs run concurrently. Replacing work in a slot cancels it and stale
 results are discarded; state, plan, and draft saves are serialized rather than
 superseded.
+
+Patch workers also parse supported old/new hunk streams with compiled Tree-sitter
+grammars and retain only semantic byte ranges in `DiffView`. Theme resolution and span
+clipping remain pure render operations; parsing never runs during a frame. Unsupported,
+failed, cancelled, or over-budget highlighting falls back to the existing plain diff.
 
 Cancellation is cooperative at the port boundary. Owned `git`/`gh` process groups are
 killed within their polling interval, and stalled LLM awaits are abandoned. Cancellation

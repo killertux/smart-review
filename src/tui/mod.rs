@@ -27,6 +27,7 @@ pub mod keymap;
 pub mod layout;
 pub mod list_view;
 pub mod markdown;
+pub(crate) mod syntax;
 pub mod terminal;
 pub mod text;
 pub mod theme;

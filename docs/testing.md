@@ -34,6 +34,11 @@ ports. TUI behavior uses `TestBackend` and, for cross-feature schedules,
 effect-to-job router, concrete fake completions can be held/released out of order, and
 state plus rendered frame are asserted without sleeps.
 
+Syntax-highlighting tests compile every supported Tree-sitter query, verify language
+detection and independent old/new ranges, and assert that semantic foregrounds preserve
+diff backgrounds and terminal-column bounds. Release builds compile the same native
+grammars for every published target.
+
 A race regression must control completion order; scheduler luck and fixed sleeps are
 not evidence. A filtered command is valid only when it discovers at least one intended
 test.

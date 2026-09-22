@@ -17,7 +17,7 @@ The review screen has five real destinations:
 | Tab | What it shows |
 |---|---|
 | **Overview** | PR metadata, concise analysis brief, risks, review steps, coverage, limitations, and suggested questions |
-| **Files** | Ordered file tree, diff, inline threads/drafts, What/Why/Verify guidance, and explicit human progress |
+| **Files** | Ordered file tree, syntax-highlighted diff, inline threads/drafts, What/Why/Verify guidance, and explicit human progress |
 | **Checks** | Actual GitHub check runs and conclusions |
 | **Discussion** | Reviews and inline threads, including resolved and outdated threads with filters |
 | **Ask** | Grounded, persistent conversations about the same context used for analysis |
@@ -25,6 +25,14 @@ The review screen has five real destinations:
 All tabs are reachable by `1`–`5`, the tab cycle, or mouse. The same layout geometry
 drives rendering and hit testing. At 80×24 the compact guidance keeps code visible;
 wide terminals can use split diff view.
+
+Text hunks are syntax highlighted in unified and split views for TypeScript/TSX,
+JavaScript/JSX, Python, Java, C#, C/C++, Go, Rust, PHP, and shell files. Old and new
+sides are parsed independently so a change on one side cannot alter the other side's
+colouring. Unknown languages, parser failures, and work beyond the bounded highlighting
+budget remain readable as plain diff text. Syntax contributes foreground colour only;
+addition/deletion backgrounds, gutters, selection, comments, and drafts keep their
+review meaning.
 
 ## Guided review and human state
 

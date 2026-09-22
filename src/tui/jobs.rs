@@ -623,14 +623,14 @@ pub enum Outcome {
 
 fn prepared_patch(
     outcome: FetchOutcome<Patch>,
-    source: DiffSource,
     head_sha: &str,
     options: DiffOptions,
     view: &ViewContext,
+    cancel: &Cancel,
 ) -> Outcome {
     Outcome::Patch {
-        outcome: Box::new(prepare_view(outcome, options, view)),
-        source,
+        outcome: Box::new(prepare_view(outcome, options, view, cancel)),
+        source: DiffSource::Forge,
         head_sha: head_sha.to_owned(),
     }
 }
@@ -639,6 +639,7 @@ fn prepare_view(
     outcome: FetchOutcome<Patch>,
     options: DiffOptions,
     context: &ViewContext,
+    cancel: &Cancel,
 ) -> FetchOutcome<crate::tui::diff_view::DiffView> {
     let build = |patch| {
         crate::tui::diff_view::DiffView::new_with_context(
@@ -648,6 +649,7 @@ fn prepare_view(
             Some(&context.head_sha),
             context.plan.clone(),
             context.comments.clone(),
+            Some(cancel),
         )
     };
     match outcome {
@@ -901,7 +903,7 @@ impl Executor {
                 options,
                 view,
             } => match prs.load_patch(*number, head_sha, cancel) {
-                Ok(outcome) => prepared_patch(outcome, DiffSource::Forge, head_sha, *options, view),
+                Ok(outcome) => prepared_patch(outcome, head_sha, *options, view, cancel),
                 Err(error) => Outcome::Failed(error.to_string()),
             },
             // A local diff is read from the worktree rather than from the forge, and
@@ -1279,6 +1281,7 @@ impl Executor {
                         FetchOutcome::Fresh(cached.value),
                         options,
                         view,
+                        cancel,
                     )),
                     source: DiffSource::Worktree,
                     head_sha: head_sha.to_owned(),
@@ -1305,7 +1308,12 @@ impl Executor {
                 let patch = crate::domain::diff::parse_patch(&text);
                 let _ = prs.store_local_patch(number, head_sha, options, &patch);
                 Outcome::Patch {
-                    outcome: Box::new(prepare_view(FetchOutcome::Fresh(patch), options, view)),
+                    outcome: Box::new(prepare_view(
+                        FetchOutcome::Fresh(patch),
+                        options,
+                        view,
+                        cancel,
+                    )),
                     source: DiffSource::Worktree,
                     head_sha: head_sha.to_owned(),
                 }
@@ -1322,6 +1330,7 @@ impl Executor {
                             },
                             options,
                             view,
+                            cancel,
                         )),
                         source: DiffSource::Worktree,
                         head_sha: head_sha.to_owned(),
