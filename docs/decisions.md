@@ -12,7 +12,7 @@ on 2026-09-21; DEC-8 was retired and DEC-15 remained open.
 | DEC-1 | PR heads use app-owned bare repositories and detached worktrees; the source clone and `.git` are never mutated. |
 | DEC-2 | Analysis and grounded chat use a deterministic inspected context; there is no agentic repository tool loop. |
 | DEC-3 | A verdict, body, and inline comments publish as one review request after exact preview. |
-| DEC-4 | Unified diff is default; split view is available at wide sizes; syntax highlighting is deferred. |
+| DEC-4 | Unified diff is default; split view is available at wide sizes; supported languages use statically bundled Tree-sitter syntax highlighting with plain-text fallback. |
 | DEC-5 | Keys are entered in the TUI, stored privately in `credentials.toml`, with provider environment variables taking precedence. |
 | DEC-6 | No default model; the user selects catalog provider/model/thinking settings. |
 | DEC-7 | Authenticated GitHub CLI is required. |

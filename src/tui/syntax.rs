@@ -21,6 +21,10 @@ use crate::ports::Cancel;
 const MAX_HUNK_BYTES: usize = 256 * 1024;
 /// Maximum duplicated old/new hunk source retained while preparing one patch.
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum source lines passed to one parser invocation.
+const MAX_HUNK_LINES: usize = 10_000;
+/// Maximum duplicated old/new source lines highlighted across one patch.
+const MAX_PATCH_LINES: usize = 25_000;
 
 /// Semantic syntax classes understood by the theme engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,9 +75,9 @@ impl SyntaxHighlights {
         if cancelled(cancel) {
             return Self::default();
         }
-        let registry = registry();
         let mut result = Self::default();
         let mut remaining = MAX_PATCH_BYTES;
+        let mut remaining_lines = MAX_PATCH_LINES;
         let mut highlighter = Highlighter::new();
 
         for (file_index, file) in patch.files.iter().enumerate() {
@@ -84,25 +88,32 @@ impl SyntaxHighlights {
                 let Some(language) = detect_language(file, side) else {
                     continue;
                 };
-                let Some(configuration) = registry.configuration(language) else {
-                    continue;
-                };
                 for hunk in &file.hunks {
                     if cancelled(cancel) {
                         return result;
                     }
-                    let bytes = SourceChunk::estimated_bytes(hunk, side);
-                    if bytes == 0 {
+                    let estimate = SourceChunk::estimate(hunk, side);
+                    if estimate.bytes == 0 {
                         continue;
                     }
-                    if bytes > MAX_HUNK_BYTES || bytes > remaining {
+                    if estimate.bytes > MAX_HUNK_BYTES
+                        || estimate.bytes > remaining
+                        || estimate.lines > MAX_HUNK_LINES
+                        || estimate.lines > remaining_lines
+                    {
                         result.limited = true;
                         continue;
                     }
-                    let Some(source) = SourceChunk::from_hunk(file_index, hunk, side, bytes) else {
+                    let Some(configuration) = registry().configuration(language) else {
                         continue;
                     };
-                    remaining -= bytes;
+                    let Some(source) =
+                        SourceChunk::from_hunk(file_index, hunk, side, estimate.bytes)
+                    else {
+                        continue;
+                    };
+                    remaining -= estimate.bytes;
+                    remaining_lines -= estimate.lines;
                     if let Some(lines) =
                         highlight_source(&mut highlighter, configuration, &source, cancel)
                     {
@@ -166,15 +177,26 @@ struct SourceChunk {
     lines: Vec<SourceLine>,
 }
 
+#[derive(Debug, Default)]
+struct SourceEstimate {
+    bytes: usize,
+    lines: usize,
+}
+
 impl SourceChunk {
-    fn estimated_bytes(hunk: &Hunk, side: Side) -> usize {
-        hunk.lines.iter().fold(0usize, |bytes, line| {
-            if belongs_to(line.kind, side) {
-                bytes.saturating_add(line.content.len()).saturating_add(1)
-            } else {
-                bytes
-            }
-        })
+    fn estimate(hunk: &Hunk, side: Side) -> SourceEstimate {
+        hunk.lines
+            .iter()
+            .fold(SourceEstimate::default(), |mut estimate, line| {
+                if belongs_to(line.kind, side) {
+                    estimate.bytes = estimate
+                        .bytes
+                        .saturating_add(line.content.len())
+                        .saturating_add(1);
+                    estimate.lines = estimate.lines.saturating_add(1);
+                }
+                estimate
+            })
     }
 
     fn from_hunk(file: usize, hunk: &Hunk, side: Side, bytes: usize) -> Option<Self> {
@@ -227,6 +249,7 @@ fn highlight_source(
         .ok()?;
     let mut classes = Vec::new();
     let mut ranges = BTreeMap::<LineKey, Vec<SyntaxSpan>>::new();
+    let mut line_cursor = 0usize;
 
     for event in events {
         if cancelled(cancel) {
@@ -242,7 +265,14 @@ fn highlight_source(
             HighlightEvent::Source { start, end } => {
                 let class = classes.iter().rev().find_map(|class| *class);
                 if let Some(class) = class {
-                    map_range(&mut ranges, &source.lines, start, end, class);
+                    map_range(
+                        &mut ranges,
+                        &source.lines,
+                        &mut line_cursor,
+                        start,
+                        end,
+                        class,
+                    );
                 }
             }
         }
@@ -253,13 +283,22 @@ fn highlight_source(
 fn map_range(
     highlighted: &mut BTreeMap<LineKey, Vec<SyntaxSpan>>,
     lines: &[SourceLine],
+    line_cursor: &mut usize,
     start: usize,
     end: usize,
     class: SyntaxClass,
 ) {
-    for line in lines
+    // `HighlightEvent::Source` ranges arrive in document order. Retain the first line
+    // that can overlap the next range rather than replaying every preceding source line
+    // for every token in a dense hunk.
+    while lines
+        .get(*line_cursor)
+        .is_some_and(|line| line.end <= start)
+    {
+        *line_cursor += 1;
+    }
+    for line in lines[*line_cursor..]
         .iter()
-        .skip_while(|line| line.end <= start)
         .take_while(|line| line.start < end)
     {
         let local_start = start.max(line.start).saturating_sub(line.start);
@@ -700,6 +739,25 @@ mod tests {
     }
 
     #[test]
+    fn too_many_short_lines_fall_back_without_parsing() {
+        let source = "\"x\"\n".repeat(MAX_HUNK_LINES + 1);
+        let mut additions = String::with_capacity(source.len() + MAX_HUNK_LINES + 1);
+        for line in source.lines() {
+            additions.push('+');
+            additions.push_str(line);
+            additions.push('\n');
+        }
+        let line_count = MAX_HUNK_LINES + 1;
+        let patch = parse_patch(&format!(
+            "diff --git a/dense.rs b/dense.rs\n--- a/dense.rs\n+++ b/dense.rs\n@@ -0,0 +1,{line_count} @@\n{additions}"
+        ));
+        let highlights = SyntaxHighlights::for_patch(&patch, None);
+
+        assert!(highlights.limited());
+        assert!(highlights.lines.is_empty());
+    }
+
+    #[test]
     fn cancellation_stops_highlight_preparation() {
         let patch = parse_patch(concat!(
             "diff --git a/src/lib.rs b/src/lib.rs\n",
@@ -714,5 +772,80 @@ mod tests {
         let highlights = SyntaxHighlights::for_patch(&patch, Some(&cancel));
 
         assert!(highlights.spans(0, Side::New, 1).is_empty());
+    }
+
+    #[test]
+    fn dense_highlight_ranges_map_without_replaying_prior_lines() {
+        const LINE_COUNT: usize = 10_000;
+        let lines = (0..LINE_COUNT)
+            .map(|index| SourceLine {
+                key: LineKey {
+                    file: 0,
+                    side: Side::New,
+                    line: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                },
+                start: index * 4,
+                end: index * 4 + 3,
+            })
+            .collect::<Vec<_>>();
+        let mut highlighted = BTreeMap::new();
+        let mut line_cursor = 0;
+
+        for line in &lines {
+            map_range(
+                &mut highlighted,
+                &lines,
+                &mut line_cursor,
+                line.start,
+                line.end,
+                SyntaxClass::String,
+            );
+        }
+
+        assert_eq!(highlighted.len(), LINE_COUNT);
+        assert_eq!(
+            highlighted.get(&lines[LINE_COUNT - 1].key),
+            Some(&vec![SyntaxSpan {
+                start: 0,
+                end: 3,
+                class: SyntaxClass::String,
+            }])
+        );
+    }
+
+    #[test]
+    #[ignore = "opt-in IR-17 reference workload; run in release mode"]
+    fn ir_17_reference_dense_syntax_hunk() {
+        const LINE_COUNT: usize = 50_000;
+        let source = "\"x\"\n".repeat(LINE_COUNT);
+        let mut additions = String::with_capacity(source.len() + LINE_COUNT);
+        for line in source.lines() {
+            additions.push('+');
+            additions.push_str(line);
+            additions.push('\n');
+        }
+        let patch = parse_patch(&format!(
+            "diff --git a/dense.rs b/dense.rs\n--- a/dense.rs\n+++ b/dense.rs\n@@ -0,0 +1,{LINE_COUNT} @@\n{additions}"
+        ));
+
+        let started = std::time::Instant::now();
+        let highlights = SyntaxHighlights::for_patch(&patch, None);
+        let duration = started.elapsed();
+        let highlighted_lines = highlights.lines.len();
+
+        eprintln!(
+            "IR17_METRIC profile={} workload=dense_syntax_hunk source_bytes={} lines={LINE_COUNT} highlighted_lines={highlighted_lines} limited={} duration_us={} projection_bytes={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            source.len(),
+            highlights.limited(),
+            duration.as_micros(),
+            highlights.projection_bytes(),
+        );
+        assert_eq!(highlighted_lines, 0);
+        assert!(highlights.limited());
     }
 }

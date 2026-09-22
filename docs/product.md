@@ -160,7 +160,7 @@ exiting and relaunching in another clone or with `--repo owner/name`.
 ## Deliberate limitations
 
 - No agentic repository browsing or tool loop; analysis and Ask use the shown bundle.
-- No syntax highlighting and no displayed hidden reasoning trace.
+- No displayed hidden reasoning trace.
 - No automatic paid re-analysis when a PR head changes. Whether to add an explicit
   commit-range/cost confirmation remains [DEC-15](decisions.md#open-decision).
 - No claim of perfect secret detection, remote exactly-once mutation, or instant
