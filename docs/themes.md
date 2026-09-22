@@ -21,6 +21,12 @@ accent = "#79c0ff"
 add = { fg = "#9be9a8", bg = "#153d2b", modifiers = ["bold"] }
 del = "#ff9b9b"
 
+[syntax]
+comment = "#8b949e"
+keyword = "#ff7b72"
+string = "#a5d6ff"
+type = "#ffa657"
+
 [ui]
 border = "#586174"
 border_focused = "#79c0ff"
@@ -47,6 +53,7 @@ with a warning rather than making the UI unusable.
 | `command` | `prompt`, `error` |
 | `picker` | `selected` |
 | `diff` | `add`, `add_emphasis`, `del`, `del_emphasis`, `context`, `hunk_header`, `line_number`, `stale`, `folded` |
+| `syntax` | `comment`, `keyword`, `string`, `number`, `type`, `function`, `constant`, `property`, `variable` |
 | `tree` | `dir`, `file`, `modified`, `added`, `deleted` |
 | `comment` | `marker` |
 | `draft` | `marker` |
@@ -55,3 +62,7 @@ with a warning rather than making the UI unusable.
 
 Run `:theme reload` after changing a file. A bad value leaves its inherited style in
 place and adds a diagnostic visible through `:doctor`.
+
+Syntax styles contribute foreground colours and modifiers only when drawn over a diff.
+Their background setting is ignored so added/deleted and cursor backgrounds remain
+visible.

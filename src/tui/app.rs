@@ -7885,6 +7885,7 @@ mod tests {
             Some("reference-head"),
             None,
             Vec::new(),
+            None,
         );
         let prepare = prepare_started.elapsed();
         let projection_bytes = view.projection_bytes();
@@ -8028,6 +8029,7 @@ mod tests {
             Some("reference-head"),
             None,
             comments,
+            None,
         );
         let prepare = started.elapsed();
         let projected_rows = view.rows.len();
@@ -8086,6 +8088,7 @@ mod tests {
             Some("reference-head"),
             None,
             Vec::new(),
+            None,
         );
         view.set_split(true);
         let prepare = started.elapsed();

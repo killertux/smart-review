@@ -9,14 +9,17 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::domain::diff::{FileStatus, LineKind};
+use crate::domain::draft::Side;
 use crate::domain::pr::{CheckState, ReviewComment};
 use crate::tui::app::{App, Pane, ReviewTab};
 use crate::tui::components::border_style;
 use crate::tui::diff_view::{DiffRow, DiffView, RowKind, SplitRow, TreeKind, TreeRow};
+use crate::tui::syntax::{SyntaxClass, SyntaxSpan};
 use crate::tui::text;
 use crate::tui::theme::{Theme, element};
 
@@ -1077,6 +1080,9 @@ fn diff_title(theme: &Theme, view: &DiffView, width: u16, app: &App) -> String {
     if app.diff_offline.is_some() {
         title.push_str("· cached ");
     }
+    if view.syntax_limited() {
+        title.push_str("· syntax partial ");
+    }
     let _ = theme;
     title
 }
@@ -1149,15 +1155,28 @@ fn unified_line(
         }
         RowKind::Line => {
             let available = usize::from(width).saturating_sub(12);
-            let content = if row.no_newline {
-                format!(
-                    "{} ⏎",
-                    text::truncate(&row.text, available.saturating_sub(2))
-                )
-            } else {
-                text::truncate(&row.text, available)
+            let body = body_style(theme, row, selected);
+            let (side, number) = match row.line_kind {
+                Some(LineKind::Delete) => (Side::Old, row.old_line),
+                Some(LineKind::Add | LineKind::Context) | None => (Side::New, row.new_line),
             };
-            spans.push(Span::styled(content, body_style(theme, row, selected)));
+            let syntax = number.map_or(&[][..], |number| view.syntax_spans(row.file, side, number));
+            let content_width = if row.no_newline {
+                available.saturating_sub(2)
+            } else {
+                available
+            };
+            spans.extend(highlighted_content(
+                theme,
+                &row.text,
+                syntax,
+                content_width,
+                body,
+                false,
+            ));
+            if row.no_newline {
+                spans.push(Span::styled(" ⏎".to_owned(), body));
+            }
         }
     }
 
@@ -1216,9 +1235,16 @@ fn split_line(
                         theme.style(element::DIFF_LINE_NUMBER)
                     },
                 ));
-                spans.push(Span::styled(
-                    text::pad(&line.content, cell_width.saturating_sub(6)),
+                let side = if left_side { Side::Old } else { Side::New };
+                let syntax =
+                    number.map_or(&[][..], |number| view.syntax_spans(row.file, side, number));
+                spans.extend(highlighted_content(
+                    theme,
+                    &line.content,
+                    syntax,
+                    cell_width.saturating_sub(6),
                     body_style_for(theme, line.kind, selected),
+                    true,
                 ));
             }
             None => {
@@ -1317,6 +1343,95 @@ fn gutter_style(theme: &Theme, row: &DiffRow, selected: bool) -> ratatui::style:
     }
 }
 
+/// Turns cached semantic byte ranges into visible spans without replacing the
+/// addition/deletion background carried by `base`.
+fn highlighted_content(
+    theme: &Theme,
+    content: &str,
+    syntax: &[SyntaxSpan],
+    width: usize,
+    base: Style,
+    pad: bool,
+) -> Vec<Span<'static>> {
+    let fitted = text::truncate(content, width);
+    let truncated = text::width(content) > width;
+    let visible = if truncated {
+        fitted
+            .strip_suffix(text::ELLIPSIS)
+            .unwrap_or(fitted.as_str())
+    } else {
+        fitted.as_str()
+    };
+    let Some(source) = content.get(..visible.len()) else {
+        return vec![Span::styled(fitted, base)];
+    };
+
+    let mut spans = Vec::with_capacity(syntax.len().saturating_mul(2).saturating_add(2));
+    let mut cursor = 0usize;
+    for range in syntax {
+        let start = range.start.max(cursor).min(source.len());
+        let end = range.end.min(source.len());
+        if start >= end {
+            continue;
+        }
+        let (Some(before), Some(token)) = (source.get(cursor..start), source.get(start..end))
+        else {
+            return vec![Span::styled(fitted, base)];
+        };
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_owned(), base));
+        }
+        spans.push(Span::styled(
+            token.to_owned(),
+            base.patch(syntax_foreground(theme, range.class)),
+        ));
+        cursor = end;
+    }
+    if let Some(rest) = source.get(cursor..)
+        && !rest.is_empty()
+    {
+        spans.push(Span::styled(rest.to_owned(), base));
+    }
+    if truncated {
+        spans.push(Span::styled(text::ELLIPSIS.to_string(), base));
+    }
+    if pad {
+        let used = text::width(&fitted);
+        let padding = width.saturating_sub(used);
+        if padding > 0 {
+            spans.push(Span::styled(" ".repeat(padding), base));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+/// Syntax contributes foreground and modifiers only; diff and cursor backgrounds
+/// remain visible whatever a user theme specifies for a token.
+fn syntax_foreground(theme: &Theme, class: SyntaxClass) -> Style {
+    let element = match class {
+        SyntaxClass::Comment => element::SYNTAX_COMMENT,
+        SyntaxClass::Keyword => element::SYNTAX_KEYWORD,
+        SyntaxClass::String => element::SYNTAX_STRING,
+        SyntaxClass::Number => element::SYNTAX_NUMBER,
+        SyntaxClass::Type => element::SYNTAX_TYPE,
+        SyntaxClass::Function => element::SYNTAX_FUNCTION,
+        SyntaxClass::Constant => element::SYNTAX_CONSTANT,
+        SyntaxClass::Property => element::SYNTAX_PROPERTY,
+        SyntaxClass::Variable => element::SYNTAX_VARIABLE,
+    };
+    let syntax = theme.style(element);
+    let mut foreground = Style::default()
+        .add_modifier(syntax.add_modifier)
+        .remove_modifier(syntax.sub_modifier);
+    if let Some(color) = syntax.fg {
+        foreground = foreground.fg(color);
+    }
+    foreground
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,6 +1452,87 @@ index 1a2b3c4..5d6e7f8 100644
 +        gross - self.discount
      }
 ";
+
+    #[test]
+    fn syntax_foregrounds_keep_the_diff_background() {
+        let theme = Theme::default();
+        let base = Style::default()
+            .bg(ratatui::style::Color::Red)
+            .fg(ratatui::style::Color::Green);
+        let spans = highlighted_content(
+            &theme,
+            "let answer = 42;",
+            &[SyntaxSpan {
+                start: 0,
+                end: 3,
+                class: SyntaxClass::Keyword,
+            }],
+            40,
+            base,
+            false,
+        );
+
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "let answer = 42;"
+        );
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.style.bg == Some(ratatui::style::Color::Red))
+        );
+        assert_eq!(spans[0].style.fg, theme.style(element::SYNTAX_KEYWORD).fg);
+    }
+
+    #[test]
+    fn highlighted_split_content_remains_column_bounded() {
+        let theme = Theme::default();
+        let spans = highlighted_content(
+            &theme,
+            "let 東京 = \"wide\";",
+            &[SyntaxSpan {
+                start: 0,
+                end: 3,
+                class: SyntaxClass::Keyword,
+            }],
+            10,
+            Style::default(),
+            true,
+        );
+        let rendered = spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text::width(&rendered), 10);
+        assert!(rendered.contains(text::ELLIPSIS));
+    }
+
+    #[test]
+    fn a_diff_row_uses_its_cached_language_ranges() {
+        let (_dir, app) = app_with_patch();
+        let view = app.review.as_ref().expect("review");
+        let row = view
+            .rows
+            .iter()
+            .find(|row| row.text.contains("let gross"))
+            .expect("Rust addition");
+        let rendered = unified_line(&app.theme, row, false, 100, view, app.drafts());
+        let keyword = rendered
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "let")
+            .expect("highlighted keyword");
+
+        assert_eq!(
+            keyword.style.fg,
+            app.theme.style(element::SYNTAX_KEYWORD).fg
+        );
+        assert_eq!(keyword.style.bg, app.theme.style(element::DIFF_ADD).bg);
+    }
 
     fn app_with_patch() -> (TempHome, App) {
         let dir = temp_home();

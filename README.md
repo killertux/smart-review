@@ -57,7 +57,8 @@ Apple Silicon. The binary still needs `git` and an authenticated `gh` on `PATH`.
 1. Run `smart-review --check`; follow any stated next action, then start the app.
 2. Filter with `/`, move with `j`/`k`, and press `Enter` on a pull request.
 3. Use `1`–`5` for **Overview**, **Files**, **Checks**, **Discussion**, and **Ask**.
-   In Files, use `Tab` to switch between the tree and diff, `]c`/`[c` for hunks,
+   Files syntax-highlights popular languages; use `Tab` to switch between the tree and
+   diff, `]c`/`[c` for hunks,
    and `}`/`{` for files.
 4. Optional: press `<leader>m` to choose a provider/model and enter its key. Press
    `<leader>a` twice on first use: the first press previews the exact context policy;
