@@ -1,4 +1,4 @@
- smart-review v0.2.0 config: built-in defaults                                                   acme/service
+ smart-review v0.3.0 config: built-in defaults                                                   acme/service
 │ filters [is:open] <leader>f adds one                                                                       │
 │ search / filters what has been fetched; :filter asks GitHub                                                │
 ┌ acme/service · open · showing 3 of 137 ────────────────────────────────────────────────────────────────────┐

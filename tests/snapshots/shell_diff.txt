@@ -1,4 +1,4 @@
- smart-review v0.2.0 config: built-in defaults                                                   acme/service
+ smart-review v0.3.0 config: built-in defaults                                                   acme/service
  #141 WIP refactor o… [1 Overview] [2 Files] [3 Checks] [4 Discussion] [5 Ask]
 ┌ recommended order · rules (3) ·┐┌ 3 files +2 −1 · unified · ctx 3 ─────────────────────────────────────────┐
 │ ▾ 1. domain (1)                ││── M src/domain/invoice.rs                                                │
